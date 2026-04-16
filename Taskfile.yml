@@ -1,0 +1,159 @@
+version: '3'
+
+silent: true
+
+tasks:
+
+  # ---------------------------------------------------------------------------
+  # Primary
+  # ---------------------------------------------------------------------------
+
+  dev:
+    desc: Run the app in dev mode with hot reload
+    dir: src-tauri
+    cmd: cargo tauri dev
+
+  build:
+    desc: Build a release package (.app / .deb / .AppImage)
+    dir: src-tauri
+    cmd: cargo tauri build
+
+  install:
+    desc: Install frontend dependencies and fetch fonts (run after fresh clone)
+    cmds:
+      - echo "Installing frontend dependencies..."
+      - cd frontend && bun install
+      - echo "Fetching fonts..."
+      - sh scripts/fetch-fonts.sh
+      - echo "Done."
+
+  # ---------------------------------------------------------------------------
+  # Hooks (prek orchestrates everything below in one shot)
+  # ---------------------------------------------------------------------------
+
+  hooks:
+    desc: Run all prek hooks against every tracked file
+    cmd: prek run --all-files
+
+  hooks:install:
+    desc: Install prek git hooks (commit + pre-push) into .git/hooks
+    cmds:
+      - prek install
+      - prek install --hook-type pre-push
+
+  # ---------------------------------------------------------------------------
+  # Checks
+  # ---------------------------------------------------------------------------
+
+  typecheck:
+    desc: TypeScript type check (frontend)
+    dir: frontend
+    cmd: bun run typecheck
+
+  check:
+    desc: Cargo check (all workspace crates)
+    cmd: cargo check --workspace --locked
+
+  lint:
+    desc: Oxlint (frontend)
+    dir: frontend
+    cmd: bunx oxlint
+
+  lint:toml:
+    desc: Taplo format check (TOML files)
+    cmd: taplo format --check
+
+  typos:
+    desc: Spell check (all files)
+    cmd: typos
+
+  deps:unused:
+    desc: cargo-machete — report unused dependencies
+    cmd: cargo machete
+
+  deps:audit:
+    desc: cargo-deny — advisories, licenses, bans, sources
+    cmd: cargo deny check
+
+  check:all:
+    desc: Run every static check — typecheck, cargo check, clippy, lint, toml, typos, deps
+    cmds:
+      - task: typecheck
+      - task: check
+      - task: clippy
+      - task: lint
+      - task: lint:toml
+      - task: typos
+      - task: deps:unused
+
+  clippy:
+    desc: cargo clippy (all workspace crates, all targets)
+    cmd: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  # ---------------------------------------------------------------------------
+  # Tests
+  # ---------------------------------------------------------------------------
+
+  test:
+    desc: Run frontend tests (vitest)
+    dir: frontend
+    cmd: bun run test
+
+  test:watch:
+    desc: Run frontend tests in watch mode
+    dir: frontend
+    cmd: bun run test:watch
+
+  test:rust:
+    desc: Run Rust tests (all workspace crates)
+    cmd: cargo test --workspace --locked
+
+  test:all:
+    desc: Run frontend and Rust tests
+    cmds:
+      - task: test
+      - task: test:rust
+
+  # ---------------------------------------------------------------------------
+  # Formatting
+  # ---------------------------------------------------------------------------
+
+  fmt:
+    desc: Format all code (rustfmt + oxfmt + taplo)
+    cmds:
+      - cargo fmt --all
+      - cd frontend && bunx oxfmt .
+      - taplo format
+
+  fmt:check:
+    desc: Check formatting without writing (CI-friendly)
+    cmds:
+      - cargo fmt --all --check
+      - cd frontend && bunx oxfmt --check .
+      - taplo format --check
+
+  # ---------------------------------------------------------------------------
+  # Build helpers
+  # ---------------------------------------------------------------------------
+
+  frontend:build:
+    desc: Build frontend only (outputs to frontend/dist)
+    dir: frontend
+    cmd: bun run build
+
+  # ---------------------------------------------------------------------------
+  # Maintenance
+  # ---------------------------------------------------------------------------
+
+  clean:
+    desc: Remove build artifacts (frontend/dist and cargo target)
+    cmds:
+      - echo "Cleaning frontend dist..."
+      - rm -rf frontend/dist
+      - echo "Cleaning cargo target..."
+      - cargo clean
+      - echo "Done."
+
+  clean:frontend:
+    desc: Remove frontend/dist only
+    cmd: rm -rf frontend/dist

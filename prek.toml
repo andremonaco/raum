@@ -1,0 +1,85 @@
+# prek — https://prek.j178.dev/
+# All hooks are `language: system`, so toolchains are managed globally
+# (brew + cargo) instead of duplicated per repo.
+
+# ---------------------------------------------------------------------------
+# Rust
+# ---------------------------------------------------------------------------
+
+[[repos]]
+repo = "local"
+
+[[repos.hooks]]
+id = "cargo-fmt"
+name = "cargo fmt"
+entry = "cargo fmt --all -- --check"
+language = "system"
+files = "\\.rs$"
+pass_filenames = false
+
+[[repos.hooks]]
+id = "cargo-clippy"
+name = "cargo clippy"
+entry = "cargo clippy --workspace --all-targets --locked -- -D warnings"
+language = "system"
+files = "\\.rs$"
+pass_filenames = false
+
+[[repos.hooks]]
+id = "cargo-machete"
+name = "cargo machete (unused deps)"
+entry = "cargo machete"
+language = "system"
+files = "(^|/)Cargo\\.toml$"
+pass_filenames = false
+
+[[repos.hooks]]
+id = "cargo-deny"
+name = "cargo deny (advisories + licenses)"
+entry = "cargo deny check"
+language = "system"
+pass_filenames = false
+# Heavier — only on push, not every commit.
+stages = ["pre-push"]
+
+# ---------------------------------------------------------------------------
+# TOML
+# ---------------------------------------------------------------------------
+
+[[repos.hooks]]
+id = "taplo-fmt"
+name = "taplo format"
+entry = "taplo format --check"
+language = "system"
+files = "\\.toml$"
+
+# ---------------------------------------------------------------------------
+# Spelling (everything)
+# ---------------------------------------------------------------------------
+
+[[repos.hooks]]
+id = "typos"
+name = "typos"
+entry = "typos"
+language = "system"
+pass_filenames = false
+
+# ---------------------------------------------------------------------------
+# Frontend — full oxc stack (replaces ESLint + Prettier)
+# ---------------------------------------------------------------------------
+
+[[repos.hooks]]
+id = "oxlint"
+name = "oxlint"
+entry = "bash -c 'cd frontend && bunx oxlint'"
+language = "system"
+files = "^frontend/.*\\.(ts|tsx|js|jsx)$"
+pass_filenames = false
+
+[[repos.hooks]]
+id = "oxfmt"
+name = "oxfmt --check"
+entry = "bash -c 'cd frontend && bunx oxfmt --check src scripts'"
+language = "system"
+files = "^frontend/.*\\.(ts|tsx|js|jsx|json|css|md)$"
+pass_filenames = false

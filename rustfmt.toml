@@ -1,0 +1,5 @@
+edition = "2024"
+max_width = 100
+use_field_init_shorthand = true
+newline_style = "Unix"
+# imports_granularity / group_imports are nightly-only; document but don't enforce.

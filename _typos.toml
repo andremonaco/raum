@@ -1,0 +1,46 @@
+# typos — https://github.com/crate-ci/typos
+
+[default]
+extend-ignore-re = [
+    # Hex colors, SHAs
+    "\\b[0-9a-fA-F]{6,40}\\b",
+]
+
+[default.extend-words]
+# Project / stack nouns
+raum = "raum"
+Raum = "Raum"
+Tauri = "Tauri"
+tauri = "tauri"
+Solid = "Solid"
+solid = "solid"
+kobalte = "kobalte"
+xterm = "xterm"
+tmux = "tmux"
+vite = "vite"
+bun = "bun"
+opencode = "opencode"
+codex = "codex"
+gridstack = "gridstack"
+cva = "cva"
+# Rust ecosystem
+clippy = "clippy"
+rustfmt = "rustfmt"
+taplo = "taplo"
+
+[files]
+extend-exclude = [
+    "target/**",
+    "frontend/dist/**",
+    "frontend/node_modules/**",
+    "frontend/.vite/**",
+    "frontend/coverage/**",
+    "frontend/bun.lock",
+    "frontend/package-lock.json",
+    "Cargo.lock",
+    "*.svg",
+    "*.png",
+    "*.ico",
+    "*.icns",
+    "frontend/src/lib/vscode-icons-subset.json",
+]

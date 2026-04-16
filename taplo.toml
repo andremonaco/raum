@@ -1,0 +1,28 @@
+# taplo — https://taplo.tamasfe.dev/configuration/
+
+include = ["**/*.toml"]
+exclude = ["target/**", "frontend/node_modules/**", "**/Cargo.lock"]
+
+[formatting]
+align_entries = false
+align_comments = true
+array_trailing_comma = true
+array_auto_expand = true
+array_auto_collapse = true
+compact_arrays = true
+compact_inline_tables = false
+column_width = 100
+indent_tables = false
+indent_entries = false
+indent_string = "    "
+reorder_keys = false
+reorder_arrays = false
+trailing_newline = true
+crlf = false
+
+[[rule]]
+# Cargo manifests: don't reorder sections — they have a canonical order
+# but taplo's default is fine; keep explicit to document intent.
+include = ["**/Cargo.toml"]
+[rule.formatting]
+reorder_keys = false

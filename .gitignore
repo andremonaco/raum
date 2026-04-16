@@ -1,0 +1,41 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+*.swo
+
+# Rust
+target/
+**/*.rs.bk
+
+# Frontend
+node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/coverage/
+
+# Tauri
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# Logs
+*.log
+
+# Local secrets
+.env
+.env.local
+
+openspec/**/*
+[.]claude/**/*
+[.]opencode/**/*
+
+# Bun
+bun.lockb
+
+# prek
+.prek/

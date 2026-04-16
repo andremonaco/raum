@@ -1,0 +1,122 @@
+name: release
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Opens / refreshes the "release PR" whenever user-visible commits
+  # land on main. The PR proposes a version bump; the maintainer edits
+  # and merges it when ready.
+  release-pr:
+    name: release-plz PR
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Fires on every push to main, but only does real work when the
+  # previous push was the release-PR merge. In that case it creates the
+  # tag + draft GitHub Release for the `raum` package.
+  release:
+    name: release-plz tag + GH release
+    runs-on: ubuntu-22.04
+    outputs:
+      released: ${{ steps.release-plz.outputs.releases_created }}
+      releases: ${{ steps.release-plz.outputs.releases }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - id: release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build:
+    name: build (${{ matrix.target.name }})
+    needs: release
+    if: ${{ needs.release.outputs.released == 'true' }}
+    runs-on: ${{ matrix.target.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { name: macos-arm64, os: macos-14, args: "--target aarch64-apple-darwin" }
+          - { name: macos-x86_64, os: macos-13, args: "--target x86_64-apple-darwin" }
+          - { name: linux-x86_64, os: ubuntu-22.04, args: "" }
+    steps:
+      - name: resolve raum release tag
+        id: tag
+        env:
+          RELEASES: ${{ needs.release.outputs.releases }}
+        run: |
+          set -euo pipefail
+          tag=$(echo "$RELEASES" | jq -r '.[] | select(.package_name == "raum") | .tag')
+          if [ -z "$tag" ] || [ "$tag" = "null" ]; then
+            echo "no release entry for package 'raum' in outputs" >&2
+            echo "$RELEASES" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          # Check out the commit release-plz tagged, not the branch HEAD,
+          # so the bundler sees the version strings that were released.
+          ref: ${{ steps.tag.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: oven-sh/setup-bun@v2
+      - name: install linux deps
+        if: startsWith(matrix.target.os, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            tmux libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
+            patchelf libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev
+      - name: install frontend
+        working-directory: frontend
+        run: bun install --frozen-lockfile
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # macOS signing/notarization (see docs/release.md):
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # Tauri updater key for signing the update artifacts:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          # release-plz already created a draft GitHub Release for this
+          # tag; tauri-action detects it by tag and uploads bundles to it.
+          tagName: ${{ steps.tag.outputs.tag }}
+          releaseName: "raum ${{ steps.tag.outputs.tag }}"
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.target.args }}
+          projectPath: src-tauri
+          updaterJsonPreferNsis: false

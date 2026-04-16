@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!--
+    Squircle background: 824x824 centered in 1024x1024 canvas.
+    100px transparent margin on all sides — Apple HIG spec.
+    rx="184" = 22.37% of 824px (standard Apple squircle proportion).
+  -->
+  <rect x="100" y="100" width="824" height="824" rx="184" ry="184" fill="#0a0a0a"/>
+
+  <!--
+    Logo art: 480x480 centered at (512,512) inside the 824x824 squircle.
+    Fill ratio: 480/824 = 58.3% — generous padding on all sides within the squircle.
+    Grid corners: TL=(272,272)  TR=(752,272)  BR=(752,752)  BL=(272,752)
+    2x2 grid midpoints: center=(512,512)
+  -->
+  <g stroke="white" stroke-width="12" fill="none" stroke-linecap="round" stroke-linejoin="round">
+
+    <!-- Outer border -->
+    <rect x="272" y="272" width="480" height="480"/>
+
+    <!-- Interior grid lines — 1 vertical, 1 horizontal (2x2 grid) -->
+    <line x1="512" y1="272" x2="512" y2="752"/>
+    <line x1="272" y1="512" x2="752" y2="512"/>
+
+    <!-- 3 rays from top-right corner (752, 272) -->
+    <line x1="752" y1="272" x2="272" y2="512"/>
+    <line x1="752" y1="272" x2="272" y2="752"/>
+    <line x1="752" y1="272" x2="512" y2="752"/>
+
+  </g>
+</svg>

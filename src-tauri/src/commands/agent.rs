@@ -1,0 +1,427 @@
+//! Agent commands (§7). Owned by Wave 2C.
+//!
+//! Exposes:
+//!
+//! * `agent_list()` — registered adapters + currently-tracked session states.
+//! * `agent_spawn(project_slug, worktree_id, harness)` — prepare to launch an
+//!   agent harness. Performs missing-binary (§7.9) and minimum-version (§7.10)
+//!   preflight and emits `agent-state-changed` / `version-warning` /
+//!   `hook-fallback` events as needed. The actual tmux session creation is
+//!   delegated to `terminal_spawn`; this command is responsible for adapter
+//!   preflight.
+//! * `agent_state(session_id)` — current `AgentState` for a tracked session.
+//!
+//! State propagation: the state machine in `raum-core::agent_state` publishes
+//! `AgentStateChanged` records onto a tokio broadcast channel owned by
+//! `AppHandleState`. A background task (registered on first use) re-emits those
+//! records to the webview via `app.emit("agent-state-changed", …)`.
+
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
+
+use raum_core::adapters::default_registry;
+use raum_core::agent::{AgentAdapter, AgentError, AgentKind, SessionId};
+use raum_core::agent_state::{AgentStateChanged, AgentStateMachine};
+use raum_core::paths;
+use serde::Serialize;
+use tauri::{AppHandle, Emitter, Runtime};
+use tokio::sync::broadcast;
+use tracing::{info, warn};
+
+use crate::state::AppHandleState;
+
+/// Number of `AgentStateChanged` records the broadcast channel buffers before
+/// slow subscribers start losing events. 256 is comfortable for bursty hook
+/// traffic while keeping memory bounded.
+pub const AGENT_EVENT_CHANNEL_CAPACITY: usize = 256;
+
+/// Rendered adapter descriptor for the top-row UI.
+#[derive(Debug, Serialize)]
+pub struct AgentListItem {
+    pub session_id: Option<String>,
+    pub harness: AgentKind,
+    pub state: raum_core::agent::AgentState,
+    pub supports_native_events: bool,
+}
+
+/// Shared agent registry + state-machine map. Stored behind `Arc<Mutex<_>>`
+/// inside `AppHandleState` (additive field; safe to add to alongside other
+/// Wave-2 owners).
+#[derive(Default)]
+pub struct AgentRegistry {
+    adapters: Vec<Arc<dyn AgentAdapter>>,
+    machines: HashMap<String, AgentStateMachine>,
+}
+
+impl std::fmt::Debug for AgentRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentRegistry")
+            .field("adapter_count", &self.adapters.len())
+            .field("machine_count", &self.machines.len())
+            .finish()
+    }
+}
+
+impl AgentRegistry {
+    #[must_use]
+    pub fn with_defaults() -> Self {
+        Self {
+            adapters: default_registry(),
+            machines: HashMap::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn find_adapter(&self, kind: AgentKind) -> Option<Arc<dyn AgentAdapter>> {
+        self.adapters.iter().find(|a| a.kind() == kind).cloned()
+    }
+
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn adapters(&self) -> &[Arc<dyn AgentAdapter>] {
+        &self.adapters
+    }
+
+    pub fn register_machine(&mut self, machine: AgentStateMachine) {
+        self.machines
+            .insert(machine.session_id().as_str().to_string(), machine);
+    }
+
+    #[must_use]
+    pub fn state_for(&self, session_id: &str) -> Option<raum_core::agent::AgentState> {
+        self.machines.get(session_id).map(|m| m.state())
+    }
+
+    #[must_use]
+    pub fn list(&self) -> Vec<AgentListItem> {
+        let mut out = Vec::new();
+        for adapter in &self.adapters {
+            out.push(AgentListItem {
+                session_id: None,
+                harness: adapter.kind(),
+                state: raum_core::agent::AgentState::Idle,
+                supports_native_events: adapter.supports_native_events(),
+            });
+        }
+        for (id, machine) in &self.machines {
+            out.push(AgentListItem {
+                session_id: Some(id.clone()),
+                harness: machine.harness(),
+                state: machine.state(),
+                supports_native_events: self
+                    .find_adapter(machine.harness())
+                    .is_some_and(|a| a.supports_native_events()),
+            });
+        }
+        out
+    }
+}
+
+/// Broadcast channel owner. Instantiated lazily via `OnceLock` so we don't
+/// need to touch `AppHandleState::default()` unnecessarily — the first call
+/// to any agent command populates the channel and spawns the re-emit task.
+pub struct AgentEventBus {
+    pub tx: broadcast::Sender<AgentStateChanged>,
+}
+
+impl std::fmt::Debug for AgentEventBus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentEventBus")
+            .field("receiver_count", &self.tx.receiver_count())
+            .finish()
+    }
+}
+
+impl AgentEventBus {
+    #[must_use]
+    pub fn new() -> Self {
+        let (tx, _rx) = broadcast::channel(AGENT_EVENT_CHANNEL_CAPACITY);
+        Self { tx }
+    }
+}
+
+impl Default for AgentEventBus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Ensure the bridge task that re-emits `AgentStateChanged` records onto the
+/// Tauri event bus is running. Idempotent — the `OnceLock` guarantees the
+/// task is spawned at most once per process.
+pub fn ensure_bridge_running<R: Runtime>(app: &AppHandle<R>, bus: &AgentEventBus) {
+    static SPAWNED: OnceLock<()> = OnceLock::new();
+    if SPAWNED.get().is_some() {
+        return;
+    }
+    let mut rx = bus.tx.subscribe();
+    let app = app.clone();
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(change) => {
+                    if let Err(e) = app.emit("agent-state-changed", &change) {
+                        warn!(error=%e, "agent-state-changed emit failed");
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    warn!(dropped = n, "agent event bus lagged");
+                }
+            }
+        }
+    });
+    let _ = SPAWNED.set(());
+}
+
+// ---- Tauri commands --------------------------------------------------------
+
+#[tauri::command]
+pub fn agent_list(state: tauri::State<'_, AppHandleState>) -> Vec<AgentListItem> {
+    let registry = state.agents.lock().expect("agent registry poisoned");
+    registry.list()
+}
+
+#[tauri::command]
+pub fn agent_state(
+    state: tauri::State<'_, AppHandleState>,
+    session_id: String,
+) -> Option<raum_core::agent::AgentState> {
+    state
+        .agents
+        .lock()
+        .expect("agent registry poisoned")
+        .state_for(&session_id)
+}
+
+#[derive(Debug, Serialize)]
+pub struct AgentSpawnReport {
+    pub session_id: String,
+    pub binary_missing: bool,
+    pub binary: String,
+    pub version_ok: Option<bool>,
+    pub version_raw: Option<String>,
+    pub hook_fallback: bool,
+    pub supports_native_events: bool,
+}
+
+#[tauri::command]
+pub async fn agent_spawn<R: Runtime>(
+    app: AppHandle<R>,
+    state: tauri::State<'_, AppHandleState>,
+    project_slug: String,
+    worktree_id: String,
+    harness: AgentKind,
+) -> Result<AgentSpawnReport, String> {
+    // Ensure bridge task is running once per process.
+    ensure_bridge_running(&app, &state.agent_events);
+
+    let adapter = {
+        let registry = state.agents.lock().expect("agent registry poisoned");
+        registry
+            .find_adapter(harness)
+            .ok_or_else(|| format!("no adapter registered for {:?}", harness))?
+    };
+
+    // §7.9 — missing-binary detection.
+    if which::which(adapter.binary_path()).is_err() {
+        info!(
+            binary = adapter.binary_path(),
+            "agent_spawn: binary missing on PATH"
+        );
+        emit_missing_binary_notification(&app, adapter.binary_path(), harness);
+        return Ok(AgentSpawnReport {
+            session_id: String::new(),
+            binary_missing: true,
+            binary: adapter.binary_path().to_string(),
+            version_ok: None,
+            version_raw: None,
+            hook_fallback: false,
+            supports_native_events: adapter.supports_native_events(),
+        });
+    }
+
+    // §7.10 — minimum-version warning (non-blocking).
+    let version = adapter.detect_version().await.ok();
+    let (version_ok, version_raw) = match &version {
+        Some(v) => {
+            if matches!(v.at_or_above_minimum, Some(false) | None) {
+                let _ = app.emit(
+                    "version-warning",
+                    serde_json::json!({
+                        "harness": harness,
+                        "raw": v.raw,
+                        "parsed": v.parsed.as_ref().map(|p| format!("{}.{}.{}", p.major, p.minor, p.patch)),
+                        "minimum": {
+                            "major": adapter.minimum_version().major,
+                            "minor": adapter.minimum_version().minor,
+                            "patch": adapter.minimum_version().patch,
+                        },
+                    }),
+                );
+            }
+            (v.at_or_above_minimum, Some(v.raw.clone()))
+        }
+        None => (None, None),
+    };
+
+    // §7.11 — attempt hook install; on failure, fall back to silence heuristic.
+    let hooks_dir = paths::hooks_dir();
+    let mut hook_fallback = false;
+    if adapter.supports_native_events() {
+        if let Err(AgentError::HookInstall(msg)) = adapter.install_hooks(&hooks_dir).await {
+            warn!(error = %msg, "hook install failed; falling back to silence heuristic");
+            hook_fallback = true;
+            let _ = app.emit(
+                "hook-fallback",
+                serde_json::json!({
+                    "harness": harness,
+                    "reason": msg,
+                }),
+            );
+        }
+    }
+
+    // Register a state machine for this session.
+    let session_id = format!(
+        "raum-{project_slug}-{worktree_id}-{}",
+        harness.binary_name()
+    );
+    let mut machine = AgentStateMachine::new(SessionId::new(session_id.clone()), harness);
+    if hook_fallback {
+        machine.set_silence_only(true);
+    }
+    {
+        let mut registry = state.agents.lock().expect("agent registry poisoned");
+        registry.register_machine(machine);
+    }
+
+    Ok(AgentSpawnReport {
+        session_id,
+        binary_missing: false,
+        binary: adapter.binary_path().to_string(),
+        version_ok,
+        version_raw,
+        hook_fallback,
+        supports_native_events: adapter.supports_native_events(),
+    })
+}
+
+fn emit_missing_binary_notification<R: Runtime>(
+    app: &AppHandle<R>,
+    binary: &str,
+    harness: AgentKind,
+) {
+    // §7.9 — non-blocking. We emit a webview event carrying the install hint;
+    // the frontend renders this as a toast via `tauri-plugin-notification` (or
+    // an inline banner, if the user denied OS notifications earlier, per §11.4).
+    let install_hint = install_hint_for(harness);
+    let payload = serde_json::json!({
+        "harness": harness,
+        "binary": binary,
+        "install_hint": install_hint,
+        "title": "raum: harness not installed",
+        "body": format!("`{binary}` is not on $PATH.\n{install_hint}"),
+    });
+    if let Err(e) = app.emit("agent-binary-missing", &payload) {
+        warn!(error=%e, "agent-binary-missing emit failed");
+    }
+}
+
+fn install_hint_for(harness: AgentKind) -> &'static str {
+    match harness {
+        AgentKind::ClaudeCode => "Install Claude Code: https://docs.claude.com/en/docs/claude-code",
+        AgentKind::Codex => "Install Codex: https://github.com/openai/codex",
+        AgentKind::OpenCode => "Install OpenCode: https://opencode.ai",
+        AgentKind::Shell => "Install a POSIX shell (sh)",
+    }
+}
+
+// The `AgentRegistry` / `AgentEventBus` fields are exposed through
+// `state::AppHandleState`; see that module for the wiring.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_lists_three_adapters_by_default() {
+        let r = AgentRegistry::with_defaults();
+        let list = r.list();
+        assert_eq!(list.len(), 3);
+        assert!(list.iter().all(|i| i.session_id.is_none()));
+    }
+
+    #[test]
+    fn registry_finds_adapter_by_kind() {
+        let r = AgentRegistry::with_defaults();
+        assert!(r.find_adapter(AgentKind::ClaudeCode).is_some());
+        assert!(r.find_adapter(AgentKind::OpenCode).is_some());
+        assert!(r.find_adapter(AgentKind::Codex).is_some());
+        assert!(r.find_adapter(AgentKind::Shell).is_none());
+    }
+
+    #[test]
+    fn state_for_missing_session_returns_none() {
+        let r = AgentRegistry::with_defaults();
+        assert!(r.state_for("raum-missing").is_none());
+    }
+
+    #[test]
+    fn registering_machine_exposes_state() {
+        let mut r = AgentRegistry::with_defaults();
+        let m = AgentStateMachine::new(SessionId::new("raum-abc"), AgentKind::ClaudeCode);
+        r.register_machine(m);
+        assert_eq!(
+            r.state_for("raum-abc"),
+            Some(raum_core::agent::AgentState::Idle)
+        );
+    }
+
+    // Tests that mutate the process-wide environment serialize on this mutex so
+    // parallel test threads don't clobber each other's `PATH`. Poisoning is
+    // ignored so one failing test doesn't cascade into the others.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[allow(unsafe_code)]
+    fn set_path(v: &str) {
+        // SAFETY: every call site holds `ENV_LOCK`.
+        unsafe { std::env::set_var("PATH", v) }
+    }
+    #[allow(unsafe_code)]
+    fn restore_path(prev: Option<std::ffi::OsString>) {
+        // SAFETY: every call site holds `ENV_LOCK`.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+    }
+
+    #[test]
+    fn missing_binary_is_returned_under_empty_path() {
+        // §7.9 test: with `PATH` scrubbed of every directory that could
+        // plausibly contain the harness binary, `adapter.spawn` must return
+        // `AgentError::BinaryMissing`.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let adapter = raum_core::adapters::ClaudeCodeAdapter::new();
+        let prev = std::env::var_os("PATH");
+        set_path("/raum-test-nonexistent-path");
+        let err = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(adapter.spawn(raum_core::agent::SpawnOptions {
+                cwd: std::path::PathBuf::from("/tmp"),
+                project_slug: "p".into(),
+                worktree_id: "w".into(),
+                extra_env: vec![],
+            }));
+        restore_path(prev);
+        assert!(
+            matches!(err, Err(AgentError::BinaryMissing { .. })),
+            "expected BinaryMissing, got {err:?}"
+        );
+    }
+}

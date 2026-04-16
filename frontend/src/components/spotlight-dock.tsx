@@ -1,0 +1,595 @@
+/**
+ * Spotlight-style command dock.
+ *
+ * Triggered by `⌘F` (or `⌘.` for backwards compatibility). Shows recent
+ * searches and all project harnesses when the input is empty; as the user
+ * types, shows matching harness sessions (click → focus pane) and project
+ * files (click → open in FileEditorModal) across ALL worktrees of the active
+ * project — each result carries a worktree badge so duplicates are
+ * distinguishable.
+ *
+ * Keyboard nav: ↑/↓ to select, Enter to activate, Escape to close.
+ */
+
+import {
+  Component,
+  For,
+  Match,
+  Show,
+  Suspense,
+  Switch,
+  type JSX,
+  createEffect,
+  createMemo,
+  createSignal,
+  lazy,
+  onCleanup,
+} from "solid-js";
+import { invoke } from "@tauri-apps/api/core";
+import {
+  clearSpotlightPendingQuery,
+  closeSpotlight,
+  spotlightOpen,
+  spotlightPendingQuery,
+  spotlightTopBarDriven,
+  spotlightTopBarQuery,
+  toggleSpotlight,
+} from "../lib/spotlightState";
+import { addRecentSearch, clearRecentSearch, recentSearches } from "../lib/recentSearchStore";
+import { terminalStore } from "../stores/terminalStore";
+import { activeProjectSlug } from "../stores/projectStore";
+import { useKeymapAction } from "../lib/keymapContext";
+const FileEditorModal = lazy(() =>
+  import("./file-editor-modal").then((m) => ({ default: m.FileEditorModal })),
+);
+import { Badge } from "./ui/badge";
+import { ClockIcon, SearchIcon, HARNESS_ICONS, type HarnessIconKind } from "./icons";
+import { FileTypeIcon } from "../lib/fileTypeIcon";
+import type { Worktree } from "../stores/worktreeStore";
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+interface FileHit {
+  path: string;
+  relPath: string;
+  name: string;
+  score: number;
+}
+
+interface WorktreeFileHit extends FileHit {
+  worktreeBranch: string;
+  worktreePath: string;
+}
+
+type RecentItem = { type: "recent"; query: string };
+type HarnessItem = {
+  type: "harness";
+  sessionId: string;
+  kind: HarnessIconKind;
+  workingState: string;
+  worktreeId: string | null;
+  /** Human-readable label derived from worktreeId (last path segment). */
+  worktreeLabel: string | null;
+};
+type FileItem = { type: "file"; hit: WorktreeFileHit };
+type ResultItem = RecentItem | HarnessItem | FileItem;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function stateColor(state: string): string {
+  if (state === "working") return "bg-emerald-500/20 text-emerald-400";
+  if (state === "waiting") return "bg-amber-500/20 text-amber-400";
+  return "bg-muted text-muted-foreground";
+}
+
+function stateLabel(state: string): string {
+  if (state === "working") return "active";
+  if (state === "waiting") return "waiting";
+  return "idle";
+}
+
+/** Return the last meaningful segment of a worktree path as a display label. */
+function worktreeLabel(worktreeId: string | null): string | null {
+  if (!worktreeId) return null;
+  const parts = worktreeId.replace(/\\/g, "/").split("/").filter(Boolean);
+  return parts.at(-1) ?? null;
+}
+
+// ---------------------------------------------------------------------------
+// SpotlightDock
+// ---------------------------------------------------------------------------
+
+export const SpotlightDock: Component = () => {
+  const [query, setQuery] = createSignal("");
+  const [fileHits, setFileHits] = createSignal<WorktreeFileHit[]>([]);
+  const [selectedIdx, setSelectedIdx] = createSignal(-1);
+  const [editorPath, setEditorPath] = createSignal<string | null>(null);
+
+  let inputRef: HTMLInputElement | undefined;
+  let fileSearchTimer: ReturnType<typeof setTimeout> | null = null;
+  let fileToken = 0;
+
+  // ⌘. — backwards-compat shortcut via keymap system
+  useKeymapAction("spotlight", toggleSpotlight);
+
+  // ⌘F — primary trigger, captured before the browser can intercept it
+  const onGlobalKeydown = (e: KeyboardEvent): void => {
+    if ((e.metaKey || e.ctrlKey) && e.key === "f" && !e.shiftKey) {
+      e.preventDefault();
+      toggleSpotlight();
+    }
+  };
+  window.addEventListener("keydown", onGlobalKeydown, { capture: true });
+  onCleanup(() => window.removeEventListener("keydown", onGlobalKeydown, { capture: true }));
+
+  // On open in modal-mode: consume pendingQuery, reset state, steal focus.
+  // In top-bar-driven mode: reset state but do NOT steal focus — the top-bar
+  // input stays focused and drives the query via the effect below.
+  createEffect(() => {
+    if (spotlightOpen()) {
+      if (spotlightTopBarDriven()) {
+        // Query comes from the top-bar; just reset the result lists.
+        setFileHits([]);
+        setSelectedIdx(-1);
+      } else {
+        const initial = spotlightPendingQuery();
+        clearSpotlightPendingQuery();
+        setQuery(initial);
+        setFileHits([]);
+        setSelectedIdx(-1);
+        if (initial) scheduleFileSearch(initial);
+        requestAnimationFrame(() => {
+          inputRef?.focus();
+          if (initial) {
+            inputRef?.setSelectionRange(initial.length, initial.length);
+          }
+        });
+      }
+    }
+  });
+
+  // While top-bar-driven, keep the local query in sync with whatever the
+  // top-bar input is typing and re-run the search on each change.
+  createEffect(() => {
+    if (!spotlightTopBarDriven()) return;
+    const q = spotlightTopBarQuery();
+    setQuery(q);
+    setSelectedIdx(-1);
+    scheduleFileSearch(q);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Worktree-aware file search
+  // ---------------------------------------------------------------------------
+
+  function scheduleFileSearch(q: string): void {
+    if (fileSearchTimer !== null) clearTimeout(fileSearchTimer);
+    fileSearchTimer = setTimeout(() => {
+      fileSearchTimer = null;
+      void runWorktreeFileSearch(q);
+    }, 120);
+  }
+
+  async function runWorktreeFileSearch(q: string): Promise<void> {
+    const slug = activeProjectSlug();
+    if (!slug || !q.trim()) {
+      setFileHits([]);
+      return;
+    }
+    const token = ++fileToken;
+    try {
+      const worktrees = await invoke<Worktree[]>("worktree_list", {
+        projectSlug: slug,
+      });
+      if (token !== fileToken) return;
+
+      const perWorktree = await Promise.all(
+        worktrees.map(async (wt) => {
+          try {
+            const hits = await invoke<FileHit[]>("search_files_in_path", {
+              path: wt.path,
+              query: q,
+            });
+            const branch =
+              wt.branch?.replace(/^refs\/heads\//, "") ?? wt.path.split("/").at(-1) ?? "main";
+            return hits.map(
+              (h): WorktreeFileHit => ({
+                ...h,
+                worktreeBranch: branch,
+                worktreePath: wt.path,
+              }),
+            );
+          } catch {
+            return [] as WorktreeFileHit[];
+          }
+        }),
+      );
+
+      if (token !== fileToken) return;
+      const merged = perWorktree
+        .flat()
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 50);
+      setFileHits(merged);
+    } catch {
+      if (token === fileToken) setFileHits([]);
+    }
+  }
+
+  function handleQueryChange(v: string): void {
+    setQuery(v);
+    setSelectedIdx(-1);
+    scheduleFileSearch(v);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Harness results — scoped to active project, show worktree label
+  // ---------------------------------------------------------------------------
+
+  const harnessMatches = createMemo<HarnessItem[]>(() => {
+    const q = query().toLowerCase().trim();
+    const slug = activeProjectSlug();
+    return Object.values(terminalStore.byId)
+      .filter((t) => !slug || t.project_slug === slug)
+      .filter(
+        (t) =>
+          !q ||
+          t.kind.toLowerCase().includes(q) ||
+          t.session_id.toLowerCase().includes(q) ||
+          (t.worktree_id?.toLowerCase().includes(q) ?? false),
+      )
+      .slice(0, 8)
+      .map(
+        (t): HarnessItem => ({
+          type: "harness" as const,
+          sessionId: t.session_id,
+          kind: t.kind as HarnessIconKind,
+          workingState: t.workingState,
+          worktreeId: t.worktree_id,
+          worktreeLabel: worktreeLabel(t.worktree_id),
+        }),
+      );
+  });
+
+  // ---------------------------------------------------------------------------
+  // Flat navigation list
+  // ---------------------------------------------------------------------------
+
+  const allItems = createMemo<ResultItem[]>(() => {
+    const q = query().trim();
+    if (!q) {
+      // Empty query: recent searches first, then all project harnesses
+      const recents = recentSearches().map((r): RecentItem => ({ type: "recent", query: r }));
+      return [...recents, ...harnessMatches()];
+    }
+    return [...harnessMatches(), ...fileHits().map((hit): FileItem => ({ type: "file", hit }))];
+  });
+
+  function activateItem(item: ResultItem): void {
+    if (item.type === "recent") {
+      setQuery(item.query);
+      setSelectedIdx(-1);
+      scheduleFileSearch(item.query);
+      return;
+    }
+    if (item.type === "harness") {
+      window.dispatchEvent(
+        new CustomEvent("terminal-focus-requested", {
+          detail: { sessionId: item.sessionId },
+        }),
+      );
+      closeSpotlight();
+      return;
+    }
+    // file
+    addRecentSearch(query());
+    setEditorPath(item.hit.path);
+    closeSpotlight();
+  }
+
+  function onKeyDown(e: KeyboardEvent): void {
+    if (!spotlightOpen()) return;
+    const items = allItems();
+    if (e.key === "Escape") {
+      e.preventDefault();
+      closeSpotlight();
+      return;
+    }
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setSelectedIdx((i) => Math.min(i + 1, items.length - 1));
+      return;
+    }
+    if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setSelectedIdx((i) => Math.max(i - 1, -1));
+      return;
+    }
+    if (e.key === "Enter") {
+      e.preventDefault();
+      const item = items[selectedIdx()];
+      if (item) activateItem(item);
+    }
+  }
+
+  window.addEventListener("keydown", onKeyDown, { capture: true });
+  onCleanup(() => {
+    window.removeEventListener("keydown", onKeyDown, { capture: true });
+    if (fileSearchTimer !== null) clearTimeout(fileSearchTimer);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Section metadata for rendering
+  // ---------------------------------------------------------------------------
+
+  const sections = createMemo(() => {
+    const items = allItems();
+    const q = query().trim();
+    const hasRecent = !q && recentSearches().length > 0;
+    const hasHarnesses = harnessMatches().length > 0;
+    const fileCount = fileHits().length;
+    return { hasRecent, hasHarnesses, harnessCount: harnessMatches().length, fileCount, items };
+  });
+
+  return (
+    <>
+      <Show when={spotlightOpen()}>
+        {/* Backdrop — dims the app without blurring it */}
+        <div
+          class="fixed inset-0 z-50 flex items-start justify-center pt-[16vh] bg-black/50"
+          onClick={closeSpotlight}
+        >
+          {/* Panel — solid background so the app behind stays crisp */}
+          <div
+            class="animate-in fade-in zoom-in-95 duration-150 w-full max-w-[640px] mx-4 overflow-hidden rounded-2xl border border-border bg-popover shadow-2xl"
+            style={{
+              "box-shadow": "0 24px 64px rgba(0,0,0,0.55), 0 0 0 1px rgba(255,255,255,0.06)",
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Search input — hidden when the top-bar input is driving the query */}
+            <Show when={!spotlightTopBarDriven()}>
+              <div class="flex items-center gap-3 px-4 py-3.5">
+                <SearchIcon class="size-4 shrink-0 text-muted-foreground/60" />
+                <input
+                  ref={(el) => (inputRef = el)}
+                  type="text"
+                  class="min-w-0 flex-1 bg-transparent text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none"
+                  placeholder="Search files and terminals…"
+                  value={query()}
+                  onInput={(e) => handleQueryChange(e.currentTarget.value)}
+                />
+                <Show when={query()}>
+                  <button
+                    type="button"
+                    class="rounded p-0.5 text-muted-foreground/50 hover:text-foreground"
+                    onClick={() => {
+                      setQuery("");
+                      setFileHits([]);
+                      setSelectedIdx(-1);
+                    }}
+                    aria-label="Clear"
+                  >
+                    <XIcon class="size-3.5" />
+                  </button>
+                </Show>
+                <kbd class="shrink-0 rounded border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
+                  ⌘F
+                </kbd>
+              </div>
+            </Show>
+
+            {/* Results */}
+            <Show
+              when={
+                sections().items.length > 0 ||
+                (query().trim().length > 0 &&
+                  sections().harnessCount === 0 &&
+                  sections().fileCount === 0)
+              }
+            >
+              <div class="border-t border-white/5" />
+              <div class="max-h-[480px] overflow-y-auto pb-1 pt-1">
+                {/* No-results message */}
+                <Show
+                  when={
+                    query().trim().length > 0 &&
+                    sections().harnessCount === 0 &&
+                    sections().fileCount === 0
+                  }
+                >
+                  <p class="px-4 py-3 text-xs text-muted-foreground/60">
+                    No results for <span class="text-foreground/80">"{query()}"</span>
+                  </p>
+                </Show>
+
+                {/* Section headers */}
+                <Show when={sections().hasRecent}>
+                  <SectionHeader label="Recent" />
+                </Show>
+                <Show when={!query().trim() && sections().hasHarnesses}>
+                  <SectionHeader label="Terminals" />
+                </Show>
+                <Show when={query().trim() && sections().harnessCount > 0}>
+                  <SectionHeader label="Terminals" />
+                </Show>
+
+                <For each={sections().items}>
+                  {(item, idx) => {
+                    const isFirstFile = createMemo(
+                      () =>
+                        item.type === "file" &&
+                        (idx() === 0 || sections().items[idx() - 1]?.type !== "file"),
+                    );
+                    return (
+                      <>
+                        <Show when={isFirstFile()}>
+                          <SectionHeader label="Files" count={sections().fileCount} />
+                        </Show>
+                        <ResultRow
+                          selected={selectedIdx() === idx()}
+                          onRowClick={() => activateItem(item)}
+                          onRowMouseEnter={() => setSelectedIdx(idx())}
+                        >
+                          <ItemContent item={item} onClearRecent={clearRecentSearch} />
+                        </ResultRow>
+                      </>
+                    );
+                  }}
+                </For>
+              </div>
+            </Show>
+          </div>
+        </div>
+      </Show>
+
+      {/* File editor: lazy-loaded so CodeMirror doesn't ship in the initial chunk */}
+      <Show when={editorPath() !== null}>
+        <Suspense>
+          <FileEditorModal open={true} path={editorPath()} onClose={() => setEditorPath(null)} />
+        </Suspense>
+      </Show>
+    </>
+  );
+};
+
+// ---------------------------------------------------------------------------
+// Sub-components
+// ---------------------------------------------------------------------------
+
+const SectionHeader: Component<{ label: string; count?: number }> = (props) => (
+  <div class="flex items-center gap-2 px-4 pb-1 pt-2">
+    <span class="text-[10px] uppercase tracking-widest text-muted-foreground/50">
+      {props.label}
+    </span>
+    <Show when={props.count !== undefined && props.count > 0}>
+      <span class="text-[10px] text-muted-foreground/40">{props.count}</span>
+    </Show>
+  </div>
+);
+
+const ResultRow: Component<{
+  selected: boolean;
+  onRowClick: () => void;
+  onRowMouseEnter: () => void;
+  children: JSX.Element;
+}> = (props) => (
+  <button
+    type="button"
+    class="group flex w-full items-center gap-2.5 px-4 py-2 text-left text-xs transition-colors duration-75"
+    classList={{
+      "bg-white/8 text-foreground": props.selected,
+      "text-foreground hover:bg-white/5": !props.selected,
+    }}
+    onClick={() => props.onRowClick()}
+    onMouseEnter={() => props.onRowMouseEnter()}
+  >
+    {props.children}
+  </button>
+);
+
+const ItemContent: Component<{
+  item: ResultItem;
+  onClearRecent: (q: string) => void;
+}> = (props) => (
+  <Switch>
+    <Match when={props.item.type === "recent" && (props.item as RecentItem)}>
+      {(recent) => (
+        <>
+          <ClockIcon class="size-3.5 shrink-0 text-muted-foreground/60" />
+          <span class="flex-1 truncate text-foreground/90">{recent().query}</span>
+          <button
+            type="button"
+            class="ml-1 rounded p-0.5 text-muted-foreground/40 opacity-0 hover:text-foreground group-hover:opacity-100"
+            onClick={(e) => {
+              e.stopPropagation();
+              props.onClearRecent(recent().query);
+            }}
+            aria-label={`Remove "${recent().query}" from recent`}
+          >
+            <XIconSmall />
+          </button>
+        </>
+      )}
+    </Match>
+    <Match when={props.item.type === "harness" && (props.item as HarnessItem)}>
+      {(harness) => {
+        const Icon = HARNESS_ICONS[harness().kind] ?? HARNESS_ICONS["shell" as HarnessIconKind];
+        return (
+          <>
+            <Icon class="size-3.5 shrink-0 text-muted-foreground" />
+            <span class="flex-1 truncate font-mono text-xs text-foreground/90">
+              {harness().sessionId}
+            </span>
+            <Show when={harness().worktreeLabel}>
+              <Badge class="shrink-0 bg-white/5 px-1.5 py-0.5 text-[9px] font-medium text-muted-foreground/70">
+                {harness().worktreeLabel}
+              </Badge>
+            </Show>
+            <Badge
+              class={`ml-1 shrink-0 px-1.5 py-0.5 text-[9px] font-medium ${stateColor(harness().workingState)}`}
+            >
+              {stateLabel(harness().workingState)}
+            </Badge>
+          </>
+        );
+      }}
+    </Match>
+    <Match when={props.item.type === "file" && (props.item as FileItem)}>
+      {(file) => (
+        <>
+          <FileTypeIcon name={file().hit.name} class="size-3.5 shrink-0 text-muted-foreground/60" />
+          <span class="truncate text-sm text-foreground/90">{file().hit.name}</span>
+          <span class="ml-1 min-w-0 flex-1 truncate text-[10px] text-muted-foreground/50">
+            {file().hit.relPath}
+          </span>
+          <Badge class="shrink-0 bg-white/5 px-1.5 py-0.5 text-[9px] font-medium text-muted-foreground/70">
+            {file().hit.worktreeBranch}
+          </Badge>
+        </>
+      )}
+    </Match>
+  </Switch>
+);
+
+function XIcon(props: { class?: string }) {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="2"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      class={props.class}
+    >
+      <line x1="18" y1="6" x2="6" y2="18" />
+      <line x1="6" y1="6" x2="18" y2="18" />
+    </svg>
+  );
+}
+
+function XIconSmall() {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="2"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      class="size-3"
+    >
+      <line x1="18" y1="6" x2="6" y2="18" />
+      <line x1="6" y1="6" x2="18" y2="18" />
+    </svg>
+  );
+}
+
+export default SpotlightDock;

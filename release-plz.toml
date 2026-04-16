@@ -1,0 +1,66 @@
+# release-plz configuration for raum.
+#
+# Flow: every push to main runs release-plz. It opens (or updates) a
+# "release PR" with the proposed version bump and changelog entry. The
+# maintainer reviews the PR — editing the version in `src-tauri/Cargo.toml`
+# before merging if a narrower bump is desired — and merges it. The merge
+# triggers the tag + draft GitHub release; the build matrix then attaches
+# signed/notarized bundles to that draft.
+#
+# Pre-1.0 narrow-bump policy: release-plz's default analyzer will propose
+# `minor` for every `feat:` commit. Don't take that literally — override
+# the version in the release PR before merging unless the feature truly
+# warrants a `0.x.0` milestone. The PR is a proposal, not a verdict.
+
+[workspace]
+# Internal app, not a library — never publish to crates.io.
+publish = false
+
+# Pre-1.0 we expect churn. cargo-semver-checks would keep flagging
+# "breaking" API changes in internal path-only crates and force minor
+# bumps we don't want. Disable it and control bumps via PR review.
+semver_check = false
+
+# Generate and commit CHANGELOG.md alongside the version bump.
+changelog_update = true
+
+# Only open a release PR when at least one user-visible commit has
+# landed. Pure `chore:` / `docs:` / `ci:` / `style:` / `test:` runs stay
+# quiet; as soon as a `feat:` / `fix:` / `perf:` / `revert:` commit
+# lands, the PR opens and includes every commit since the last release.
+release_commits = "^(feat|fix|perf|revert)(\\(.*\\))?!?:"
+
+# Label the release PR so it's easy to filter in the UI.
+pr_labels = ["release"]
+
+# -----------------------------------------------------------------------
+# Only the shippable `raum` binary gets a tag + GitHub Release. The
+# internal workspace crates are path-only dependencies; they have no
+# downstream consumers, so tagging + releasing them would just be noise.
+# -----------------------------------------------------------------------
+
+[[package]]
+name = "raum"
+git_release_enable = true
+git_tag_enable = true
+# Create the GH release as a draft so the build matrix has time to
+# attach signed bundles before anything is visible publicly. The
+# maintainer publishes the draft manually after the post-release smoke
+# test (see docs/release.md).
+git_release_draft = true
+
+[[package]]
+name = "raum-core"
+release = false
+
+[[package]]
+name = "raum-tmux"
+release = false
+
+[[package]]
+name = "raum-hydration"
+release = false
+
+[[package]]
+name = "raum-hooks"
+release = false

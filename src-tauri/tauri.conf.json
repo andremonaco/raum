@@ -1,0 +1,70 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "raum",
+  "identifier": "de.raum.desktop",
+  "build": {
+    "frontendDist": "../frontend/dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "cd ../frontend && bun run dev",
+    "beforeBuildCommand": "cd ../frontend && bun run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "raum",
+        "label": "main",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 960,
+        "minHeight": 600,
+        "visible": false,
+        "hiddenTitle": true,
+        "fullscreen": false,
+        "resizable": true,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data: blob:; connect-src 'self' ipc: http://ipc.localhost"
+    },
+    "withGlobalTauri": true
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app", "appimage", "deb"],
+    "category": "DeveloperTool",
+    "shortDescription": "Lightning-fast, recoverable terminals for AI agent harnesses.",
+    "longDescription": "raum orchestrates terminals and agent CLIs (Claude Code, Codex, OpenCode) on macOS and Linux. Every pty lives inside a tmux session, so agents survive app restarts and crashes.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "macOS": {
+      "frameworks": [],
+      "minimumSystemVersion": "11.0",
+      "files": {
+        "Resources/Assets.car": "icons/icon-compiled/Assets.car"
+      },
+      "infoPlist": "Info.plist"
+    },
+    "linux": {
+      "deb": {
+        "depends": ["tmux", "git"]
+      },
+      "appimage": {
+        "bundleMediaFramework": false
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/andremonaco/raum/releases/latest/download/latest.json"
+      ],
+      "pubkey": "REPLACE_ME_WITH_TAURI_UPDATER_PUBKEY"
+    }
+  }
+}
