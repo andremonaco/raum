@@ -25,7 +25,7 @@ use std::path::PathBuf;
 
 use raum_core::config::{
     AgentDefaults, BranchPrefixMode, EffectiveProjectConfig, HydrationManifest, ProjectConfig,
-    WorktreeConfig,
+    WorktreeConfig, WorktreeHooks,
 };
 use raum_core::project::project_with_defaults;
 use raum_core::sigil::{is_valid_sigil, resolve_sigil};
@@ -112,6 +112,25 @@ pub struct WorktreeConfigDto {
     pub path_pattern: String,
     pub branch_prefix_mode: BranchPrefixMode,
     pub branch_prefix_custom: Option<String>,
+    pub hooks: WorktreeHooksDto,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeHooksDto {
+    pub pre_create: Option<String>,
+    pub post_create: Option<String>,
+    pub timeout_secs: u32,
+}
+
+impl From<WorktreeHooks> for WorktreeHooksDto {
+    fn from(h: WorktreeHooks) -> Self {
+        Self {
+            pre_create: h.pre_create,
+            post_create: h.post_create,
+            timeout_secs: h.timeout_secs,
+        }
+    }
 }
 
 impl From<EffectiveProjectConfig> for EffectiveProjectDto {
@@ -129,6 +148,7 @@ impl From<EffectiveProjectConfig> for EffectiveProjectDto {
                 path_pattern: eff.worktree.path_pattern,
                 branch_prefix_mode: eff.worktree.branch_prefix_mode,
                 branch_prefix_custom: eff.worktree.branch_prefix_custom,
+                hooks: eff.worktree.hooks.into(),
             },
             agent_defaults: eff.agent_defaults,
         }

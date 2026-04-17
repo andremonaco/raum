@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use raum_core::store::ConfigStore;
+use raum_hooks::EventSocketHandle;
 use raum_tmux::TmuxManager;
 
 use crate::commands::agent::{AgentEventBus, AgentRegistry};
@@ -30,6 +31,14 @@ pub struct AppHandleState {
     /// `worktree-branches-changed` when the underlying HEAD changes so the UI
     /// can refresh branch badges without polling.
     pub git_watchers: Mutex<HashMap<String, GitHeadWatcher>>,
+    /// §7.6 — hook-event UDS socket handle. Populated once during Tauri
+    /// `setup`; `None` when socket bind failed (logged as a warning so we
+    /// degrade to the silence heuristic instead of crashing the app).
+    ///
+    /// The drain task that forwards events into the state-machine bridge
+    /// takes ownership of the `rx` receiver; we keep the handle alive here
+    /// only to hold the `JoinHandle` + socket path for diagnostics.
+    pub event_socket: Mutex<Option<EventSocketHandle>>,
 }
 
 impl Default for AppHandleState {
@@ -41,6 +50,7 @@ impl Default for AppHandleState {
             agents: Mutex::new(AgentRegistry::with_defaults()),
             agent_events: AgentEventBus::new(),
             git_watchers: Mutex::new(HashMap::new()),
+            event_socket: Mutex::new(None),
         }
     }
 }

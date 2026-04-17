@@ -120,6 +120,23 @@ pub fn check_harnesses() -> HarnessReport {
     HarnessReport { harnesses }
 }
 
+/// Async variant of [`check_harnesses`] that probes the four binaries
+/// concurrently. Node-based CLIs (`claude`, `opencode`) cold-start at a few
+/// hundred ms each; running them in parallel cuts the total wall-clock time
+/// from ~sum to ~max. Called from the `harnesses_check` Tauri command so the
+/// IPC round-trip stays off the main thread.
+pub async fn check_harnesses_async() -> HarnessReport {
+    let (shell, claude, codex, opencode) = tokio::join!(
+        check_harness_async(AgentKind::Shell),
+        check_harness_async(AgentKind::ClaudeCode),
+        check_harness_async(AgentKind::Codex),
+        check_harness_async(AgentKind::OpenCode),
+    );
+    HarnessReport {
+        harnesses: vec![shell, claude, codex, opencode],
+    }
+}
+
 fn check_harness(kind: AgentKind) -> HarnessStatus {
     let binary = kind.binary_name();
     let resolved_path = which::which(binary)
@@ -131,6 +148,62 @@ fn check_harness(kind: AgentKind) -> HarnessStatus {
     let settings_path = settings_path_for(kind).map(|p| p.to_string_lossy().into_owned());
 
     let output = Command::new(binary).arg("--version").output();
+    let Ok(output) = output else {
+        return HarnessStatus {
+            kind,
+            binary: binary.into(),
+            found: false,
+            version: None,
+            raw: None,
+            resolved_path,
+            minimum,
+            meets_minimum: None,
+            supports_native_events,
+            install_hint,
+            settings_path,
+        };
+    };
+    let raw_stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let raw_stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let raw_line = if raw_stdout.is_empty() {
+        raw_stderr
+    } else {
+        raw_stdout
+    };
+    let version = Version::parse(&raw_line);
+    let meets_minimum = match (&version, &minimum) {
+        (Some(v), Some(min)) => Some(v >= min),
+        _ => None,
+    };
+    HarnessStatus {
+        kind,
+        binary: binary.into(),
+        found: true,
+        version,
+        raw: Some(raw_line),
+        resolved_path,
+        minimum,
+        meets_minimum,
+        supports_native_events,
+        install_hint,
+        settings_path,
+    }
+}
+
+async fn check_harness_async(kind: AgentKind) -> HarnessStatus {
+    let binary = kind.binary_name();
+    let resolved_path = which::which(binary)
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned());
+    let minimum = minimum_version_for(kind);
+    let supports_native_events = supports_native_events_for(kind);
+    let install_hint = install_hint_for(kind).map(str::to_string);
+    let settings_path = settings_path_for(kind).map(|p| p.to_string_lossy().into_owned());
+
+    let output = tokio::process::Command::new(binary)
+        .arg("--version")
+        .output()
+        .await;
     let Ok(output) = output else {
         return HarnessStatus {
             kind,

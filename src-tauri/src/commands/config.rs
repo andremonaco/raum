@@ -8,8 +8,9 @@
 //! Plus `os_info` so the wizard can pick the right install/upgrade commands
 //! (Homebrew on macOS vs apt/dnf/pacman/zypper/apk on Linux).
 
-use raum_core::config::{ActiveLayoutState, Config};
+use raum_core::config::{ActiveLayoutState, Config, DEFAULT_PATH_PATTERN};
 use raum_core::prereqs::{self, HarnessReport, PrereqReport};
+use raum_hydration::validate_path_pattern;
 use serde::Serialize;
 
 use crate::state::AppHandleState;
@@ -82,8 +83,8 @@ pub fn prereqs_check() -> PrereqReport {
 /// report whether it's installed (plus its version). Purely informational;
 /// nothing is persisted.
 #[tauri::command]
-pub fn harnesses_check() -> HarnessReport {
-    prereqs::check_harnesses()
+pub async fn harnesses_check() -> HarnessReport {
+    prereqs::check_harnesses_async().await
 }
 
 /// §13.2 — mark onboarding complete. Called on wizard finish *or* skip-from-any-step.
@@ -143,4 +144,30 @@ pub fn config_set_harness_flags(
         _ => return Err(format!("unknown harness: {harness}")),
     }
     store.write_config(&cfg).map_err(|e| e.to_string())
+}
+
+/// Persist the global worktree `path_pattern`. Called by the Worktrees settings
+/// section when the user picks a preset or edits a custom pattern.
+///
+/// An empty/whitespace-only pattern is treated as "reset to default" and stores
+/// the built-in `DEFAULT_PATH_PATTERN`. Validation uses the same rules as
+/// `worktree_preview_path` so an invalid pattern here surfaces the same error
+/// the user would see at worktree-create time.
+#[tauri::command]
+pub fn config_set_worktree_path_pattern(
+    state: tauri::State<'_, AppHandleState>,
+    pattern: String,
+) -> Result<String, String> {
+    let trimmed = pattern.trim();
+    let effective = if trimmed.is_empty() {
+        DEFAULT_PATH_PATTERN.to_string()
+    } else {
+        validate_path_pattern(trimmed).map_err(|e| e.to_string())?;
+        trimmed.to_string()
+    };
+    let store = state.config_store.lock().map_err(|e| e.to_string())?;
+    let mut cfg: Config = store.read_config().map_err(|e| e.to_string())?;
+    cfg.worktree_config.path_pattern.clone_from(&effective);
+    store.write_config(&cfg).map_err(|e| e.to_string())?;
+    Ok(effective)
 }

@@ -12,8 +12,8 @@ use thiserror::Error;
 use tracing::{debug, info, warn};
 
 use crate::config::{
-    ActiveLayoutState, Config, EffectiveProjectConfig, Keybindings, LayoutLibrary, ProjectConfig,
-    QuickfireHistory, RaumToml, SessionState, WorktreePresetPointer,
+    ActiveLayoutState, Config, EffectiveProjectConfig, Keybindings, ProjectConfig,
+    QuickfireHistory, RaumToml, SessionState,
 };
 use crate::paths;
 
@@ -65,12 +65,10 @@ impl ConfigStore {
             self.write_config(&Config::default())?;
         }
 
-        // Touch empty layouts.toml / keybindings.toml so users discover the file.
-        for name in ["layouts.toml", "keybindings.toml"] {
-            let p = self.root.join(name);
-            if !p.exists() {
-                atomic_write(&p, b"")?;
-            }
+        // Touch empty keybindings.toml so users discover the file.
+        let kb = self.root.join("keybindings.toml");
+        if !kb.exists() {
+            atomic_write(&kb, b"")?;
         }
         Ok(())
     }
@@ -143,16 +141,6 @@ impl ConfigStore {
         self.root.join("projects").join(slug).join("project.toml")
     }
 
-    // ---- layouts.toml -------------------------------------------------------
-
-    pub fn read_layouts(&self) -> Result<LayoutLibrary, StoreError> {
-        read_toml_or_default(&self.root.join("layouts.toml"))
-    }
-
-    pub fn write_layouts(&self, library: &LayoutLibrary) -> Result<(), StoreError> {
-        write_toml(&self.root.join("layouts.toml"), library)
-    }
-
     // ---- keybindings.toml ---------------------------------------------------
 
     pub fn read_keybindings(&self) -> Result<Keybindings, StoreError> {
@@ -172,23 +160,6 @@ impl ConfigStore {
     pub fn write_sessions(&self, state: &SessionState) -> Result<(), StoreError> {
         ensure_dir_0700(&self.root.join("state"))?;
         write_toml(&self.root.join("state").join("sessions.toml"), state)
-    }
-
-    // ---- state/worktree-presets.toml ---------------------------------------
-
-    pub fn read_worktree_presets(&self) -> Result<WorktreePresetPointer, StoreError> {
-        read_toml_or_default(&self.root.join("state").join("worktree-presets.toml"))
-    }
-
-    pub fn write_worktree_presets(
-        &self,
-        pointers: &WorktreePresetPointer,
-    ) -> Result<(), StoreError> {
-        ensure_dir_0700(&self.root.join("state"))?;
-        write_toml(
-            &self.root.join("state").join("worktree-presets.toml"),
-            pointers,
-        )
     }
 
     // ---- state/quickfire-history.toml --------------------------------------
@@ -487,7 +458,6 @@ impl<T: Serialize> DebouncedWriter<T> {
 mod tests {
     use super::*;
     use crate::agent::AgentKind;
-    use crate::config::{LayoutCell, LayoutPreset};
     use tempfile::tempdir;
 
     #[test]
@@ -500,7 +470,6 @@ mod tests {
         assert!(dir.path().join("state").is_dir());
         assert!(dir.path().join("logs").is_dir());
         assert!(dir.path().join("config.toml").is_file());
-        assert!(dir.path().join("layouts.toml").is_file());
         assert!(dir.path().join("keybindings.toml").is_file());
     }
 
@@ -579,31 +548,6 @@ mod tests {
     }
 
     #[test]
-    fn layouts_round_trip() {
-        let dir = tempdir().unwrap();
-        let store = ConfigStore::new(dir.path());
-        store.ensure_layout().unwrap();
-        let lib = LayoutLibrary {
-            presets: vec![LayoutPreset {
-                name: "two-agents".into(),
-                cells: vec![LayoutCell {
-                    x: 0,
-                    y: 0,
-                    w: 6,
-                    h: 10,
-                    kind: AgentKind::ClaudeCode,
-                    title: None,
-                }],
-                created_at: Some(1),
-            }],
-        };
-        store.write_layouts(&lib).unwrap();
-        let back = store.read_layouts().unwrap();
-        assert_eq!(back.presets.len(), 1);
-        assert_eq!(back.presets[0].name, "two-agents");
-    }
-
-    #[test]
     fn keybindings_round_trip() {
         let dir = tempdir().unwrap();
         let store = ConfigStore::new(dir.path());
@@ -636,22 +580,6 @@ mod tests {
         store.write_sessions(&st).unwrap();
         let back = store.read_sessions().unwrap();
         assert_eq!(back.sessions.len(), 1);
-    }
-
-    #[test]
-    fn worktree_presets_round_trip() {
-        let dir = tempdir().unwrap();
-        let store = ConfigStore::new(dir.path());
-        store.ensure_layout().unwrap();
-        let mut map = std::collections::BTreeMap::new();
-        map.insert("acme/main".into(), "two-agents".into());
-        let p = WorktreePresetPointer { map };
-        store.write_worktree_presets(&p).unwrap();
-        let back = store.read_worktree_presets().unwrap();
-        assert_eq!(
-            back.map.get("acme/main").map(String::as_str),
-            Some("two-agents")
-        );
     }
 
     #[test]
@@ -714,6 +642,7 @@ mod tests {
                 path_pattern: "project-pattern/{branch-slug}".into(),
                 branch_prefix_mode: crate::config::BranchPrefixMode::None,
                 branch_prefix_custom: None,
+                ..crate::config::WorktreeConfig::default()
             },
             ..ProjectConfig::default()
         }
@@ -736,6 +665,7 @@ mod tests {
                 path_pattern: "raum-pattern/{branch-slug}".into(),
                 branch_prefix_mode: crate::config::BranchPrefixMode::Username,
                 branch_prefix_custom: None,
+                ..crate::config::WorktreeConfig::default()
             }),
             ..RaumToml::default()
         };
@@ -773,19 +703,15 @@ mod tests {
     async fn debounced_writer_coalesces_five_rapid_writes() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("out.toml");
-        let writer: DebouncedWriter<LayoutLibrary> =
+        let writer: DebouncedWriter<QuickfireHistory> =
             DebouncedWriter::new(path.clone(), std::time::Duration::from_millis(500));
 
         // Five submits inside one 500ms quiet window.
         for i in 0..5 {
-            let lib = LayoutLibrary {
-                presets: vec![LayoutPreset {
-                    name: format!("p{i}"),
-                    cells: vec![],
-                    created_at: None,
-                }],
+            let hist = QuickfireHistory {
+                entries: vec![format!("cmd-{i}")],
             };
-            writer.submit(&lib).unwrap();
+            writer.submit(&hist).unwrap();
         }
 
         // Advance past the quiet window so the background task flushes once.
@@ -794,8 +720,8 @@ mod tests {
 
         let raw = std::fs::read_to_string(&path).unwrap();
         // Only the last submitted value survives.
-        assert!(raw.contains("\"p4\"") || raw.contains("p4"));
-        assert!(!raw.contains("\"p3\""));
+        assert!(raw.contains("cmd-4"));
+        assert!(!raw.contains("cmd-3"));
 
         // Count temp files; there should be no leftover `.out.toml.*.tmp`.
         let entries: Vec<_> = std::fs::read_dir(dir.path())
@@ -813,10 +739,10 @@ mod tests {
     async fn debounced_writer_flushes_on_drop_via_flush_method() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("out.toml");
-        let writer: DebouncedWriter<LayoutLibrary> =
+        let writer: DebouncedWriter<QuickfireHistory> =
             DebouncedWriter::new(path.clone(), std::time::Duration::from_millis(500));
-        let lib = LayoutLibrary::default();
-        writer.submit(&lib).unwrap();
+        let hist = QuickfireHistory::default();
+        writer.submit(&hist).unwrap();
         tokio::time::advance(std::time::Duration::from_millis(600)).await;
         writer.flush().await;
         assert!(path.exists());

@@ -4,10 +4,10 @@
 
 pub mod agent;
 pub mod config;
+pub mod devtools;
 pub mod files;
 pub mod git_watcher;
 pub mod hotkeys;
-pub mod layouts;
 pub mod notifications;
 pub mod project;
 pub mod search;

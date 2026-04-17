@@ -30,6 +30,14 @@ const SUBS: &[&str] = &[
     "branch-slug",
     "branch-name",
     "project-slug",
+    // Aliases — friendlier names surfaced by the settings UI. `{repo-name}`
+    // maps to the project root basename (same as `{base-folder}`),
+    // `{worktree-slug}` maps to the slugified branch (same as `{branch-slug}`),
+    // and `{repo-root}` expands to the full project root path so the
+    // inside-project preset can be written as `{repo-root}/.raum/{worktree-slug}`.
+    "repo-name",
+    "worktree-slug",
+    "repo-root",
 ];
 
 /// Validate that `pattern` only uses the supported substitutions and contains at least one
@@ -40,7 +48,10 @@ pub fn validate_path_pattern(pattern: &str) -> Result<(), PatternError> {
             return Err(PatternError::UnknownSubstitution(tok));
         }
     }
-    if !pattern.contains("{branch-slug}") && !pattern.contains("{branch-name}") {
+    if !pattern.contains("{branch-slug}")
+        && !pattern.contains("{branch-name}")
+        && !pattern.contains("{worktree-slug}")
+    {
         return Err(PatternError::NoBranchToken);
     }
     Ok(())
@@ -72,14 +83,24 @@ pub fn resolve_worktree_pattern(
         path_pattern: DEFAULT_PATH_PATTERN.into(),
         branch_prefix_mode: BranchPrefixMode::None,
         branch_prefix_custom: None,
+        ..WorktreeConfig::default()
     }
 }
 
 /// Render `pattern` against `inputs`, producing an absolute-ish `PathBuf`.
 ///
-/// Supports all five substitutions: `{parent-dir}`, `{base-folder}`, `{branch-slug}`,
-/// `{branch-name}`, `{project-slug}`. `{branch-slug}` runs the branch name through
-/// `slug::slugify`, which normalises slashes and spaces to `-`.
+/// Supported substitutions:
+///
+/// | token             | value                                                       |
+/// | ----------------- | ----------------------------------------------------------- |
+/// | `{parent-dir}`    | parent directory of the project root                        |
+/// | `{base-folder}`   | basename of the project root                                |
+/// | `{repo-name}`     | alias of `{base-folder}`                                    |
+/// | `{repo-root}`     | full project root path (`{parent-dir}/{base-folder}`)       |
+/// | `{branch-slug}`   | slugified branch (`feat/new-darkmode` → `feat-new-darkmode`)|
+/// | `{worktree-slug}` | alias of `{branch-slug}`                                    |
+/// | `{branch-name}`   | raw branch name (no slugging)                               |
+/// | `{project-slug}`  | project slug from `project.toml`                            |
 pub fn preview_path_pattern(pattern: &str, inputs: &PatternInputs) -> PathBuf {
     let root = &inputs.project.root_path;
     let parent_dir = root.parent().map_or_else(PathBuf::new, Path::to_path_buf);
@@ -88,11 +109,19 @@ pub fn preview_path_pattern(pattern: &str, inputs: &PatternInputs) -> PathBuf {
         .and_then(|s| s.to_str())
         .unwrap_or("project")
         .to_string();
+    let repo_root = root.to_string_lossy().into_owned();
     let branch_slug = slug::slugify(inputs.branch);
     let branch_name = inputs.branch.to_string();
     let project_slug = inputs.project.slug.clone();
 
+    // Order matters: expand the longer tokens (`{worktree-slug}`, `{repo-root}`,
+    // `{repo-name}`) before the shorter ones that share prefixes (`{branch-*}`,
+    // `{parent-dir}`, `{base-folder}`) so a literal `replace` on the latter
+    // doesn't accidentally consume part of the former.
     let rendered = pattern
+        .replace("{repo-root}", &repo_root)
+        .replace("{repo-name}", &base_folder)
+        .replace("{worktree-slug}", &branch_slug)
         .replace("{parent-dir}", &parent_dir.to_string_lossy())
         .replace("{base-folder}", &base_folder)
         .replace("{branch-slug}", &branch_slug)
@@ -238,6 +267,57 @@ mod tests {
             },
         );
         assert!(!preview.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn preview_repo_name_aliases_base_folder() {
+        let p = project_with("");
+        let a = preview_path_pattern(
+            "{parent-dir}/{repo-name}-worktrees/{worktree-slug}",
+            &PatternInputs {
+                project: &p,
+                branch: "feat/new-darkmode",
+            },
+        );
+        let b = preview_path_pattern(
+            "{parent-dir}/{base-folder}-worktrees/{branch-slug}",
+            &PatternInputs {
+                project: &p,
+                branch: "feat/new-darkmode",
+            },
+        );
+        assert_eq!(a, b);
+        assert_eq!(
+            a,
+            PathBuf::from("/tmp/work/demo-worktrees/feat-new-darkmode")
+        );
+    }
+
+    #[test]
+    fn preview_repo_root_expands_to_project_root() {
+        let p = project_with("");
+        let preview = preview_path_pattern(
+            "{repo-root}/.raum/{worktree-slug}",
+            &PatternInputs {
+                project: &p,
+                branch: "feat/new-darkmode",
+            },
+        );
+        assert_eq!(
+            preview,
+            PathBuf::from("/tmp/work/demo/.raum/feat-new-darkmode")
+        );
+    }
+
+    #[test]
+    fn validates_pattern_using_worktree_slug_alias() {
+        // `{worktree-slug}` alone satisfies the branch-token requirement.
+        validate_path_pattern("{repo-root}/.raum/{worktree-slug}").unwrap();
+    }
+
+    #[test]
+    fn validates_pattern_using_repo_name_alias() {
+        validate_path_pattern("{parent-dir}/{repo-name}-wt/{worktree-slug}").unwrap();
     }
 
     #[test]

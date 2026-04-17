@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::{AgentKind, AgentState, SessionId};
 use crate::config::DEFAULT_SILENCE_THRESHOLD_MS;
+use crate::harness::Reliability;
 
 /// Hook event shape consumed by the state machine.
 ///
@@ -37,9 +38,12 @@ pub struct AgentStateChanged {
     pub harness: AgentKind,
     pub from: AgentState,
     pub to: AgentState,
-    /// Set when the machine arrived at the new state via silence heuristic
-    /// rather than a hook event (§7.7 + §7.11 fallback path).
-    pub via_silence_heuristic: bool,
+    /// How confident we are in the transition. Replaces the previous
+    /// `via_silence_heuristic: bool` flag (per-harness notification plan,
+    /// Phase 1). `Deterministic` / `EventDriven` transitions came from a
+    /// harness-native signal (hook, SSE, OSC); `Heuristic` transitions
+    /// came from the silence fallback in `tick_silence`.
+    pub reliability: Reliability,
 }
 
 #[derive(Debug, Clone)]
@@ -101,18 +105,20 @@ impl AgentStateMachine {
     pub fn on_hook_event(&mut self, ev: &HookEvent) -> Option<AgentStateChanged> {
         if self.silence_only {
             // In fallback mode, the only signal is silence. Treat hook events
-            // purely as "activity" → Working.
-            return self.transition(AgentState::Working, false);
+            // purely as "activity" → Working. The transition itself is still
+            // deterministic (we saw a real hook fire) even though the
+            // downstream Waiting transition will be heuristic.
+            return self.transition(AgentState::Working, Reliability::Deterministic);
         }
         let next = classify_hook_event(&ev.event);
-        self.transition(next, false)
+        self.transition(next, Reliability::Deterministic)
     }
 
     /// Apply a Codex-stream event. The `event` name space is the same as
     /// `HookEvent::event` so we delegate.
     pub fn on_codex_event(&mut self, event_name: &str) -> Option<AgentStateChanged> {
         let next = classify_hook_event(event_name);
-        self.transition(next, false)
+        self.transition(next, Reliability::Deterministic)
     }
 
     /// Silence-heuristic tick: the caller supplies the age of the last stdout
@@ -123,12 +129,16 @@ impl AgentStateMachine {
             return None;
         }
         if last_output_age >= self.silence_threshold {
-            return self.transition(AgentState::Waiting, true);
+            return self.transition(AgentState::Waiting, Reliability::Heuristic);
         }
         None
     }
 
-    fn transition(&mut self, next: AgentState, via_silence: bool) -> Option<AgentStateChanged> {
+    fn transition(
+        &mut self,
+        next: AgentState,
+        reliability: Reliability,
+    ) -> Option<AgentStateChanged> {
         if next == self.state {
             return None;
         }
@@ -139,7 +149,7 @@ impl AgentStateMachine {
             harness: self.harness,
             from,
             to: next,
-            via_silence_heuristic: via_silence,
+            reliability,
         })
     }
 }
@@ -212,7 +222,7 @@ mod tests {
         m.on_hook_event(&ev("UserPromptSubmit"));
         let change = m.on_hook_event(&ev("Notification")).unwrap();
         assert_eq!(change.to, AgentState::Waiting);
-        assert!(!change.via_silence_heuristic);
+        assert_eq!(change.reliability, Reliability::Deterministic);
     }
 
     #[test]
@@ -249,7 +259,7 @@ mod tests {
         // At / above threshold: → Waiting, flagged via heuristic.
         let change = m.tick_silence(Duration::from_millis(150)).unwrap();
         assert_eq!(change.to, AgentState::Waiting);
-        assert!(change.via_silence_heuristic);
+        assert_eq!(change.reliability, Reliability::Heuristic);
     }
 
     #[test]

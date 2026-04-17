@@ -105,6 +105,7 @@ fn worktree_creation_respects_pattern_prefix_and_hydration() {
             path_pattern: "project-should-be-overridden/{branch-slug}".into(),
             branch_prefix_mode: BranchPrefixMode::None,
             branch_prefix_custom: None,
+            ..WorktreeConfig::default()
         },
         hydration: HydrationManifest {
             copy: vec!["should-be-overridden".into()],

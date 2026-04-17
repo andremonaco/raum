@@ -15,17 +15,24 @@
 //! `AgentStateChanged` records onto a tokio broadcast channel owned by
 //! `AppHandleState`. A background task (registered on first use) re-emits those
 //! records to the webview via `app.emit("agent-state-changed", …)`.
+//!
+//! The existing consumer of `raum_core::AgentAdapter` continues to use it via
+//! the Phase-2 deprecation shim; `#![allow(deprecated)]` keeps the callsite
+//! warning-free until the src-tauri migration to the split trait surface
+//! completes in a follow-up change.
+#![allow(deprecated)]
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
-use raum_core::adapters::default_registry;
 use raum_core::agent::{AgentAdapter, AgentError, AgentKind, SessionId};
-use raum_core::agent_state::{AgentStateChanged, AgentStateMachine};
+use raum_core::agent_state::{AgentStateChanged, AgentStateMachine, HookEvent as CoreHookEvent};
+use raum_core::harness::default_registry;
 use raum_core::paths;
+use raum_hooks::HookEvent;
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Runtime};
-use tokio::sync::broadcast;
+use tauri::{AppHandle, Emitter, Manager, Runtime};
+use tokio::sync::{broadcast, mpsc};
 use tracing::{info, warn};
 
 use crate::state::AppHandleState;
@@ -87,6 +94,28 @@ impl AgentRegistry {
             .insert(machine.session_id().as_str().to_string(), machine);
     }
 
+    /// Apply a hook event to every state machine whose harness matches
+    /// `kind`. Returns the subset of resulting transitions (`None` when
+    /// the machine's state did not change). Called by the event-socket
+    /// drain task; the Phase 1 routing is broadcast-by-harness because
+    /// the hook-event wire shape does not yet carry a session id.
+    pub fn apply_hook_to_matching(
+        &mut self,
+        kind: AgentKind,
+        event: &CoreHookEvent,
+    ) -> Vec<AgentStateChanged> {
+        let mut out = Vec::new();
+        for machine in self.machines.values_mut() {
+            if machine.harness() != kind {
+                continue;
+            }
+            if let Some(change) = machine.on_hook_event(event) {
+                out.push(change);
+            }
+        }
+        out
+    }
+
     #[must_use]
     pub fn state_for(&self, session_id: &str) -> Option<raum_core::agent::AgentState> {
         self.machines.get(session_id).map(|m| m.state())
@@ -143,6 +172,73 @@ impl AgentEventBus {
 impl Default for AgentEventBus {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Map a wire-format harness string (as emitted by the hook scripts in
+/// `raum-hooks`) to the typed [`AgentKind`]. Returns `None` for unknown
+/// harnesses so the drain loop can log-and-drop without panicking.
+fn agent_kind_from_wire(s: &str) -> Option<AgentKind> {
+    match s {
+        "shell" => Some(AgentKind::Shell),
+        "claude-code" => Some(AgentKind::ClaudeCode),
+        "codex" => Some(AgentKind::Codex),
+        "opencode" => Some(AgentKind::OpenCode),
+        _ => None,
+    }
+}
+
+/// Drain the hook-event UDS socket into the per-session state machines
+/// and broadcast the resulting transitions onto [`AgentEventBus`].
+///
+/// Wiring (Phase 1):
+/// 1. `raum_hooks::spawn_event_socket` produces [`HookEvent`] values.
+/// 2. This loop converts each event to a `raum-core::agent_state::HookEvent`
+///    and feeds every registered state machine whose harness matches.
+/// 3. Resulting `AgentStateChanged` records go onto the broadcast bus;
+///    `ensure_bridge_running` re-emits them as `agent-state-changed`
+///    events to the Tauri webview.
+///
+/// Runs until `rx` closes. The caller owns spawning; invoke it once from
+/// Tauri `setup` after `spawn_event_socket` binds the UDS socket.
+///
+/// Routing is currently broadcast-by-harness — the hook-event wire
+/// shape does not yet carry a session id, so every machine with the
+/// matching `AgentKind` advances. This is a Phase 1 limitation; Phase 2
+/// adds session-scoped routing once `raum-hooks` embeds `$RAUM_SESSION`
+/// in the event payload.
+pub async fn drive_event_socket<R: Runtime>(
+    mut rx: mpsc::Receiver<HookEvent>,
+    bus: AgentEventBus,
+    app: AppHandle<R>,
+) {
+    while let Some(ev) = rx.recv().await {
+        let Some(kind) = agent_kind_from_wire(&ev.harness) else {
+            warn!(
+                harness = %ev.harness,
+                event = %ev.event,
+                "event-socket drain: unknown harness, dropping event",
+            );
+            continue;
+        };
+        let core_event = CoreHookEvent {
+            harness: ev.harness.clone(),
+            event: ev.event.clone(),
+            payload: ev.payload.clone(),
+        };
+        let state: tauri::State<'_, crate::state::AppHandleState> = app.state();
+        let changes: Vec<AgentStateChanged> = {
+            let Ok(mut registry) = state.agents.lock() else {
+                warn!("event-socket drain: agent registry lock poisoned; dropping event");
+                continue;
+            };
+            registry.apply_hook_to_matching(kind, &core_event)
+        };
+        for change in changes {
+            // Broadcast buffer fills silently when the bridge task is
+            // behind; the `ensure_bridge_running` task logs the lag.
+            let _ = bus.tx.send(change);
+        }
     }
 }
 
@@ -375,6 +471,52 @@ mod tests {
         assert_eq!(
             r.state_for("raum-abc"),
             Some(raum_core::agent::AgentState::Idle)
+        );
+    }
+
+    #[test]
+    fn agent_kind_wire_mapping_covers_every_harness_filename() {
+        // Mirrors `raum_hooks::scripts::harness_filename` (private but
+        // stable): the drain loop must accept every harness the hook
+        // scripts can identify themselves as.
+        assert_eq!(agent_kind_from_wire("shell"), Some(AgentKind::Shell));
+        assert_eq!(
+            agent_kind_from_wire("claude-code"),
+            Some(AgentKind::ClaudeCode)
+        );
+        assert_eq!(agent_kind_from_wire("codex"), Some(AgentKind::Codex));
+        assert_eq!(agent_kind_from_wire("opencode"), Some(AgentKind::OpenCode));
+        assert_eq!(agent_kind_from_wire("unknown-harness"), None);
+    }
+
+    #[test]
+    fn apply_hook_to_matching_advances_machines_of_matching_harness() {
+        let mut r = AgentRegistry::with_defaults();
+        r.register_machine(AgentStateMachine::new(
+            SessionId::new("raum-cc-1"),
+            AgentKind::ClaudeCode,
+        ));
+        r.register_machine(AgentStateMachine::new(
+            SessionId::new("raum-cc-2"),
+            AgentKind::ClaudeCode,
+        ));
+        r.register_machine(AgentStateMachine::new(
+            SessionId::new("raum-oc-1"),
+            AgentKind::OpenCode,
+        ));
+
+        let event = CoreHookEvent {
+            harness: "claude-code".into(),
+            event: "UserPromptSubmit".into(),
+            payload: serde_json::Value::Null,
+        };
+        let changes = r.apply_hook_to_matching(AgentKind::ClaudeCode, &event);
+        assert_eq!(changes.len(), 2, "both CC machines must advance");
+        assert!(changes.iter().all(|c| c.harness == AgentKind::ClaudeCode));
+        assert_eq!(
+            r.state_for("raum-oc-1"),
+            Some(raum_core::agent::AgentState::Idle),
+            "OpenCode machine must be untouched",
         );
     }
 

@@ -1,8 +1,7 @@
 //! Worktree commands (§6.5–§6.8, §9.1–§9.7). Owned by Wave 2B;
 //! Wave 3C adds `worktree_status`, `quickfire_history_*`, and
 //! `config_set_sidebar_width` for the sidebar
-//! (`frontend/src/components/Sidebar.tsx`). `layouts_list` lives in
-//! `commands/layouts.rs` (Wave 3D) and the sidebar calls it there.
+//! (`frontend/src/components/Sidebar.tsx`).
 //!
 //! Exposes the Tauri surface that the Solid UI calls:
 //!
@@ -14,8 +13,6 @@
 //!   `git worktree add`, then apply the hydration manifest.
 //! * `worktree_list` — list worktrees for a project.
 //! * `worktree_remove` — remove a worktree.
-//! * `worktree_preset_get` — fetch the last-used preset pointer for a
-//!   worktree (D5: `state/worktree-presets.toml`). UI does NOT auto-apply.
 //! * `worktree_config_write` — save a TOML fragment either into the project's
 //!   `.raum.toml` (if `in_repo`) or into the user-level `project.toml`.
 //! * `worktree_status` — §9.1 poll `git status --porcelain=v2` for a worktree
@@ -32,8 +29,9 @@ use std::process::Command;
 
 use raum_core::config::{BranchPrefixMode, QUICKFIRE_HISTORY_LIMIT, WorktreeConfig};
 use raum_hydration::{
-    CreateOptions, PatternInputs, PrefixContext, apply_branch_prefix, apply_hydration,
-    preview_path_pattern, resolve_worktree_pattern, worktree_create as git_worktree_create,
+    CreateOptions, HookContext, HookError, HookPhase, PatternInputs, PrefixContext,
+    apply_branch_prefix, apply_hydration, preview_path_pattern, resolve_hook_path,
+    resolve_worktree_pattern, run_hook, worktree_create as git_worktree_create,
     worktree_list as git_worktree_list, worktree_remove as git_worktree_remove,
 };
 use serde::{Deserialize, Serialize};
@@ -102,6 +100,10 @@ pub struct WorktreeCreated {
     pub copied: usize,
     pub symlinked: usize,
     pub skipped: usize,
+    /// Which hooks executed successfully (e.g. `["preCreate", "postCreate"]`).
+    /// Empty when no hooks are configured.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hooks_ran: Vec<String>,
 }
 
 // ---- preview commands ------------------------------------------------------
@@ -192,8 +194,41 @@ pub fn worktree_create(
             branch: &prefixed,
         },
     );
+    // If the user picked the inside-project preset (target lives under
+    // `<root>/.raum/…`), make sure the directory is gitignored so the worktree
+    // doesn't show up in the main repo's index. Failure is never fatal — a
+    // read-only repo or a project without git should still be able to create
+    // worktrees.
+    if target_is_inside_raum_dir(&effective.root_path, &target) {
+        if let Err(e) = ensure_raum_gitignored(&effective.root_path) {
+            tracing::warn!(
+                root = %effective.root_path.display(),
+                error = %e,
+                "worktree_create: failed to update .gitignore for .raum/"
+            );
+        }
+    }
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir parent: {e}"))?;
+    }
+
+    let hooks = &effective.worktree.hooks;
+    let timeout_secs = hooks.timeout_secs;
+    let mut hooks_ran: Vec<String> = Vec::new();
+
+    // Pre-create hook: runs with the project root as cwd, before git creates
+    // anything. Failure aborts creation — no worktree ends up on disk.
+    if let Some(raw) = hooks.pre_create.as_deref() {
+        let script = resolve_hook_path(&effective.root_path, raw);
+        let ctx = HookContext {
+            project_slug: &effective.slug,
+            project_root: &effective.root_path,
+            worktree_path: &target,
+            branch: &prefixed,
+        };
+        run_hook(HookPhase::PreCreate, &script, &ctx, timeout_secs)
+            .map_err(|e| format_hook_error("preCreate", &e))?;
+        hooks_ran.push("preCreate".into());
     }
 
     git_worktree_create(
@@ -218,6 +253,28 @@ pub fn worktree_create(
         skipped = report.skipped.len();
     }
 
+    // Post-create hook: cwd is the fresh worktree. Failure does NOT roll back —
+    // the worktree exists, so we surface the error with a note so the user can
+    // inspect or delete manually.
+    if let Some(raw) = hooks.post_create.as_deref() {
+        let script = resolve_hook_path(&effective.root_path, raw);
+        let ctx = HookContext {
+            project_slug: &effective.slug,
+            project_root: &effective.root_path,
+            worktree_path: &target,
+            branch: &prefixed,
+        };
+        if let Err(e) = run_hook(HookPhase::PostCreate, &script, &ctx, timeout_secs) {
+            rescan_git_watcher(&state, &project_slug, &effective.root_path);
+            return Err(format!(
+                "{} (worktree was created at {} — inspect or remove manually)",
+                format_hook_error("postCreate", &e),
+                target.display()
+            ));
+        }
+        hooks_ran.push("postCreate".into());
+    }
+
     rescan_git_watcher(&state, &project_slug, &effective.root_path);
 
     Ok(WorktreeCreated {
@@ -226,7 +283,12 @@ pub fn worktree_create(
         copied,
         symlinked,
         skipped,
+        hooks_ran,
     })
+}
+
+fn format_hook_error(phase: &str, err: &HookError) -> String {
+    format!("hook:{phase}: {err}")
 }
 
 #[tauri::command]
@@ -355,48 +417,6 @@ pub fn worktree_remove(
     git_worktree_remove(&effective.root_path, Path::new(&path), force)
         .map_err(|e| format!("remove: {e}"))?;
     rescan_git_watcher(&state, &project_slug, &effective.root_path);
-    Ok(())
-}
-
-#[tauri::command]
-pub fn worktree_preset_get(
-    state: tauri::State<'_, AppHandleState>,
-    worktree_id: String,
-) -> Result<Option<String>, String> {
-    let store = state.config_store.lock().map_err(|e| e.to_string())?;
-    let pointers = store
-        .read_worktree_presets()
-        .map_err(|e| format!("read pointers: {e}"))?;
-    Ok(pointers.map.get(&worktree_id).cloned())
-}
-
-/// §10.4 — set (or clear) the last-used preset pointer for a worktree.
-///
-/// Pass `Some(name)` after a successful apply-preset flow; pass `None` (or an
-/// empty string) to remove the pointer entirely. Writes go through
-/// `ConfigStore::write_worktree_presets` which is atomic (temp + rename).
-/// Frontend debounces invokes at 500 ms (§10.9).
-#[tauri::command]
-pub fn worktree_preset_set(
-    state: tauri::State<'_, AppHandleState>,
-    worktree_id: String,
-    preset_name: Option<String>,
-) -> Result<(), String> {
-    let store = state.config_store.lock().map_err(|e| e.to_string())?;
-    let mut pointers = store
-        .read_worktree_presets()
-        .map_err(|e| format!("read pointers: {e}"))?;
-    match preset_name {
-        Some(name) if !name.trim().is_empty() => {
-            pointers.map.insert(worktree_id, name);
-        }
-        _ => {
-            pointers.map.remove(&worktree_id);
-        }
-    }
-    store
-        .write_worktree_presets(&pointers)
-        .map_err(|e| format!("write pointers: {e}"))?;
     Ok(())
 }
 
@@ -736,8 +756,7 @@ pub fn quickfire_history_push(
 
 /// §9.7 — persist the sidebar width drag handle into
 /// `config.toml.sidebar.width_px`. The frontend already debounces drag events;
-/// this command is a direct read-modify-write so we stay out of the debounce
-/// machinery the rest of raum uses for layouts.
+/// this command is a direct read-modify-write.
 ///
 /// Width is clamped to `[160, 800]` to defend against accidental "drag to
 /// 0" states that would render the sidebar invisible and unrecoverable
@@ -789,6 +808,7 @@ fn load_effective(
             path_pattern: resolved.path_pattern,
             branch_prefix_mode: eff.worktree.branch_prefix_mode,
             branch_prefix_custom: eff.worktree.branch_prefix_custom.clone(),
+            hooks: eff.worktree.hooks.clone(),
         };
     }
     Ok(eff)
@@ -808,6 +828,53 @@ fn rescan_git_watcher(state: &tauri::State<'_, AppHandleState>, slug: &str, root
             w.rescan(root);
         }
     }
+}
+
+/// True when `target` lives somewhere under `<root>/.raum/`. Used to gate the
+/// `.gitignore` auto-write on the inside-project worktree preset.
+fn target_is_inside_raum_dir(root: &Path, target: &Path) -> bool {
+    let raum_dir = root.join(".raum");
+    target.starts_with(&raum_dir)
+}
+
+/// Ensure `<root>/.gitignore` lists `.raum/`. Idempotent:
+///
+/// * Missing file → create one containing `.raum/\n`.
+/// * Existing file that already ignores `.raum` (or `.raum/`) → no-op.
+/// * Existing file without the entry → append a `.raum/` line (preserving a
+///   trailing newline if one was present, adding one otherwise).
+fn ensure_raum_gitignored(root: &Path) -> std::io::Result<()> {
+    let gitignore = root.join(".gitignore");
+    match std::fs::read_to_string(&gitignore) {
+        Ok(existing) => {
+            if gitignore_has_raum_entry(&existing) {
+                return Ok(());
+            }
+            let mut updated = existing;
+            if !updated.ends_with('\n') {
+                updated.push('\n');
+            }
+            updated.push_str(".raum/\n");
+            std::fs::write(&gitignore, updated)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::write(&gitignore, ".raum/\n")
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn gitignore_has_raum_entry(body: &str) -> bool {
+    body.lines().any(|line| {
+        let trimmed = line.trim();
+        // Skip comments and blank lines. Accept either `.raum` or `.raum/` —
+        // git treats both as ignoring the directory at repo root. Also accept
+        // the leading-slash forms users sometimes write (`/.raum`, `/.raum/`).
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            return false;
+        }
+        matches!(trimmed, ".raum" | ".raum/" | "/.raum" | "/.raum/")
+    })
 }
 
 #[cfg(test)]
@@ -870,5 +937,76 @@ mod tests {
         );
         let status = parse_porcelain_v2(input);
         assert!(!status.dirty);
+    }
+
+    #[test]
+    fn target_is_inside_raum_detects_inside_and_outside() {
+        let root = Path::new("/projects/demo");
+        assert!(target_is_inside_raum_dir(
+            root,
+            Path::new("/projects/demo/.raum/feat-x")
+        ));
+        assert!(target_is_inside_raum_dir(
+            root,
+            Path::new("/projects/demo/.raum")
+        ));
+        assert!(!target_is_inside_raum_dir(
+            root,
+            Path::new("/projects/demo-worktrees/feat-x")
+        ));
+        assert!(!target_is_inside_raum_dir(
+            root,
+            Path::new("/projects/demo/subdir/.raum/x")
+        ));
+    }
+
+    #[test]
+    fn gitignore_entry_detection() {
+        assert!(gitignore_has_raum_entry(".raum/\n"));
+        assert!(gitignore_has_raum_entry("node_modules\n.raum\n"));
+        assert!(gitignore_has_raum_entry("# comment\n/.raum/\n"));
+        assert!(!gitignore_has_raum_entry(""));
+        assert!(!gitignore_has_raum_entry("node_modules\ndist\n"));
+        // Partial matches must not count.
+        assert!(!gitignore_has_raum_entry(".raum-backup\n"));
+        assert!(!gitignore_has_raum_entry("# .raum/\n"));
+    }
+
+    #[test]
+    fn ensure_raum_gitignored_creates_file() {
+        let dir = tempfile::tempdir().unwrap();
+        ensure_raum_gitignored(dir.path()).unwrap();
+        let body = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert_eq!(body, ".raum/\n");
+    }
+
+    #[test]
+    fn ensure_raum_gitignored_appends_missing_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let gi = dir.path().join(".gitignore");
+        std::fs::write(&gi, "node_modules\ndist\n").unwrap();
+        ensure_raum_gitignored(dir.path()).unwrap();
+        let body = std::fs::read_to_string(&gi).unwrap();
+        assert_eq!(body, "node_modules\ndist\n.raum/\n");
+    }
+
+    #[test]
+    fn ensure_raum_gitignored_adds_newline_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let gi = dir.path().join(".gitignore");
+        std::fs::write(&gi, "node_modules").unwrap();
+        ensure_raum_gitignored(dir.path()).unwrap();
+        let body = std::fs::read_to_string(&gi).unwrap();
+        assert_eq!(body, "node_modules\n.raum/\n");
+    }
+
+    #[test]
+    fn ensure_raum_gitignored_is_noop_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let gi = dir.path().join(".gitignore");
+        std::fs::write(&gi, "node_modules\n.raum/\n").unwrap();
+        ensure_raum_gitignored(dir.path()).unwrap();
+        let body = std::fs::read_to_string(&gi).unwrap();
+        assert_eq!(body, "node_modules\n.raum/\n");
     }
 }

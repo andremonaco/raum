@@ -1,19 +1,31 @@
-//! OpenCode adapter (§7.4).
+//! OpenCode adapter.
 //!
 //! Analogous to the Claude Code adapter, but writes to
 //! `$XDG_CONFIG_HOME/opencode/config.json` (or `~/.config/opencode/config.json`).
+//! Phase 4 will replace the settings-file write with an SSE subscription on
+//! OpenCode's local HTTP server; Phase 2 keeps the existing install so
+//! observation keeps working end-to-end.
 
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
-use serde_json::{Value, json};
-use tracing::{info, warn};
+use serde_json::json;
+use tracing::info;
 
-use crate::agent::{
-    AgentAdapter, AgentError, AgentKind, SessionId, SpawnOptions, VersionReport, semver_lite,
+#[allow(deprecated)]
+use crate::agent::AgentAdapter;
+use crate::agent::{AgentError, AgentKind, SessionId, SpawnOptions, VersionReport, semver_lite};
+use crate::config_io::managed_json::{
+    self, MARKER_BEGIN, MARKER_KEY, ManagedJsonError, ManagedJsonHooks,
+};
+use crate::harness::channel::NotificationChannel;
+use crate::harness::reply::PermissionReplier;
+use crate::harness::setup::{SelftestReport, SetupContext, SetupError, SetupPlan};
+use crate::harness::traits::{
+    HarnessIdentity, HarnessRuntime, LaunchOverrides, NotificationSetup, SessionSpec,
 };
 
-use super::{MARKER_BEGIN, MARKER_END, MARKER_KEY, hook_script_path};
+use super::hook_script_path;
 
 #[derive(Debug, Clone, Default)]
 pub struct OpenCodeAdapter {
@@ -54,6 +66,7 @@ fn default_settings_path() -> PathBuf {
 }
 
 #[async_trait]
+#[allow(deprecated)]
 impl AgentAdapter for OpenCodeAdapter {
     fn kind(&self) -> AgentKind {
         AgentKind::OpenCode
@@ -86,7 +99,11 @@ impl AgentAdapter for OpenCodeAdapter {
     }
 
     async fn detect_version(&self) -> Result<VersionReport, AgentError> {
-        super::claude_code::run_version(self.binary_path(), &self.minimum_version()).await
+        super::claude_code::run_version(
+            <Self as AgentAdapter>::binary_path(self),
+            &<Self as AgentAdapter>::minimum_version(self),
+        )
+        .await
     }
 
     fn minimum_version(&self) -> semver_lite::Version {
@@ -98,103 +115,103 @@ impl AgentAdapter for OpenCodeAdapter {
     }
 }
 
+// ---- New trait split (Phase 2) ---------------------------------------------
+
+#[async_trait]
+impl HarnessIdentity for OpenCodeAdapter {
+    fn kind(&self) -> AgentKind {
+        AgentKind::OpenCode
+    }
+    fn binary(&self) -> &'static str {
+        "opencode"
+    }
+    fn minimum_version(&self) -> semver_lite::Version {
+        semver_lite::Version {
+            major: 0,
+            minor: 1,
+            patch: 0,
+        }
+    }
+    async fn detect_version(&self) -> Result<VersionReport, AgentError> {
+        super::claude_code::run_version(
+            <Self as HarnessIdentity>::binary(self),
+            &<Self as HarnessIdentity>::minimum_version(self),
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl NotificationSetup for OpenCodeAdapter {
+    /// Phase 2 placeholder — returns an empty plan. Phase 4 will switch
+    /// to the SSE channel; the settings-file injection stays alive via
+    /// the legacy `install_hooks` path until then.
+    async fn plan(&self, _ctx: &SetupContext) -> Result<SetupPlan, SetupError> {
+        Ok(SetupPlan::new(AgentKind::OpenCode))
+    }
+
+    async fn selftest(&self, _ctx: &SetupContext) -> SelftestReport {
+        SelftestReport::ok(
+            AgentKind::OpenCode,
+            "selftest not implemented until Phase 4 (OpenCode SSE)",
+            0,
+        )
+    }
+}
+
+impl HarnessRuntime for OpenCodeAdapter {
+    fn channels(&self, _session: &SessionSpec) -> Vec<Box<dyn NotificationChannel>> {
+        Vec::new()
+    }
+
+    fn replier(&self, _session: &SessionSpec) -> Option<Box<dyn PermissionReplier>> {
+        None
+    }
+
+    fn launch_overrides(&self) -> LaunchOverrides {
+        LaunchOverrides::default()
+    }
+}
+
 /// Install raum hooks into an OpenCode `config.json` at `path`. Mirrors the
 /// Claude Code install path (see that module for the marker-discipline rationale).
 pub fn install_opencode_hooks(path: &Path, script: &Path) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let existing: Value = if path.exists() {
-        let raw = std::fs::read_to_string(path)?;
-        if raw.trim().is_empty() {
-            json!({})
-        } else {
-            match serde_json::from_str(&raw) {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!(?path, error=%e, "opencode config.json unparsable; leaving file untouched");
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("config.json is not valid JSON: {e}"),
-                    ));
-                }
-            }
-        }
-    } else {
-        json!({})
-    };
+    managed_json::apply_managed_hooks(&ManagedJsonHooks {
+        path,
+        events: &["Notification", "Stop", "UserPromptSubmit"],
+        make_entry: &|event| {
+            json!({
+                MARKER_KEY: MARKER_BEGIN,
+                "_raum_event": event,
+                "matcher": ".*",
+                "hooks": [
+                    { "type": "command", "command": format!("{} {}", script.display(), event) }
+                ],
+            })
+        },
+    })
+    .map_err(managed_json_error_to_io)
+}
 
-    let mut root = existing;
-    if !root.is_object() {
-        root = json!({});
-    }
-
-    let hooks = root
-        .as_object_mut()
-        .expect("root is object")
-        .entry("hooks")
-        .or_insert_with(|| json!({}));
-    if !hooks.is_object() {
-        *hooks = json!({});
-    }
-
-    for event in ["Notification", "Stop", "UserPromptSubmit"] {
-        let arr = hooks
-            .as_object_mut()
-            .expect("hooks is object")
-            .entry(event)
-            .or_insert_with(|| json!([]));
-        if !arr.is_array() {
-            *arr = json!([]);
-        }
-        let arr_mut = arr.as_array_mut().expect("hooks.* is array");
-        arr_mut.retain(|v| !is_raum_managed(v));
-        // `_raum_managed_marker: "<raum-managed>"` identifies entries we own;
-        // see the Claude Code adapter module doc for the rationale.
-        arr_mut.push(json!({
-            MARKER_KEY: MARKER_BEGIN,
-            "_raum_event": event,
-            "matcher": ".*",
-            "hooks": [
-                { "type": "command", "command": format!("{} {}", script.display(), event) }
-            ],
-        }));
-    }
-
-    let serialized = serde_json::to_string_pretty(&root).map_err(|e| {
-        std::io::Error::new(
+fn managed_json_error_to_io(e: ManagedJsonError) -> std::io::Error {
+    match e {
+        ManagedJsonError::Io(err) => err,
+        ManagedJsonError::InvalidJson(err) => std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("serialize config.json failed: {e}"),
-        )
-    })?;
-    atomic_write(path, serialized.as_bytes())?;
-    Ok(())
-}
-
-fn is_raum_managed(v: &Value) -> bool {
-    v.as_object()
-        .and_then(|o| o.get(MARKER_KEY))
-        .and_then(|m| m.as_str())
-        .is_some_and(|s| s == MARKER_BEGIN || s == MARKER_END)
-}
-
-fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)?;
-    let tmp = parent.join(format!(
-        ".raum-tmp-{}",
-        path.file_name()
-            .and_then(|f| f.to_str())
-            .unwrap_or("config.json")
-    ));
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+            format!("config.json is not valid JSON: {err}"),
+        ),
+        ManagedJsonError::Serialize(err) => std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("serialize config.json failed: {err}"),
+        ),
+    }
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
+    use serde_json::Value;
     use tempfile::tempdir;
 
     #[tokio::test]

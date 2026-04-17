@@ -33,20 +33,12 @@ pub fn config_file() -> PathBuf {
     config_root().join("config.toml")
 }
 
-pub fn layouts_file() -> PathBuf {
-    config_root().join("layouts.toml")
-}
-
 pub fn keybindings_file() -> PathBuf {
     config_root().join("keybindings.toml")
 }
 
 pub fn sessions_state_file() -> PathBuf {
     state_dir().join("sessions.toml")
-}
-
-pub fn worktree_presets_file() -> PathBuf {
-    state_dir().join("worktree-presets.toml")
 }
 
 pub fn quickfire_history_file() -> PathBuf {

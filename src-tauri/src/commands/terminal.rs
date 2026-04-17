@@ -223,20 +223,62 @@ pub async fn terminal_spawn<R: Runtime>(
     .map_err(|e| format!("spawn_blocking join: {e}"))?
     .map_err(|e| format!("tmux new-session: {e}"))?;
 
+    // Now that the session exists, boot the real process and wire the output
+    // pipeline. Harnesses get spawned via `respawn-pane` so their banner +
+    // prompt are fully captured. Shells get a kickstart Enter so the login-
+    // shell prompt reprints through the pipe.
+    attach_pipeline(
+        app,
+        &state,
+        session_id.clone(),
+        args.kind,
+        args.project_slug,
+        args.worktree_id,
+        tmux,
+        on_data,
+        Some(BootPlan { harness_cmd }),
+    )
+    .await?;
+
+    Ok(session_id)
+}
+
+/// How to initialise a fresh tmux session after `new-session`. Only used by
+/// `terminal_spawn`; `terminal_reattach` passes `None` because the harness is
+/// already running from the prior app instance.
+struct BootPlan {
+    /// `Some(cmd)` → respawn the pane with this harness command.
+    /// `None` → plain shell, send a kickstart Enter so the prompt reprints
+    /// through pipe-pane (which was attached after the original prompt).
+    harness_cmd: Option<String>,
+}
+
+/// Shared post-`new_session` path: boot (if needed), attach pipe-pane → FIFO
+/// → coalescer → delivery channel, start the monitor task, and register a
+/// `TerminalEntry`. Called by both `terminal_spawn` (with `BootPlan::Some`)
+/// and `terminal_reattach` (with `BootPlan::None`).
+#[allow(clippy::too_many_arguments)]
+async fn attach_pipeline<R: Runtime>(
+    app: AppHandle<R>,
+    state: &AppHandleState,
+    session_id: String,
+    kind: AgentKind,
+    project_slug: Option<String>,
+    worktree_id: Option<String>,
+    tmux: Arc<TmuxManager>,
+    on_data: Channel<InvokeResponseBody>,
+    boot: Option<BootPlan>,
+) -> Result<(), String> {
     // Wire pipe-pane -> FIFO -> coalescer -> Channel<InvokeResponseBody::Raw>.
     let fifo_path = fifo_path_for(&session_id);
     let mut pipe = pipe_pane_to_fifo(&tmux, &session_id, &fifo_path)
         .await
         .map_err(|e| format!("pipe-pane: {e}"))?;
 
-    // Now that pipe-pane is attached, boot the real process. Harnesses get
-    // spawned via `respawn-pane` so their banner + prompt are fully captured.
-    // Shells get a kickstart Enter so the login-shell prompt reprints through
-    // the pipe (the original prompt was emitted before pipe-pane was wired).
-    {
+    if let Some(plan) = boot {
         let tmux_for_boot = tmux.clone();
         let id_for_boot = session_id.clone();
-        let harness = harness_cmd.clone();
+        let harness = plan.harness_cmd;
         tokio::task::spawn_blocking(move || -> Result<(), raum_tmux::TmuxError> {
             if let Some(cmd) = harness {
                 tmux_for_boot.respawn_with(&id_for_boot, &cmd)?;
@@ -299,9 +341,9 @@ pub async fn terminal_spawn<R: Runtime>(
 
     let entry = TerminalEntry {
         session_id: session_id.clone(),
-        project_slug: args.project_slug,
-        worktree_id: args.worktree_id,
-        kind: args.kind,
+        project_slug,
+        worktree_id,
+        kind,
         created_unix: now_unix_secs(),
         fifo_path,
         pipe: Some(pipe),
@@ -323,8 +365,80 @@ pub async fn terminal_spawn<R: Runtime>(
         coalesce_bytes = COALESCE_BYTES,
         coalesce_ms = COALESCE_INTERVAL_MS,
         xterm_scrollback = XTERM_SCROLLBACK,
-        "terminal_spawn: session ready"
+        "attach_pipeline: session ready"
     );
+
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReattachArgs {
+    pub session_id: String,
+    pub kind: AgentKind,
+    pub project_slug: Option<String>,
+    pub worktree_id: Option<String>,
+}
+
+/// §3.6 — reattach to a pre-existing tmux session that survived a previous
+/// raum run. Verifies the session still exists on the `-L raum` socket, then
+/// wires pipe-pane + coalescer + delivery + monitor the same way
+/// `terminal_spawn` does (minus `new-session` and harness boot).
+///
+/// The frontend invokes this when `TerminalPane` mounts with a persisted
+/// `sessionId`. On `Err("not-found")` (or any other error) the caller should
+/// fall back to `terminal_spawn` and create a fresh session.
+#[tauri::command]
+pub async fn terminal_reattach<R: Runtime>(
+    app: AppHandle<R>,
+    state: tauri::State<'_, AppHandleState>,
+    args: ReattachArgs,
+    on_data: Channel<InvokeResponseBody>,
+) -> Result<String, String> {
+    let tmux: Arc<TmuxManager> = state.tmux.clone();
+    let session_id = args.session_id.clone();
+
+    // Idempotent early return if the registry already tracks this session.
+    // Guards against double-reattach if a pane remounts mid-session.
+    {
+        let reg = state
+            .terminals
+            .lock()
+            .map_err(|e| format!("terminals lock: {e}"))?;
+        if reg.list().iter().any(|e| e.session_id == session_id) {
+            return Ok(session_id);
+        }
+    }
+
+    // Verify the tmux session exists. Cheap: list_sessions hits the socket
+    // once and returns every live session.
+    let exists = {
+        let tmux_for_check = tmux.clone();
+        let target = session_id.clone();
+        tokio::task::spawn_blocking(move || {
+            tmux_for_check
+                .list_sessions()
+                .map(|sessions| sessions.iter().any(|s| s.id == target))
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking join: {e}"))?
+        .map_err(|e| format!("tmux list-sessions: {e}"))?
+    };
+    if !exists {
+        return Err("not-found".to_string());
+    }
+
+    attach_pipeline(
+        app,
+        &state,
+        session_id.clone(),
+        args.kind,
+        args.project_slug,
+        args.worktree_id,
+        tmux,
+        on_data,
+        None,
+    )
+    .await?;
 
     Ok(session_id)
 }

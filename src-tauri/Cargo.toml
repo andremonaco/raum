@@ -26,7 +26,7 @@ raum-tmux = { path = "../crates/raum-tmux" }
 raum-hydration = { path = "../crates/raum-hydration" }
 raum-hooks = { path = "../crates/raum-hooks" }
 
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["image-png"] }
 tauri-plugin-decorum = "1"
 tauri-plugin-single-instance = "2"
 tauri-plugin-notification = "2"
@@ -54,3 +54,7 @@ ignored = ["raum-hooks", "tracing-subscriber"]
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
+# Enable the WebView devtools in release builds. Debug builds already get
+# devtools automatically via `debug_assertions`. Power users who build from
+# source can opt in with `cargo tauri build --features devtools`.
+devtools = ["tauri/devtools"]

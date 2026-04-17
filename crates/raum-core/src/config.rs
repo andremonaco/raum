@@ -89,7 +89,7 @@ impl HarnessConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WorktreeConfig {
     #[serde(rename = "pathPattern")]
@@ -98,6 +98,10 @@ pub struct WorktreeConfig {
     pub branch_prefix_mode: BranchPrefixMode,
     #[serde(rename = "branchPrefixCustom", skip_serializing_if = "Option::is_none")]
     pub branch_prefix_custom: Option<String>,
+    /// Optional executable scripts that run before / after worktree creation.
+    /// Defaults omit the entire table from serialized TOML.
+    #[serde(default, skip_serializing_if = "WorktreeHooks::is_default")]
+    pub hooks: WorktreeHooks,
 }
 
 impl Default for WorktreeConfig {
@@ -106,7 +110,54 @@ impl Default for WorktreeConfig {
             path_pattern: DEFAULT_PATH_PATTERN.to_string(),
             branch_prefix_mode: BranchPrefixMode::None,
             branch_prefix_custom: None,
+            hooks: WorktreeHooks::default(),
         }
+    }
+}
+
+/// User-defined executable scripts run around worktree creation.
+///
+/// * `pre_create` runs before `git worktree add` (cwd = project root); failure aborts creation.
+/// * `post_create` runs after hydration completes (cwd = new worktree); failure leaves the
+///   worktree in place so the user can inspect partial state.
+///
+/// Hook paths may be absolute or relative; relative paths resolve against the project root.
+/// Scripts receive context via env vars: `RAUM_PHASE`, `RAUM_PROJECT_SLUG`, `RAUM_PROJECT_ROOT`,
+/// `RAUM_WORKTREE_PATH`, `RAUM_BRANCH`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WorktreeHooks {
+    #[serde(rename = "preCreate", skip_serializing_if = "Option::is_none")]
+    pub pre_create: Option<String>,
+    #[serde(rename = "postCreate", skip_serializing_if = "Option::is_none")]
+    pub post_create: Option<String>,
+    /// Per-hook timeout in seconds. `0` disables the timeout.
+    #[serde(rename = "timeoutSecs", default = "default_hook_timeout_secs")]
+    pub timeout_secs: u32,
+}
+
+pub const DEFAULT_HOOK_TIMEOUT_SECS: u32 = 300;
+
+fn default_hook_timeout_secs() -> u32 {
+    DEFAULT_HOOK_TIMEOUT_SECS
+}
+
+impl Default for WorktreeHooks {
+    fn default() -> Self {
+        Self {
+            pre_create: None,
+            post_create: None,
+            timeout_secs: DEFAULT_HOOK_TIMEOUT_SECS,
+        }
+    }
+}
+
+impl WorktreeHooks {
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        self.pre_create.is_none()
+            && self.post_create.is_none()
+            && self.timeout_secs == DEFAULT_HOOK_TIMEOUT_SECS
     }
 }
 
@@ -299,46 +350,6 @@ pub struct EffectiveProjectConfig {
     pub has_raum_toml: bool,
 }
 
-/// User-global `layouts.toml` — named layout presets.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct LayoutLibrary {
-    #[serde(rename = "preset", default)]
-    pub presets: Vec<LayoutPreset>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct LayoutPreset {
-    // Primitives first — `cells` is an array-of-tables which must come last.
-    pub name: String,
-    /// Seconds since UNIX epoch (UTC). Optional for forward compatibility
-    /// with presets authored before this field existed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub created_at: Option<u64>,
-    pub cells: Vec<LayoutCell>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct LayoutCell {
-    pub x: u32,
-    pub y: u32,
-    pub w: u32,
-    pub h: u32,
-    pub kind: AgentKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-}
-
-/// `state/worktree-presets.toml` — per-worktree last-used preset pointer map.
-///
-/// Serializes as a flat `{worktree-id → preset-name}` TOML (keys at root),
-/// matching the on-disk shape declared in design D5.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct WorktreePresetPointer {
-    pub map: BTreeMap<String, String>,
-}
-
 /// `state/sessions.toml` — transient cross-project session index.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -373,9 +384,6 @@ pub struct QuickfireHistory {
 pub struct ActiveLayoutState {
     /// Unix seconds when this snapshot was last written.
     pub saved_at: u64,
-    /// Name of the preset this layout was derived from, if any.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_preset: Option<String>,
     /// Project / worktree context at the time of save.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_slug: Option<String>,
@@ -405,6 +413,10 @@ pub struct ActiveLayoutTab {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// User-chosen display label shown in the pane's tab strip. When unset,
+    /// the UI falls back to the harness icon + state indicator only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 impl QuickfireHistory {
@@ -457,6 +469,7 @@ mod tests {
                 path_pattern: DEFAULT_PATH_PATTERN.into(),
                 branch_prefix_mode: BranchPrefixMode::Custom,
                 branch_prefix_custom: Some("feature/".into()),
+                ..WorktreeConfig::default()
             },
             ..Config::default()
         };
@@ -495,6 +508,7 @@ mod tests {
                 path_pattern: "{parent-dir}/wt/{branch-slug}".into(),
                 branch_prefix_mode: BranchPrefixMode::Username,
                 branch_prefix_custom: None,
+                ..WorktreeConfig::default()
             }),
             agent_defaults: None,
             unknown: BTreeMap::new(),
@@ -517,39 +531,9 @@ mod tests {
     }
 
     #[test]
-    fn layout_library_roundtrip() {
-        let lib = LayoutLibrary {
-            presets: vec![LayoutPreset {
-                name: "two-agents".into(),
-                cells: vec![
-                    LayoutCell {
-                        x: 0,
-                        y: 0,
-                        w: 6,
-                        h: 10,
-                        kind: AgentKind::ClaudeCode,
-                        title: Some("main".into()),
-                    },
-                    LayoutCell {
-                        x: 6,
-                        y: 0,
-                        w: 6,
-                        h: 10,
-                        kind: AgentKind::Codex,
-                        title: None,
-                    },
-                ],
-                created_at: Some(1_714_000_000),
-            }],
-        };
-        roundtrip(lib);
-    }
-
-    #[test]
     fn active_layout_state_roundtrip() {
         let state = ActiveLayoutState {
             saved_at: 1_714_000_001,
-            source_preset: Some("two-agents".into()),
             project_slug: Some("acme".into()),
             worktree_id: Some("/path/to/wt".into()),
             cells: vec![ActiveLayoutCell {
@@ -565,10 +549,12 @@ mod tests {
                     ActiveLayoutTab {
                         id: "tab-1".into(),
                         session_id: Some("raum-claude-123".into()),
+                        label: Some("Main agent".into()),
                     },
                     ActiveLayoutTab {
                         id: "tab-2".into(),
                         session_id: None,
+                        label: None,
                     },
                 ],
             }],
@@ -593,14 +579,6 @@ mod tests {
             }],
         };
         roundtrip(st);
-    }
-
-    #[test]
-    fn worktree_preset_pointer_roundtrip() {
-        let mut map = BTreeMap::new();
-        map.insert("acme/main".into(), "two-agents".into());
-        let p = WorktreePresetPointer { map };
-        roundtrip(p);
     }
 
     #[test]
