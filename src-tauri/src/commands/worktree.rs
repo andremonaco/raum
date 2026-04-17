@@ -529,11 +529,9 @@ fn parse_porcelain_v2(stdout: &str) -> WorktreeStatus {
         let marker = parts.next().unwrap_or("");
         let rest = parts.next().unwrap_or("");
         match marker {
-            "?" => {
-                // Untracked: "? <path>"
-                if !rest.is_empty() {
-                    status.untracked.push(rest.to_string());
-                }
+            // Untracked: "? <path>"
+            "?" if !rest.is_empty() => {
+                status.untracked.push(rest.to_string());
             }
             "1" => {
                 // Ordinary changed entry:

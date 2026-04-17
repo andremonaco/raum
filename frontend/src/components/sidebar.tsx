@@ -62,7 +62,7 @@ import {
 } from "../stores/projectStore";
 import { agentStore, type AgentListItem } from "../stores/agentStore";
 import { terminalStore } from "../stores/terminalStore";
-import { AlertCircleIcon, CheckIcon, LoaderIcon } from "./icons";
+import { ActivityIcon, AlertCircleIcon, CheckIcon, LoaderIcon } from "./icons";
 import { CreateWorktreeModal } from "./create-worktree-modal";
 const DiffViewerModal = lazy(() =>
   import("./diff-viewer-modal").then((m) => ({ default: m.DiffViewerModal })),
@@ -120,6 +120,89 @@ const SIDEBAR_MAX_PX = 800;
 // Wide enough to hold three size-2.5 icons (10 px each) + two gap-0.5 gaps
 // (2 px each) + minimal padding on either side = 34 px content + ~10 px room.
 const SIDEBAR_COLLAPSED_PX = 44;
+// ---- Harness counter -------------------------------------------------------
+
+interface HarnessCounts {
+  active: number;
+  waiting: number;
+  idle: number;
+}
+
+interface HarnessCounterProps {
+  counts: HarnessCounts;
+  /** Compact variant drops the bordered pill — used in dense rows. */
+  compact?: boolean;
+}
+
+/**
+ * Mirrors the top-right harness widget in `top-row.tsx`. Same icons, same
+ * colour treatment, scoped to a worktree or aggregated across a project.
+ *
+ * Animations are deliberately subtle: `animate-spin` on the loader (already
+ * built-in) for active work, `animate-pulse` on the alert circle when input
+ * is waited on. Idle gets no motion.
+ */
+const HarnessCounter: Component<HarnessCounterProps> = (counterProps) => {
+  const c = () => counterProps.counts;
+  const containerClass = () =>
+    counterProps.compact
+      ? "flex shrink-0 items-center gap-1 font-mono text-[10px]"
+      : "flex shrink-0 items-center gap-0.5 rounded-md border border-zinc-800/60 bg-zinc-900/40 px-1 py-0.5 font-mono text-[10px]";
+  const cellClass = "inline-flex items-center gap-0.5 px-0.5";
+  return (
+    <span class={containerClass()} data-testid="worktree-harness-counts">
+      <span
+        class={cellClass}
+        classList={{
+          "text-emerald-400": c().active > 0,
+          "text-zinc-700": c().active === 0,
+        }}
+        title={`${c().active} active`}
+      >
+        <Show when={c().active > 0} fallback={<ActivityIcon class="size-2.5" />}>
+          <LoaderIcon class="size-2.5 animate-spin" />
+        </Show>
+        {c().active}
+      </span>
+      <span
+        class={cellClass}
+        classList={{
+          "text-amber-400": c().waiting > 0,
+          "text-zinc-700": c().waiting === 0,
+        }}
+        title={`${c().waiting} waiting`}
+      >
+        <AlertCircleIcon class="size-2.5" classList={{ "animate-pulse": c().waiting > 0 }} />
+        {c().waiting}
+      </span>
+      <span
+        class={cellClass}
+        classList={{
+          "text-zinc-400": c().idle > 0,
+          "text-zinc-700": c().idle === 0,
+        }}
+        title={`${c().idle} idle`}
+      >
+        <CheckIcon class="size-2.5" />
+        {c().idle}
+      </span>
+    </span>
+  );
+};
+
+/** Sum harness counts across every terminal whose `worktree_id` is in `paths`. */
+function countHarnessesForPaths(paths: Set<string>): HarnessCounts {
+  let active = 0;
+  let waiting = 0;
+  let idle = 0;
+  for (const t of Object.values(terminalStore.byId)) {
+    if (t.worktree_id === null || !paths.has(t.worktree_id)) continue;
+    if (t.workingState === "working") active++;
+    else if (t.workingState === "waiting") waiting++;
+    else idle++;
+  }
+  return { active, waiting, idle };
+}
 
 // ---- Worktree row ----------------------------------------------------------
 
@@ -186,19 +269,7 @@ const WorktreeRow: Component<WorktreeRowProps> = (rowProps) => {
   // §8.3 / §9.x — count harnesses attached to *this* worktree. The authoritative
   // wiring lives in terminalStore; `worktree_id` is the worktree's filesystem
   // path (matches `wt.path`).
-  const harnessCounts = createMemo(() => {
-    const path = rowProps.worktree.path;
-    let active = 0;
-    let waiting = 0;
-    let idle = 0;
-    for (const t of Object.values(terminalStore.byId)) {
-      if (t.worktree_id !== path) continue;
-      if (t.workingState === "working") active++;
-      else if (t.workingState === "waiting") waiting++;
-      else idle++;
-    }
-    return { active, waiting, idle };
-  });
+  const harnessCounts = createMemo(() => countHarnessesForPaths(new Set([rowProps.worktree.path])));
 
   const focusAgent = (sessionId: string | null) => {
     if (!sessionId) return;
@@ -309,49 +380,9 @@ const WorktreeRow: Component<WorktreeRowProps> = (rowProps) => {
               </span>
             </span>
 
-            {/* Terminal badges — all 3 shown whenever any terminals exist */}
+            {/* Terminal badges — same widget as top-row.tsx, scoped per worktree */}
             <Show when={totalTerminals() > 0}>
-              <span
-                class="flex shrink-0 items-center gap-1 font-mono text-[10px]"
-                data-testid="worktree-harness-counts"
-              >
-                <span
-                  class="inline-flex items-center gap-0.5"
-                  classList={{
-                    "text-emerald-400": harnessCounts().active > 0,
-                    "text-zinc-700": harnessCounts().active === 0,
-                  }}
-                  title={`${harnessCounts().active} active`}
-                >
-                  <LoaderIcon
-                    class="size-2.5"
-                    classList={{ "animate-spin": harnessCounts().active > 0 }}
-                  />
-                  {harnessCounts().active}
-                </span>
-                <span
-                  class="inline-flex items-center gap-0.5"
-                  classList={{
-                    "text-amber-400": harnessCounts().waiting > 0,
-                    "text-zinc-700": harnessCounts().waiting === 0,
-                  }}
-                  title={`${harnessCounts().waiting} waiting`}
-                >
-                  <AlertCircleIcon class="size-2.5" />
-                  {harnessCounts().waiting}
-                </span>
-                <span
-                  class="inline-flex items-center gap-0.5"
-                  classList={{
-                    "text-zinc-400": harnessCounts().idle > 0,
-                    "text-zinc-700": harnessCounts().idle === 0,
-                  }}
-                  title={`${harnessCounts().idle} idle`}
-                >
-                  <CheckIcon class="size-2.5" />
-                  {harnessCounts().idle}
-                </span>
-              </span>
+              <HarnessCounter counts={harnessCounts()} compact />
             </Show>
           </span>
 
@@ -393,7 +424,12 @@ const WorktreeRow: Component<WorktreeRowProps> = (rowProps) => {
       <Show when={expanded()}>
         <div class="ml-5 mt-1 space-y-2 border-l border-zinc-800 pl-2">
           {/* Git staging view */}
-          <Show when={unstaged().length > 0 || status().staged.length > 0}>
+          <Show
+            when={unstaged().length > 0 || status().staged.length > 0}
+            fallback={
+              <div class="px-1 py-1 font-mono text-[10px] italic text-zinc-600">No changes</div>
+            }
+          >
             <div class="space-y-1.5">
               {/* Unstaged */}
               <Show when={unstaged().length > 0}>
@@ -608,6 +644,16 @@ const ProjectSection: Component<ProjectSectionProps> = (sectionProps) => {
     filteredItems().filter((wt) => wt.path !== sectionProps.project.rootPath),
   );
 
+  // Aggregate harness counts across every worktree in this project so the
+  // project card mirrors the top-right widget at project granularity.
+  const projectCounts = createMemo(() =>
+    countHarnessesForPaths(new Set(items().map((wt) => wt.path))),
+  );
+  const projectTotal = createMemo(() => {
+    const c = projectCounts();
+    return c.active + c.waiting + c.idle;
+  });
+
   return (
     <section class="mb-2">
       <Show
@@ -620,6 +666,24 @@ const ProjectSection: Component<ProjectSectionProps> = (sectionProps) => {
       >
         {/* Card container — groups main + worktrees visually */}
         <div class="overflow-hidden rounded-md border border-zinc-800/60">
+          {/* Project header — name + aggregated harness counter */}
+          <div class="flex items-center justify-between gap-2 border-b border-zinc-800/60 bg-zinc-900/50 px-2 py-1">
+            <span class="flex min-w-0 items-center gap-1.5">
+              <span
+                class="inline-flex w-3 shrink-0 select-none items-center justify-center font-mono text-[11px] leading-none tabular-nums"
+                style={{ color: sectionProps.project.color }}
+                aria-hidden="true"
+              >
+                {sectionProps.project.sigil}
+              </span>
+              <span class="truncate font-mono text-[11px] font-medium text-zinc-300">
+                {sectionProps.project.name}
+              </span>
+            </span>
+            <Show when={projectTotal() > 0}>
+              <HarnessCounter counts={projectCounts()} />
+            </Show>
+          </div>
           {/* Main worktree — slightly elevated background */}
           <Show when={mainWorktree()}>
             {(main) => (

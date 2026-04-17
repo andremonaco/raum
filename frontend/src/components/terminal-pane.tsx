@@ -365,6 +365,12 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
     // Auto-copy on selection release (Zellij-style). Fires on mouseup so a
     // mid-drag selection doesn't clobber the clipboard, and on Shift keyup so
     // keyboard-driven selections are covered too.
+    //
+    // We listen for mouseup on `window`, not `host`, because a selection that
+    // starts inside the pane often ends outside it — e.g. dragging bottom-to-top
+    // the cursor crosses the top edge of the pane before release. A flag set on
+    // mousedown-inside-host scopes the window listener to drags owned by this
+    // pane so other panes' mouseups don't trigger a spurious copy here.
     const copySelection = async (): Promise<void> => {
       if (!term || !term.hasSelection()) return;
       const text = term.getSelection();
@@ -382,15 +388,26 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         setCopiedFlash(false);
       }, COPY_FLASH_MS);
     };
-    const onMouseUp = (): void => {
+    let dragActive = false;
+    const onMouseDown = (): void => {
+      dragActive = true;
+    };
+    const onWindowMouseUp = (): void => {
+      if (!dragActive) return;
+      dragActive = false;
       void copySelection();
     };
     const onKeyUp = (ev: KeyboardEvent): void => {
       if (ev.key !== "Shift") return;
       void copySelection();
     };
-    host.addEventListener("mouseup", onMouseUp);
+    host.addEventListener("mousedown", onMouseDown);
+    window.addEventListener("mouseup", onWindowMouseUp);
     term.textarea?.addEventListener("keyup", onKeyUp);
+    onCleanup(() => {
+      host?.removeEventListener("mousedown", onMouseDown);
+      window.removeEventListener("mouseup", onWindowMouseUp);
+    });
 
     // §4.7 — register with the global search registry.
     registerTerminal({
