@@ -50,29 +50,29 @@ describe("rendererScheduler", () => {
     expect(snapshot().every((s) => s.renderer === "canvas")).toBe(true);
   });
 
-  it("promotes to WebGL on request and caps at MAX_WEBGL_PANES", () => {
+  it("promotes to WebGL on request and caps at MAX_WEBGL_PANES", async () => {
     for (let i = 0; i < MAX_WEBGL_PANES + 2; i++) {
       const id = `p-${i}`;
       registerPane(id, fakeTerminal());
-      requestWebgl(id);
+      await requestWebgl(id);
     }
     const webglCount = snapshot().filter((s) => s.renderer === "webgl").length;
     expect(webglCount).toBe(MAX_WEBGL_PANES);
   });
 
-  it("evicts the LRU pane when the cap is hit", () => {
+  it("evicts the LRU pane when the cap is hit", async () => {
     for (let i = 0; i < MAX_WEBGL_PANES; i++) {
       const id = `p-${i}`;
       registerPane(id, fakeTerminal());
-      requestWebgl(id);
+      await requestWebgl(id);
     }
     // p-0 is least recently used. Touch p-1..MAX-1 to bump their MRU, then
     // register and promote a fresh pane.
     for (let i = 1; i < MAX_WEBGL_PANES; i++) {
-      requestWebgl(`p-${i}`);
+      await requestWebgl(`p-${i}`);
     }
     registerPane("new", fakeTerminal());
-    requestWebgl("new");
+    await requestWebgl("new");
 
     const byId = new Map(snapshot().map((s) => [s.paneId, s]));
     expect(byId.get("p-0")?.renderer).toBe("canvas");
