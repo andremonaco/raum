@@ -11,7 +11,7 @@
  */
 
 import type { JSXElement } from "solid-js";
-import { Component, For, Show, createEffect, createResource, createSignal } from "solid-js";
+import { Component, For, Show, createEffect, createResource, createSignal, on } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { check as checkForUpdate, type Update } from "@tauri-apps/plugin-updater";
@@ -25,13 +25,15 @@ import {
   refreshNotificationConfig,
 } from "../lib/notificationCenter";
 import {
+  harnessHealth,
   harnessReport,
   refreshHarnessReport,
   type HarnessStatus,
 } from "../stores/harnessStatusStore";
 import { openUrl } from "@tauri-apps/plugin-opener";
 
-import { CheckIcon, HARNESS_ICONS, PlayIcon, type HarnessIconKind } from "./icons";
+import { CheckIcon, HARNESS_ICONS, LoaderIcon, PlayIcon, type HarnessIconKind } from "./icons";
+import { Scrollable } from "./ui/scrollable";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -53,7 +55,7 @@ const CUSTOM_SOUND_VALUE = "__custom__";
 // Types
 // ---------------------------------------------------------------------------
 
-type SectionId = "notifications" | "harnesses" | "updates";
+type SectionId = "notifications" | "harnesses" | "health" | "worktrees" | "updates";
 
 interface Section {
   id: SectionId;
@@ -102,6 +104,47 @@ const SECTIONS: Section[] = [
         <rect x="9" y="9" width="6" height="6" rx="1" />
         <path d="M9 3h6M9 21h6M3 9v6M21 9v6" />
         <path d="M9 3v2M15 3v2M9 19v2M15 19v2M3 9h2M3 15h2M19 9h2M19 15h2" />
+      </svg>
+    ),
+  },
+  {
+    id: "health",
+    label: "Harness Health",
+    icon: () => (
+      <svg
+        xmlns="http://www.w3.org/2000/svg"
+        class="size-3 shrink-0"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
+      </svg>
+    ),
+  },
+  {
+    id: "worktrees",
+    label: "Worktrees",
+    icon: () => (
+      <svg
+        xmlns="http://www.w3.org/2000/svg"
+        class="size-3 shrink-0"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        {/* git-branch-ish icon: two nodes connected by a curve. */}
+        <circle cx="6" cy="6" r="2" />
+        <circle cx="6" cy="18" r="2" />
+        <circle cx="18" cy="8" r="2" />
+        <path d="M6 8v8" />
+        <path d="M18 10c0 4-4 4-6 4H8" />
       </svg>
     ),
   },
@@ -562,9 +605,27 @@ const StatusPill: Component<{
   );
 };
 
-const HarnessStatusBadge: Component<{ status: HarnessStatus | undefined }> = (props) => {
+const HarnessStatusBadge: Component<{
+  status: HarnessStatus | undefined;
+  loading: boolean;
+}> = (props) => {
+  // While the probe is in flight we hide any stale cached status and show a
+  // spinner — navigating to the Harnesses section always re-probes, and the
+  // user's expectation is "see loading, then see result".
+  const resolved = () => (props.loading ? undefined : props.status);
   return (
-    <Show when={props.status} fallback={<StatusPill tone="muted">Checking…</StatusPill>}>
+    <Show
+      when={resolved()}
+      fallback={
+        <span
+          class="inline-flex size-4 shrink-0 items-center justify-center rounded-full bg-muted/30 text-muted-foreground"
+          title="Checking…"
+          aria-label="Checking"
+        >
+          <LoaderIcon class="size-2.5 animate-spin" />
+        </span>
+      }
+    >
       {(s) => (
         <Show when={s().found} fallback={<StatusPill tone="error">Not installed</StatusPill>}>
           <Show
@@ -671,12 +732,19 @@ const HarnessesSection: Component<{ active: boolean }> = (props) => {
   // Re-probe in the background only when the user actually navigates to this
   // section. The cached value from `harnessStatusStore` (populated at app
   // boot) is shown instantly. We skip if the initial boot probe is still in
-  // flight — its result is already fresh enough.
-  createEffect(() => {
-    if (props.active && !harnessReport.loading) {
-      void refreshHarnessReport();
-    }
-  });
+  // flight — its result is already fresh enough. `on` tracks only
+  // `props.active`; reading `loading` inside is untracked so the completing
+  // probe cannot re-trigger this effect into an infinite refetch loop.
+  createEffect(
+    on(
+      () => props.active,
+      (active) => {
+        if (active && !harnessReport.loading) {
+          void refreshHarnessReport();
+        }
+      },
+    ),
+  );
 
   const statusFor = (id: HarnessIconKind): HarnessStatus | undefined =>
     harnessReport()?.harnesses.find((h) => h.kind === id);
@@ -757,7 +825,7 @@ const HarnessesSection: Component<{ active: boolean }> = (props) => {
                     </p>
                   </div>
                   <div class="shrink-0 pt-0.5">
-                    <HarnessStatusBadge status={status()} />
+                    <HarnessStatusBadge status={status()} loading={harnessReport.loading} />
                   </div>
                 </div>
 
@@ -883,6 +951,284 @@ const HarnessesSection: Component<{ active: boolean }> = (props) => {
         </For>
       </div>
     </div>
+  );
+};
+
+// ---------------------------------------------------------------------------
+// Worktrees section
+// ---------------------------------------------------------------------------
+
+const WORKTREE_PRESETS = {
+  inside: "{repo-root}/.raum/{worktree-slug}",
+  sibling: "{parent-dir}/{repo-name}-worktrees/{worktree-slug}",
+} as const;
+
+type WorktreePresetKey = keyof typeof WORKTREE_PRESETS | "custom";
+
+interface ProjectListItem {
+  slug: string;
+  name: string;
+  rootPath: string;
+}
+
+/** Mirror of `slug::slugify` just close enough for a live preview. The real
+ *  slugging happens in Rust at worktree-create time. */
+function slugifyForPreview(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+/** Pure-frontend mirror of `preview_path_pattern` in
+ *  `crates/raum-hydration/src/pattern.rs`. Used so the settings preview stays
+ *  responsive while the user types without round-tripping through a Tauri
+ *  command that reads the stored pattern. */
+function renderPathPreview(pattern: string, rootPath: string, branch: string): string {
+  const norm = rootPath.replace(/\/+$/, "");
+  const lastSlash = norm.lastIndexOf("/");
+  const parentDir = lastSlash > 0 ? norm.slice(0, lastSlash) : "";
+  const baseFolder = lastSlash >= 0 ? norm.slice(lastSlash + 1) : norm || "project";
+  const branchSlug = slugifyForPreview(branch);
+  return pattern
+    .replace(/\{repo-root\}/g, norm)
+    .replace(/\{repo-name\}/g, baseFolder)
+    .replace(/\{worktree-slug\}/g, branchSlug)
+    .replace(/\{parent-dir\}/g, parentDir)
+    .replace(/\{base-folder\}/g, baseFolder)
+    .replace(/\{branch-slug\}/g, branchSlug)
+    .replace(/\{branch-name\}/g, branch)
+    .replace(/\{project-slug\}/g, baseFolder);
+}
+
+function detectPreset(pattern: string): WorktreePresetKey {
+  if (pattern === WORKTREE_PRESETS.inside) return "inside";
+  if (pattern === WORKTREE_PRESETS.sibling) return "sibling";
+  return "custom";
+}
+
+const WorktreesSection: Component<{ active: boolean }> = (props) => {
+  const [pattern, setPattern] = createSignal<string>(WORKTREE_PRESETS.sibling);
+  const [customDraft, setCustomDraft] = createSignal<string>(WORKTREE_PRESETS.sibling);
+  const [preset, setPreset] = createSignal<WorktreePresetKey>("sibling");
+  const [saving, setSaving] = createSignal(false);
+  const [seeded, setSeeded] = createSignal(false);
+  const [saveError, setSaveError] = createSignal<string | undefined>(undefined);
+
+  // Seed from config when the section mounts (runs once because the modal
+  // keeps sections mounted and toggles visibility via `hidden`).
+  void (async () => {
+    try {
+      const cfg = await invoke<{ worktreeConfig?: { pathPattern?: string } }>("config_get");
+      const p = cfg.worktreeConfig?.pathPattern?.trim();
+      const effective = p && p.length > 0 ? p : WORKTREE_PRESETS.sibling;
+      setPattern(effective);
+      setCustomDraft(effective);
+      setPreset(detectPreset(effective));
+    } catch {
+      // leave defaults — invalid config shouldn't block the UI.
+    } finally {
+      setSeeded(true);
+    }
+  })();
+
+  const [projects] = createResource<ProjectListItem[]>(async () => {
+    try {
+      return await invoke<ProjectListItem[]>("project_list");
+    } catch {
+      return [];
+    }
+  });
+
+  const previewProject = () => projects()?.[0];
+  const previewRoot = () => previewProject()?.rootPath ?? "/Users/you/example-project";
+  const previewBranch = "feat/new-darkmode";
+
+  const previewPath = () => renderPathPreview(pattern(), previewRoot(), previewBranch);
+
+  async function persist(next: string) {
+    setSaving(true);
+    setSaveError(undefined);
+    try {
+      const stored = await invoke<string>("config_set_worktree_path_pattern", {
+        pattern: next,
+      });
+      // Backend echoes the effective pattern (e.g. empty → built-in default).
+      // Re-sync if the stored value differs from what the UI sent.
+      if (stored !== next) {
+        setPattern(stored);
+        setCustomDraft(stored);
+        setPreset(detectPreset(stored));
+      }
+    } catch (e) {
+      setSaveError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function selectPreset(next: WorktreePresetKey) {
+    setPreset(next);
+    if (next === "custom") {
+      // Don't persist yet — wait for the user to edit + blur. Seed the draft
+      // from the currently-stored pattern so they can tweak rather than start
+      // from scratch.
+      setCustomDraft(pattern());
+      return;
+    }
+    const p = WORKTREE_PRESETS[next];
+    setPattern(p);
+    setCustomDraft(p);
+    void persist(p);
+  }
+
+  function commitCustom() {
+    const next = customDraft().trim();
+    if (!next) return;
+    if (next === pattern()) return;
+    setPattern(next);
+    void persist(next);
+  }
+
+  // Watch the modal becoming active — re-check projects so a project added
+  // while the modal was closed still shows up in the preview.
+  createEffect(
+    on(
+      () => props.active,
+      (active) => {
+        if (active) {
+          void invoke<ProjectListItem[]>("project_list")
+            .then(() => {
+              /* triggers resource refetch next read */
+            })
+            .catch(() => {});
+        }
+      },
+    ),
+  );
+
+  return (
+    <div class="flex flex-col gap-4">
+      <div class="flex flex-col gap-1.5">
+        <h4 class="text-[10px] uppercase tracking-wider text-muted-foreground">
+          Worktree location
+        </h4>
+        <p class="text-[10px] text-muted-foreground">
+          Where raum puts new git worktrees. Tokens are substituted at create time.
+        </p>
+        <div class="flex flex-col gap-1.5">
+          <PresetRow
+            checked={preset() === "inside"}
+            disabled={!seeded() || saving()}
+            title="Inside the project"
+            description="Lives under a .raum/ folder at the project root. raum adds .raum/ to .gitignore the first time you use this."
+            pattern={WORKTREE_PRESETS.inside}
+            onSelect={() => selectPreset("inside")}
+          />
+          <PresetRow
+            checked={preset() === "sibling"}
+            disabled={!seeded() || saving()}
+            title="Sibling folder"
+            description="Dropped next to the project in a <name>-worktrees/ directory. This is the default."
+            pattern={WORKTREE_PRESETS.sibling}
+            onSelect={() => selectPreset("sibling")}
+          />
+          <PresetRow
+            checked={preset() === "custom"}
+            disabled={!seeded() || saving()}
+            title="Custom"
+            description="Write your own pattern using the tokens below."
+            pattern={preset() === "custom" ? customDraft() : "…"}
+            onSelect={() => selectPreset("custom")}
+          />
+        </div>
+      </div>
+
+      <Show when={preset() === "custom"}>
+        <div class="flex flex-col gap-1.5">
+          <h4 class="text-[10px] uppercase tracking-wider text-muted-foreground">Custom pattern</h4>
+          <input
+            type="text"
+            class="w-full rounded border border-border bg-background px-2 py-1 font-mono text-xs text-foreground focus:border-ring focus:outline-none disabled:opacity-50"
+            placeholder="{repo-root}/.raum/{worktree-slug}"
+            value={customDraft()}
+            onInput={(e) => setCustomDraft(e.currentTarget.value)}
+            onBlur={commitCustom}
+            disabled={saving()}
+          />
+          <p class="text-[10px] text-muted-foreground">
+            Tokens: <code class="rounded bg-muted px-1 py-px font-mono">{"{repo-root}"}</code>,{" "}
+            <code class="rounded bg-muted px-1 py-px font-mono">{"{repo-name}"}</code>,{" "}
+            <code class="rounded bg-muted px-1 py-px font-mono">{"{parent-dir}"}</code>,{" "}
+            <code class="rounded bg-muted px-1 py-px font-mono">{"{worktree-slug}"}</code>,{" "}
+            <code class="rounded bg-muted px-1 py-px font-mono">{"{branch-name}"}</code>.
+          </p>
+        </div>
+      </Show>
+
+      <div class="flex flex-col gap-1.5">
+        <h4 class="text-[10px] uppercase tracking-wider text-muted-foreground">Preview</h4>
+        <div class="rounded border border-border bg-card/30 px-3 py-2">
+          <p class="text-[10px] text-muted-foreground">
+            Example for branch{" "}
+            <code class="rounded bg-muted px-1 py-px font-mono">{previewBranch}</code>
+            <Show
+              when={previewProject()}
+              fallback={<> in a hypothetical project (no projects registered yet)</>}
+            >
+              {" "}
+              in {previewProject()?.name}
+            </Show>
+            :
+          </p>
+          <p class="mt-1 truncate font-mono text-xs text-foreground" data-testid="worktree-preview">
+            {previewPath()}
+          </p>
+        </div>
+      </div>
+
+      <Show when={saveError()}>
+        <div class="rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-[10px] text-red-300">
+          {saveError()}
+        </div>
+      </Show>
+    </div>
+  );
+};
+
+const PresetRow: Component<{
+  checked: boolean;
+  disabled?: boolean;
+  title: string;
+  description: string;
+  pattern: string;
+  onSelect: () => void;
+}> = (props) => {
+  return (
+    <button
+      type="button"
+      onClick={() => !props.disabled && props.onSelect()}
+      disabled={props.disabled}
+      class={cx(
+        "flex items-start gap-2 rounded border px-3 py-2 text-left transition-colors disabled:pointer-events-none disabled:opacity-50",
+        props.checked
+          ? "border-primary/60 bg-primary/10"
+          : "border-border bg-card/30 hover:bg-accent/50",
+      )}
+    >
+      <span
+        class={cx(
+          "mt-0.5 block size-3 shrink-0 rounded-full border-2",
+          props.checked ? "border-primary bg-primary" : "border-muted-foreground/40",
+        )}
+        aria-hidden="true"
+      />
+      <div class="min-w-0 flex-1">
+        <p class="text-xs text-foreground">{props.title}</p>
+        <p class="text-[10px] text-muted-foreground">{props.description}</p>
+        <p class="mt-1 truncate font-mono text-[10px] text-muted-foreground/80">{props.pattern}</p>
+      </div>
+    </button>
   );
 };
 
@@ -1186,6 +1532,102 @@ const UpdatesSection: Component = () => {
  * laggy. Paying it once on modal open keeps subsequent tab switches at the
  * cost of a CSS class flip.
  */
+/**
+ * Harness Health panel (Phase 2 scaffold).
+ *
+ * Renders a per-harness summary of channel reliability + the latest
+ * selftest result. This panel is intentionally minimal in Phase 2 —
+ * Phase 3/4 will plug the backend `plan`/`selftest` commands in; for
+ * now it reads from `harnessHealth()` which is populated on demand by
+ * the rest of the app.
+ */
+const HealthSection: Component = () => {
+  const entries = () => Object.values(harnessHealth());
+  return (
+    <div class="flex flex-col gap-3">
+      <p class="text-xs text-zinc-400">
+        Channel + selftest status for every bound harness. Reliability badges mirror what the dock
+        renders on the Waiting state.
+      </p>
+      <Show
+        when={entries().length > 0}
+        fallback={
+          <div class="rounded border border-dashed border-zinc-800 bg-zinc-900/40 p-3 text-[11px] text-zinc-500">
+            No health data yet. Bind a harness to a project to populate this panel.
+          </div>
+        }
+      >
+        <ul class="flex flex-col gap-2">
+          <For each={entries()}>
+            {(entry) => {
+              const kind = entry.kind;
+              const Icon = HARNESS_ICONS[kind as keyof typeof HARNESS_ICONS];
+              return (
+                <li class="rounded border border-zinc-800 bg-zinc-900/60 px-3 py-2 text-[11px]">
+                  <div class="flex items-center gap-2">
+                    <Show when={Icon}>{Icon ? <Icon class="size-3" /> : null}</Show>
+                    <span class="font-medium text-zinc-200">{kind}</span>
+                    <span class="ml-auto text-[10px] text-zinc-500">
+                      {entry.setupOk == null
+                        ? "setup pending"
+                        : entry.setupOk
+                          ? "setup ok"
+                          : "setup degraded"}
+                    </span>
+                  </div>
+                  <Show when={entry.setup && entry.setup.length > 0}>
+                    <ul class="mt-1 ml-5 list-disc text-[10px] text-zinc-400">
+                      <For each={entry.setup!}>
+                        {(a) => (
+                          <li>
+                            <span
+                              class={
+                                a.outcome === "failed"
+                                  ? "text-red-400"
+                                  : a.outcome === "skipped"
+                                    ? "text-amber-400"
+                                    : "text-emerald-400"
+                              }
+                            >
+                              {a.outcome}
+                            </span>{" "}
+                            <span class="text-zinc-500">{a.actionKind}</span>
+                            <Show when={a.detail}>
+                              {(d) => <span class="text-zinc-600"> — {d()}</span>}
+                            </Show>
+                          </li>
+                        )}
+                      </For>
+                    </ul>
+                  </Show>
+                  <Show when={entry.selftest}>
+                    {(st) => (
+                      <div class="mt-1 flex items-center gap-2 text-[10px] text-zinc-400">
+                        <span class={st().ok ? "text-emerald-400" : "text-red-400"}>
+                          selftest {st().ok ? "ok" : "failed"}
+                        </span>
+                        <span class="text-zinc-600">— {st().detail}</span>
+                        <span class="ml-auto text-zinc-600">{st().elapsedMs} ms</span>
+                      </div>
+                    )}
+                  </Show>
+                  <button
+                    type="button"
+                    class="mt-2 rounded border border-zinc-800 px-2 py-0.5 text-[10px] text-zinc-400 hover:bg-zinc-800"
+                    onClick={() => void refreshHarnessReport()}
+                  >
+                    Run again
+                  </button>
+                </li>
+              );
+            }}
+          </For>
+        </ul>
+      </Show>
+    </div>
+  );
+};
+
 const SectionContent: Component<{ section: SectionId }> = (props) => {
   return (
     <>
@@ -1194,6 +1636,12 @@ const SectionContent: Component<{ section: SectionId }> = (props) => {
       </div>
       <div class={cx(props.section === "harnesses" ? "" : "hidden")}>
         <HarnessesSection active={props.section === "harnesses"} />
+      </div>
+      <div class={cx(props.section === "health" ? "" : "hidden")}>
+        <HealthSection />
+      </div>
+      <div class={cx(props.section === "worktrees" ? "" : "hidden")}>
+        <WorktreesSection active={props.section === "worktrees"} />
       </div>
       <div class={cx(props.section === "updates" ? "" : "hidden")}>
         <UpdatesSection />
@@ -1238,7 +1686,7 @@ export const SettingsModal: Component<SettingsModalProps> = (props) => {
               </div>
 
               {/* Nav items */}
-              <nav class="flex-1 overflow-y-auto px-1.5 pb-1.5">
+              <Scrollable class="min-h-0 flex-1 px-1.5 pb-1.5">
                 <p class="mb-0.5 px-1.5 pt-2 text-[9px] uppercase tracking-wider text-muted-foreground/50">
                   General
                 </p>
@@ -1259,7 +1707,7 @@ export const SettingsModal: Component<SettingsModalProps> = (props) => {
                     </button>
                   )}
                 </For>
-              </nav>
+              </Scrollable>
             </div>
 
             {/* Right content */}
@@ -1289,9 +1737,9 @@ export const SettingsModal: Component<SettingsModalProps> = (props) => {
               </div>
 
               {/* Scrollable content area */}
-              <div class="flex-1 overflow-y-auto px-4 py-4">
+              <Scrollable class="min-h-0 flex-1 px-4 py-4">
                 <SectionContent section={activeSection()} />
-              </div>
+              </Scrollable>
             </div>
           </div>
         </DialogPrimitive.Content>

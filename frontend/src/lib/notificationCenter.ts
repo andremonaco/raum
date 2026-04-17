@@ -33,7 +33,7 @@ import {
 } from "@tauri-apps/plugin-notification";
 import { createSignal } from "solid-js";
 
-import type { AgentKind, AgentState } from "../stores/agentStore";
+import type { AgentKind, AgentState, Reliability } from "../stores/agentStore";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -44,8 +44,31 @@ interface AgentStateChangedPayload {
   harness: AgentKind;
   from: AgentState;
   to: AgentState;
-  via_silence_heuristic: boolean;
+  /**
+   * Per-harness notification plan, Phase 1. Replaces the previous
+   * boolean `via_silence_heuristic` flag on this payload. Optional for
+   * backwards compatibility with any cached events emitted before the
+   * transition lands, but the backend always writes it.
+   */
+  reliability?: Reliability;
 }
+
+/**
+ * Phase 2 — backend emits this on `notification-event` when a
+ * PermissionRequest hook arrives carrying a request_id. The frontend
+ * renders a notification with Allow / Deny / Ask action buttons; the
+ * user's click invokes `reply_permission`.
+ */
+interface NotificationEventPayload {
+  harness: AgentKind;
+  event: string;
+  session_id?: string | null;
+  request_id: string;
+  payload?: Record<string, unknown> | null;
+}
+
+/** Kebab-case decision tag matching Rust-side `Decision::wire_tag`. */
+export type PermissionDecision = "allow" | "allow-and-remember" | "deny" | "ask";
 
 /** Per-agent notification metadata the caller can optionally supply. */
 export interface NotificationContext {
@@ -431,11 +454,32 @@ export async function startNotificationCenter(): Promise<UnlistenFn> {
     handleAgentStateChanged(ev.payload);
   });
 
-  // §11.6 — click-to-focus. The `onAction` listener fires when the user
-  // clicks the notification body on macOS / Linux.
+  // Phase 2 — PermissionRequest notifications with Allow/Deny actions.
+  const unlistenPermission = await listen<NotificationEventPayload>("notification-event", (ev) => {
+    void dispatchPermissionNotification(ev.payload);
+  });
+
+  // §11.6 — click-to-focus + Phase 2 permission reply routing. The
+  // `onAction` listener fires when the user clicks a notification body
+  // or an action button. Action clicks carry the raum `action` extra
+  // which we route into `reply_permission`.
   const actionListener = await onAction((payload) => {
     const extra = payload.extra;
     const sessionId = typeof extra?.sessionId === "string" ? extra.sessionId : "";
+    const requestId = typeof extra?.requestId === "string" ? extra.requestId : "";
+    const decision =
+      typeof extra?.decision === "string" ? (extra.decision as PermissionDecision) : null;
+
+    if (requestId && decision) {
+      void invoke("reply_permission", {
+        args: { request_id: requestId, session_id: sessionId || null, decision },
+      }).catch((e) => {
+        console.warn("reply_permission failed", e);
+      });
+      return;
+    }
+
+    // Fallback: ordinary click-to-focus.
     void invoke("notifications_focus_main").catch(() => {
       /* best-effort */
     });
@@ -454,10 +498,85 @@ export async function startNotificationCenter(): Promise<UnlistenFn> {
 
   return () => {
     unlistenState();
+    unlistenPermission();
     actionListener.unregister();
     for (const t of debounceTimers.values()) clearTimeout(t);
     debounceTimers.clear();
   };
+}
+
+/**
+ * Surface a permission-request notification with Allow / Deny / Ask
+ * action buttons. When the user clicks an action the backend
+ * `reply_permission` Tauri command is invoked with the decision tag.
+ */
+async function dispatchPermissionNotification(payload: NotificationEventPayload): Promise<void> {
+  if (!payload.request_id) return;
+
+  const ctx = payload.session_id ? contextBySession.get(payload.session_id) : undefined;
+  const title = `${ctx?.projectName ?? "raum"}: ${payload.harness} needs permission`;
+  const summary = permissionSummaryFor(payload);
+
+  if (permissionState() === "granted") {
+    try {
+      sendNotification({
+        title,
+        body: summary,
+        extra: {
+          sessionId: payload.session_id ?? "",
+          requestId: payload.request_id,
+        },
+        actions: [
+          {
+            id: "allow",
+            title: "Allow",
+            extra: {
+              sessionId: payload.session_id ?? "",
+              requestId: payload.request_id,
+              decision: "allow",
+            },
+          },
+          {
+            id: "deny",
+            title: "Deny",
+            extra: {
+              sessionId: payload.session_id ?? "",
+              requestId: payload.request_id,
+              decision: "deny",
+            },
+          },
+          {
+            id: "ask",
+            title: "Ask in terminal",
+            extra: {
+              sessionId: payload.session_id ?? "",
+              requestId: payload.request_id,
+              decision: "ask",
+            },
+          },
+        ],
+      } as unknown as Parameters<typeof sendNotification>[0]);
+      return;
+    } catch (e) {
+      console.warn("sendNotification (permission) failed", e);
+    }
+  }
+
+  // Fallback: in-app banner so the user still sees the request.
+  bannerCounter += 1;
+  setBanners((prev) => [
+    ...prev,
+    { id: bannerCounter, title, body: summary, sessionId: payload.session_id ?? "" },
+  ]);
+}
+
+function permissionSummaryFor(payload: NotificationEventPayload): string {
+  const p = payload.payload as Record<string, unknown> | null | undefined;
+  if (p && typeof p === "object") {
+    const tool = typeof p.tool_name === "string" ? p.tool_name : null;
+    if (tool) return `${tool} requires permission — Allow or Deny?`;
+  }
+  return "Permission requested — Allow or Deny?";
 }
 
 // ---------------------------------------------------------------------------
