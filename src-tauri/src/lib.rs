@@ -10,6 +10,7 @@ use raum_core::logging;
 use raum_core::paths;
 use raum_core::store::ConfigStore;
 use tauri::{Emitter, Manager};
+#[cfg(target_os = "macos")]
 use tauri_plugin_decorum::WebviewWindowExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 use tracing::{info, warn};

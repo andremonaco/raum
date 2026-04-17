@@ -256,7 +256,7 @@ mod tests {
     fn silence_is_ignored_when_not_working() {
         let mut m = sm();
         // Still Idle — tick should not fire.
-        assert!(m.tick_silence(Duration::from_millis(10_000)).is_none());
+        assert!(m.tick_silence(Duration::from_secs(10)).is_none());
     }
 
     #[test]
@@ -293,6 +293,6 @@ mod tests {
         let mut m = BTreeMap::new();
         m.insert("codex".into(), 2000u64);
         let d = resolve_silence_threshold(AgentKind::Codex, &m);
-        assert_eq!(d, Duration::from_millis(2000));
+        assert_eq!(d, Duration::from_secs(2));
     }
 }
