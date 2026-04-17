@@ -25,6 +25,8 @@ pub mod claude_code;
 pub mod codex;
 pub mod event;
 pub mod opencode;
+pub mod opencode_reply;
+pub mod opencode_sse;
 pub mod reply;
 pub mod setup;
 pub mod traits;

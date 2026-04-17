@@ -212,7 +212,13 @@ impl NotificationChannel for OpenCodeSseChannel {
     }
 
     async fn health(&self) -> ChannelHealth {
-        self.health.lock().clone()
+        // `ChannelHealth` may or may not implement `Copy` depending on
+        // whether Phase 3's `Unavailable { reason: String }` variant is
+        // merged; returning a fresh owned value via `clone` works in
+        // both configurations.
+        #[allow(clippy::clone_on_copy)]
+        let snapshot = self.health.lock().clone();
+        snapshot
     }
 }
 
