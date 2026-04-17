@@ -26,6 +26,12 @@ block in `tauri.conf.json` before building from source.
   rendered by xterm.js. It never leaves the host.
 - **Hook events** travel over a Unix domain socket at
   `~/.config/raum/state/events.sock`. No TCP, no UDP.
+- **OpenCode harness** events reach raum through a loopback-only HTTP
+  call to `http://127.0.0.1:<port>/event` (SSE) and the matching POST
+  reply to `http://127.0.0.1:<port>/permission/:id/reply`. The port is
+  discovered from `$OPENCODE_PORT`, the OpenCode lockfile under
+  `$XDG_STATE_HOME/opencode/lockfile`, or falls back to the documented
+  default `4096`. raum never opens non-loopback sockets for this path.
 - **Project / worktree / layout config** lives under `~/.config/raum/`
   (XDG-aware), created with `0700` permissions.
 - **Logs** rotate daily into `~/.config/raum/logs/` with 3-day retention.
