@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::agent::AgentKind;
-use crate::config_io::managed_json::atomic_write;
+use crate::config_io::managed_json::{atomic_write, is_raum_managed};
 
 /// Context handed to each [`crate::harness::traits::NotificationSetup`]
 /// planner. Carries paths the planner needs to decide what to do (hook
@@ -98,6 +98,15 @@ pub enum SetupAction {
         key_path: Vec<String>,
         value: bool,
     },
+    /// Parse a JSON settings file and drop every array entry that is
+    /// tagged with the `_raum_managed_marker: "<raum-managed>"`
+    /// sentinel. Used by adapters (OpenCode, Phase 4) that previously
+    /// injected hook entries into a harness's config file and are now
+    /// migrating to a different notification transport.
+    ///
+    /// No-op when the file is missing or unparsable — the executor
+    /// refuses to scribble over a user's hand-edited-but-broken JSON.
+    RemoveManagedJsonEntries { path: PathBuf },
 }
 
 /// Plan a harness returns from its [`crate::harness::traits::NotificationSetup::plan`].
@@ -300,7 +309,73 @@ impl SetupExecutor {
             SetupAction::EnsureFeatureFlag { .. } => ActionOutcome::Skipped {
                 reason: "feature-flag action not implemented until Phase 3".into(),
             },
+            SetupAction::RemoveManagedJsonEntries { path } => remove_managed_entries(path),
         }
+    }
+}
+
+/// Body of [`SetupAction::RemoveManagedJsonEntries`]. Kept private because
+/// the executor is the only caller; extracted purely so the logic is easy
+/// to follow and test against.
+fn remove_managed_entries(path: &Path) -> ActionOutcome {
+    if !path.exists() {
+        return ActionOutcome::Skipped {
+            reason: format!("{} does not exist", path.display()),
+        };
+    }
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            return ActionOutcome::Failed {
+                error: format!("read {}: {e}", path.display()),
+            };
+        }
+    };
+    if raw.trim().is_empty() {
+        return ActionOutcome::Skipped {
+            reason: format!("{} is empty", path.display()),
+        };
+    }
+    let mut root: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            return ActionOutcome::Skipped {
+                reason: format!("{} is not parsable JSON: {e}", path.display()),
+            };
+        }
+    };
+    let mut removed = 0usize;
+    if let Some(hooks) = root
+        .as_object_mut()
+        .and_then(|o| o.get_mut("hooks"))
+        .and_then(|v| v.as_object_mut())
+    {
+        for (_event, arr) in hooks.iter_mut() {
+            if let Some(list) = arr.as_array_mut() {
+                let before = list.len();
+                list.retain(|v| !is_raum_managed(v));
+                removed += before - list.len();
+            }
+        }
+    }
+    if removed == 0 {
+        return ActionOutcome::Skipped {
+            reason: format!("no <raum-managed> entries in {}", path.display()),
+        };
+    }
+    let serialized = match serde_json::to_string_pretty(&root) {
+        Ok(s) => s,
+        Err(e) => {
+            return ActionOutcome::Failed {
+                error: format!("serialize: {e}"),
+            };
+        }
+    };
+    match atomic_write(path, serialized.as_bytes()) {
+        Ok(()) => ActionOutcome::Applied,
+        Err(e) => ActionOutcome::Failed {
+            error: format!("write: {e}"),
+        },
     }
 }
 
@@ -376,6 +451,97 @@ mod tests {
         plan.push(SetupAction::AssertBinary { name: "sh".into() });
         assert!(!plan.is_empty());
         assert_eq!(plan.len(), 1);
+    }
+
+    #[test]
+    fn remove_managed_json_noop_when_file_missing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut plan = SetupPlan::new(AgentKind::OpenCode);
+        plan.push(SetupAction::RemoveManagedJsonEntries { path: path.clone() });
+        let report = SetupExecutor::new().apply(&plan);
+        assert!(report.ok);
+        assert!(matches!(
+            report.actions[0].outcome,
+            ActionOutcome::Skipped { .. }
+        ));
+    }
+
+    #[test]
+    fn remove_managed_json_strips_only_raum_entries() {
+        use crate::config_io::managed_json::{MARKER_BEGIN, MARKER_KEY};
+        use serde_json::json;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let original = json!({
+            "provider": { "openai": { "model": "gpt-4" } },
+            "hooks": {
+                "Notification": [
+                    { "matcher": "user", "hooks": [] },
+                    { MARKER_KEY: MARKER_BEGIN, "matcher": ".*", "hooks": [] }
+                ],
+                "Stop": [
+                    { MARKER_KEY: MARKER_BEGIN, "matcher": ".*", "hooks": [] }
+                ]
+            }
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&original).unwrap()).unwrap();
+
+        let mut plan = SetupPlan::new(AgentKind::OpenCode);
+        plan.push(SetupAction::RemoveManagedJsonEntries { path: path.clone() });
+        let report = SetupExecutor::new().apply(&plan);
+        assert!(report.ok);
+        assert!(matches!(report.actions[0].outcome, ActionOutcome::Applied));
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        // Unrelated config preserved.
+        assert_eq!(
+            parsed["provider"]["openai"]["model"].as_str().unwrap(),
+            "gpt-4"
+        );
+        // User entry preserved, raum entry removed.
+        let notif = parsed["hooks"]["Notification"].as_array().unwrap();
+        assert_eq!(notif.len(), 1);
+        assert_eq!(notif[0]["matcher"].as_str().unwrap(), "user");
+        let stop = parsed["hooks"]["Stop"].as_array().unwrap();
+        assert!(stop.is_empty());
+    }
+
+    #[test]
+    fn remove_managed_json_skips_unparsable() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "{not json").unwrap();
+        let mut plan = SetupPlan::new(AgentKind::OpenCode);
+        plan.push(SetupAction::RemoveManagedJsonEntries { path: path.clone() });
+        let report = SetupExecutor::new().apply(&plan);
+        assert!(report.ok);
+        assert!(matches!(
+            report.actions[0].outcome,
+            ActionOutcome::Skipped { .. }
+        ));
+        // Original bytes preserved.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{not json");
+    }
+
+    #[test]
+    fn remove_managed_json_skips_when_nothing_to_remove() {
+        use serde_json::json;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let original = json!({
+            "hooks": { "Notification": [{ "matcher": "user", "hooks": [] }] }
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&original).unwrap()).unwrap();
+        let mut plan = SetupPlan::new(AgentKind::OpenCode);
+        plan.push(SetupAction::RemoveManagedJsonEntries { path: path.clone() });
+        let report = SetupExecutor::new().apply(&plan);
+        assert!(report.ok);
+        assert!(matches!(
+            report.actions[0].outcome,
+            ActionOutcome::Skipped { .. }
+        ));
     }
 
     #[test]
