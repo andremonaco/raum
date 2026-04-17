@@ -50,6 +50,7 @@ import {
   activeWorktreeStore,
   setActiveWorktree,
   cacheWorktreeList,
+  useBranchesVersion,
   worktreesByProject,
   type Worktree,
 } from "../stores/worktreeStore";
@@ -63,11 +64,11 @@ import { agentStore, type AgentListItem } from "../stores/agentStore";
 import { terminalStore } from "../stores/terminalStore";
 import { AlertCircleIcon, CheckIcon, LoaderIcon } from "./icons";
 import { CreateWorktreeModal } from "./create-worktree-modal";
-const FileEditorModal = lazy(() =>
-  import("./file-editor-modal").then((m) => ({ default: m.FileEditorModal })),
+const DiffViewerModal = lazy(() =>
+  import("./diff-viewer-modal").then((m) => ({ default: m.DiffViewerModal })),
 );
-import { isEditableFile } from "../lib/fileUtils";
 import { useKeymapAction } from "../lib/keymapContext";
+import { sidebarHidden } from "../lib/sidebarVisibility";
 
 // ---- Tauri command wrappers -----------------------------------------------
 
@@ -138,8 +139,7 @@ interface WorktreeRowProps {
  */
 const WorktreeRow: Component<WorktreeRowProps> = (rowProps) => {
   const [expanded, setExpanded] = createSignal(false);
-  const [editorPath, setEditorPath] = createSignal<string | null>(null);
-  const [wigglePath, setWigglePath] = createSignal<string | null>(null);
+  const [diffTarget, setDiffTarget] = createSignal<{ file: string; staged: boolean } | null>(null);
   const [status, setStatus] = createSignal<WorktreeStatus>({
     dirty: false,
     untracked: [],
@@ -229,13 +229,8 @@ const WorktreeRow: Component<WorktreeRowProps> = (rowProps) => {
     void runPoll();
   };
 
-  const openFile = (file: string) => {
-    const fullPath = `${rowProps.worktree.path}/${file}`;
-    if (!isEditableFile(fullPath)) {
-      setWigglePath(file);
-      return;
-    }
-    setEditorPath(fullPath);
+  const openDiff = (file: string, staged: boolean) => {
+    setDiffTarget({ file, staged });
   };
 
   const unstaged = createMemo(() => [...status().untracked, ...status().modified]);
@@ -382,9 +377,15 @@ const WorktreeRow: Component<WorktreeRowProps> = (rowProps) => {
         </span>
       </button>
 
-      <Show when={editorPath() !== null}>
+      <Show when={diffTarget() !== null}>
         <Suspense>
-          <FileEditorModal open={true} path={editorPath()} onClose={() => setEditorPath(null)} />
+          <DiffViewerModal
+            open={true}
+            worktreePath={rowProps.worktree.path}
+            file={diffTarget()?.file ?? null}
+            staged={diffTarget()?.staged ?? false}
+            onClose={() => setDiffTarget(null)}
+          />
         </Suspense>
       </Show>
 
@@ -410,33 +411,37 @@ const WorktreeRow: Component<WorktreeRowProps> = (rowProps) => {
                   </div>
                   <ul>
                     <For each={unstaged()}>
-                      {(file) => (
-                        <li
-                          class="flex items-center justify-between gap-1 rounded px-1 py-0.5 hover:bg-zinc-900"
-                          classList={{ wiggle: wigglePath() === file }}
-                          onAnimationEnd={() => {
-                            if (wigglePath() === file) setWigglePath(null);
-                          }}
-                        >
-                          <button
-                            type="button"
-                            class="flex min-w-0 flex-1 items-center gap-1.5 truncate text-left font-mono text-[11px] text-zinc-400 hover:text-zinc-100"
-                            title={file}
-                            onClick={() => openFile(file)}
-                          >
-                            <FileTypeIcon name={file} class="size-3.5 shrink-0 opacity-75" />
-                            <span class="truncate">{file}</span>
-                          </button>
-                          <button
-                            type="button"
-                            class="shrink-0 rounded px-1 text-[10px] text-emerald-500 hover:bg-zinc-800"
-                            onClick={() => void stageFile(file)}
-                            title="Stage file"
-                          >
-                            +
-                          </button>
-                        </li>
-                      )}
+                      {(file) => {
+                        const lastSlash = file.lastIndexOf("/");
+                        const dir = lastSlash >= 0 ? file.slice(0, lastSlash) : "";
+                        const name = lastSlash >= 0 ? file.slice(lastSlash + 1) : file;
+                        return (
+                          <li class="flex items-center justify-between gap-1 rounded px-1 py-0.5 hover:bg-zinc-900">
+                            <button
+                              type="button"
+                              class="flex min-w-0 flex-1 items-center gap-1.5 text-left font-mono text-[11px] text-zinc-400 hover:text-zinc-100"
+                              title={`View diff: ${file}`}
+                              onClick={() => openDiff(file, false)}
+                            >
+                              <FileTypeIcon name={file} class="size-3.5 shrink-0 opacity-75" />
+                              <span class="min-w-0 flex-1 truncate">
+                                <span>{name}</span>
+                                <Show when={dir !== ""}>
+                                  <span class="ml-1.5 text-[10px] text-zinc-600">{dir}</span>
+                                </Show>
+                              </span>
+                            </button>
+                            <button
+                              type="button"
+                              class="shrink-0 rounded px-1 text-[10px] text-emerald-500 hover:bg-zinc-800"
+                              onClick={() => void stageFile(file)}
+                              title="Stage file"
+                            >
+                              +
+                            </button>
+                          </li>
+                        );
+                      }}
                     </For>
                   </ul>
                 </div>
@@ -457,33 +462,37 @@ const WorktreeRow: Component<WorktreeRowProps> = (rowProps) => {
                   </div>
                   <ul>
                     <For each={status().staged}>
-                      {(file) => (
-                        <li
-                          class="flex items-center justify-between gap-1 rounded px-1 py-0.5 hover:bg-zinc-900"
-                          classList={{ wiggle: wigglePath() === file }}
-                          onAnimationEnd={() => {
-                            if (wigglePath() === file) setWigglePath(null);
-                          }}
-                        >
-                          <button
-                            type="button"
-                            class="flex min-w-0 flex-1 items-center gap-1.5 truncate text-left font-mono text-[11px] text-zinc-300 hover:text-zinc-100"
-                            title={file}
-                            onClick={() => openFile(file)}
-                          >
-                            <FileTypeIcon name={file} class="size-3.5 shrink-0 opacity-75" />
-                            <span class="truncate">{file}</span>
-                          </button>
-                          <button
-                            type="button"
-                            class="shrink-0 rounded px-1 text-[10px] text-rose-400 hover:bg-zinc-800"
-                            onClick={() => void unstageFile(file)}
-                            title="Unstage file"
-                          >
-                            −
-                          </button>
-                        </li>
-                      )}
+                      {(file) => {
+                        const lastSlash = file.lastIndexOf("/");
+                        const dir = lastSlash >= 0 ? file.slice(0, lastSlash) : "";
+                        const name = lastSlash >= 0 ? file.slice(lastSlash + 1) : file;
+                        return (
+                          <li class="flex items-center justify-between gap-1 rounded px-1 py-0.5 hover:bg-zinc-900">
+                            <button
+                              type="button"
+                              class="flex min-w-0 flex-1 items-center gap-1.5 text-left font-mono text-[11px] text-zinc-300 hover:text-zinc-100"
+                              title={`View diff: ${file}`}
+                              onClick={() => openDiff(file, true)}
+                            >
+                              <FileTypeIcon name={file} class="size-3.5 shrink-0 opacity-75" />
+                              <span class="min-w-0 flex-1 truncate">
+                                <span>{name}</span>
+                                <Show when={dir !== ""}>
+                                  <span class="ml-1.5 text-[10px] text-zinc-600">{dir}</span>
+                                </Show>
+                              </span>
+                            </button>
+                            <button
+                              type="button"
+                              class="shrink-0 rounded px-1 text-[10px] text-rose-400 hover:bg-zinc-800"
+                              onClick={() => void unstageFile(file)}
+                              title="Unstage file"
+                            >
+                              −
+                            </button>
+                          </li>
+                        );
+                      }}
                     </For>
                   </ul>
                 </div>
@@ -567,7 +576,10 @@ interface ProjectSectionProps {
 
 const ProjectSection: Component<ProjectSectionProps> = (sectionProps) => {
   const slug = createMemo(() => sectionProps.project.slug);
-  const [worktrees, { refetch }] = createResource(slug, fetchWorktrees);
+  const [worktrees, { refetch }] = createResource(
+    () => ({ slug: slug(), v: useBranchesVersion(slug()) }),
+    ({ slug: s }) => fetchWorktrees(s),
+  );
 
   const items = createMemo(() => {
     const cached = worktreesByProject()[slug()];
@@ -667,32 +679,49 @@ const ProjectSection: Component<ProjectSectionProps> = (sectionProps) => {
 
 interface ResizeHandleProps {
   onChange: (width: number) => void;
+  onCommit: (width: number) => void;
+  onDragChange: (active: boolean) => void;
   getWidth: () => number;
 }
 
 /**
- * Drag the right edge to resize. We write the new width to `config.toml` on
- * drag-end, not on every mousemove, so the backend only sees one
- * `config_set_sidebar_width` per interaction.
+ * Drag the right edge to resize. Pointer-move samples are coalesced via
+ * `requestAnimationFrame` so we only push one width into the Solid signal per
+ * frame, and the backend `config_set_sidebar_width` invoke is fired exactly
+ * once on drag-end (via `onCommit`).
  */
 const ResizeHandle: Component<ResizeHandleProps> = (handleProps) => {
   const onPointerDown = (ev: PointerEvent) => {
     ev.preventDefault();
     const startX = ev.clientX;
     const startWidth = handleProps.getWidth();
+    let pending = startWidth;
+    let rafId: number | null = null;
+
+    const flush = () => {
+      rafId = null;
+      handleProps.onChange(pending);
+    };
+
     const onMove = (move: PointerEvent) => {
-      const next = Math.max(
+      pending = Math.max(
         SIDEBAR_MIN_PX,
         Math.min(SIDEBAR_MAX_PX, startWidth + (move.clientX - startX)),
       );
-      handleProps.onChange(next);
+      if (rafId === null) rafId = requestAnimationFrame(flush);
     };
     const onUp = () => {
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
-      // Persist once on drag-end. The component's effect below will handle
-      // the invoke.
+      if (rafId !== null) {
+        cancelAnimationFrame(rafId);
+        rafId = null;
+      }
+      handleProps.onChange(pending);
+      handleProps.onDragChange(false);
+      handleProps.onCommit(pending);
     };
+    handleProps.onDragChange(true);
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
   };
@@ -712,10 +741,11 @@ const ResizeHandle: Component<ResizeHandleProps> = (handleProps) => {
 export const Sidebar: Component = () => {
   const [width, setWidth] = createSignal(280);
   const [collapsed, setCollapsed] = createSignal(false);
+  const [dragging, setDragging] = createSignal(false);
   const [worktreeFilter, setWorktreeFilter] = createSignal("");
   // Tracks which project slug has its create-worktree modal open (null = closed).
   const [createModalSlug, setCreateModalSlug] = createSignal<string | null>(null);
-  // Track the last value we persisted so the write-back effect doesn't echo
+  // Track the last value we persisted so the drag-end commit doesn't echo
   // the value we just loaded from disk back through `config_set_sidebar_width`.
   // Initialised to `undefined` so the first persisted width always gets
   // skipped (we never write on hydrate, only on user-driven changes).
@@ -754,16 +784,16 @@ export const Sidebar: Component = () => {
   // a no-op API so this is a safe call.
   useKeymapAction("toggle-sidebar", () => setCollapsed((v) => !v));
 
-  // Persist width changes back to `config.toml`. Skip any write that would
-  // echo the value we just hydrated from disk.
-  createEffect(() => {
-    const px = width();
+  // Persist width back to `config.toml` exactly once per drag (on pointer-up
+  // via `ResizeHandle.onCommit`). Skip any write that would echo the value we
+  // just hydrated from disk, or repeat the last-persisted value.
+  const commitWidth = (px: number) => {
     if (lastPersisted === undefined || lastPersisted === px) return;
     lastPersisted = px;
     void invoke<number>("config_set_sidebar_width", { width: px }).catch(() => {
       /* log-only */
     });
-  });
+  };
 
   // Fetch worktrees for all projects when collapsed so the mini-view has data.
   // When expanded, each ProjectSection mounts and fetches its own worktrees.
@@ -778,147 +808,156 @@ export const Sidebar: Component = () => {
   const renderedWidth = createMemo(() => (collapsed() ? SIDEBAR_COLLAPSED_PX : width()));
 
   return (
-    <aside
-      class="relative flex shrink-0 flex-col overflow-hidden border-r border-zinc-800 text-xs text-zinc-400 transition-[width] duration-100"
-      style={{ width: `${renderedWidth()}px` }}
-    >
-      {/* ---- Collapsed mini-view ------------------------------------------------ */}
-      {/* Shows the same three-icon status counter as the top-right harness     */}
-      {/* widget, scoped per worktree. Icons are coloured when count > 0 and    */}
-      {/* dimmed to zinc-700 when 0 — identical semantics to the global widget  */}
-      {/* so users build one visual vocabulary across the whole UI.             */}
-      <Show when={collapsed()}>
-        <div class="flex flex-col overflow-y-auto py-1">
-          <For each={projectStore.items}>
-            {(project, projectIdx) => {
-              const wts = createMemo(() => worktreesByProject()[project.slug] ?? []);
-              return (
-                <>
-                  <Show when={projectIdx() > 0 && wts().length > 0}>
-                    {/* Thin project separator line in the project's colour */}
-                    <div
-                      class="mx-auto my-1 h-px w-6 rounded-full opacity-30"
-                      style={{ background: project.color }}
-                      aria-hidden="true"
-                    />
-                  </Show>
-                  <For each={wts()}>
-                    {(wt) => {
-                      const counts = createMemo(() => {
-                        let active = 0;
-                        let waiting = 0;
-                        let idle = 0;
-                        for (const t of Object.values(terminalStore.byId)) {
-                          if (t.worktree_id !== wt.path) continue;
-                          if (t.workingState === "working") active++;
-                          else if (t.workingState === "waiting") waiting++;
-                          else idle++;
-                        }
-                        return { active, waiting, idle };
-                      });
-
-                      const isActiveWt = createMemo(
-                        () => activeWorktreeStore.byProject[project.slug] === wt.path,
-                      );
-
-                      const wtName = createMemo(() => {
-                        const parts = wt.path.split("/");
-                        return parts[parts.length - 1] ?? wt.path;
-                      });
-
-                      return (
-                        <button
-                          type="button"
-                          class="flex w-full items-center justify-center gap-0.5 rounded px-0.5 py-1.5 hover:bg-zinc-800"
-                          classList={{ "bg-zinc-900": isActiveWt() }}
-                          title={`${wtName()} — ${counts().active} active · ${counts().waiting} waiting · ${counts().idle} idle`}
-                          onClick={() => setActiveWorktree(project.slug, wt.path)}
-                        >
-                          {/* Active — spinning loader, emerald when > 0 */}
-                          <span
-                            class="flex items-center"
-                            classList={{
-                              "text-emerald-400": counts().active > 0,
-                              "text-zinc-700": counts().active === 0,
-                            }}
-                          >
-                            <LoaderIcon
-                              class="size-2.5"
-                              classList={{ "animate-spin": counts().active > 0 }}
-                            />
-                          </span>
-                          {/* Waiting — alert circle, amber when > 0 */}
-                          <span
-                            class="flex items-center"
-                            classList={{
-                              "text-amber-400": counts().waiting > 0,
-                              "text-zinc-700": counts().waiting === 0,
-                            }}
-                          >
-                            <AlertCircleIcon class="size-2.5" />
-                          </span>
-                          {/* Idle — check, zinc when > 0 */}
-                          <span
-                            class="flex items-center"
-                            classList={{
-                              "text-zinc-400": counts().idle > 0,
-                              "text-zinc-700": counts().idle === 0,
-                            }}
-                          >
-                            <CheckIcon class="size-2.5" />
-                          </span>
-                        </button>
-                      );
-                    }}
-                  </For>
-                </>
-              );
-            }}
-          </For>
-        </div>
-      </Show>
-
-      <Show when={!collapsed()}>
-        {/* Search + add row */}
-        <div class="flex shrink-0 items-center gap-1 border-b border-zinc-800 px-2 py-2">
-          <input
-            type="search"
-            class="min-w-0 flex-1 rounded border border-zinc-800 bg-zinc-900 px-2 py-1 text-[11px] text-zinc-100 placeholder-zinc-600 focus:border-zinc-600 focus:outline-none"
-            placeholder="Filter worktrees…"
-            value={worktreeFilter()}
-            onInput={(e) => setWorktreeFilter(e.currentTarget.value)}
-            aria-label="Filter worktrees"
-          />
-          <button
-            type="button"
-            class="shrink-0 rounded px-1.5 py-1 text-[11px] text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100 disabled:cursor-not-allowed disabled:opacity-40"
-            title={activeProjectSlug() ? "New worktree" : "Select a project first"}
-            disabled={!activeProjectSlug()}
-            onClick={() => setCreateModalSlug(activeProjectSlug() ?? null)}
-          >
-            +
-          </button>
-        </div>
-        <div class="flex-1 overflow-y-auto p-2">
-          <Show
-            when={projectStore.items.length > 0}
-            fallback={<p class="px-2 text-zinc-600">No projects registered yet.</p>}
-          >
+    <Show when={!sidebarHidden()}>
+      <aside
+        class={`relative flex shrink-0 flex-col overflow-hidden border-r border-zinc-800 text-xs text-zinc-400${
+          dragging() ? "" : " transition-[width] duration-100"
+        }`}
+        style={{ width: `${renderedWidth()}px` }}
+      >
+        {/* ---- Collapsed mini-view ------------------------------------------------ */}
+        {/* Shows the same three-icon status counter as the top-right harness     */}
+        {/* widget, scoped per worktree. Icons are coloured when count > 0 and    */}
+        {/* dimmed to zinc-700 when 0 — identical semantics to the global widget  */}
+        {/* so users build one visual vocabulary across the whole UI.             */}
+        <Show when={collapsed()}>
+          <div class="flex flex-col overflow-y-auto py-1">
             <For each={projectStore.items}>
-              {(project) => (
-                <ProjectSection
-                  project={project}
-                  worktreeFilter={worktreeFilter()}
-                  createOpen={createModalSlug() === project.slug}
-                  onCreateClose={() => setCreateModalSlug(null)}
-                />
-              )}
+              {(project, projectIdx) => {
+                const wts = createMemo(() => worktreesByProject()[project.slug] ?? []);
+                return (
+                  <>
+                    <Show when={projectIdx() > 0 && wts().length > 0}>
+                      {/* Thin project separator line in the project's colour */}
+                      <div
+                        class="mx-auto my-1 h-px w-6 rounded-full opacity-30"
+                        style={{ background: project.color }}
+                        aria-hidden="true"
+                      />
+                    </Show>
+                    <For each={wts()}>
+                      {(wt) => {
+                        const counts = createMemo(() => {
+                          let active = 0;
+                          let waiting = 0;
+                          let idle = 0;
+                          for (const t of Object.values(terminalStore.byId)) {
+                            if (t.worktree_id !== wt.path) continue;
+                            if (t.workingState === "working") active++;
+                            else if (t.workingState === "waiting") waiting++;
+                            else idle++;
+                          }
+                          return { active, waiting, idle };
+                        });
+
+                        const isActiveWt = createMemo(
+                          () => activeWorktreeStore.byProject[project.slug] === wt.path,
+                        );
+
+                        const wtName = createMemo(() => {
+                          const parts = wt.path.split("/");
+                          return parts[parts.length - 1] ?? wt.path;
+                        });
+
+                        return (
+                          <button
+                            type="button"
+                            class="flex w-full items-center justify-center gap-0.5 rounded px-0.5 py-1.5 hover:bg-zinc-800"
+                            classList={{ "bg-zinc-900": isActiveWt() }}
+                            title={`${wtName()} — ${counts().active} active · ${counts().waiting} waiting · ${counts().idle} idle`}
+                            onClick={() => setActiveWorktree(project.slug, wt.path)}
+                          >
+                            {/* Active — spinning loader, emerald when > 0 */}
+                            <span
+                              class="flex items-center"
+                              classList={{
+                                "text-emerald-400": counts().active > 0,
+                                "text-zinc-700": counts().active === 0,
+                              }}
+                            >
+                              <LoaderIcon
+                                class="size-2.5"
+                                classList={{ "animate-spin": counts().active > 0 }}
+                              />
+                            </span>
+                            {/* Waiting — alert circle, amber when > 0 */}
+                            <span
+                              class="flex items-center"
+                              classList={{
+                                "text-amber-400": counts().waiting > 0,
+                                "text-zinc-700": counts().waiting === 0,
+                              }}
+                            >
+                              <AlertCircleIcon class="size-2.5" />
+                            </span>
+                            {/* Idle — check, zinc when > 0 */}
+                            <span
+                              class="flex items-center"
+                              classList={{
+                                "text-zinc-400": counts().idle > 0,
+                                "text-zinc-700": counts().idle === 0,
+                              }}
+                            >
+                              <CheckIcon class="size-2.5" />
+                            </span>
+                          </button>
+                        );
+                      }}
+                    </For>
+                  </>
+                );
+              }}
             </For>
-          </Show>
-        </div>
-        <ResizeHandle getWidth={() => width()} onChange={(next) => setWidth(next)} />
-      </Show>
-    </aside>
+          </div>
+        </Show>
+
+        <Show when={!collapsed()}>
+          {/* Search + add row */}
+          <div class="flex shrink-0 items-center gap-1 border-b border-zinc-800 px-2 py-2">
+            <input
+              type="search"
+              class="min-w-0 flex-1 rounded border border-zinc-800 bg-zinc-900 px-2 py-1 text-[11px] text-zinc-100 placeholder-zinc-600 focus:border-zinc-600 focus:outline-none"
+              placeholder="Filter worktrees…"
+              value={worktreeFilter()}
+              onInput={(e) => setWorktreeFilter(e.currentTarget.value)}
+              aria-label="Filter worktrees"
+            />
+            <button
+              type="button"
+              class="shrink-0 rounded px-1.5 py-1 text-[11px] text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100 disabled:cursor-not-allowed disabled:opacity-40"
+              title={activeProjectSlug() ? "New worktree" : "Select a project first"}
+              disabled={!activeProjectSlug()}
+              onClick={() => setCreateModalSlug(activeProjectSlug() ?? null)}
+            >
+              +
+            </button>
+          </div>
+          <div class="flex-1 overflow-y-auto p-2">
+            <Show
+              when={projectStore.items.length > 0}
+              fallback={<p class="px-2 text-zinc-600">No projects registered yet.</p>}
+            >
+              <For each={projectStore.items}>
+                {(project) => (
+                  <ProjectSection
+                    project={project}
+                    worktreeFilter={worktreeFilter()}
+                    createOpen={createModalSlug() === project.slug}
+                    onCreateClose={() => setCreateModalSlug(null)}
+                  />
+                )}
+              </For>
+            </Show>
+          </div>
+          <ResizeHandle
+            getWidth={() => width()}
+            onChange={(next) => setWidth(next)}
+            onCommit={commitWidth}
+            onDragChange={setDragging}
+          />
+        </Show>
+      </aside>
+    </Show>
   );
 };
 

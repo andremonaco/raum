@@ -5,8 +5,8 @@
   "build": {
     "frontendDist": "../frontend/dist",
     "devUrl": "http://localhost:5173",
-    "beforeDevCommand": "cd ../frontend && bun run dev",
-    "beforeBuildCommand": "cd ../frontend && bun run build"
+    "beforeDevCommand": "cd \"$(git rev-parse --show-toplevel)/frontend\" && bun run dev",
+    "beforeBuildCommand": "cd \"$(git rev-parse --show-toplevel)/frontend\" && bun run build"
   },
   "app": {
     "windows": [
@@ -25,7 +25,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data: blob:; connect-src 'self' ipc: http://ipc.localhost"
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' ipc: http://ipc.localhost"
     },
     "withGlobalTauri": true
   },
@@ -64,7 +64,7 @@
       "endpoints": [
         "https://github.com/andremonaco/raum/releases/latest/download/latest.json"
       ],
-      "pubkey": "REPLACE_ME_WITH_TAURI_UPDATER_PUBKEY"
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDE1ODVEMjU4QTRCMzczNwpSV1EzTjB1S0pWMVlBZWtjRnpLR3c5WGVwN2MzNURRVXJmTFdjMzdwVEJCYjA4dmhnSEdjejdSYQo="
     }
   }
 }

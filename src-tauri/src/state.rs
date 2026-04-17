@@ -1,11 +1,13 @@
 //! Tauri-managed shared state. Wave 2 fills in TmuxManager / agent registry / etc.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use raum_core::store::ConfigStore;
 use raum_tmux::TmuxManager;
 
 use crate::commands::agent::{AgentEventBus, AgentRegistry};
+use crate::commands::git_watcher::GitHeadWatcher;
 
 /// Shared app state. Other Wave-2 agents may add sibling fields here; keep the
 /// additions additive so parallel waves don't clobber each other.
@@ -24,6 +26,10 @@ pub struct AppHandleState {
     /// raum-core to the Tauri event bus. The bridge task is spawned lazily on
     /// first use (see `commands::agent::ensure_bridge_running`).
     pub agent_events: AgentEventBus,
+    /// Per-project `.git/HEAD` watchers. Each entry emits
+    /// `worktree-branches-changed` when the underlying HEAD changes so the UI
+    /// can refresh branch badges without polling.
+    pub git_watchers: Mutex<HashMap<String, GitHeadWatcher>>,
 }
 
 impl Default for AppHandleState {
@@ -34,6 +40,7 @@ impl Default for AppHandleState {
             terminals: Mutex::new(crate::commands::terminal::TerminalRegistry::default()),
             agents: Mutex::new(AgentRegistry::with_defaults()),
             agent_events: AgentEventBus::new(),
+            git_watchers: Mutex::new(HashMap::new()),
         }
     }
 }

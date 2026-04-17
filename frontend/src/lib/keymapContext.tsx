@@ -69,6 +69,12 @@ export interface KeymapApi {
   register(action: string, handler: Handler): () => void;
   /** Invoke the top-of-stack handler for `action`. Returns whether one ran. */
   dispatch(action: string, event?: KeyboardEvent): boolean;
+  /**
+   * Replace the effective keymap with the result of a successful save
+   * (`keymap_set_override` / `keymap_clear_override`). Lets the editor
+   * modal apply changes without reloading from disk.
+   */
+  replaceEntries(next: KeymapEntry[]): void;
 }
 
 const KeymapContext = createContext<KeymapApi | undefined>(undefined);
@@ -333,6 +339,7 @@ export const KeymapProvider: Component<KeymapProviderProps> = (props) => {
     },
     register,
     dispatch,
+    replaceEntries: setEntries,
   };
 
   return <KeymapContext.Provider value={api}>{props.children}</KeymapContext.Provider>;
@@ -354,6 +361,7 @@ export function useKeymap(): KeymapApi {
       accelerator: () => undefined,
       register: () => () => undefined,
       dispatch: () => false,
+      replaceEntries: () => undefined,
     };
   }
   return ctx;

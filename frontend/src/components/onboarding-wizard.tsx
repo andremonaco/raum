@@ -524,7 +524,7 @@ export const OnboardingWizard: Component<OnboardingWizardProps> = (props) => {
   const [spawningKinds, setSpawningKinds] = createSignal<Set<Harness>>(new Set());
   const [spawnErrors, setSpawnErrors] = createSignal<Partial<Record<Harness, string>>>({});
   const availableHarnesses = (): HarnessStatus[] =>
-    (harnessReport()?.harnesses ?? []).filter((h) => h.found);
+    (harnessReport()?.harnesses ?? []).filter((h) => h.found && h.kind !== ("shell" as Harness));
 
   async function spawnHarness(kind: Harness) {
     setSpawningKinds((prev) => new Set(prev).add(kind));
@@ -750,7 +750,9 @@ export const OnboardingWizard: Component<OnboardingWizardProps> = (props) => {
                         aria-label="Harness availability"
                         data-testid="onboarding-harness"
                       >
-                        <For each={report().harnesses}>
+                        <For
+                          each={report().harnesses.filter((h) => h.kind !== ("shell" as Harness))}
+                        >
                           {(status) => <HarnessRow status={status} />}
                         </For>
                       </ul>

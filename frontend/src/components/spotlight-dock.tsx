@@ -345,10 +345,7 @@ export const SpotlightDock: Component = () => {
         >
           {/* Panel — solid background so the app behind stays crisp */}
           <div
-            class="animate-in fade-in zoom-in-95 duration-150 w-full max-w-[640px] mx-4 overflow-hidden rounded-2xl border border-border bg-popover shadow-2xl"
-            style={{
-              "box-shadow": "0 24px 64px rgba(0,0,0,0.55), 0 0 0 1px rgba(255,255,255,0.06)",
-            }}
+            class="floating-surface animate-in fade-in zoom-in-95 duration-150 w-full max-w-[640px] mx-4 overflow-hidden rounded-2xl border border-border bg-popover"
             onClick={(e) => e.stopPropagation()}
           >
             {/* Search input — hidden when the top-bar input is driving the query */}

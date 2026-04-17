@@ -32,6 +32,7 @@ use raum_core::sigil::{is_valid_sigil, resolve_sigil};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Runtime};
 
+use crate::commands::git_watcher::GitHeadWatcher;
 use crate::state::AppHandleState;
 
 /// UI-facing projection of a `ProjectConfig`. Mirrors the canonical fields the
@@ -141,7 +142,8 @@ impl From<EffectiveProjectConfig> for EffectiveProjectDto {
 /// `project_with_defaults` and flips `in_repo_settings` on when the project
 /// root already carries a `.raum.toml`.
 #[tauri::command]
-pub fn project_register(
+pub fn project_register<R: Runtime>(
+    app: AppHandle<R>,
     state: tauri::State<'_, AppHandleState>,
     root_path: String,
     name: String,
@@ -175,6 +177,19 @@ pub fn project_register(
     store
         .write_project(&project)
         .map_err(|e| format!("write_project: {e}"))?;
+
+    drop(store);
+
+    match GitHeadWatcher::start(project.slug.clone(), &project.root_path, app) {
+        Ok(watcher) => {
+            if let Ok(mut watchers) = state.git_watchers.lock() {
+                watchers.insert(project.slug.clone(), watcher);
+            }
+        }
+        Err(e) => {
+            tracing::warn!(slug = %project.slug, error = %e, "git_watcher: start failed");
+        }
+    }
 
     Ok(ProjectListItem::from_project(&project, has_raum_toml))
 }
@@ -308,7 +323,13 @@ pub fn project_remove(state: tauri::State<'_, AppHandleState>, slug: String) -> 
         .map_err(|e| format!("config_store lock: {e}"))?;
     store
         .delete_project(&slug)
-        .map_err(|e| format!("delete_project: {e}"))
+        .map_err(|e| format!("delete_project: {e}"))?;
+    drop(store);
+
+    if let Ok(mut watchers) = state.git_watchers.lock() {
+        watchers.remove(&slug);
+    }
+    Ok(())
 }
 
 /// §5.4 — merged `project.toml` + `.raum.toml` view.

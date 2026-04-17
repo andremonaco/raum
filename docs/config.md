@@ -38,7 +38,7 @@ branchPrefixMode  = "none"          # "none" | "username" | "custom"
 webgl_on_linux = false   # opt-in: WebGL on WebKitGTK is off by default (§4.3)
 
 [notifications]
-# sound = "/path/to/bell.wav"      # optional; played on `waiting` (§11.5)
+# sound = "/System/Library/Sounds/Glass.aiff"  # optional; OS sound or custom path (§11.5)
 notifications_hint_shown = false   # set true after the "permission denied" banner
 
 [sidebar]
@@ -61,7 +61,7 @@ collapsed = false
 | `worktreeConfig.branchPrefixMode`         | `"none"`                                                         | `none` / `username` / `custom`. |
 | `worktreeConfig.branchPrefixCustom`       | _unset_                                                          | Required when `branchPrefixMode = "custom"`. |
 | `rendering.webgl_on_linux`                | `false`                                                          | Opt-in WebGL on WebKitGTK (§4.3). |
-| `notifications.sound`                     | _unset_                                                          | Path to an audio file played on `waiting` (§11.5). |
+| `notifications.sound`                     | _unset_                                                          | Path to an audio file played on `waiting`. Settings UI offers a dropdown of OS-bundled sounds (`/System/Library/Sounds/*.aiff` on macOS, `/usr/share/sounds/freedesktop/stereo/*.oga` on Linux) or a custom path (§11.5). |
 | `notifications.notifications_hint_shown`  | `false`                                                          | Marks the one-time in-app banner as shown. |
 | `sidebar.width_px`                        | `280`                                                            | Persisted drag width (§9.7). |
 | `sidebar.collapsed`                       | `false`                                                          | Persisted collapse toggle. |

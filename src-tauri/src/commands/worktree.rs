@@ -218,6 +218,8 @@ pub fn worktree_create(
         skipped = report.skipped.len();
     }
 
+    rescan_git_watcher(&state, &project_slug, &effective.root_path);
+
     Ok(WorktreeCreated {
         path: target.to_string_lossy().into_owned(),
         branch: prefixed,
@@ -352,6 +354,7 @@ pub fn worktree_remove(
     let effective = load_effective(&state, &project_slug)?;
     git_worktree_remove(&effective.root_path, Path::new(&path), force)
         .map_err(|e| format!("remove: {e}"))?;
+    rescan_git_watcher(&state, &project_slug, &effective.root_path);
     Ok(())
 }
 
@@ -646,6 +649,52 @@ pub async fn git_unstage(worktree_path: String, files: Vec<String>) -> Result<()
     .map_err(|e| format!("spawn_blocking join: {e}"))?
 }
 
+/// Return the unified diff for a single file in the worktree at `worktree_path`.
+///
+/// `staged = true`  → `git diff --cached -- <file>` (index vs HEAD).
+/// `staged = false` → `git diff -- <file>` (worktree vs index). Falls back to
+/// `git diff --no-index -- /dev/null <file>` when the tracked diff is empty,
+/// which covers the untracked-file case so the viewer can still show the full
+/// added content instead of an empty pane.
+#[tauri::command]
+pub async fn git_diff(worktree_path: String, file: String, staged: bool) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = Command::new("git");
+        cmd.args(["-C", &worktree_path, "diff", "--no-color"]);
+        if staged {
+            cmd.arg("--cached");
+        }
+        cmd.arg("--").arg(&file);
+        let out = cmd.output().map_err(|e| format!("git diff: {e}"))?;
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+        }
+        let tracked = String::from_utf8_lossy(&out.stdout).to_string();
+        if !staged && tracked.is_empty() {
+            // Untracked file: synthesise a diff against /dev/null so the viewer
+            // shows the whole file as added. `git diff --no-index` always exits
+            // 1 when there are differences, so we don't treat that as an error.
+            let untracked = Command::new("git")
+                .args([
+                    "-C",
+                    &worktree_path,
+                    "diff",
+                    "--no-color",
+                    "--no-index",
+                    "--",
+                    "/dev/null",
+                    &file,
+                ])
+                .output()
+                .map_err(|e| format!("git diff --no-index: {e}"))?;
+            return Ok(String::from_utf8_lossy(&untracked.stdout).to_string());
+        }
+        Ok(tracked)
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking join: {e}"))?
+}
+
 // ---- §9.6 quickfire history ------------------------------------------------
 
 /// §9.6 — list persisted quick-fire commands, most-recent first.
@@ -751,6 +800,16 @@ fn os_username() -> String {
     std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
         .unwrap_or_default()
+}
+
+/// Re-sync the slug's `GitHeadWatcher` against the current on-disk layout.
+/// A no-op when no watcher is registered (e.g. bootstrap failed).
+fn rescan_git_watcher(state: &tauri::State<'_, AppHandleState>, slug: &str, root: &Path) {
+    if let Ok(mut watchers) = state.git_watchers.lock() {
+        if let Some(w) = watchers.get_mut(slug) {
+            w.rescan(root);
+        }
+    }
 }
 
 #[cfg(test)]

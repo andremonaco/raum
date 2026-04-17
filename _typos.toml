@@ -27,6 +27,8 @@ cva = "cva"
 clippy = "clippy"
 rustfmt = "rustfmt"
 taplo = "taplo"
+# Homebrew / macOS version symbols
+sur = "sur"
 
 [files]
 extend-exclude = [

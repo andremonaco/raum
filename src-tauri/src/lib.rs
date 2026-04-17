@@ -54,6 +54,8 @@ pub fn run() {
             commands::os_info,
             commands::keymap_get_defaults,
             commands::keymap_get_effective,
+            commands::keymap_set_override,
+            commands::keymap_clear_override,
             commands::prereqs_check,
             commands::harnesses_check,
             commands::terminal::terminal_spawn,
@@ -87,6 +89,7 @@ pub fn run() {
             commands::worktree_status,
             commands::git_stage,
             commands::git_unstage,
+            commands::git_diff,
             commands::quickfire_history_get,
             commands::quickfire_history_push,
             commands::config_set_sidebar_width,
@@ -99,6 +102,8 @@ pub fn run() {
             commands::notifications::notifications_focus_main,
             commands::notifications::notifications_mark_hint_shown,
             commands::notifications::config_set_notifications,
+            commands::notifications::notifications_list_system_sounds,
+            commands::notifications::notifications_read_sound_bytes,
             commands::config_set_harness_flags,
             // Global search — file search over a project's root or arbitrary path.
             commands::search::project_find_files,
@@ -106,6 +111,9 @@ pub fn run() {
             // File editor — read/write files on behalf of the frontend.
             commands::files::file_read,
             commands::files::file_write,
+            // Updater — persists the "check on launch" pref; actual
+            // check/install happen via tauri-plugin-updater directly.
+            commands::updater::config_set_updater_check_on_launch,
         ])
         .setup(|app| {
             let main_window = app.get_webview_window("main").unwrap();
@@ -134,10 +142,55 @@ pub fn run() {
             // accelerators can be overridden via keybindings.toml; we look them
             // up through `merged_keymap` so user overrides take effect.
             register_global_shortcuts(app.handle());
+
+            bootstrap_git_watchers(app);
             Ok(())
         })
         .run(tauri::generate_context!())
         .expect("failed while running raum");
+}
+
+/// Start a `GitHeadWatcher` for every already-registered project so branch
+/// badges refresh automatically after startup. Failures per project are
+/// logged and skipped — a bad repo never blocks launch.
+fn bootstrap_git_watchers(app: &mut tauri::App) {
+    let state: tauri::State<'_, state::AppHandleState> = app.state();
+    let handle = app.handle().clone();
+
+    let slugs_and_roots: Vec<(String, std::path::PathBuf)> = {
+        let Ok(store) = state.config_store.lock() else {
+            warn!("bootstrap_git_watchers: config_store lock poisoned");
+            return;
+        };
+        let slugs = match store.list_project_slugs() {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "bootstrap_git_watchers: list_project_slugs failed");
+                return;
+            }
+        };
+        slugs
+            .into_iter()
+            .filter_map(|slug| match store.read_project(&slug) {
+                Ok(Some(p)) => Some((p.slug, p.root_path)),
+                _ => None,
+            })
+            .collect()
+    };
+
+    let Ok(mut watchers) = state.git_watchers.lock() else {
+        warn!("bootstrap_git_watchers: git_watchers lock poisoned");
+        return;
+    };
+    for (slug, root) in slugs_and_roots {
+        match commands::git_watcher::GitHeadWatcher::start(slug.clone(), &root, handle.clone()) {
+            Ok(w) => {
+                info!(slug = %slug, "git_watcher: started");
+                watchers.insert(slug, w);
+            }
+            Err(e) => warn!(slug = %slug, error = %e, "git_watcher: start failed"),
+        }
+    }
 }
 
 /// §12.3 — register the OS-level global shortcuts (`focus-raum`,

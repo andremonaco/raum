@@ -5,12 +5,14 @@
 pub mod agent;
 pub mod config;
 pub mod files;
+pub mod git_watcher;
 pub mod hotkeys;
 pub mod layouts;
 pub mod notifications;
 pub mod project;
 pub mod search;
 pub mod terminal;
+pub mod updater;
 pub mod worktree;
 
 // Each submodule's `#[tauri::command]` items are referenced fully-qualified from

@@ -233,8 +233,7 @@ export const FileEditorModal: Component<FileEditorModalProps> = (props) => {
 
       {/* Modal panel */}
       <div
-        class="animate-in fade-in zoom-in-95 duration-150 fixed inset-x-4 bottom-4 top-[6vh] z-[60] mx-auto flex max-w-5xl flex-col overflow-hidden rounded-2xl border border-white/10 bg-[#282c34] shadow-2xl"
-        style={{ "box-shadow": "0 30px 80px rgba(0,0,0,0.7), 0 0 0 1px rgba(255,255,255,0.06)" }}
+        class="floating-surface animate-in fade-in zoom-in-95 duration-150 fixed inset-x-4 bottom-4 top-[6vh] z-[60] mx-auto flex max-w-5xl flex-col overflow-hidden rounded-2xl border border-border bg-[#282c34]"
         onKeyDown={onKeyDown}
         // Prevent backdrop click from closing when clicking panel
         onClick={(e) => e.stopPropagation()}

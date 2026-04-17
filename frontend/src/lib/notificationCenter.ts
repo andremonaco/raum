@@ -186,16 +186,70 @@ function bodyFor(ctx: NotificationContext | undefined, sessionId: string): strin
   return `Session ${sessionId} is awaiting your reply.`;
 }
 
-function playSound(path: string): void {
+// ObjectURL cache keyed by the absolute on-disk path. The webview can't
+// fetch arbitrary `file://` URLs, so we round-trip the bytes through a
+// Tauri command once per session and reuse the resulting Blob URL on every
+// subsequent notification.
+const audioObjectUrlCache = new Map<string, string>();
+const audioInflight = new Map<string, Promise<string | null>>();
+
+function mimeForSoundPath(path: string): string {
+  const lower = path.toLowerCase();
+  if (lower.endsWith(".aiff") || lower.endsWith(".aif")) return "audio/aiff";
+  if (lower.endsWith(".oga") || lower.endsWith(".ogg")) return "audio/ogg";
+  if (lower.endsWith(".wav")) return "audio/wav";
+  if (lower.endsWith(".mp3")) return "audio/mpeg";
+  if (lower.endsWith(".flac")) return "audio/flac";
+  if (lower.endsWith(".m4a")) return "audio/mp4";
+  return "application/octet-stream";
+}
+
+async function objectUrlForSound(path: string): Promise<string | null> {
+  const cached = audioObjectUrlCache.get(path);
+  if (cached) return cached;
+  const inflight = audioInflight.get(path);
+  if (inflight) return inflight;
+
+  const job = (async () => {
+    try {
+      const bytes = await invoke<number[]>("notifications_read_sound_bytes", { path });
+      const blob = new Blob([Uint8Array.from(bytes)], { type: mimeForSoundPath(path) });
+      const url = URL.createObjectURL(blob);
+      audioObjectUrlCache.set(path, url);
+      return url;
+    } catch (e) {
+      console.warn("notifications_read_sound_bytes failed", path, e);
+      return null;
+    } finally {
+      audioInflight.delete(path);
+    }
+  })();
+  audioInflight.set(path, job);
+  return job;
+}
+
+async function playSound(path: string): Promise<void> {
+  const url = await objectUrlForSound(path);
+  if (!url) return;
   try {
-    const audio = new Audio(path);
+    const audio = new Audio(url);
     audio.volume = 1.0;
-    void audio.play().catch(() => {
+    await audio.play().catch(() => {
       // Swallow: autoplay may be blocked; the notification fires regardless.
     });
   } catch {
     // `new Audio` can throw under locked-down CSP; best-effort only.
   }
+}
+
+/**
+ * Play `path` once for the settings preview button. Bypasses the
+ * focus / debounce gate so the user can audition a sound without an agent
+ * actually transitioning to `waiting`.
+ */
+export async function previewSound(path: string): Promise<void> {
+  if (!path) return;
+  await playSound(path);
 }
 
 async function isWindowUnfocused(): Promise<boolean> {
@@ -253,7 +307,7 @@ async function dispatchWaitingNotification(sessionId: string, harness: AgentKind
   const body = bodyFor(ctx, sessionId);
   const soundPath = await readSoundPath();
 
-  if (soundPath) playSound(soundPath);
+  if (soundPath) void playSound(soundPath);
 
   if (!(await isWindowUnfocused())) return;
 
@@ -295,7 +349,7 @@ async function dispatchDoneNotification(
     doneState === "completed" ? "Agent completed successfully." : "Agent encountered an error.";
 
   const soundPath = await readSoundPath();
-  if (soundPath) playSound(soundPath);
+  if (soundPath) void playSound(soundPath);
 
   if (!(await isWindowUnfocused())) return;
 
@@ -441,6 +495,9 @@ export function __resetNotificationCenterForTests(): void {
   setPermissionState("unknown");
   lastBadgeCount = -1;
   windowHandle = null;
+  for (const url of audioObjectUrlCache.values()) URL.revokeObjectURL(url);
+  audioObjectUrlCache.clear();
+  audioInflight.clear();
 }
 
 /** @internal — hand the event handler directly so tests don't need Tauri IPC. */

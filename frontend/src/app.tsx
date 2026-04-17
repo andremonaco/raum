@@ -1,5 +1,7 @@
 import { Show, createResource, createSignal, onMount, type Component } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
+import { check as checkForUpdate } from "@tauri-apps/plugin-updater";
+import { isPermissionGranted, sendNotification } from "@tauri-apps/plugin-notification";
 import { TopRow } from "./components/top-row";
 import { Sidebar } from "./components/sidebar";
 import { TerminalGrid } from "./components/terminal-grid";
@@ -12,6 +14,62 @@ import { startNotificationCenter } from "./lib/notificationCenter";
 
 interface RaumConfigSnapshot {
   onboarded?: boolean;
+  updater?: {
+    check_on_launch?: boolean;
+  };
+}
+
+/** 5 hours between background update polls. Long enough to stay quiet on
+ *  the IPC bus and avoid rate-limiting GitHub, short enough that a machine
+ *  left open overnight picks up a fresh release by morning. */
+const UPDATE_POLL_INTERVAL_MS = 5 * 60 * 60 * 1000;
+
+/** Startup grace period before the first check so it doesn't compete with
+ *  tmux hydration and initial pane spawns over the Tauri IPC bus. */
+const UPDATE_STARTUP_DELAY_MS = 10_000;
+
+/** Run one updater check. Surfaces an OS notification only when the
+ *  reported version differs from the one we last notified about, so a user
+ *  who dismisses a notification isn't re-pinged every poll cycle for the
+ *  same release. Swallows all errors — a missing network must not bubble
+ *  out of the periodic timer. */
+async function runBackgroundUpdateCheck(lastNotified: { version: string | null }): Promise<void> {
+  try {
+    const update = await checkForUpdate();
+    if (!update) return;
+    if (lastNotified.version === update.version) return;
+    lastNotified.version = update.version;
+    try {
+      if (await isPermissionGranted()) {
+        sendNotification({
+          title: `raum update available: ${update.version}`,
+          body: "Open Settings → Updates to download and install.",
+        });
+      }
+    } catch {
+      /* notification plugin unavailable — silently skip */
+    }
+    console.info(`raum: update ${update.version} available`);
+  } catch (e) {
+    console.warn("background update check failed", e);
+  }
+}
+
+/** Run a background updater check after startup (when the user has opted
+ *  in) and repeat every 5 hours for the life of the process. The Settings
+ *  → Updates pane remains the canonical install surface; this just
+ *  nudges users when a release drops while the app is running. */
+async function scheduleBackgroundUpdateCheck(snapshot: RaumConfigSnapshot): Promise<void> {
+  if (import.meta.env.DEV) return;
+  if (snapshot.updater?.check_on_launch === false) return;
+
+  await new Promise((resolve) => setTimeout(resolve, UPDATE_STARTUP_DELAY_MS));
+
+  const lastNotified: { version: string | null } = { version: null };
+  await runBackgroundUpdateCheck(lastNotified);
+  setInterval(() => {
+    void runBackgroundUpdateCheck(lastNotified);
+  }, UPDATE_POLL_INTERVAL_MS);
 }
 
 interface TerminalListItem {
@@ -68,6 +126,7 @@ const App: Component = () => {
       const c = await invoke<RaumConfigSnapshot>("config_get");
       // Hydrate the grid after confirming we're inside a Tauri host.
       await hydrateActiveLayout();
+      void scheduleBackgroundUpdateCheck(c);
       return c;
     } catch {
       return { onboarded: true };

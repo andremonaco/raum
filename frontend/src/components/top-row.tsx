@@ -59,10 +59,12 @@ import { useKeymap } from "../lib/keymapContext";
 import { PROJECT_COLOR_PALETTE } from "../lib/projectColors";
 import { PROJECT_SIGIL_PALETTE, SIGIL_RESET, deriveSigilFromSlug } from "../lib/projectSigils";
 import { closeSearchPanel, searchPanelOpen, toggleSearchPanel } from "../lib/searchPanelState";
+import { toggleSidebarHidden } from "../lib/sidebarVisibility";
 import { closeSpotlight, setTopBarQuery, spotlightOpen } from "../lib/spotlightState";
 import { matchesAccelerator } from "../lib/accelerator";
 import { GlobalSearchPanel } from "./global-search-panel";
 import { AddProjectModal } from "./add-project-modal";
+import { KeymapSettingsModal } from "./keymap-settings-modal";
 import { SettingsModal } from "./settings-modal";
 import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
@@ -84,12 +86,17 @@ import {
   ClockIcon,
   GitBranchIcon,
   HARNESS_ICONS,
+  KeyboardIcon,
   LoaderIcon,
   PlusIcon,
   RaumLogo,
   SearchIcon,
 } from "./icons";
-import type { Worktree } from "../stores/worktreeStore";
+import {
+  subscribeWorktreeBranchEvents,
+  useBranchesVersion,
+  type Worktree,
+} from "../stores/worktreeStore";
 import { ProjectSettingsDialog } from "./project-settings-dialog";
 
 // Internal value kept as "needs-input" so the keymap wiring (§8.5) and the
@@ -162,8 +169,8 @@ const ProjectTab: Component<ProjectTabProps> = (props) => {
   const [hexInput, setHexInput] = createSignal("");
 
   const [branch] = createResource(
-    () => props.project.slug,
-    async (slug): Promise<string | null> => {
+    () => ({ slug: props.project.slug, v: useBranchesVersion(props.project.slug) }),
+    async ({ slug }): Promise<string | null> => {
       try {
         const items = await invoke<Worktree[]>("worktree_list", {
           projectSlug: slug,
@@ -176,6 +183,8 @@ const ProjectTab: Component<ProjectTabProps> = (props) => {
     },
   );
 
+  // Persist a new color. The popover stays open so the user can keep
+  // tweaking (mirrors the sigil picker behaviour below).
   async function pickColor(hex: string) {
     try {
       const updated = await invoke<ProjectListItem>("project_update", {
@@ -184,8 +193,6 @@ const ProjectTab: Component<ProjectTabProps> = (props) => {
       upsertProject(updated);
     } catch (e) {
       console.warn("project_update color failed", e);
-    } finally {
-      setSwatchOpen(false);
     }
   }
 
@@ -318,7 +325,7 @@ const ProjectTab: Component<ProjectTabProps> = (props) => {
 
       <Show when={menuOpen()}>
         <div
-          class="absolute left-0 top-full z-50 mt-1 w-48 rounded-md border border-border bg-popover p-1 text-xs shadow-md"
+          class="floating-surface absolute left-0 top-full z-50 mt-1 w-48 rounded-xl border border-border bg-popover p-1 text-xs"
           role="menu"
           onMouseLeave={() => setMenuOpen(false)}
         >
@@ -349,6 +356,7 @@ export const TopRow: Component = () => {
   const [accel] = createResource(fetchGlobalSearchAccel);
   const [modalOpen, setModalOpen] = createSignal(false);
   const [appSettingsOpen, setAppSettingsOpen] = createSignal(false);
+  const [keymapSettingsOpen, setKeymapSettingsOpen] = createSignal(false);
   const [confirmRemove, setConfirmRemove] = createSignal<ProjectListItem | undefined>(undefined);
 
   // Top-bar search input — controlled so we can clear it when the spotlight closes.
@@ -388,6 +396,7 @@ export const TopRow: Component = () => {
     let unlistenProject: UnlistenFn | undefined;
     let unlistenAgent: UnlistenFn | undefined;
     let unlistenAgentState: UnlistenFn | undefined;
+    let unlistenBranches: UnlistenFn | undefined;
 
     void refreshProjects();
     void refreshAgents();
@@ -403,6 +412,13 @@ export const TopRow: Component = () => {
     subscribeAgentEvents()
       .then((u) => {
         unlistenAgent = u;
+      })
+      .catch(() => {
+        /* Tauri context unavailable (tests). */
+      });
+    subscribeWorktreeBranchEvents()
+      .then((u) => {
+        unlistenBranches = u;
       })
       .catch(() => {
         /* Tauri context unavailable (tests). */
@@ -434,6 +450,7 @@ export const TopRow: Component = () => {
       unlistenProject?.();
       unlistenAgent?.();
       unlistenAgentState?.();
+      unlistenBranches?.();
     });
   });
 
@@ -621,9 +638,17 @@ export const TopRow: Component = () => {
           </button>
           <button
             type="button"
+            aria-label="Edit keyboard shortcuts"
+            class="rounded p-1 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200"
+            onClick={() => setKeymapSettingsOpen(true)}
+          >
+            <KeyboardIcon class="size-3.5" />
+          </button>
+          <button
+            type="button"
             aria-label="Toggle sidebar"
             class="rounded p-1 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200"
-            onClick={() => keymap.dispatch("toggle-sidebar")}
+            onClick={() => toggleSidebarHidden()}
           >
             <svg
               xmlns="http://www.w3.org/2000/svg"
@@ -879,6 +904,11 @@ export const TopRow: Component = () => {
       <GlobalSearchPanel open={searchPanelOpen()} onClose={() => closeSearchPanel()} />
 
       <SettingsModal open={appSettingsOpen()} onClose={() => setAppSettingsOpen(false)} />
+
+      <KeymapSettingsModal
+        open={keymapSettingsOpen()}
+        onClose={() => setKeymapSettingsOpen(false)}
+      />
     </>
   );
 };

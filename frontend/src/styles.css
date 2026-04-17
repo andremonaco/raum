@@ -133,3 +133,14 @@ body,
 .no-scrollbar::-webkit-scrollbar {
   display: none;
 }
+
+/*
+ * Shared visual token for floating surfaces (dialogs, popovers, spotlight,
+ * dropdowns, command menus, …). Kept in one place so every transient panel
+ * has the same depth, rim, and corner radius — do NOT reinvent locally.
+ */
+.floating-surface {
+  box-shadow:
+    0 24px 64px rgba(0, 0, 0, 0.55),
+    0 0 0 1px rgba(255, 255, 255, 0.06);
+}

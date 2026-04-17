@@ -31,8 +31,10 @@ src-tauri/gen/schemas/
 .env.local
 
 openspec/**/*
-[.]claude/**/*
-[.]opencode/**/*
+.claude/**/*
+.opencode/**/*
+passphrase/**/*
+.raum-updater-key.pem
 
 # Bun
 bun.lockb

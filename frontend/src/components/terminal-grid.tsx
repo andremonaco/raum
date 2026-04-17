@@ -195,29 +195,39 @@ export const TerminalGrid: Component = () => {
         "harnesses_check",
       );
       const found = report.harnesses.filter((h) => h.found).map((h) => h.kind);
-      return ["shell", ...found];
+      return ["shell", ...found.filter((k) => k !== "shell")];
     } catch {
       return ["shell", "claude-code", "codex", "opencode"];
     }
   });
 
-  // Initialize Gridstack lazily the first time a host div renders (which
-  // happens once `runtimeLayoutStore.cells.length > 0`). The effect
-  // intentionally init-once: subsequent runs are no-ops via the handle
-  // guard so transitioning cells back to empty doesn't destroy the grid.
+  // Gridstack lifecycle. The host div is wrapped in `<Show when=cells.length>0>`,
+  // so it unmounts when the last cell closes and remounts on the next spawn.
+  // We must tear down the grid when the host goes away — otherwise the stale
+  // `handle` blocks re-init on the fresh host, and new cells render without
+  // gridstack styles (tiny box in the top-left corner).
   let cleanupGrid: (() => void) | null = null;
   createEffect(() => {
-    // Reactive reads so this re-runs when cells transition 0 → >0 *or* when
-    // the host ref assignment lands.
     const hasCells = runtimeLayoutStore.cells.length > 0;
     const el = host();
-    if (!hasCells || !el || handle()) return;
+    const h = handle();
 
-    const h = initGrid(el);
-    if (!h) return;
-    setHandle(h);
+    // Teardown: host unmounted or grid emptied while a handle is live.
+    if (h && (!hasCells || !el)) {
+      cleanupGrid?.();
+      cleanupGrid = null;
+      setHandle(null);
+      return;
+    }
 
-    const unsubChange = onChange(h, (cells) => {
+    // Init: first cell after empty, host is mounted, no live handle.
+    if (!hasCells || !el || h) return;
+
+    const newH = initGrid(el);
+    if (!newH) return;
+    setHandle(newH);
+
+    const unsubChange = onChange(newH, (cells) => {
       // Runtime store is the source of truth; gridstack reports new geometry
       // after a drag or resize settles. Patch only geometry (not kind).
       //
@@ -230,7 +240,7 @@ export const TerminalGrid: Component = () => {
     });
     cleanupGrid = () => {
       unsubChange();
-      h.destroy();
+      newH.destroy();
     };
   });
   onCleanup(() => {

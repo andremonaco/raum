@@ -37,6 +37,7 @@ import "@xterm/xterm/css/xterm.css";
 import type { AgentKind } from "../lib/agentKind";
 import { registerPane, requestWebgl, unregisterPane } from "../lib/rendererScheduler";
 import { registerTerminal, unregisterTerminal } from "../lib/terminalRegistry";
+import { CopyIcon } from "./icons";
 
 /** xterm.js scrollback cap (§3.8 / §4.1). Mirrors `XTERM_SCROLLBACK` in Rust. */
 export const XTERM_SCROLLBACK_LINES = 10_000;
@@ -103,6 +104,9 @@ const MIN_SPAWN_ROWS = 5;
 /** Upper bound before we give up waiting for `document.fonts.ready`. */
 const FONTS_READY_TIMEOUT_MS = 500;
 
+/** Duration the "Copied" flash stays visible after an auto-copy (ms). */
+const COPY_FLASH_MS = 900;
+
 export const TerminalPane: Component<TerminalPaneProps> = (props) => {
   const paneId = createUniqueId();
   let host: HTMLDivElement | undefined;
@@ -122,12 +126,14 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
 
   const [sessionId, setSessionId] = createSignal<string | null>(props.sessionId ?? null);
   const [errorMsg, setErrorMsg] = createSignal<string | null>(null);
+  const [copiedFlash, setCopiedFlash] = createSignal<boolean>(false);
 
   let term: Terminal | null = null;
   let fit: FitAddon | null = null;
   let search: SearchAddon | null = null;
   let resizeObserver: ResizeObserver | null = null;
   let resizeTimer: ReturnType<typeof setTimeout> | null = null;
+  let copyFlashTimer: ReturnType<typeof setTimeout> | null = null;
 
   onMount(() => {
     if (!host) return;
@@ -356,6 +362,36 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       requestWebgl(paneId);
     });
 
+    // Auto-copy on selection release (Zellij-style). Fires on mouseup so a
+    // mid-drag selection doesn't clobber the clipboard, and on Shift keyup so
+    // keyboard-driven selections are covered too.
+    const copySelection = async (): Promise<void> => {
+      if (!term || !term.hasSelection()) return;
+      const text = term.getSelection();
+      if (!text || text.trim().length === 0) return;
+      try {
+        if (!navigator.clipboard?.writeText) return;
+        await navigator.clipboard.writeText(text);
+      } catch {
+        return;
+      }
+      setCopiedFlash(true);
+      if (copyFlashTimer !== null) clearTimeout(copyFlashTimer);
+      copyFlashTimer = setTimeout(() => {
+        copyFlashTimer = null;
+        setCopiedFlash(false);
+      }, COPY_FLASH_MS);
+    };
+    const onMouseUp = (): void => {
+      void copySelection();
+    };
+    const onKeyUp = (ev: KeyboardEvent): void => {
+      if (ev.key !== "Shift") return;
+      void copySelection();
+    };
+    host.addEventListener("mouseup", onMouseUp);
+    term.textarea?.addEventListener("keyup", onKeyUp);
+
     // §4.7 — register with the global search registry.
     registerTerminal({
       paneId,
@@ -386,6 +422,10 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
     if (resizeTimer !== null) {
       clearTimeout(resizeTimer);
       resizeTimer = null;
+    }
+    if (copyFlashTimer !== null) {
+      clearTimeout(copyFlashTimer);
+      copyFlashTimer = null;
     }
     try {
       resizeObserver?.disconnect();
@@ -422,6 +462,14 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       data-testid="terminal-pane"
     >
       <div ref={(el) => (host = el)} class="min-h-0 min-w-0 flex-1 overflow-hidden" />
+      <div
+        class="pointer-events-none absolute top-2 right-2 z-20 flex items-center gap-1 rounded-md bg-zinc-100/95 px-2 py-1 text-[11px] font-medium text-zinc-900 shadow-md transition-opacity duration-150"
+        classList={{ "opacity-100": copiedFlash(), "opacity-0": !copiedFlash() }}
+        aria-hidden={!copiedFlash()}
+      >
+        <CopyIcon class="h-3.5 w-3.5" />
+        <span>Copied</span>
+      </div>
       {errorMsg() ? (
         <div class="border-t border-red-800 bg-red-950/60 px-2 py-1 text-[11px] text-red-300">
           {errorMsg()}

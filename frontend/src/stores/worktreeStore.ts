@@ -7,6 +7,7 @@
 
 import { createStore } from "solid-js/store";
 import { createSignal } from "solid-js";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 /** Shape of a worktree as surfaced by `worktree_list`. */
 export interface Worktree {
@@ -62,5 +63,32 @@ export function clearWorktreeListCache(projectSlug: string): void {
     const next = { ...prev };
     delete next[projectSlug];
     return next;
+  });
+}
+
+/**
+ * Per-slug version counter bumped whenever the backend emits
+ * `worktree-branches-changed` (fired by the `.git/HEAD` file watcher in
+ * `src-tauri/src/commands/git_watcher.rs`). Components include this in their
+ * `createResource` source so Solid refetches `worktree_list` on every branch
+ * switch — no polling.
+ */
+const [branchesVersion, setBranchesVersion] = createSignal<Record<string, number>>({});
+
+export function useBranchesVersion(projectSlug: string): number {
+  return branchesVersion()[projectSlug] ?? 0;
+}
+
+/**
+ * Subscribe to backend `worktree-branches-changed` events. Mirrors the pattern
+ * used by `subscribeProjectEvents` — wrap the `listen` in an async function
+ * so the module stays importable under vitest (where the Tauri IPC runtime is
+ * not initialised). Callers should invoke this from `onMount` and dispose via
+ * the returned unlisten function.
+ */
+export async function subscribeWorktreeBranchEvents(): Promise<UnlistenFn> {
+  return listen<{ slug: string }>("worktree-branches-changed", (ev) => {
+    const { slug } = ev.payload;
+    setBranchesVersion((prev) => ({ ...prev, [slug]: (prev[slug] ?? 0) + 1 }));
   });
 }

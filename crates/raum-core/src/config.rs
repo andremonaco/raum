@@ -33,6 +33,7 @@ pub struct Config {
     pub sidebar: SidebarConfig,
     pub keybindings: Keybindings,
     pub harnesses: HarnessesConfig,
+    pub updater: UpdaterConfig,
     /// Catch-all for forward-compatible keys so unknown user-added settings
     /// survive a round-trip. Logged at INFO by the store when populated.
     #[serde(flatten, skip_serializing_if = "BTreeMap::is_empty")]
@@ -50,6 +51,7 @@ impl Default for Config {
             sidebar: SidebarConfig::default(),
             keybindings: Keybindings::default(),
             harnesses: HarnessesConfig::default(),
+            updater: UpdaterConfig::default(),
             unknown: BTreeMap::new(),
         }
     }
@@ -154,6 +156,26 @@ impl Default for NotificationsConfig {
             notifications_hint_shown: false,
             notify_on_waiting: true,
             notify_on_done: true,
+        }
+    }
+}
+
+/// Auto-updater preferences. The signing key + endpoint live in
+/// `tauri.conf.json`; this struct only captures per-user toggles.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdaterConfig {
+    /// Run a background `check()` a few seconds after launch and surface a
+    /// non-blocking toast if a newer release is available. On by default;
+    /// the frontend still skips the check in dev builds.
+    #[serde(default = "default_true")]
+    pub check_on_launch: bool,
+}
+
+impl Default for UpdaterConfig {
+    fn default() -> Self {
+        Self {
+            check_on_launch: true,
         }
     }
 }
