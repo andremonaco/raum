@@ -86,6 +86,8 @@ pub fn run() {
             commands::agent::agent_list,
             commands::agent::agent_spawn,
             commands::agent::agent_state,
+            // §7.6 — Phase 2: reply to a parked PermissionRequest hook.
+            commands::permission::reply_permission,
             // §5.4 — project command surface (Wave 3B).
             commands::project::project_register,
             commands::project::project_list,

@@ -185,6 +185,22 @@ impl TmuxManager {
         initial_command: Option<&str>,
         initial_size: Option<(u32, u32)>,
     ) -> Result<(), TmuxError> {
+        self.new_session_with_env(id, cwd, initial_command, initial_size, &[])
+    }
+
+    /// Variant of [`Self::new_session`] that injects additional
+    /// environment variables into the spawned session via tmux's
+    /// `-e KEY=VALUE` flag. Used by the Phase-2 harness notification
+    /// wiring to export `RAUM_SESSION=<session_id>` so the hook
+    /// script embeds the session id in every event.
+    pub fn new_session_with_env(
+        &self,
+        id: &str,
+        cwd: &std::path::Path,
+        initial_command: Option<&str>,
+        initial_size: Option<(u32, u32)>,
+        env: &[(&str, &str)],
+    ) -> Result<(), TmuxError> {
         let mut cmd = self.cmd();
         cmd.args([
             "new-session",
@@ -194,6 +210,9 @@ impl TmuxManager {
             "-c",
             cwd.to_string_lossy().as_ref(),
         ]);
+        for (k, v) in env {
+            cmd.arg("-e").arg(format!("{k}={v}"));
+        }
         if initial_command.is_some() {
             // Portable placeholder: produces no terminal output and never
             // exits, so `pipe-pane` can attach without missing bytes and the

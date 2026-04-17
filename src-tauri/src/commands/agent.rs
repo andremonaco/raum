@@ -97,8 +97,8 @@ impl AgentRegistry {
     /// Apply a hook event to every state machine whose harness matches
     /// `kind`. Returns the subset of resulting transitions (`None` when
     /// the machine's state did not change). Called by the event-socket
-    /// drain task; the Phase 1 routing is broadcast-by-harness because
-    /// the hook-event wire shape does not yet carry a session id.
+    /// drain task when no session_id is present on the wire (legacy
+    /// fire-and-forget events).
     pub fn apply_hook_to_matching(
         &mut self,
         kind: AgentKind,
@@ -114,6 +114,28 @@ impl AgentRegistry {
             }
         }
         out
+    }
+
+    /// Phase-2 session-scoped routing: apply `event` to only the
+    /// machine matching `session_id`, if one exists. Falls back to
+    /// broadcasting by harness when the session is unknown — some
+    /// hook events race the spawn path and arrive before
+    /// `agent_spawn` has registered the state machine.
+    pub fn apply_hook_for_session(
+        &mut self,
+        kind: AgentKind,
+        session_id: &str,
+        event: &CoreHookEvent,
+    ) -> Vec<AgentStateChanged> {
+        if let Some(machine) = self.machines.get_mut(session_id) {
+            if machine.harness() == kind {
+                if let Some(change) = machine.on_hook_event(event) {
+                    return vec![change];
+                }
+                return Vec::new();
+            }
+        }
+        self.apply_hook_to_matching(kind, event)
     }
 
     #[must_use]
@@ -232,12 +254,35 @@ pub async fn drive_event_socket<R: Runtime>(
                 warn!("event-socket drain: agent registry lock poisoned; dropping event");
                 continue;
             };
-            registry.apply_hook_to_matching(kind, &core_event)
+            match ev.session_id.as_deref() {
+                Some(sid) => registry.apply_hook_for_session(kind, sid, &core_event),
+                None => registry.apply_hook_to_matching(kind, &core_event),
+            }
         };
         for change in changes {
             // Broadcast buffer fills silently when the bridge task is
             // behind; the `ensure_bridge_running` task logs the lag.
             let _ = bus.tx.send(change);
+        }
+
+        // Phase 2: surface `PermissionRequest` events to the webview
+        // with enough context (request_id + session_id + payload) for
+        // the frontend to render action buttons and call
+        // `reply_permission`. Observation-only events don't need this
+        // channel — they already travel via `agent-state-changed`.
+        if ev.event == "PermissionRequest"
+            && let Some(req_id) = ev.request_id.as_deref()
+        {
+            let payload = serde_json::json!({
+                "harness": ev.harness,
+                "event": ev.event,
+                "session_id": ev.session_id,
+                "request_id": req_id,
+                "payload": ev.payload,
+            });
+            if let Err(e) = app.emit("notification-event", &payload) {
+                warn!(error=%e, "notification-event emit failed");
+            }
         }
     }
 }

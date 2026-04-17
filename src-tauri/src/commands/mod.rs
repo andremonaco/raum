@@ -9,6 +9,7 @@ pub mod files;
 pub mod git_watcher;
 pub mod hotkeys;
 pub mod notifications;
+pub mod permission;
 pub mod project;
 pub mod search;
 pub mod terminal;

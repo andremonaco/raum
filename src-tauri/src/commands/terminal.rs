@@ -211,12 +211,17 @@ pub async fn terminal_spawn<R: Runtime>(
     let id_for_new = session_id.clone();
     let use_placeholder = harness_cmd.is_some();
     let initial_size = sanitize_initial_size(args.cols, args.rows);
+    // Phase 2 — export RAUM_SESSION into the new tmux session's env so
+    // the hook script embeds the session id in every event. The wire
+    // name mirrors `raum_hooks::RAUM_SESSION_ENV`.
+    let raum_session_value = session_id.clone();
     tokio::task::spawn_blocking(move || {
-        mgr_for_new.new_session(
+        mgr_for_new.new_session_with_env(
             &id_for_new,
             &cwd,
             use_placeholder.then_some("placeholder"),
             initial_size,
+            &[(raum_hooks::RAUM_SESSION_ENV, raum_session_value.as_str())],
         )
     })
     .await
