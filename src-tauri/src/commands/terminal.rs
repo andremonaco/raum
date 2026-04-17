@@ -145,8 +145,7 @@ fn sanitize_initial_size(cols: Option<u32>, rows: Option<u32>) -> Option<(u32, u
 fn now_unix_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
 fn generate_session_id(kind: AgentKind) -> String {
@@ -154,8 +153,7 @@ fn generate_session_id(kind: AgentKind) -> String {
     // session name on the raum socket.
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_millis());
     format!("raum-{}-{}-{}", kind.binary_name(), ms, std::process::id())
 }
 

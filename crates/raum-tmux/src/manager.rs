@@ -431,8 +431,7 @@ impl TmuxManager {
         };
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
         let threshold_secs = u64::from(threshold_days) * 24 * 60 * 60;
         let mut killed = Vec::new();
         for s in live {

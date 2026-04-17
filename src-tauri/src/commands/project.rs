@@ -212,8 +212,7 @@ pub fn project_list(
             Ok(Some(project)) => {
                 let has_raum_toml = store
                     .read_raum_toml(&project.root_path)
-                    .map(|o| o.is_some())
-                    .unwrap_or(false);
+                    .is_ok_and(|o| o.is_some());
                 out.push(ProjectListItem::from_project(&project, has_raum_toml));
             }
             Ok(None) => {}
