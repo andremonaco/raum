@@ -14,15 +14,22 @@
 
 import { Component, For, Show, Suspense, createSignal, lazy, onCleanup, onMount } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
-import { listTerminals, type RegisteredTerminal } from "../lib/terminalRegistry";
+import {
+  listTerminalBuffers,
+  listTerminals,
+  type RegisteredTerminal,
+  type TerminalBufferKind,
+} from "../lib/terminalRegistry";
 import { activeProjectSlug } from "../stores/projectStore";
 import { isEditableFile } from "../lib/fileUtils";
+import { tildify } from "../lib/pathDisplay";
 const FileEditorModal = lazy(() =>
   import("./file-editor-modal").then((m) => ({ default: m.FileEditorModal })),
 );
 import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
 import { TextField, TextFieldInput, TextFieldLabel } from "./ui/text-field";
+import { Scrollable } from "./ui/scrollable";
 
 interface FileHit {
   path: string;
@@ -31,8 +38,16 @@ interface FileHit {
   score: number;
 }
 
+type MatchBuffer = TerminalBufferKind | "tmux-history" | "tmux-live";
+
 interface Match {
   row: number;
+  col: number;
+  preview: string;
+  buffer: MatchBuffer;
+}
+
+interface LineMatch {
   col: number;
   preview: string;
 }
@@ -49,20 +64,32 @@ export interface GlobalSearchPanelProps {
   onClose: () => void;
 }
 
+function matchSourceLabel(buffer: MatchBuffer): string {
+  switch (buffer) {
+    case "alternate":
+      return "live";
+    case "normal":
+      return "history";
+    case "tmux-history":
+    case "tmux-live":
+      return "tmux";
+  }
+}
+
 function buildMatcher(
   needle: string,
   opts: { regex: boolean; caseSensitive: boolean },
-): ((line: string) => Match[]) | null {
+): ((line: string) => LineMatch[]) | null {
   if (!needle) return null;
   if (opts.regex) {
     try {
       const re = new RegExp(needle, opts.caseSensitive ? "g" : "gi");
       return (line: string) => {
-        const matches: Match[] = [];
+        const matches: LineMatch[] = [];
         re.lastIndex = 0;
         let m: RegExpExecArray | null;
         while ((m = re.exec(line)) !== null) {
-          matches.push({ row: 0, col: m.index, preview: line });
+          matches.push({ col: m.index, preview: line });
           if (m[0].length === 0) re.lastIndex += 1;
         }
         return matches;
@@ -74,16 +101,35 @@ function buildMatcher(
   const target = opts.caseSensitive ? needle : needle.toLowerCase();
   return (line: string) => {
     const hay = opts.caseSensitive ? line : line.toLowerCase();
-    const matches: Match[] = [];
+    const matches: LineMatch[] = [];
     let from = 0;
     while (true) {
       const at = hay.indexOf(target, from);
       if (at < 0) break;
-      matches.push({ row: 0, col: at, preview: line });
+      matches.push({ col: at, preview: line });
       from = at + Math.max(target.length, 1);
     }
     return matches;
   };
+}
+
+interface PaneTextHit {
+  sessionId: string;
+  normal: string;
+  alternate: string | null;
+}
+
+async function fetchTmuxCaptures(sessionIds: string[]): Promise<Map<string, PaneTextHit>> {
+  if (sessionIds.length === 0) return new Map();
+  try {
+    const hits = await invoke<PaneTextHit[]>("terminal_capture_text", { sessionIds });
+    const byId = new Map<string, PaneTextHit>();
+    for (const hit of hits) byId.set(hit.sessionId, hit);
+    return byId;
+  } catch {
+    // Search must still succeed from xterm buffers alone if the IPC fails.
+    return new Map();
+  }
 }
 
 async function runSearch(
@@ -93,27 +139,88 @@ async function runSearch(
 ): Promise<PaneResult[]> {
   const match = buildMatcher(needle, opts);
   if (!match) return [];
-  const out: PaneResult[] = [];
-  for (const reg of listTerminals()) {
+
+  const panes = listTerminals();
+  const sessionIds = panes.map((p) => p.sessionId).filter((id): id is string => Boolean(id));
+  const tmuxByIdPromise = fetchTmuxCaptures(sessionIds);
+
+  const byPane = new Map<string, PaneResult>();
+  for (const reg of panes) {
     if (cancel.aborted) break;
     const pane = collectFromPane(reg, match);
-    if (pane.matches.length > 0) out.push(pane);
+    byPane.set(reg.paneId, pane);
     await new Promise<void>((r) => queueMicrotask(r));
+  }
+  if (cancel.aborted) return [];
+
+  const tmuxById = await tmuxByIdPromise;
+  if (cancel.aborted) return [];
+  for (const reg of panes) {
+    if (!reg.sessionId) continue;
+    const hit = tmuxById.get(reg.sessionId);
+    if (!hit) continue;
+    const pane =
+      byPane.get(reg.paneId) ??
+      ({ paneId: reg.paneId, sessionId: reg.sessionId, kind: reg.kind, matches: [] } as PaneResult);
+    mergeTmuxMatches(pane, hit, match);
+    byPane.set(reg.paneId, pane);
+  }
+
+  const out: PaneResult[] = [];
+  for (const reg of panes) {
+    const pane = byPane.get(reg.paneId);
+    if (pane && pane.matches.length > 0) out.push(pane);
   }
   return out;
 }
 
-function collectFromPane(reg: RegisteredTerminal, match: (line: string) => Match[]): PaneResult {
-  const buf = reg.terminal.buffer.active;
+function mergeTmuxMatches(
+  pane: PaneResult,
+  hit: PaneTextHit,
+  match: (line: string) => LineMatch[],
+): void {
+  // Dedupe against matches already produced by the xterm walk — for shell
+  // panes the tail of tmux's history mirrors xterm's normal buffer, and for
+  // harnesses the tmux alt-screen frame mirrors xterm's alternate buffer.
+  // Keying on (col, preview) keeps the xterm hit (which has a precise row)
+  // whenever a line appears in both sources.
+  const seen = new Set<string>();
+  for (const m of pane.matches) seen.add(`${m.col}\x00${m.preview}`);
+
+  const walk = (text: string, kind: "tmux-history" | "tmux-live"): void => {
+    if (!text) return;
+    const lines = text.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (!line) continue;
+      for (const m of match(line)) {
+        const key = `${m.col}\x00${m.preview}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        pane.matches.push({ row: i, col: m.col, preview: m.preview, buffer: kind });
+      }
+    }
+  };
+  walk(hit.normal, "tmux-history");
+  if (hit.alternate) walk(hit.alternate, "tmux-live");
+}
+
+function collectFromPane(
+  reg: RegisteredTerminal,
+  match: (line: string) => LineMatch[],
+): PaneResult {
   const matches: Match[] = [];
-  for (let y = 0; y < buf.length; y++) {
-    const line = buf.getLine(y);
-    if (!line) continue;
-    const text = line.translateToString(true);
-    if (!text) continue;
-    const lineMatches = match(text);
-    for (const m of lineMatches) {
-      matches.push({ row: y, col: m.col, preview: text });
+  for (const view of listTerminalBuffers(reg.terminal)) {
+    const buf = view.buffer;
+    for (let y = 0; y < buf.length; y++) {
+      const line = buf.getLine(y);
+      if (!line) continue;
+      const text = line.translateToString(true);
+      if (!text) continue;
+      const lineMatches = match(text);
+      for (const m of lineMatches) {
+        matches.push({ row: y, col: m.col, preview: text, buffer: view.kind });
+      }
     }
   }
   return {
@@ -220,7 +327,12 @@ export const GlobalSearchPanel: Component<GlobalSearchPanelProps> = (props) => {
   const onRowClick = (pane: PaneResult, m: Match): void => {
     const reg = listTerminals().find((t) => t.paneId === pane.paneId);
     if (!reg) return;
-    reg.scrollToLine(m.row);
+    // Tmux-sourced matches live outside xterm.js's scrollback (they only
+    // exist in the tmux history-limit), so we can't scroll xterm to an
+    // exact row. Focus the pane and let the user scroll tmux itself.
+    if (m.buffer === "normal" || m.buffer === "alternate") {
+      reg.revealBufferLine(m.buffer, m.row);
+    }
     reg.focus();
     props.onClose();
   };
@@ -237,7 +349,7 @@ export const GlobalSearchPanel: Component<GlobalSearchPanelProps> = (props) => {
     <>
       <Show when={props.open}>
         <div
-          class="fixed inset-0 z-50 flex flex-col bg-background/95 text-foreground"
+          class="fixed inset-0 z-50 flex flex-col bg-background text-foreground"
           role="dialog"
           aria-label="Global scrollback search"
           data-testid="global-search-panel"
@@ -305,7 +417,7 @@ export const GlobalSearchPanel: Component<GlobalSearchPanelProps> = (props) => {
             </div>
           </Show>
 
-          <div class="flex-1 overflow-y-auto px-3 py-2 text-xs">
+          <Scrollable class="min-h-0 flex-1 px-3 py-2 text-xs">
             <Show
               when={hasAnyResults()}
               fallback={
@@ -334,7 +446,7 @@ export const GlobalSearchPanel: Component<GlobalSearchPanelProps> = (props) => {
                             type="button"
                             class="flex w-full items-baseline gap-2 rounded px-2 py-1 text-left font-mono hover:bg-muted"
                             onClick={() => onFileClick(hit)}
-                            title={hit.path}
+                            title={tildify(hit.path)}
                           >
                             <span class="truncate text-foreground">{hit.name}</span>
                             <span class="truncate text-[10px] text-muted-foreground">
@@ -376,7 +488,7 @@ export const GlobalSearchPanel: Component<GlobalSearchPanelProps> = (props) => {
                               onClick={() => onRowClick(pane, m)}
                             >
                               <span class="text-muted-foreground">
-                                {m.row}:{m.col}
+                                {matchSourceLabel(m.buffer)} {m.row}:{m.col}
                               </span>{" "}
                               <span class="text-foreground">{m.preview}</span>
                             </button>
@@ -388,7 +500,7 @@ export const GlobalSearchPanel: Component<GlobalSearchPanelProps> = (props) => {
                 )}
               </For>
             </Show>
-          </div>
+          </Scrollable>
         </div>
       </Show>
       <Show when={editorPath() !== null}>

@@ -40,6 +40,10 @@ pub struct HookEvent {
     #[serde(default)]
     pub request_id: Option<String>,
     #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub reliability: Option<String>,
+    #[serde(default)]
     pub payload: serde_json::Value,
 }
 
@@ -102,6 +106,21 @@ impl PendingRequests {
     /// connection goes away for other reasons (shutdown, timeout).
     pub fn drop_key(&self, key: &PendingKey) -> bool {
         self.inner.lock().is_ok_and(|mut g| g.remove(key).is_some())
+    }
+
+    /// Remove every parked writer whose key matches `session_id`.
+    /// Dropping the writer closes the UDS connection, which unblocks
+    /// the hook script's `read` with EOF. Returns the number of
+    /// entries evicted. Used when the user aborts an interactive
+    /// question — the harness will cancel its own prompt and any
+    /// remaining parked writers for the session become stale.
+    pub fn drop_session(&self, session_id: &str) -> usize {
+        let Ok(mut g) = self.inner.lock() else {
+            return 0;
+        };
+        let before = g.len();
+        g.retain(|key, _| key.session_id.as_deref() != Some(session_id));
+        before - g.len()
     }
 
     /// Write `decision` (followed by a newline) to the parked writer
@@ -420,6 +439,60 @@ mod tests {
         let mut line = String::new();
         reader.read_line(&mut line).await.unwrap();
         assert_eq!(line.trim(), "deny");
+    }
+
+    #[tokio::test]
+    async fn drop_session_evicts_only_matching_session() {
+        let dir = tempdir().unwrap();
+        let sock_path = dir.path().join("events.sock");
+        let handle = spawn_event_socket(&sock_path).await.unwrap();
+
+        // Park three writers: two for session "a", one for session "b",
+        // plus one session-less entry.
+        for (sid, rid) in [
+            (Some("a"), "r1"),
+            (Some("a"), "r2"),
+            (Some("b"), "r3"),
+            (None, "legacy"),
+        ] {
+            let client = UnixStream::connect(&sock_path).await.unwrap();
+            let (_r, mut w) = client.into_split();
+            let raw = match sid {
+                Some(s) => format!(
+                    "{{\"harness\":\"claude-code\",\"event\":\"PermissionRequest\",\
+                     \"session_id\":\"{s}\",\"request_id\":\"{rid}\",\"payload\":{{}}}}\n"
+                ),
+                None => format!(
+                    "{{\"harness\":\"claude-code\",\"event\":\"PermissionRequest\",\
+                     \"request_id\":\"{rid}\",\"payload\":{{}}}}\n"
+                ),
+            };
+            w.write_all(raw.as_bytes()).await.unwrap();
+            w.flush().await.unwrap();
+            // Leak the write half so the connection stays alive until we evict it.
+            std::mem::forget(w);
+        }
+
+        for _ in 0..50 {
+            if handle.pending.len() == 4 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(handle.pending.len(), 4);
+
+        let evicted = handle.pending.drop_session("a");
+        assert_eq!(evicted, 2);
+        assert_eq!(handle.pending.len(), 2);
+
+        // Session "b" and the legacy session-less entry survive.
+        assert!(
+            handle
+                .pending
+                .drop_key(&PendingKey::new(Some("b".into()), "r3"))
+        );
+        assert!(handle.pending.drop_key(&PendingKey::new(None, "legacy")));
+        assert!(handle.pending.is_empty());
     }
 
     #[test]

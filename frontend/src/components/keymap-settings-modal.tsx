@@ -29,6 +29,7 @@ import {
 import { KeyboardIcon, SearchIcon } from "./icons";
 import { Kbd, KbdGroup } from "./ui/kbd";
 import { Badge } from "./ui/badge";
+import { Scrollable } from "./ui/scrollable";
 
 // ---------------------------------------------------------------------------
 // Category grouping — mirrors the section comments in
@@ -73,12 +74,10 @@ const CATEGORY_BY_ACTION: Record<string, Category> = {
   "toggle-quick-fire": "Chrome",
   "focus-quick-fire": "Chrome",
   "global-search": "Chrome",
-  "open-grid-builder": "Chrome",
   "cheat-sheet": "Chrome",
   spotlight: "Chrome",
   "new-worktree": "Worktrees",
   "switch-worktree": "Worktrees",
-  "apply-last-used-preset": "Worktrees",
   "focus-raum": "Global",
   "spawn-shell-global": "Global",
 };
@@ -233,7 +232,7 @@ export const KeymapSettingsModal: Component<KeymapSettingsModalProps> = (props) 
   return (
     <Show when={props.open}>
       <div
-        class="fixed inset-0 z-50 flex items-start justify-center pt-[12vh] bg-black/50"
+        class="fixed inset-0 z-50 flex items-start justify-center pt-[12vh] bg-scrim"
         onClick={() => props.onClose()}
       >
         <div
@@ -259,7 +258,7 @@ export const KeymapSettingsModal: Component<KeymapSettingsModalProps> = (props) 
           </div>
 
           {/* Body */}
-          <div class="flex-1 overflow-y-auto">
+          <Scrollable class="min-h-0 flex-1">
             <Show
               when={groupedRows().length > 0}
               fallback={
@@ -300,7 +299,7 @@ export const KeymapSettingsModal: Component<KeymapSettingsModalProps> = (props) 
                 )}
               </For>
             </Show>
-          </div>
+          </Scrollable>
 
           {/* Footer */}
           <div class="flex items-center justify-between border-t border-white/5 px-4 py-2 text-[11px] text-muted-foreground/70">
@@ -379,7 +378,7 @@ const ShortcutRow: Component<{
           <div class="flex items-center gap-2">
             <span class="truncate text-xs text-foreground/90">{props.row.description}</span>
             <Show when={props.row.global}>
-              <Badge class="shrink-0 bg-amber-500/10 px-1.5 py-0.5 text-[9px] font-medium text-amber-300/90">
+              <Badge class="shrink-0 bg-warning/10 px-1.5 py-0.5 text-[9px] font-medium text-warning">
                 restart required
               </Badge>
             </Show>
@@ -430,13 +429,13 @@ const ShortcutRow: Component<{
       </div>
 
       <Show when={props.isEditing && conflict()}>
-        <div class="pl-0 text-[10px] text-amber-400/80">
+        <div class="pl-0 text-[10px] text-warning">
           Conflicts with <span class="font-mono">{conflict()}</span> — last wins
         </div>
       </Show>
 
       <Show when={props.errorMessage}>
-        <div class="pl-0 text-[10px] text-red-400/90">{props.errorMessage}</div>
+        <div class="pl-0 text-[10px] text-destructive">{props.errorMessage}</div>
       </Show>
     </div>
   );

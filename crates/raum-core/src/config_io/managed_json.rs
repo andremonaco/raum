@@ -176,6 +176,75 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+// ---- Codex hooks.json helper (Phase 3) --------------------------------------
+
+/// Adapter-supplied configuration for [`apply_managed_codex_hooks`].
+///
+/// Codex's `hooks.json` has a different top-level shape than Claude Code's
+/// `settings.json`:
+///
+/// ```json
+/// {
+///   "hooks": {
+///     "SessionStart": [
+///       { "matcher": "startup|resume", "hooks": [ … ] }
+///     ],
+///     "Stop": [ { "hooks": [ … ] } ]
+///   }
+/// }
+/// ```
+///
+/// The event arrays live under a top-level `hooks` key rather than alongside
+/// arbitrary user keys at the object root. This helper preserves any
+/// non-event keys the user added at the root (e.g. `"$schema"`), and any
+/// non-raum array entries under each event.
+#[allow(missing_debug_implementations)]
+pub struct ManagedCodexHooks<'a> {
+    /// Absolute path to the Codex hooks file, usually `~/.codex/hooks.json`
+    /// or a per-repo `<repo>/.codex/hooks.json`.
+    pub path: &'a Path,
+    /// Event names raum subscribes to (e.g. `SessionStart`, `Stop`).
+    pub events: &'a [&'a str],
+    /// Build a single raum-managed array entry for `event`. The helper
+    /// injects the [`MARKER_KEY`] sentinel if the builder forgot.
+    pub make_entry: &'a dyn Fn(&str) -> Value,
+}
+
+/// Apply raum-managed entries to `$.hooks.<event>` arrays in a Codex
+/// `hooks.json` at `spec.path`. Returns `Ok(())` on success. Refuses to
+/// rewrite the file when it exists but is unparsable (so user-edited
+/// but syntactically broken content is not silently overwritten).
+pub fn apply_managed_codex_hooks(spec: &ManagedCodexHooks<'_>) -> Result<(), ManagedJsonError> {
+    if let Some(parent) = spec.path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut root = load_json_or_empty_object(spec.path)?;
+    ensure_object(&mut root);
+
+    let hooks = root
+        .as_object_mut()
+        .expect("root is object after ensure_object")
+        .entry("hooks")
+        .or_insert_with(|| json!({}));
+    ensure_object(hooks);
+    let hooks_obj = hooks.as_object_mut().expect("hooks is object");
+    for event in spec.events {
+        let arr_entry = hooks_obj
+            .entry((*event).to_string())
+            .or_insert_with(|| json!([]));
+        ensure_array(arr_entry);
+        let arr = arr_entry.as_array_mut().expect("hooks.<event> is array");
+        arr.retain(|v| !is_raum_managed(v));
+        let mut entry = (spec.make_entry)(event);
+        ensure_marker(&mut entry);
+        arr.push(entry);
+    }
+
+    let serialized = serde_json::to_string_pretty(&root).map_err(ManagedJsonError::Serialize)?;
+    atomic_write(spec.path, serialized.as_bytes())?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,5 +414,145 @@ mod tests {
         let path = dir.path().join("nested").join("deep").join("settings.json");
         atomic_write(&path, b"{}").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"{}");
+    }
+
+    // ---- Codex helper tests ------------------------------------------------
+
+    fn codex_entry(event: &str) -> Value {
+        json!({
+            "matcher": if event == "SessionStart" { "startup|resume" } else { ".*" },
+            "hooks": [
+                { "type": "command", "command": format!("/bin/true {event}") }
+            ],
+        })
+    }
+
+    #[test]
+    fn codex_creates_missing_file_wrapped_under_hooks_key() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        apply_managed_codex_hooks(&ManagedCodexHooks {
+            path: &path,
+            events: &["SessionStart", "Stop"],
+            make_entry: &codex_entry,
+        })
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        // Codex shape: top level has a `hooks` key, NOT flat event keys.
+        assert!(parsed["hooks"].is_object());
+        assert!(parsed.get("SessionStart").is_none());
+        for event in ["SessionStart", "Stop"] {
+            let arr = parsed["hooks"][event].as_array().unwrap();
+            assert_eq!(arr.len(), 1);
+            assert_eq!(arr[0][MARKER_KEY].as_str().unwrap(), MARKER_BEGIN);
+        }
+    }
+
+    #[test]
+    fn codex_preserves_sibling_keys_and_non_raum_entries() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        let original = json!({
+            "$schema": "https://example.com/codex-hooks.schema.json",
+            "hooks": {
+                "SessionStart": [
+                    { "matcher": "startup", "hooks": [{ "type":"command", "command":"echo hi" }] }
+                ],
+                "PreToolUse": [
+                    { "matcher": "Bash", "hooks": [] }
+                ]
+            }
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&original).unwrap()).unwrap();
+
+        apply_managed_codex_hooks(&ManagedCodexHooks {
+            path: &path,
+            events: &["SessionStart", "Stop"],
+            make_entry: &codex_entry,
+        })
+        .unwrap();
+
+        let parsed: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        // Top-level sibling key survived.
+        assert_eq!(
+            parsed["$schema"].as_str().unwrap(),
+            "https://example.com/codex-hooks.schema.json"
+        );
+        // PreToolUse untouched.
+        assert_eq!(parsed["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+        // SessionStart has user entry + raum entry.
+        let ss = parsed["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(ss.len(), 2);
+        assert!(
+            ss.iter()
+                .any(|v| v["matcher"].as_str() == Some("startup") && !is_raum_managed(v))
+        );
+        assert!(ss.iter().any(is_raum_managed));
+    }
+
+    #[test]
+    fn codex_reinstall_is_byte_identical() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        apply_managed_codex_hooks(&ManagedCodexHooks {
+            path: &path,
+            events: &["SessionStart", "Stop", "PreToolUse"],
+            make_entry: &codex_entry,
+        })
+        .unwrap();
+        let first = std::fs::read_to_string(&path).unwrap();
+        apply_managed_codex_hooks(&ManagedCodexHooks {
+            path: &path,
+            events: &["SessionStart", "Stop", "PreToolUse"],
+            make_entry: &codex_entry,
+        })
+        .unwrap();
+        let second = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn codex_replaces_stale_raum_entry_without_duplicating() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        let stale = json!({
+            "hooks": {
+                "SessionStart": [
+                    {
+                        MARKER_KEY: MARKER_BEGIN,
+                        "matcher": ".*",
+                        "hooks": [{ "type": "command", "command": "/old/path.sh" }]
+                    }
+                ]
+            }
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&stale).unwrap()).unwrap();
+        apply_managed_codex_hooks(&ManagedCodexHooks {
+            path: &path,
+            events: &["SessionStart"],
+            make_entry: &codex_entry,
+        })
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let arr = parsed["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        let cmd = arr[0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(cmd.starts_with("/bin/true "), "got: {cmd}");
+        assert!(!cmd.contains("/old/path.sh"));
+    }
+
+    #[test]
+    fn codex_unparsable_json_refuses_to_overwrite() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        std::fs::write(&path, "{broken").unwrap();
+        let err = apply_managed_codex_hooks(&ManagedCodexHooks {
+            path: &path,
+            events: &["SessionStart"],
+            make_entry: &codex_entry,
+        })
+        .unwrap_err();
+        assert!(matches!(err, ManagedJsonError::InvalidJson(_)));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{broken");
     }
 }

@@ -186,18 +186,7 @@ const DEFAULTS: &[(&str, &str, &str, bool)] = &[
         "Focus quick-fire input",
         false,
     ),
-    (
-        "global-search",
-        "CmdOrCtrl+Shift+F",
-        "Global scrollback search",
-        false,
-    ),
-    (
-        "open-grid-builder",
-        "CmdOrCtrl+Shift+G",
-        "Open the grid builder",
-        false,
-    ),
+    ("global-search", "CmdOrCtrl+F", "Global search", false),
     (
         "cheat-sheet",
         "CmdOrCtrl+/",
@@ -205,6 +194,7 @@ const DEFAULTS: &[(&str, &str, &str, bool)] = &[
         false,
     ),
     ("spotlight", "CmdOrCtrl+.", "Open spotlight dock", false),
+    ("reload", "CmdOrCtrl+R", "Reload the app", false),
     // ---- worktrees --------------------------------------------------------
     (
         "new-worktree",
@@ -213,12 +203,6 @@ const DEFAULTS: &[(&str, &str, &str, bool)] = &[
         false,
     ),
     ("switch-worktree", "CmdOrCtrl+P", "Switch worktree", false),
-    (
-        "apply-last-used-preset",
-        "CmdOrCtrl+Shift+L",
-        "Apply last-used preset",
-        false,
-    ),
     // ---- global (OS-level) shortcuts -------------------------------------
     ("focus-raum", "CmdOrCtrl+Alt+R", "Focus raum window", true),
     (
@@ -484,8 +468,6 @@ mod tests {
             "switch-worktree",
             "maximize-pane",
             "global-search",
-            "open-grid-builder",
-            "apply-last-used-preset",
             "spotlight",
             // design D8 global shortcuts
             "focus-raum",

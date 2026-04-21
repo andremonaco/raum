@@ -11,26 +11,58 @@
  */
 
 import type { JSXElement } from "solid-js";
-import { Component, For, Show, createEffect, createResource, createSignal, on } from "solid-js";
+import {
+  Component,
+  For,
+  Show,
+  createEffect,
+  createResource,
+  createSignal,
+  on,
+  onCleanup,
+} from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { check as checkForUpdate, type Update } from "@tauri-apps/plugin-updater";
 import { Dialog as DialogPrimitive } from "@kobalte/core/dialog";
 
 import { cx } from "~/lib/cva";
+import { tildify } from "~/lib/pathDisplay";
 import {
+  DEFAULT_THEME_ID,
+  THEME_CATALOG,
+  beginThemePreview,
+  endThemePreview,
+  getCurrentTheme,
+  pickCustomThemeFile,
+  previewThemeId,
+  setCustomThemePath,
+  setThemeId,
+  subscribeThemeChange,
+  type ThemeCatalogEntry,
+} from "~/lib/theme/themeController";
+import {
+  type BadgeMode,
   ensureNotificationPermission,
+  osNotificationsUnavailable,
   permissionState,
   previewSound,
   refreshNotificationConfig,
+  sendTestNotification,
 } from "../lib/notificationCenter";
 import {
   harnessHealth,
   harnessReport,
+  installHarness,
   refreshHarnessReport,
+  runHarnessSelftest,
+  scanHarnessInstallState,
+  type ConfigPathEntry,
   type HarnessStatus,
+  type ScanReport,
 } from "../stores/harnessStatusStore";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { activeProjectSlug, projectStore } from "../stores/projectStore";
+import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 
 import { CheckIcon, HARNESS_ICONS, LoaderIcon, PlayIcon, type HarnessIconKind } from "./icons";
 import { Scrollable } from "./ui/scrollable";
@@ -55,7 +87,7 @@ const CUSTOM_SOUND_VALUE = "__custom__";
 // Types
 // ---------------------------------------------------------------------------
 
-type SectionId = "notifications" | "harnesses" | "health" | "worktrees" | "updates";
+type SectionId = "appearance" | "notifications" | "harnesses" | "worktrees" | "updates";
 
 interface Section {
   id: SectionId;
@@ -68,6 +100,26 @@ interface Section {
 // ---------------------------------------------------------------------------
 
 const SECTIONS: Section[] = [
+  {
+    id: "appearance",
+    label: "Appearance",
+    icon: () => (
+      <svg
+        xmlns="http://www.w3.org/2000/svg"
+        class="size-3 shrink-0"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        {/* Two overlapping rounded panes — reads as stacked app windows. */}
+        <rect x="3" y="4" width="13" height="13" rx="2.5" />
+        <rect x="8" y="7" width="13" height="13" rx="2.5" />
+      </svg>
+    ),
+  },
   {
     id: "notifications",
     label: "Notifications",
@@ -104,24 +156,6 @@ const SECTIONS: Section[] = [
         <rect x="9" y="9" width="6" height="6" rx="1" />
         <path d="M9 3h6M9 21h6M3 9v6M21 9v6" />
         <path d="M9 3v2M15 3v2M9 19v2M15 19v2M3 9h2M3 15h2M19 9h2M19 15h2" />
-      </svg>
-    ),
-  },
-  {
-    id: "health",
-    label: "Harness Health",
-    icon: () => (
-      <svg
-        xmlns="http://www.w3.org/2000/svg"
-        class="size-3 shrink-0"
-        viewBox="0 0 24 24"
-        fill="none"
-        stroke="currentColor"
-        stroke-width="2"
-        stroke-linecap="round"
-        stroke-linejoin="round"
-      >
-        <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
       </svg>
     ),
   },
@@ -183,10 +217,10 @@ const PermissionBadge: Component = () => {
   const color = () => {
     const s = permissionState();
     return s === "granted"
-      ? "bg-emerald-500/15 text-emerald-400"
+      ? "bg-success/15 text-success"
       : s === "denied"
-        ? "bg-red-500/15 text-red-400"
-        : "bg-zinc-500/15 text-zinc-400";
+        ? "bg-destructive/15 text-destructive"
+        : "bg-muted text-muted-foreground";
   };
 
   return (
@@ -237,6 +271,237 @@ const ToggleRow: Component<{
   );
 };
 
+/**
+ * Curated VSCode theme picker. Drives `lib/theme/themeController` —
+ * persistence + xterm/CodeMirror retheme — while keeping the picker UI
+ * pattern identical to the Notifications "Sound" dropdown so the two
+ * sibling Appearance pickers feel familiar.
+ *
+ * Custom themes (BYO) live behind a dedicated "Load custom .json…" item
+ * that opens the Tauri dialog plugin, reads the file via `file_read`,
+ * normalizes it through the same pipeline as catalog themes, and
+ * persists the path to `AppearanceConfig.custom_theme_path` so it
+ * survives across launches.
+ */
+const ThemePickerSection: Component = () => {
+  const [selectedId, setSelectedId] = createSignal<string>(
+    getCurrentTheme()?.id ?? DEFAULT_THEME_ID,
+  );
+  const [selectedLabel, setSelectedLabel] = createSignal<string>(
+    getCurrentTheme()?.label ?? "raum Default Dark",
+  );
+  const [busy, setBusy] = createSignal(false);
+  const [error, setError] = createSignal<string | null>(null);
+  const [showAttribution, setShowAttribution] = createSignal(false);
+
+  // The controller fires after every successful theme apply (boot,
+  // catalog pick, or custom load). Mirror its state into local signals so
+  // the trigger label and the active-row check stay in sync regardless of
+  // who initiated the change.
+  const unsubscribe = subscribeThemeChange((next) => {
+    setSelectedId(next.id);
+    setSelectedLabel(next.label);
+    setError(null);
+  });
+  onCleanup(() => unsubscribe());
+
+  const dark: ThemeCatalogEntry[] = THEME_CATALOG.filter((e) => e.type === "dark");
+  const light: ThemeCatalogEntry[] = THEME_CATALOG.filter((e) => e.type === "light");
+
+  const isCustom = () => selectedId().startsWith("custom:");
+
+  const pickCurated = async (id: string): Promise<void> => {
+    if (busy()) return;
+    setBusy(true);
+    setError(null);
+    try {
+      // The theme may already be live via the hover preview; `setThemeId`
+      // is still the right call — it overrides any preview session and
+      // handles the persist. Broadcasting an already-current theme is a
+      // cheap no-op in the subscribers.
+      await setThemeId(id);
+    } catch (e) {
+      console.warn("setThemeId failed", e);
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const pickCustom = async (): Promise<void> => {
+    if (busy()) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const path = await pickCustomThemeFile();
+      if (!path) return;
+      await setCustomThemePath(path);
+    } catch (e) {
+      console.warn("setCustomThemePath failed", e);
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /**
+   * Fire a preview for the given theme id. Swallows errors so a broken
+   * catalog entry doesn't tear down the picker.
+   */
+  const hoverPreview = (id: string): void => {
+    void previewThemeId(id).catch((e) => console.warn("previewThemeId failed", e));
+  };
+
+  /**
+   * Called when the dropdown opens/closes. On open we snapshot the current
+   * theme (so we can restore it on dismiss); on close we restore unless
+   * `pickCurated` already committed (in which case `setThemeId` cleared the
+   * preview session and `endThemePreview` is a no-op).
+   */
+  const onDropdownOpenChange = (open: boolean): void => {
+    if (open) {
+      beginThemePreview();
+    } else {
+      endThemePreview(false);
+    }
+  };
+
+  const triggerLabel = (): string => (isCustom() ? `Custom: ${selectedLabel()}` : selectedLabel());
+
+  return (
+    <div class="flex flex-col gap-1.5">
+      <h4 class="text-[10px] uppercase tracking-wider text-muted-foreground">Theme</h4>
+      <div class="flex flex-col gap-2 rounded border border-border bg-card/30 px-3 py-3">
+        <p class="text-[10px] text-muted-foreground">
+          Built on the VSCode theme JSON format — the same shape used by Dracula, Tokyo Night,
+          GitHub, Catppuccin, and friends. Switching retints chrome, terminals, and the file editor
+          without remounting anything.
+        </p>
+
+        <div class="flex items-center gap-1.5">
+          <DropdownMenu onOpenChange={onDropdownOpenChange}>
+            <DropdownMenuTrigger
+              as="button"
+              type="button"
+              disabled={busy()}
+              class="flex flex-1 items-center justify-between gap-2 rounded border border-border bg-background px-2 py-1 text-xs text-foreground transition-colors hover:bg-accent focus:border-ring focus:outline-none disabled:pointer-events-none disabled:opacity-50"
+            >
+              <span class="truncate">{triggerLabel()}</span>
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                class="size-3 shrink-0 text-muted-foreground"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <polyline points="6 9 12 15 18 9" />
+              </svg>
+            </DropdownMenuTrigger>
+            <DropdownMenuPortal>
+              <DropdownMenuContent class="max-h-[320px] min-w-[var(--kb-popper-anchor-width)] overflow-y-auto">
+                <div class="px-2 py-1 text-[9px] uppercase tracking-wider text-muted-foreground/70">
+                  Dark
+                </div>
+                <For each={dark}>
+                  {(entry) => (
+                    <DropdownMenuItem
+                      class="text-xs"
+                      onSelect={() => void pickCurated(entry.id)}
+                      onMouseEnter={() => hoverPreview(entry.id)}
+                      onFocus={() => hoverPreview(entry.id)}
+                    >
+                      <CheckIcon
+                        class={cx(
+                          "size-3",
+                          selectedId() === entry.id ? "opacity-100" : "opacity-0",
+                        )}
+                      />
+                      <span>{entry.label}</span>
+                    </DropdownMenuItem>
+                  )}
+                </For>
+                <DropdownMenuSeparator />
+                <div class="px-2 py-1 text-[9px] uppercase tracking-wider text-muted-foreground/70">
+                  Light
+                </div>
+                <For each={light}>
+                  {(entry) => (
+                    <DropdownMenuItem
+                      class="text-xs"
+                      onSelect={() => void pickCurated(entry.id)}
+                      onMouseEnter={() => hoverPreview(entry.id)}
+                      onFocus={() => hoverPreview(entry.id)}
+                    >
+                      <CheckIcon
+                        class={cx(
+                          "size-3",
+                          selectedId() === entry.id ? "opacity-100" : "opacity-0",
+                        )}
+                      />
+                      <span>{entry.label}</span>
+                    </DropdownMenuItem>
+                  )}
+                </For>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem class="text-xs" onSelect={() => void pickCustom()}>
+                  <CheckIcon class={cx("size-3", isCustom() ? "opacity-100" : "opacity-0")} />
+                  <span>Load custom .json…</span>
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenuPortal>
+          </DropdownMenu>
+        </div>
+
+        <Show when={error()}>
+          <p class="text-[10px] text-destructive">{error()}</p>
+        </Show>
+
+        <button
+          type="button"
+          onClick={() => setShowAttribution((v) => !v)}
+          class="flex items-center gap-1 self-start text-[10px] text-muted-foreground/70 transition-colors hover:text-foreground"
+        >
+          <span>{showAttribution() ? "Hide" : "Show"} attributions</span>
+        </button>
+        <Show when={showAttribution()}>
+          <div class="rounded border border-border/70 bg-background/40 px-2 py-1.5 text-[10px] leading-snug text-muted-foreground">
+            <p class="mb-1">
+              Curated themes are sourced from{" "}
+              <code class="font-mono text-muted-foreground/90">tm-themes</code> (Shiki). Each theme
+              retains its upstream license — see{" "}
+              <code class="font-mono text-muted-foreground/90">
+                frontend/src/themes/catalog/LICENSES/
+              </code>{" "}
+              for full attributions.
+            </p>
+            <ul class="grid grid-cols-2 gap-x-3 gap-y-0.5">
+              <For each={THEME_CATALOG.filter((e) => e.sourceVersion !== "local")}>
+                {(e) => (
+                  <li class="truncate">
+                    {e.label} <span class="text-muted-foreground/60">— MIT</span>
+                  </li>
+                )}
+              </For>
+            </ul>
+          </div>
+        </Show>
+      </div>
+    </div>
+  );
+};
+
+const AppearanceSection: Component = () => {
+  return (
+    <div class="flex flex-col gap-4">
+      <ThemePickerSection />
+    </div>
+  );
+};
+
 // ---------------------------------------------------------------------------
 // Notifications section
 // ---------------------------------------------------------------------------
@@ -245,7 +510,90 @@ interface NotifConfig {
   notify_on_waiting: boolean;
   notify_on_done: boolean;
   sound: string | null;
+  badge_mode: BadgeMode;
 }
+
+function isBadgeMode(value: unknown): value is BadgeMode {
+  return value === "off" || value === "critical" || value === "all_unread";
+}
+
+const BADGE_MODE_OPTIONS: { value: BadgeMode; label: string; description: string }[] = [
+  {
+    value: "off",
+    label: "Off",
+    description: "Never show a dock or taskbar badge.",
+  },
+  {
+    value: "critical",
+    label: "Critical only",
+    description: "Count only open permission requests.",
+  },
+  {
+    value: "all_unread",
+    label: "All unread",
+    description: "Count every agent currently waiting, completed, or errored.",
+  },
+];
+
+/**
+ * Compact per-harness summary rendered inside the Notifications section.
+ * Shows one row per harness that has an event surface (all except shell)
+ * with a ready/not-ready pill derived from the shared scan in
+ * `harnessStatusStore`. The full install / troubleshooting UI lives in the
+ * Harnesses section; this view is intentionally read-only.
+ */
+const HarnessNotificationsSummary: Component = () => {
+  const activeProjectRoot = () => {
+    const slug = activeProjectSlug();
+    if (!slug) return null;
+    return projectStore.items.find((p) => p.slug === slug)?.rootPath ?? null;
+  };
+
+  void scanHarnessInstallState(activeProjectRoot());
+
+  const osGranted = () => permissionState() === "granted";
+
+  const rowTone = (kind: HarnessIconKind): "ok" | "warn" | "error" | "muted" => {
+    const scan = harnessHealth()[kind]?.scan ?? null;
+    if (!scan) return "muted";
+    if (!pathsReady(scan)) return "error";
+    if (!osGranted()) return "warn";
+    return "ok";
+  };
+
+  const rowLabel = (kind: HarnessIconKind): string => {
+    const scan = harnessHealth()[kind]?.scan ?? null;
+    if (!scan) return "Scanning…";
+    if (!pathsReady(scan)) return "Not configured";
+    if (!osGranted()) return "OS permission needed";
+    return "Working";
+  };
+
+  return (
+    <div class="flex flex-col gap-1.5">
+      <h4 class="text-[10px] uppercase tracking-wider text-muted-foreground">Per harness</h4>
+      <div class="flex flex-col divide-y divide-border/50 rounded border border-border bg-card/30">
+        <For each={HARNESS_ENTRIES.filter((e) => e.id !== "shell")}>
+          {(entry) => {
+            const Icon = HARNESS_ICONS[entry.id];
+            return (
+              <div class="flex items-center gap-2 px-3 py-2">
+                <Icon class="size-3.5 shrink-0 text-foreground" />
+                <span class="text-xs text-foreground">{entry.label}</span>
+                <span class="ml-auto">
+                  <StatusPill tone={rowTone(entry.id)}>{rowLabel(entry.id)}</StatusPill>
+                </span>
+              </div>
+            );
+          }}
+        </For>
+      </div>
+      <p class="text-[10px] text-muted-foreground">
+        Configure or reinstall each harness from Settings → Harnesses.
+      </p>
+    </div>
+  );
+};
 
 const NotificationsSection: Component = () => {
   const [config] = createResource<NotifConfig>(async () => {
@@ -254,12 +602,15 @@ const NotificationsSection: Component = () => {
         notify_on_waiting?: boolean;
         notify_on_done?: boolean;
         sound?: string | null;
+        badge_mode?: string;
       };
     }>("config_get");
+    const rawBadgeMode = cfg.notifications?.badge_mode;
     return {
       notify_on_waiting: cfg.notifications?.notify_on_waiting ?? true,
       notify_on_done: cfg.notifications?.notify_on_done ?? true,
       sound: cfg.notifications?.sound ?? null,
+      badge_mode: isBadgeMode(rawBadgeMode) ? rawBadgeMode : "all_unread",
     };
   });
 
@@ -279,6 +630,7 @@ const NotificationsSection: Component = () => {
   const [localDone, setLocalDone] = createSignal(true);
   // The on-disk sound path stored in config. "" means no sound.
   const [localSound, setLocalSound] = createSignal("");
+  const [localBadgeMode, setLocalBadgeMode] = createSignal<BadgeMode>("all_unread");
   // Whether the user has chosen "Custom path…" — sticks even if the path
   // happens to match a system sound, so they can edit freely.
   const [customMode, setCustomMode] = createSignal(false);
@@ -293,6 +645,7 @@ const NotificationsSection: Component = () => {
     if (c && sounds && !seeded()) {
       setLocalWaiting(c.notify_on_waiting);
       setLocalDone(c.notify_on_done);
+      setLocalBadgeMode(c.badge_mode);
       const path = c.sound ?? "";
       setLocalSound(path);
       // If a path is set and it doesn't match any discovered system sound,
@@ -303,13 +656,19 @@ const NotificationsSection: Component = () => {
     }
   });
 
-  const saveConfig = async (patch: { waiting?: boolean; done?: boolean; sound?: string }) => {
+  const saveConfig = async (patch: {
+    waiting?: boolean;
+    done?: boolean;
+    sound?: string;
+    badgeMode?: BadgeMode;
+  }) => {
     setSaving(true);
     try {
       await invoke("config_set_notifications", {
         notifyOnWaiting: patch.waiting ?? localWaiting(),
         notifyOnDone: patch.done ?? localDone(),
         sound: (patch.sound ?? localSound()) || null,
+        badgeMode: patch.badgeMode ?? localBadgeMode(),
       });
       await refreshNotificationConfig();
     } catch (e) {
@@ -327,6 +686,11 @@ const NotificationsSection: Component = () => {
   const handleDoneToggle = async (v: boolean) => {
     setLocalDone(v);
     await saveConfig({ done: v });
+  };
+
+  const handleBadgeModeSelect = async (value: BadgeMode) => {
+    setLocalBadgeMode(value);
+    await saveConfig({ badgeMode: value });
   };
 
   const handleSoundSelect = async (value: string) => {
@@ -377,7 +741,7 @@ const NotificationsSection: Component = () => {
           </div>
           <div class="flex items-center gap-2">
             <PermissionBadge />
-            <Show when={permissionState() !== "granted"}>
+            <Show when={permissionState() !== "granted" && !osNotificationsUnavailable()}>
               <button
                 type="button"
                 class="rounded border border-border bg-background px-2 py-0.5 text-[10px] text-foreground transition-colors hover:bg-accent disabled:pointer-events-none disabled:opacity-50"
@@ -387,9 +751,28 @@ const NotificationsSection: Component = () => {
                 Request
               </button>
             </Show>
+            <button
+              type="button"
+              class="rounded border border-border bg-background px-2 py-0.5 text-[10px] text-foreground transition-colors hover:bg-accent disabled:pointer-events-none disabled:opacity-50"
+              onClick={() => void sendTestNotification()}
+              title="Send a test notification to verify it reaches you."
+            >
+              Send test
+            </button>
           </div>
         </div>
+        <Show when={osNotificationsUnavailable()}>
+          <p class="rounded border border-warning/30 bg-warning/10 px-2 py-1 text-[10px] text-warning">
+            System notifications unavailable. On macOS this means raum is running unbundled (
+            <code>task dev</code>); the OS only registers signed <code>.app</code> bundles. In-app
+            banners and sound still fire — run <code>task build</code> and launch{" "}
+            <code>target/release/bundle/macos/raum.app</code> to enable real notifications.
+          </p>
+        </Show>
       </div>
+
+      {/* Per-harness notification readiness (read-only). */}
+      <HarnessNotificationsSummary />
 
       {/* When to notify */}
       <div class="flex flex-col gap-1.5">
@@ -409,6 +792,66 @@ const NotificationsSection: Component = () => {
             onChange={handleDoneToggle}
             disabled={saving()}
           />
+        </div>
+      </div>
+
+      {/* Dock badge */}
+      <div class="flex flex-col gap-1.5">
+        <h4 class="text-[10px] uppercase tracking-wider text-muted-foreground">Dock badge</h4>
+        <div class="flex flex-col gap-1.5 rounded border border-border bg-card/30 px-3 py-2">
+          <p class="text-[10px] text-muted-foreground">
+            How much detail to show on the dock / taskbar icon. The OS must also allow badges for
+            raum (macOS: System Settings → Notifications → raum).
+          </p>
+          <DropdownMenu>
+            <DropdownMenuTrigger
+              as="button"
+              type="button"
+              disabled={saving()}
+              class="flex flex-1 items-center justify-between gap-2 rounded border border-border bg-background px-2 py-1 text-xs text-foreground transition-colors hover:bg-accent focus:border-ring focus:outline-none disabled:pointer-events-none disabled:opacity-50"
+            >
+              <span class="truncate">
+                {BADGE_MODE_OPTIONS.find((o) => o.value === localBadgeMode())?.label ??
+                  "All unread"}
+              </span>
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                class="size-3 shrink-0 text-muted-foreground"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <polyline points="6 9 12 15 18 9" />
+              </svg>
+            </DropdownMenuTrigger>
+            <DropdownMenuPortal>
+              <DropdownMenuContent class="min-w-[var(--kb-popper-anchor-width)]">
+                <For each={BADGE_MODE_OPTIONS}>
+                  {(opt) => (
+                    <DropdownMenuItem
+                      class="text-xs"
+                      onSelect={() => void handleBadgeModeSelect(opt.value)}
+                    >
+                      <CheckIcon
+                        class={cx(
+                          "size-3",
+                          localBadgeMode() === opt.value ? "opacity-100" : "opacity-0",
+                        )}
+                      />
+                      <span class="flex flex-col">
+                        <span>{opt.label}</span>
+                        <span class="text-[10px] text-muted-foreground">{opt.description}</span>
+                      </span>
+                    </DropdownMenuItem>
+                  )}
+                </For>
+              </DropdownMenuContent>
+            </DropdownMenuPortal>
+          </DropdownMenu>
         </div>
       </div>
 
@@ -584,13 +1027,13 @@ const StatusPill: Component<{
   const color = () => {
     switch (props.tone) {
       case "ok":
-        return "bg-emerald-500/15 text-emerald-400";
+        return "bg-success/15 text-success";
       case "warn":
-        return "bg-amber-500/15 text-amber-400";
+        return "bg-warning/15 text-warning";
       case "error":
-        return "bg-red-500/15 text-red-400";
+        return "bg-destructive/15 text-destructive";
       case "muted":
-        return "bg-zinc-500/15 text-zinc-400";
+        return "bg-muted text-muted-foreground";
     }
   };
   return (
@@ -632,7 +1075,7 @@ const HarnessStatusBadge: Component<{
             when={s().meetsMinimum === false}
             fallback={
               <span
-                class="inline-flex size-4 shrink-0 items-center justify-center rounded-full bg-emerald-500/15 text-emerald-400"
+                class="inline-flex size-4 shrink-0 items-center justify-center rounded-full bg-success/15 text-success"
                 title="Installed"
                 aria-label="Installed"
               >
@@ -681,8 +1124,8 @@ const InstallPanel: Component<{
   };
 
   return (
-    <div class="mt-1 flex flex-col gap-1.5 rounded border border-amber-500/30 bg-amber-500/5 px-2.5 py-2">
-      <p class="text-[10px] font-medium text-amber-400">Install this harness</p>
+    <div class="mt-1 flex flex-col gap-1.5 rounded-md border border-warning/30 bg-warning/5 px-2.5 py-2">
+      <p class="text-[10px] font-medium text-warning">Install this harness</p>
       <Show when={command()}>
         {(cmd) => (
           <div class="flex items-center gap-1.5 rounded bg-background/60 px-2 py-1">
@@ -703,7 +1146,7 @@ const InstallPanel: Component<{
         {(url) => (
           <button
             type="button"
-            class="self-start rounded border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[10px] text-amber-300 transition-colors hover:bg-amber-500/20 disabled:pointer-events-none disabled:opacity-50"
+            class="self-start rounded-md border border-warning/40 bg-warning/10 px-2 py-0.5 text-[10px] text-warning transition-colors hover:bg-warning/20 disabled:pointer-events-none disabled:opacity-45"
             onClick={() => void handleOpenDocs()}
             disabled={openingDocs()}
           >
@@ -744,6 +1187,22 @@ const HarnessesSection: Component<{ active: boolean }> = (props) => {
         }
       },
     ),
+  );
+
+  // Rescan the raum-hooks install state whenever this tab becomes
+  // active or the active project changes, so each harness card's
+  // Notifications sub-row shows fresh ready/not-ready state.
+  const harnessesActiveProjectRoot = () => {
+    const slug = activeProjectSlug();
+    if (!slug) return null;
+    return projectStore.items.find((p) => p.slug === slug)?.rootPath ?? null;
+  };
+  createEffect(
+    on([() => props.active, activeProjectSlug], ([active]) => {
+      if (active) {
+        void scanHarnessInstallState(harnessesActiveProjectRoot());
+      }
+    }),
   );
 
   const statusFor = (id: HarnessIconKind): HarnessStatus | undefined =>
@@ -795,7 +1254,7 @@ const HarnessesSection: Component<{ active: boolean }> = (props) => {
     <div class="flex flex-col gap-3">
       <div class="flex items-start justify-between gap-3">
         <p class="text-[10px] text-muted-foreground">
-          Status of each harness binary on $PATH, plus any extra flags raum appends when spawning.
+          Detected harnesses and the extra flags raum passes when launching them.
         </p>
         <button
           type="button"
@@ -856,31 +1315,6 @@ const HarnessesSection: Component<{ active: boolean }> = (props) => {
                     </Show>
                   </div>
 
-                  {/* Minimum version line (only when we have one) */}
-                  <Show when={status()?.minimum}>
-                    {(min) => (
-                      <div class="flex items-baseline justify-between gap-3">
-                        <span class="text-[9px] uppercase tracking-wider text-muted-foreground/60">
-                          Minimum
-                        </span>
-                        <span
-                          class={cx(
-                            "font-mono text-[10px]",
-                            status()?.meetsMinimum === false
-                              ? "text-amber-400"
-                              : "text-muted-foreground",
-                          )}
-                        >
-                          {min()}
-                          <Show when={status()?.meetsMinimum === false}>
-                            {" "}
-                            <span class="text-amber-400">· below minimum</span>
-                          </Show>
-                        </span>
-                      </div>
-                    )}
-                  </Show>
-
                   {/* Resolved path line (only when found) */}
                   <Show when={status()?.found && status()?.resolvedPath}>
                     {(path) => (
@@ -896,33 +1330,6 @@ const HarnessesSection: Component<{ active: boolean }> = (props) => {
                         </span>
                       </div>
                     )}
-                  </Show>
-
-                  {/* Hook config line (only when applicable) */}
-                  <Show when={status()?.settingsPath}>
-                    {(settingsPath) => (
-                      <div class="flex items-baseline justify-between gap-3">
-                        <span class="shrink-0 text-[9px] uppercase tracking-wider text-muted-foreground/60">
-                          Hooks
-                        </span>
-                        <span
-                          class="min-w-0 truncate text-right font-mono text-[10px] text-muted-foreground"
-                          title={settingsPath()}
-                        >
-                          {settingsPath()}
-                        </span>
-                      </div>
-                    )}
-                  </Show>
-
-                  {/* Native events indicator */}
-                  <Show when={status()?.supportsNativeEvents}>
-                    <div class="flex items-baseline justify-between gap-3">
-                      <span class="text-[9px] uppercase tracking-wider text-muted-foreground/60">
-                        Events
-                      </span>
-                      <span class="text-[10px] text-muted-foreground">Native hooks supported</span>
-                    </div>
                   </Show>
 
                   {/* Install action when missing (only for harnesses we can install) */}
@@ -945,6 +1352,12 @@ const HarnessesSection: Component<{ active: boolean }> = (props) => {
                     onBlur={() => handleBlur(entry.id)}
                   />
                 </div>
+
+                {/* Per-harness notification install status. Shell has no
+                    hook/event surface, so skip the row there. */}
+                <Show when={entry.id !== "shell"}>
+                  <HarnessNotificationStatus kind={entry.id} />
+                </Show>
               </div>
             );
           }}
@@ -1041,7 +1454,7 @@ const WorktreesSection: Component<{ active: boolean }> = (props) => {
   });
 
   const previewProject = () => projects()?.[0];
-  const previewRoot = () => previewProject()?.rootPath ?? "/Users/you/example-project";
+  const previewRoot = () => tildify(previewProject()?.rootPath) || "~/example-project";
   const previewBranch = "feat/new-darkmode";
 
   const previewPath = () => renderPathPreview(pattern(), previewRoot(), previewBranch);
@@ -1188,7 +1601,7 @@ const WorktreesSection: Component<{ active: boolean }> = (props) => {
       </div>
 
       <Show when={saveError()}>
-        <div class="rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-[10px] text-red-300">
+        <div class="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-[10px] text-destructive">
           {saveError()}
         </div>
       </Show>
@@ -1402,7 +1815,7 @@ const UpdatesSection: Component = () => {
                 </p>
               </Show>
               <Show when={phase().kind === "up-to-date"}>
-                <p class="text-xs text-emerald-400">raum is up to date.</p>
+                <p class="text-xs text-success">raum is up to date.</p>
                 <p class="text-[10px] text-muted-foreground">
                   You're running the latest published release.
                 </p>
@@ -1415,7 +1828,7 @@ const UpdatesSection: Component = () => {
                     <>
                       <p class="text-xs text-foreground">
                         Update available:{" "}
-                        <span class="font-mono text-amber-400">{p.update.version}</span>
+                        <span class="font-mono text-warning">{p.update.version}</span>
                       </p>
                       <p class="text-[10px] text-muted-foreground">
                         Released {p.update.date ?? "recently"}. Click "Install" to download and
@@ -1454,7 +1867,7 @@ const UpdatesSection: Component = () => {
                   if (p.kind !== "installed") return null;
                   return (
                     <>
-                      <p class="text-xs text-emerald-400">
+                      <p class="text-xs text-success">
                         Installed {p.version}. Relaunch raum to finish.
                       </p>
                       <p class="text-[10px] text-muted-foreground">
@@ -1470,7 +1883,7 @@ const UpdatesSection: Component = () => {
                   if (p.kind !== "error") return null;
                   return (
                     <>
-                      <p class="text-xs text-red-400">Update failed</p>
+                      <p class="text-xs text-destructive">Update failed</p>
                       <p class="text-[10px] text-muted-foreground" title={p.message}>
                         {p.message}
                       </p>
@@ -1483,7 +1896,7 @@ const UpdatesSection: Component = () => {
               <Show when={phase().kind === "available"}>
                 <button
                   type="button"
-                  class="rounded border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[10px] text-amber-300 transition-colors hover:bg-amber-500/20 disabled:pointer-events-none disabled:opacity-50"
+                  class="rounded-md border border-warning/40 bg-warning/10 px-2 py-0.5 text-[10px] text-warning transition-colors hover:bg-warning/20 disabled:pointer-events-none disabled:opacity-45"
                   onClick={() => void runInstall()}
                   disabled={isBusy()}
                 >
@@ -1533,97 +1946,234 @@ const UpdatesSection: Component = () => {
  * cost of a CSS class flip.
  */
 /**
- * Harness Health panel (Phase 2 scaffold).
- *
- * Renders a per-harness summary of channel reliability + the latest
- * selftest result. This panel is intentionally minimal in Phase 2 —
- * Phase 3/4 will plug the backend `plan`/`selftest` commands in; for
- * now it reads from `harnessHealth()` which is populated on demand by
- * the rest of the app.
+ * Small "open-in-Finder" button next to a path. Uses the Tauri opener
+ * plugin's `revealItemInDir`, which opens Finder/Explorer/Nautilus and
+ * highlights the file (no need to compute the parent directory
+ * ourselves). Keyboard-accessible via the native `<button>` focus
+ * ring.
  */
-const HealthSection: Component = () => {
-  const entries = () => Object.values(harnessHealth());
+const RevealPathRow: Component<{ entry: ConfigPathEntry }> = (props) => {
+  const reveal = async () => {
+    try {
+      await revealItemInDir(props.entry.path);
+    } catch (e) {
+      console.warn("revealItemInDir failed", e);
+    }
+  };
+  const statusTone = () => {
+    if (!props.entry.exists) return "text-muted-foreground";
+    return props.entry.raumManaged ? "text-success" : "text-warning";
+  };
+  const statusLabel = () => {
+    if (!props.entry.exists) return "not created";
+    return props.entry.raumManaged ? "managed" : "needs setup";
+  };
   return (
-    <div class="flex flex-col gap-3">
-      <p class="text-xs text-zinc-400">
-        Channel + selftest status for every bound harness. Reliability badges mirror what the dock
-        renders on the Waiting state.
-      </p>
-      <Show
-        when={entries().length > 0}
-        fallback={
-          <div class="rounded border border-dashed border-zinc-800 bg-zinc-900/40 p-3 text-[11px] text-zinc-500">
-            No health data yet. Bind a harness to a project to populate this panel.
-          </div>
-        }
+    <div class="flex items-center gap-2 text-[10px]">
+      <span class="shrink-0 text-[9px] uppercase tracking-wider text-muted-foreground/60">
+        {props.entry.label}
+      </span>
+      <button
+        type="button"
+        class="focus-ring group inline-flex min-w-0 flex-1 items-center gap-1.5 rounded border border-transparent bg-background/40 px-1.5 py-0.5 text-left text-muted-foreground transition-colors hover:border-border hover:text-foreground"
+        onClick={() => void reveal()}
+        title={`Reveal in file manager — ${tildify(props.entry.path)}`}
+        aria-label={`Reveal ${props.entry.label} in file manager`}
       >
-        <ul class="flex flex-col gap-2">
-          <For each={entries()}>
-            {(entry) => {
-              const kind = entry.kind;
-              const Icon = HARNESS_ICONS[kind as keyof typeof HARNESS_ICONS];
-              return (
-                <li class="rounded border border-zinc-800 bg-zinc-900/60 px-3 py-2 text-[11px]">
-                  <div class="flex items-center gap-2">
-                    <Show when={Icon}>{Icon ? <Icon class="size-3" /> : null}</Show>
-                    <span class="font-medium text-zinc-200">{kind}</span>
-                    <span class="ml-auto text-[10px] text-zinc-500">
-                      {entry.setupOk == null
-                        ? "setup pending"
-                        : entry.setupOk
-                          ? "setup ok"
-                          : "setup degraded"}
-                    </span>
-                  </div>
-                  <Show when={entry.setup && entry.setup.length > 0}>
-                    <ul class="mt-1 ml-5 list-disc text-[10px] text-zinc-400">
-                      <For each={entry.setup!}>
-                        {(a) => (
-                          <li>
-                            <span
-                              class={
-                                a.outcome === "failed"
-                                  ? "text-red-400"
-                                  : a.outcome === "skipped"
-                                    ? "text-amber-400"
-                                    : "text-emerald-400"
-                              }
-                            >
-                              {a.outcome}
-                            </span>{" "}
-                            <span class="text-zinc-500">{a.actionKind}</span>
-                            <Show when={a.detail}>
-                              {(d) => <span class="text-zinc-600"> — {d()}</span>}
-                            </Show>
-                          </li>
-                        )}
-                      </For>
-                    </ul>
+        <svg
+          xmlns="http://www.w3.org/2000/svg"
+          class="size-3 shrink-0"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          aria-hidden="true"
+        >
+          <path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z" />
+        </svg>
+        <span class="min-w-0 truncate font-mono">{tildify(props.entry.path)}</span>
+      </button>
+      <span class={cx("shrink-0 text-[9px]", statusTone())}>{statusLabel()}</span>
+    </div>
+  );
+};
+
+const pathsReady = (scan: ScanReport | null): boolean => {
+  if (!scan) return false;
+  return scan.raumHooksInstalled;
+};
+
+/**
+ * Per-harness notification setup row (Phase 7b rewrite).
+ *
+ * Rendered once per harness inside `HarnessesSection`, so the user
+ * sees install state inline with the rest of the harness settings
+ * (their mental model is "configure Claude Code under Claude Code").
+ *
+ * Reads from `harnessStatusStore` via `harnessHealth()`; the scan is
+ * triggered by the parent section when it becomes active.
+ *
+ *  * Ready-state pill combining `raumHooksInstalled` AND OS
+ *    notification permission (the "notifications ready" rule — both
+ *    the transport and the consumer have to work).
+ *  * Clickable managed-config paths (reveal in Finder/Explorer).
+ *  * On-demand Install button that runs the setup plan + selftest.
+ *  * Warning row when OS notifications are granted but the harness
+ *    isn't wired yet.
+ */
+const HarnessNotificationStatus: Component<{ kind: HarnessIconKind }> = (props) => {
+  const activeSlug = () => activeProjectSlug();
+  const activeProjectRoot = () => {
+    const slug = activeSlug();
+    if (!slug) return null;
+    return projectStore.items.find((p) => p.slug === slug)?.rootPath ?? null;
+  };
+  const [installing, setInstalling] = createSignal(false);
+
+  const osNotificationsGranted = () => permissionState() === "granted";
+
+  const entry = () => harnessHealth()[props.kind] ?? null;
+  const scan = () => entry()?.scan ?? null;
+  const installed = () => scan()?.raumHooksInstalled ?? false;
+  const canInstall = () => !!scan() && (scan()?.binaryOnPath ?? false);
+  const ready = () => pathsReady(scan()) && osNotificationsGranted();
+  const disabledReason = () => {
+    const s = scan();
+    if (!s) return null;
+    if (!s.binaryOnPath) return `Install ${s.binary} first`;
+    return null;
+  };
+
+  const onInstall = async () => {
+    setInstalling(true);
+    try {
+      const ok = await installHarness({
+        harness: props.kind,
+        projectSlug: activeSlug() ?? null,
+        worktreeId: null,
+      });
+      if (ok) {
+        // Setup + selftest events were emitted by the backend;
+        // additionally rescan paths so the Ready pill flips
+        // immediately.
+        await scanHarnessInstallState(activeProjectRoot());
+      }
+    } finally {
+      setInstalling(false);
+    }
+  };
+
+  return (
+    <div class="flex flex-col gap-1.5 border-t border-border/50 px-3 py-2">
+      <div class="flex items-center gap-2">
+        <span class="text-[9px] uppercase tracking-wider text-muted-foreground/60">
+          Notifications
+        </span>
+        <span class="ml-auto">
+          <Show when={scan()} fallback={<StatusPill tone="muted">Scanning…</StatusPill>}>
+            <Show
+              when={ready()}
+              fallback={
+                <StatusPill tone={installed() ? "warn" : "error"}>
+                  {installed() ? "Notifications not ready" : "Notifications not ready"}
+                </StatusPill>
+              }
+            >
+              <StatusPill tone="ok">Notifications ready</StatusPill>
+            </Show>
+          </Show>
+        </span>
+      </div>
+
+      {/* Reason / note line */}
+      <Show when={scan()?.note}>
+        {(note) => <p class="text-[10px] text-muted-foreground">{note()}</p>}
+      </Show>
+
+      {/* Managed config paths (clickable to reveal) */}
+      <Show when={(scan()?.configPaths.length ?? 0) > 0}>
+        <div class="flex flex-col gap-0.5">
+          <For each={scan()!.configPaths}>{(p) => <RevealPathRow entry={p} />}</For>
+        </div>
+      </Show>
+
+      {/* Smart warning: OS permission granted but harness not wired. */}
+      <Show when={scan() && !installed() && osNotificationsGranted() && canInstall()}>
+        <div class="rounded border border-warning/40 bg-warning/10 px-2 py-1 text-[10px] text-warning">
+          OS notifications are enabled but {props.kind} isn't configured to send them. Click Install
+          to fix.
+        </div>
+      </Show>
+
+      {/* Binary missing row */}
+      <Show when={scan() && !scan()!.binaryOnPath}>
+        <div class="rounded border border-destructive/30 bg-destructive/5 px-2 py-1 text-[10px] text-destructive">
+          {scan()?.binary} isn't installed yet. Install it to enable notifications.
+        </div>
+      </Show>
+
+      {/* Setup report — surfaces per-action failures so the user knows
+          which file couldn't be written. */}
+      <Show when={entry()?.setup && entry()!.setup!.length > 0 && entry()?.setupOk === false}>
+        <ul class="ml-5 list-disc text-[10px] text-muted-foreground">
+          <For each={entry()!.setup!}>
+            {(a) => (
+              <Show when={a.outcome === "failed"}>
+                <li>
+                  <span class="text-destructive">{a.outcome}</span>{" "}
+                  <span class="text-foreground-subtle">{a.actionKind}</span>
+                  <Show when={a.detail}>
+                    {(d) => <span class="text-foreground-dim"> — {d()}</span>}
                   </Show>
-                  <Show when={entry.selftest}>
-                    {(st) => (
-                      <div class="mt-1 flex items-center gap-2 text-[10px] text-zinc-400">
-                        <span class={st().ok ? "text-emerald-400" : "text-red-400"}>
-                          selftest {st().ok ? "ok" : "failed"}
-                        </span>
-                        <span class="text-zinc-600">— {st().detail}</span>
-                        <span class="ml-auto text-zinc-600">{st().elapsedMs} ms</span>
-                      </div>
-                    )}
-                  </Show>
-                  <button
-                    type="button"
-                    class="mt-2 rounded border border-zinc-800 px-2 py-0.5 text-[10px] text-zinc-400 hover:bg-zinc-800"
-                    onClick={() => void refreshHarnessReport()}
-                  >
-                    Run again
-                  </button>
                 </li>
-              );
-            }}
+              </Show>
+            )}
           </For>
         </ul>
       </Show>
+
+      {/* Selftest report */}
+      <Show when={entry()?.selftest}>
+        {(st) => (
+          <div class="flex items-center gap-2 text-[10px] text-muted-foreground">
+            <span class={st().ok ? "text-success" : "text-destructive"}>
+              Test {st().ok ? "passed" : "failed"}
+            </span>
+            <Show when={!st().ok && st().detail}>
+              <span class="text-foreground-dim">— {st().detail}</span>
+            </Show>
+          </div>
+        )}
+      </Show>
+
+      {/* Install / Reinstall + Selftest row */}
+      <div class="flex flex-wrap items-center gap-1.5">
+        <Show when={(scan()?.configPaths.length ?? 0) > 0 || !installed()}>
+          <button
+            type="button"
+            class="focus-ring rounded-md border border-border bg-background px-2 py-0.5 text-[10px] text-foreground transition-colors hover:bg-accent disabled:pointer-events-none disabled:opacity-50"
+            onClick={() => void onInstall()}
+            disabled={installing() || !canInstall() || !scan()}
+            title={disabledReason() ?? undefined}
+          >
+            {installing() ? "Installing…" : installed() ? "Reinstall" : "Install"}
+          </button>
+        </Show>
+        <button
+          type="button"
+          class="focus-ring rounded-md border border-border px-2 py-0.5 text-[10px] text-muted-foreground hover:bg-hover hover:text-foreground"
+          onClick={() => {
+            void runHarnessSelftest(props.kind, {
+              projectSlug: activeSlug() ?? null,
+              worktreeId: null,
+            });
+          }}
+        >
+          Test
+        </button>
+      </div>
     </div>
   );
 };
@@ -1631,14 +2181,14 @@ const HealthSection: Component = () => {
 const SectionContent: Component<{ section: SectionId }> = (props) => {
   return (
     <>
+      <div class={cx(props.section === "appearance" ? "" : "hidden")}>
+        <AppearanceSection />
+      </div>
       <div class={cx(props.section === "notifications" ? "" : "hidden")}>
         <NotificationsSection />
       </div>
       <div class={cx(props.section === "harnesses" ? "" : "hidden")}>
         <HarnessesSection active={props.section === "harnesses"} />
-      </div>
-      <div class={cx(props.section === "health" ? "" : "hidden")}>
-        <HealthSection />
       </div>
       <div class={cx(props.section === "worktrees" ? "" : "hidden")}>
         <WorktreesSection active={props.section === "worktrees"} />
@@ -1660,17 +2210,17 @@ export interface SettingsModalProps {
 }
 
 export const SettingsModal: Component<SettingsModalProps> = (props) => {
-  const [activeSection, setActiveSection] = createSignal<SectionId>("notifications");
+  const [activeSection, setActiveSection] = createSignal<SectionId>("appearance");
 
   return (
     <DialogPrimitive open={props.open} onOpenChange={(o) => !o && props.onClose()}>
       <DialogPrimitive.Portal>
         {/* Overlay */}
-        <DialogPrimitive.Overlay class="data-[expanded]:animate-in data-[closed]:animate-out data-[closed]:fade-out-0 data-[expanded]:fade-in-0 fixed inset-0 z-50 bg-black/60" />
+        <DialogPrimitive.Overlay class="data-[expanded]:animate-in data-[closed]:animate-out data-[closed]:fade-out-0 data-[expanded]:fade-in-0 fixed inset-0 z-50 bg-scrim-strong" />
 
         {/* Modal shell */}
         <DialogPrimitive.Content
-          class="floating-surface data-[expanded]:animate-in data-[closed]:animate-out data-[closed]:fade-out-0 data-[expanded]:fade-in-0 data-[closed]:zoom-out-95 data-[expanded]:zoom-in-95 fixed top-[50%] left-[50%] z-50 flex w-full max-w-2xl translate-x-[-50%] translate-y-[-50%] flex-col overflow-hidden rounded-2xl border border-border bg-popover duration-200 focus:outline-none"
+          class="floating-surface data-[expanded]:animate-in data-[closed]:animate-out data-[closed]:fade-out-0 data-[expanded]:fade-in-0 data-[closed]:zoom-out-95 data-[expanded]:zoom-in-95 fixed top-[50%] left-[50%] z-50 flex w-full max-w-2xl translate-x-[-50%] translate-y-[-50%] flex-col overflow-hidden rounded-xl border border-border-subtle bg-popover duration-200 focus:outline-none"
           style={{ height: "520px" }}
         >
           {/* Title row (visually hidden, for accessibility) */}
@@ -1679,7 +2229,7 @@ export const SettingsModal: Component<SettingsModalProps> = (props) => {
           {/* Body: left sidebar + right content */}
           <div class="flex min-h-0 flex-1 overflow-hidden">
             {/* Left nav sidebar */}
-            <div class="flex w-40 shrink-0 flex-col border-r border-border bg-zinc-900/50">
+            <div class="flex w-40 shrink-0 flex-col border-r border-border-subtle bg-panel">
               {/* Sidebar header */}
               <div class="flex h-9 items-center px-3">
                 <span class="text-xs text-foreground">Settings</span>
@@ -1695,7 +2245,7 @@ export const SettingsModal: Component<SettingsModalProps> = (props) => {
                     <button
                       type="button"
                       class={cx(
-                        "flex w-full items-center gap-2 rounded px-1.5 py-1 text-[11px] transition-colors",
+                        "flex w-full items-center gap-2 rounded px-1.5 py-1 text-[11px] transition-colors focus:outline-none focus-visible:outline-none",
                         activeSection() === section.id
                           ? "bg-accent text-accent-foreground font-medium"
                           : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",

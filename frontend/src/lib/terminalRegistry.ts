@@ -5,9 +5,17 @@
  * the search panel materializes the set lazily when invoked, not reactively.
  */
 
-import type { Terminal } from "@xterm/xterm";
+import type { IBuffer, Terminal } from "@xterm/xterm";
 import type { SearchAddon } from "@xterm/addon-search";
 import type { AgentKind } from "./agentKind";
+
+export type TerminalBufferKind = "normal" | "alternate";
+
+export interface RegisteredTerminalBuffer {
+  kind: TerminalBufferKind;
+  active: boolean;
+  buffer: IBuffer;
+}
 
 export interface RegisteredTerminal {
   paneId: string;
@@ -17,8 +25,8 @@ export interface RegisteredTerminal {
   worktreeId: string | null;
   terminal: Terminal;
   search: SearchAddon;
-  /** Scroll to a given 0-based row index in the xterm.js buffer. */
-  scrollToLine: (row: number) => void;
+  /** Reveal a match in the chosen xterm.js buffer. */
+  revealBufferLine: (buffer: TerminalBufferKind, row: number) => void;
   /** Move focus to the pane and its xterm.js textarea. */
   focus: () => void;
 }
@@ -39,6 +47,26 @@ export function listTerminals(): RegisteredTerminal[] {
 
 export function getTerminal(paneId: string): RegisteredTerminal | undefined {
   return entries.get(paneId);
+}
+
+export function listTerminalBuffers(terminal: Terminal): RegisteredTerminalBuffer[] {
+  const active = terminal.buffer.active;
+  const normal = terminal.buffer.normal;
+  const views: RegisteredTerminalBuffer[] = [
+    {
+      kind: "normal",
+      active: active.type === "normal",
+      buffer: normal,
+    },
+  ];
+  if (active.type === "alternate") {
+    views.push({
+      kind: "alternate",
+      active: true,
+      buffer: active,
+    });
+  }
+  return views;
 }
 
 /** Test-only helper: wipe the registry between tests. Not exported from the

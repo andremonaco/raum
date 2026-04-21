@@ -7,10 +7,20 @@ import { Sidebar } from "./components/sidebar";
 import { TerminalGrid } from "./components/terminal-grid";
 import { OnboardingWizard } from "./components/onboarding-wizard";
 import { SpotlightDock } from "./components/spotlight-dock";
-import { KeymapProvider } from "./lib/keymapContext";
-import { setRuntimeLayout, type ActiveLayoutState } from "./stores/runtimeLayoutStore";
-import type { CellKind } from "./stores/layoutPresetStore";
+import { Toaster } from "./components/ui/sonner";
+import { KeymapProvider, useKeymapAction } from "./lib/keymapContext";
+import {
+  setRuntimeLayout,
+  type ActiveLayoutState,
+  type CellKind,
+} from "./stores/runtimeLayoutStore";
 import { startNotificationCenter } from "./lib/notificationCenter";
+import { installGlobalContextMenuSuppressor } from "./lib/suppressContextMenu";
+import { installDevtoolsShortcut } from "./lib/devtoolsShortcut";
+import { loadThemeFromConfig } from "./lib/theme/themeController";
+import { initHomeDir } from "./lib/pathDisplay";
+import { installFileDrop } from "./lib/fileDrop";
+import "overlayscrollbars/overlayscrollbars.css";
 
 interface RaumConfigSnapshot {
   onboarded?: boolean;
@@ -72,23 +82,23 @@ async function scheduleBackgroundUpdateCheck(snapshot: RaumConfigSnapshot): Prom
   }, UPDATE_POLL_INTERVAL_MS);
 }
 
-interface TerminalListItem {
-  session_id: string;
-}
-
-/** Rehydrate the runtime grid from the last-saved `state/active-layout.toml`.
- *  Cross-references live tmux sessions so dead session IDs are stripped (the
- *  pane reverts to "spawn" state naturally). No-ops when no snapshot exists. */
+/** Rehydrate the runtime grid from the last-saved `active-layout.toml`.
+ *
+ *  Persisted `session_id`s are passed through verbatim — `TerminalPane`
+ *  attempts `terminal_reattach(session_id, …)` on mount and falls back to
+ *  `terminal_spawn` if the tmux session no longer exists. The previous
+ *  implementation cross-referenced `terminal_list()` here to strip dead
+ *  ids, but that registry is EMPTY on fresh app boot (no panes have
+ *  spawned yet), so it filtered out EVERY persisted id and forced every
+ *  pane to spawn fresh — which is exactly how we ended up with hundreds
+ *  of dangling tmux sessions. The authoritative live-check now happens
+ *  inside `terminal_reattach` where `tmux has-session` is the source of
+ *  truth. No-ops when no snapshot exists. */
 async function hydrateActiveLayout(): Promise<void> {
   try {
-    const [saved, live] = await Promise.all([
-      invoke<ActiveLayoutState>("active_layout_get"),
-      invoke<TerminalListItem[]>("terminal_list"),
-    ]);
+    const saved = await invoke<ActiveLayoutState>("active_layout_get");
 
     if (!saved.cells || saved.cells.length === 0) return;
-
-    const liveIds = new Set(live.map((s) => s.session_id));
 
     const cells = saved.cells.map((c) => ({
       id: c.id,
@@ -101,19 +111,34 @@ async function hydrateActiveLayout(): Promise<void> {
       activeTabId: c.active_tab_id,
       tabs: c.tabs.map((t) => ({
         id: t.id,
-        sessionId: t.session_id && liveIds.has(t.session_id) ? t.session_id : undefined,
+        sessionId: t.session_id,
+        label: t.label,
       })),
     }));
 
-    setRuntimeLayout(cells, saved.source_preset ?? null);
+    setRuntimeLayout(cells);
   } catch {
     // Non-Tauri environment (browser dev) or missing file — silently skip.
   }
 }
 
+/** Registers app-root keymap handlers that don't live on any single
+ *  feature component. Must be rendered inside `KeymapProvider`. */
+const RootShortcuts: Component = () => {
+  useKeymapAction("reload", () => {
+    window.location.reload();
+  });
+  return null;
+};
+
 const App: Component = () => {
   onMount(() => {
     void startNotificationCenter().catch((e) => console.warn("startNotificationCenter failed", e));
+    installGlobalContextMenuSuppressor();
+    installDevtoolsShortcut();
+    void loadThemeFromConfig().catch((e) => console.warn("loadThemeFromConfig failed", e));
+    void initHomeDir();
+    void installFileDrop().catch((e) => console.warn("installFileDrop failed", e));
   });
 
   // §13.2 — mount the onboarding wizard on first launch (config.onboarded =
@@ -141,7 +166,8 @@ const App: Component = () => {
 
   return (
     <KeymapProvider>
-      <div class="flex h-full w-full flex-col bg-background text-foreground font-mono">
+      <RootShortcuts />
+      <div class="flex h-full w-full flex-col text-foreground font-mono">
         <TopRow />
         <div class="flex flex-1 min-h-0">
           <Sidebar />
@@ -153,6 +179,7 @@ const App: Component = () => {
           <OnboardingWizard onDone={() => setDismissed(true)} />
         </Show>
         <SpotlightDock />
+        <Toaster />
       </div>
     </KeymapProvider>
   );

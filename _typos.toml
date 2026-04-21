@@ -45,4 +45,9 @@ extend-exclude = [
     "*.ico",
     "*.icns",
     "frontend/src/lib/vscode-icons-subset.json",
+    # Curated VSCode themes copied verbatim from `tm-themes`. Theme JSON
+    # contains TextMate scope strings authored by upstream theme creators —
+    # spelling drift in those scopes (e.g. "repitition") matches grammars in
+    # the wild and must not be "fixed" or syntax highlighting breaks.
+    "frontend/src/themes/catalog/**/*.json",
 ]

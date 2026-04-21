@@ -96,6 +96,7 @@ pub struct SessionSpec {
     pub project_slug: String,
     pub worktree_id: String,
     pub cwd: std::path::PathBuf,
+    pub opencode_port: Option<u16>,
 }
 
 /// Env vars + CLI flag overrides for a harness spawn. Empty by default so

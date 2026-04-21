@@ -11,6 +11,12 @@
 //!   `packages/opencode/src/permission/index.ts`).
 //! * `permission.replied` → [`NotificationKind::TurnEnd`] (clears the
 //!   pending request).
+//! * `question.asked` → [`NotificationKind::IdlePromptNeeded`] so OpenCode
+//!   interactive questions drive the same visible `Waiting` state as Claude
+//!   Code's idle/elicitation prompts.
+//! * `question.replied` / `question.rejected` → [`NotificationKind::TurnStart`]
+//!   so the session leaves `Waiting` as soon as the question is answered or
+//!   dismissed.
 //! * `session.idle` (deprecated alias retained for back-compat) and
 //!   `session.status` with `status.type == "idle"` → idle signal; we do
 //!   not synthesise a `PermissionNeeded` from idle, only a `TurnEnd`
@@ -422,6 +428,40 @@ fn translate(
                 payload: env.properties,
             })
         }
+        "question.asked" => {
+            // Schema (confirmed against anomalyco/opencode @ dev):
+            //   { id: string, sessionID: string, questions: [...], tool?: ... }
+            let session = env
+                .properties
+                .get("sessionID")
+                .and_then(Value::as_str)
+                .map_or_else(|| fallback.clone(), SessionId::new);
+            Some(NotificationEvent {
+                session_id: session,
+                harness: AgentKind::OpenCode,
+                kind: NotificationKind::IdlePromptNeeded,
+                source,
+                reliability: Reliability::Deterministic,
+                request_id: None,
+                payload: env.properties,
+            })
+        }
+        "question.replied" | "question.rejected" => {
+            let session = env
+                .properties
+                .get("sessionID")
+                .and_then(Value::as_str)
+                .map_or_else(|| fallback.clone(), SessionId::new);
+            Some(NotificationEvent {
+                session_id: session,
+                harness: AgentKind::OpenCode,
+                kind: NotificationKind::TurnStart,
+                source,
+                reliability: Reliability::Deterministic,
+                request_id: None,
+                payload: env.properties,
+            })
+        }
         "session.idle" => {
             // Deprecated-but-still-emitted per
             // `packages/opencode/src/session/status.ts`: fired whenever
@@ -550,6 +590,39 @@ mod tests {
         let ev = translate(data, &pending, &fallback).expect("event");
         assert_eq!(ev.kind, NotificationKind::TurnEnd);
         assert!(pending.lock().is_empty());
+    }
+
+    #[test]
+    fn translate_question_asked_is_idle_prompt_needed() {
+        let pending = new_pending_map();
+        let fallback = SessionId::new("raum-default");
+        let data = r#"{"type":"question.asked","properties":{"id":"q-1","sessionID":"sess-1","questions":[{"question":"Continue?","header":"Confirm","options":[{"label":"Yes","description":"Proceed"}]}]}}"#;
+        let ev = translate(data, &pending, &fallback).expect("event");
+        assert_eq!(ev.kind, NotificationKind::IdlePromptNeeded);
+        assert_eq!(ev.session_id, SessionId::new("sess-1"));
+        assert!(ev.request_id.is_none());
+        assert!(pending.lock().is_empty());
+    }
+
+    #[test]
+    fn translate_question_replied_is_turn_start() {
+        let pending = new_pending_map();
+        let fallback = SessionId::new("raum-default");
+        let data = r#"{"type":"question.replied","properties":{"sessionID":"sess-1","requestID":"q-1","answers":[["Yes"]]}}"#;
+        let ev = translate(data, &pending, &fallback).expect("event");
+        assert_eq!(ev.kind, NotificationKind::TurnStart);
+        assert_eq!(ev.session_id, SessionId::new("sess-1"));
+    }
+
+    #[test]
+    fn translate_question_rejected_is_turn_start() {
+        let pending = new_pending_map();
+        let fallback = SessionId::new("raum-default");
+        let data =
+            r#"{"type":"question.rejected","properties":{"sessionID":"sess-1","requestID":"q-1"}}"#;
+        let ev = translate(data, &pending, &fallback).expect("event");
+        assert_eq!(ev.kind, NotificationKind::TurnStart);
+        assert_eq!(ev.session_id, SessionId::new("sess-1"));
     }
 
     #[test]

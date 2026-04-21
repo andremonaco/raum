@@ -1,10 +1,16 @@
 //! Claude Code adapter.
 //!
-//! Installs the raum hook script into `~/.claude/settings.json`. Phase 2
-//! expanded coverage from `{Notification, Stop, UserPromptSubmit}` to the
-//! full set `{PermissionRequest, Notification, Stop, UserPromptSubmit,
-//! StopFailure}`. The `PermissionRequest` hook is the only synchronous
-//! one — see [`crate::harness::reply`] for the decision wire format.
+//! Installs the raum hook script into a project's
+//! `.claude/settings.local.json` (falling back to `~/.claude/settings.json`
+//! when no project_dir is set). Per the official Claude Code docs,
+//! `settings.local.json` is the personal/auto-gitignored layer: raum hooks
+//! carry machine-specific paths (hook-script location, event socket) and
+//! must never land in `settings.json`, which is the shared/team-checked-in
+//! layer. Phase 2 expanded coverage from `{Notification, Stop,
+//! UserPromptSubmit}` to the full set `{PermissionRequest, Notification,
+//! Stop, UserPromptSubmit, StopFailure}`. The `PermissionRequest` hook is
+//! the only synchronous one — see [`crate::harness::reply`] for the
+//! decision wire format.
 //!
 //! # Marker discipline
 //!
@@ -32,7 +38,10 @@ use crate::config_io::managed_json::{
 };
 use crate::harness::channel::NotificationChannel;
 use crate::harness::reply::PermissionReplier;
-use crate::harness::setup::{SelftestReport, SetupAction, SetupContext, SetupError, SetupPlan};
+use crate::harness::setup::{
+    ConfigPathEntry, ConfigScope, ScanReport, SelftestReport, SetupAction, SetupContext,
+    SetupError, SetupPlan, inspect_json_path,
+};
 use crate::harness::traits::{
     HarnessIdentity, HarnessRuntime, LaunchOverrides, NotificationSetup, SessionSpec,
 };
@@ -80,18 +89,56 @@ impl ClaudeCodeAdapter {
         }
     }
 
+    /// Legacy settings path (no context). Falls back to
+    /// `~/.claude/settings.json`; the Phase-6 production path is
+    /// [`Self::settings_path_for_ctx`].
     #[must_use]
     pub fn settings_path(&self) -> PathBuf {
         if let Some(p) = &self.settings_path_override {
             return p.clone();
         }
-        default_settings_path()
+        default_user_settings_path()
+    }
+
+    /// Project-scoped settings path. Resolves to
+    /// `<ctx.project_dir>/.claude/settings.local.json` when `project_dir`
+    /// is populated, or falls back to the legacy user-global path when
+    /// it is empty (tests / deprecated shim).
+    ///
+    /// `settings.local.json` is the officially-documented personal,
+    /// auto-gitignored layer; using it keeps raum's machine-specific
+    /// hook paths out of the repo's shared `settings.json`.
+    #[must_use]
+    pub fn settings_path_for_ctx(&self, ctx: &SetupContext) -> PathBuf {
+        if let Some(p) = &self.settings_path_override {
+            return p.clone();
+        }
+        if ctx.project_dir.as_os_str().is_empty() {
+            return default_user_settings_path();
+        }
+        ctx.project_dir.join(".claude").join("settings.local.json")
     }
 }
 
-fn default_settings_path() -> PathBuf {
+fn default_user_settings_path() -> PathBuf {
     let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from);
     home.join(".claude").join("settings.json")
+}
+
+/// Legacy user-global `settings.json` path keyed off an explicit
+/// `home_dir`. Used by the migration probe so the adapter respects
+/// `SetupContext::home_dir` (which tests can override to a tempdir).
+fn legacy_user_settings_path(home_dir: &Path) -> PathBuf {
+    home_dir.join(".claude").join("settings.json")
+}
+
+/// Legacy project-scoped `<project>/.claude/settings.json` path. Prior
+/// raum versions wrote managed hook entries here, which incorrectly
+/// polluted the repo's shared settings file. The migration probe sweeps
+/// any raum-managed entries out of it before writing the new
+/// `settings.local.json`.
+fn legacy_project_settings_path(project_dir: &Path) -> PathBuf {
+    project_dir.join(".claude").join("settings.json")
 }
 
 #[async_trait]
@@ -173,14 +220,27 @@ impl HarnessIdentity for ClaudeCodeAdapter {
 
 #[async_trait]
 impl NotificationSetup for ClaudeCodeAdapter {
-    /// Build the plan that installs raum hooks into `~/.claude/settings.json`.
+    /// Build the plan that installs raum hooks into the project's
+    /// `.claude/settings.local.json` (falling back to
+    /// `~/.claude/settings.json` when no project_dir is set).
     ///
     /// Every hook entry is tagged with
     /// `_raum_managed_marker: "<raum-managed>"`; re-running the plan
     /// replaces the raum entries without touching user-authored ones.
     async fn plan(&self, ctx: &SetupContext) -> Result<SetupPlan, SetupError> {
         let script = hook_script_path(&ctx.hooks_dir, "claude-code");
-        let settings_path = self.settings_path();
+        let settings_path = self.settings_path_for_ctx(ctx);
+        // Migration: earlier raum versions wrote managed entries into
+        // either the user-global `~/.claude/settings.json` or — worse —
+        // the repo's shared `<project>/.claude/settings.json`. Both are
+        // swept before we write the new `settings.local.json` target,
+        // so upgrading cleans up without the user having to do anything.
+        // The `RemoveManagedJsonEntries` action is a no-op when the file
+        // is missing or carries no raum-managed entries.
+        let legacy_user = legacy_user_settings_path(&ctx.home_dir);
+        let legacy_project = (!ctx.project_dir.as_os_str().is_empty())
+            .then(|| legacy_project_settings_path(&ctx.project_dir));
+        let skip_migration = self.settings_path_override.is_some();
 
         // Build the in-memory JSON we want on disk, then serialise once.
         let mut root = if settings_path.exists() {
@@ -225,6 +285,29 @@ impl NotificationSetup for ClaudeCodeAdapter {
         let mut plan = SetupPlan::new(AgentKind::ClaudeCode);
         plan.push(SetupAction::AssertBinary {
             name: "claude".into(),
+        });
+        if !skip_migration {
+            if let Some(legacy_project) = legacy_project
+                && legacy_project != settings_path
+            {
+                plan.push(SetupAction::RemoveManagedJsonEntries {
+                    path: legacy_project,
+                });
+            }
+            if legacy_user != settings_path {
+                plan.push(SetupAction::RemoveManagedJsonEntries { path: legacy_user });
+            }
+        }
+        // Write the hook-dispatcher script itself. Without this the
+        // `command` reference in settings.json points at a path that
+        // does not exist on disk — the script must land as part of the
+        // same atomic plan apply.
+        plan.push(SetupAction::WriteShellScript {
+            path: script.clone(),
+            content: crate::harness::hook_script::body(
+                crate::harness::hook_script::HookDispatcher::ClaudeCode,
+            ),
+            mode: 0o700,
         });
         plan.push(SetupAction::WriteJson {
             path: settings_path,
@@ -285,6 +368,48 @@ impl NotificationSetup for ClaudeCodeAdapter {
             "synthetic Notification written to event socket",
             started.elapsed().as_millis() as u64,
         )
+    }
+}
+
+impl ClaudeCodeAdapter {
+    /// Pure-read scan: report whether Claude Code's project-scoped
+    /// `settings.local.json` exists and carries raum-managed entries.
+    /// Does not spawn the `claude` binary.
+    #[must_use]
+    pub fn scan(&self, ctx: &SetupContext) -> ScanReport {
+        let binary = <Self as HarnessIdentity>::binary(self);
+        let binary_on_path = which::which(binary).is_ok();
+        let settings_path = self.settings_path_for_ctx(ctx);
+        let (exists, raum_managed) = inspect_json_path(&settings_path);
+        let entry = ConfigPathEntry {
+            kind: ConfigScope::Project,
+            label: "Claude Code local settings".into(),
+            path: settings_path.clone(),
+            exists,
+            raum_managed,
+        };
+        let raum_hooks_installed = exists && raum_managed;
+        let reason_if_not_installed = if !binary_on_path {
+            Some(format!("{binary} binary not found on PATH"))
+        } else if !exists {
+            Some(format!("{} does not exist yet", settings_path.display()))
+        } else if !raum_managed {
+            Some(format!(
+                "{} has no raum-managed entries",
+                settings_path.display()
+            ))
+        } else {
+            None
+        };
+        ScanReport {
+            harness: AgentKind::ClaudeCode,
+            binary: binary.into(),
+            binary_on_path,
+            raum_hooks_installed,
+            config_paths: vec![entry],
+            reason_if_not_installed,
+            note: None,
+        }
     }
 }
 
@@ -555,6 +680,205 @@ mod tests {
             .iter()
             .any(|a| matches!(a, SetupAction::AssertBinary { name } if name == "claude"));
         assert!(has_assert, "plan must AssertBinary `claude`");
+    }
+
+    #[tokio::test]
+    async fn settings_path_for_ctx_resolves_under_project_dir() {
+        let adapter = ClaudeCodeAdapter::new();
+        let dir = tempdir().unwrap();
+        let ctx = SetupContext::new(
+            dir.path().join("hooks"),
+            dir.path().join("events.sock"),
+            "demo",
+        )
+        .with_project_dir(dir.path().to_path_buf());
+        let resolved = adapter.settings_path_for_ctx(&ctx);
+        assert_eq!(
+            resolved,
+            dir.path().join(".claude").join("settings.local.json")
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_path_for_ctx_falls_back_without_project_dir() {
+        // Empty project_dir → use legacy global path so plan-only tests
+        // (no explicit project) still work.
+        let adapter = ClaudeCodeAdapter::new();
+        let dir = tempdir().unwrap();
+        let ctx = SetupContext::new(
+            dir.path().join("hooks"),
+            dir.path().join("events.sock"),
+            "demo",
+        );
+        let resolved = adapter.settings_path_for_ctx(&ctx);
+        assert!(
+            resolved.ends_with(".claude/settings.json"),
+            "unexpected: {}",
+            resolved.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_emits_migration_action_when_legacy_entry_present() {
+        // Simulate a pre-Phase-6 install that wrote raum-managed
+        // entries into `~/.claude/settings.json`. When the new plan
+        // runs with a real project_dir, a `RemoveManagedJsonEntries`
+        // must be emitted for the legacy path.
+        let tmp = tempdir().unwrap();
+        let fake_home = tmp.path().to_path_buf();
+        let project_dir = tmp.path().join("project-42");
+        let legacy = fake_home.join(".claude").join("settings.json");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        let stale = json!({
+            "hooks": {
+                "Notification": [
+                    { MARKER_KEY: MARKER_BEGIN, "matcher": ".*", "hooks": [] }
+                ]
+            }
+        });
+        std::fs::write(&legacy, serde_json::to_string_pretty(&stale).unwrap()).unwrap();
+
+        let adapter = ClaudeCodeAdapter::new();
+        let ctx = SetupContext::new(
+            tmp.path().join("hooks"),
+            tmp.path().join("events.sock"),
+            "demo",
+        )
+        .with_project_dir(project_dir.clone())
+        .with_home_dir(fake_home.clone());
+        let plan = <ClaudeCodeAdapter as NotificationSetup>::plan(&adapter, &ctx)
+            .await
+            .unwrap();
+        let has_migration = plan.actions.iter().any(
+            |a| matches!(a, SetupAction::RemoveManagedJsonEntries { path } if path == &legacy),
+        );
+        assert!(has_migration, "expected legacy migration action: {plan:?}");
+        // Project-local write target must be under project_dir AND use
+        // `settings.local.json` (the personal, auto-gitignored layer).
+        let has_project_write = plan.actions.iter().any(|a| matches!(
+            a,
+            SetupAction::WriteJson { path, .. } if path == &project_dir.join(".claude").join("settings.local.json")
+        ));
+        assert!(
+            has_project_write,
+            "expected project-local WriteJson: {plan:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_sweeps_legacy_project_settings_json() {
+        // Earlier raum versions wrote managed entries into the repo's
+        // shared `.claude/settings.json`. When the new plan runs, a
+        // `RemoveManagedJsonEntries` for that path must be emitted so
+        // upgrading cleans up the repo without user intervention.
+        let tmp = tempdir().unwrap();
+        let project_dir = tmp.path().join("project-7");
+        let legacy_project = project_dir.join(".claude").join("settings.json");
+        std::fs::create_dir_all(legacy_project.parent().unwrap()).unwrap();
+        let stale = json!({
+            "hooks": {
+                "Notification": [
+                    { MARKER_KEY: MARKER_BEGIN, "matcher": ".*", "hooks": [] }
+                ]
+            }
+        });
+        std::fs::write(
+            &legacy_project,
+            serde_json::to_string_pretty(&stale).unwrap(),
+        )
+        .unwrap();
+
+        let adapter = ClaudeCodeAdapter::new();
+        let ctx = SetupContext::new(
+            tmp.path().join("hooks"),
+            tmp.path().join("events.sock"),
+            "demo",
+        )
+        .with_project_dir(project_dir.clone())
+        .with_home_dir(tmp.path().to_path_buf());
+        let plan = <ClaudeCodeAdapter as NotificationSetup>::plan(&adapter, &ctx)
+            .await
+            .unwrap();
+        let has_project_migration = plan.actions.iter().any(|a| {
+            matches!(
+                a,
+                SetupAction::RemoveManagedJsonEntries { path } if path == &legacy_project
+            )
+        });
+        assert!(
+            has_project_migration,
+            "expected sweep of project settings.json: {plan:?}"
+        );
+
+        // Applying the plan must strip the stale entry from settings.json.
+        let report = crate::harness::SetupExecutor::new().apply(&plan);
+        assert!(report.ok, "plan apply failed: {report:?}");
+        let parsed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&legacy_project).unwrap()).unwrap();
+        let notif = parsed["hooks"]["Notification"].as_array().unwrap();
+        assert!(
+            notif.iter().all(|v| !is_raum_managed(v)),
+            "settings.json should no longer contain raum entries"
+        );
+        // …and the new settings.local.json should carry the fresh entries.
+        let local = project_dir.join(".claude").join("settings.local.json");
+        assert!(local.exists(), "expected {local:?} to be written");
+        let parsed_local: Value =
+            serde_json::from_str(&std::fs::read_to_string(&local).unwrap()).unwrap();
+        for event in RAUM_HOOK_EVENTS {
+            let arr = parsed_local["hooks"][event].as_array().unwrap();
+            assert_eq!(arr.len(), 1);
+            assert!(is_raum_managed(&arr[0]));
+        }
+    }
+
+    #[tokio::test]
+    async fn scan_flags_missing_settings_as_not_installed() {
+        let dir = tempdir().unwrap();
+        let project = dir.path().join("project");
+        let adapter = ClaudeCodeAdapter::new();
+        let ctx = SetupContext::new(
+            dir.path().join("hooks"),
+            dir.path().join("events.sock"),
+            "demo",
+        )
+        .with_project_dir(project.clone());
+        let report = adapter.scan(&ctx);
+        assert_eq!(report.harness, AgentKind::ClaudeCode);
+        assert_eq!(report.config_paths.len(), 1);
+        let entry = &report.config_paths[0];
+        assert_eq!(
+            entry.path,
+            project.join(".claude").join("settings.local.json")
+        );
+        assert!(!entry.exists);
+        assert!(!entry.raum_managed);
+        assert!(!report.raum_hooks_installed);
+        assert!(report.reason_if_not_installed.is_some());
+    }
+
+    #[tokio::test]
+    async fn scan_reports_raum_managed_when_plan_applied() {
+        let dir = tempdir().unwrap();
+        let project = dir.path().join("project");
+        let adapter = ClaudeCodeAdapter::new();
+        let ctx = SetupContext::new(
+            dir.path().join("hooks"),
+            dir.path().join("events.sock"),
+            "demo",
+        )
+        .with_project_dir(project.clone());
+        let plan = <ClaudeCodeAdapter as NotificationSetup>::plan(&adapter, &ctx)
+            .await
+            .unwrap();
+        let report = crate::harness::SetupExecutor::new().apply(&plan);
+        assert!(report.ok);
+        let scan = adapter.scan(&ctx);
+        // Even if the binary is missing (CI sandbox), the files
+        // should be raum-managed now.
+        let entry = &scan.config_paths[0];
+        assert!(entry.exists);
+        assert!(entry.raum_managed);
     }
 
     #[tokio::test]

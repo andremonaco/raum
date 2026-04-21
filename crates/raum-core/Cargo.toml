@@ -50,6 +50,13 @@ bytes = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
 wiremock = "0.6"
+# Phase 5 E2E tests: some tests mutate process-wide state (env vars,
+# $HOME, $RAUM_EVENT_SOCK) and must not run concurrently.
+serial_test = "3"
+# Phase 5 round-trip tests drive the real Unix-domain event socket
+# via raum-hooks. Kept as a dev-dep (not a main dep) because raum-core
+# owns the script bodies; raum-hooks is the runtime consumer.
+raum-hooks = { path = "../raum-hooks" }
 
 [package.metadata.cargo-machete]
 # Used via re-exports or macro expansion that machete cannot trace statically.

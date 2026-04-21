@@ -11,6 +11,8 @@
 //! flag on `AgentStateChanged`. It is strictly more expressive — a
 //! three-valued enum the UI can render as a badge.
 
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{AgentKind, AgentState, SessionId};
@@ -90,6 +92,16 @@ impl Reliability {
             Self::Heuristic => "heuristic",
         }
     }
+
+    #[must_use]
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "deterministic" => Some(Self::Deterministic),
+            "event-driven" => Some(Self::EventDriven),
+            "heuristic" => Some(Self::Heuristic),
+            _ => None,
+        }
+    }
 }
 
 /// Semantic classification of a notification event. Maps onto the
@@ -127,6 +139,17 @@ impl NotificationKind {
             Self::Error => AgentState::Errored,
         }
     }
+
+    #[must_use]
+    pub fn wire_event_name(self) -> &'static str {
+        match self {
+            Self::TurnStart => "UserPromptSubmit",
+            Self::PermissionNeeded => "PermissionRequest",
+            Self::IdlePromptNeeded => "Notification",
+            Self::TurnEnd => "Stop",
+            Self::Error => "Error",
+        }
+    }
 }
 
 /// Unified notification event shape (Phase 1 wire type). Phase 2+ will
@@ -148,6 +171,18 @@ pub struct NotificationEvent {
     pub payload: serde_json::Value,
 }
 
+/// Parse a hook payload that may arrive either as a structured JSON value
+/// or as a JSON string emitted by a shell script over the UDS socket.
+#[must_use]
+pub fn decode_payload(payload: &serde_json::Value) -> Cow<'_, serde_json::Value> {
+    if let Some(raw) = payload.as_str()
+        && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw)
+    {
+        return Cow::Owned(parsed);
+    }
+    Cow::Borrowed(payload)
+}
+
 /// Classify a raw hook-event name (matching the string emitted by the
 /// installed hook scripts) into a [`NotificationKind`].
 ///
@@ -156,15 +191,90 @@ pub struct NotificationEvent {
 /// backwards compatibility while giving the new code path a typed
 /// classifier to delegate to.
 #[must_use]
-pub fn classify_notification_kind(event_name: &str) -> NotificationKind {
+pub fn classify_notification_kind(event_name: &str) -> Option<NotificationKind> {
     match event_name {
-        "Notification" => NotificationKind::IdlePromptNeeded,
-        "PermissionRequest" => NotificationKind::PermissionNeeded,
-        "Stop" => NotificationKind::TurnEnd,
-        "Error" | "ToolError" | "StopFailure" => NotificationKind::Error,
-        // Everything else (UserPromptSubmit, PreToolUse, SessionStart, …)
-        // counts as the harness working.
-        _ => NotificationKind::TurnStart,
+        "Notification" => Some(NotificationKind::IdlePromptNeeded),
+        "PermissionRequest" => Some(NotificationKind::PermissionNeeded),
+        "Stop" => Some(NotificationKind::TurnEnd),
+        "Error" | "ToolError" | "StopFailure" => Some(NotificationKind::Error),
+        // SessionStart fires at harness boot before the user has typed
+        // anything — it must not promote to Working. The state machine
+        // still arms output-based recovery on SessionStart via
+        // `AgentStateMachine::on_hook_event` so real PTY activity can
+        // later flip Idle → Working.
+        "SessionStart" => None,
+        // Everything else (UserPromptSubmit, PreToolUse, …) counts as the
+        // harness working.
+        _ => Some(NotificationKind::TurnStart),
+    }
+}
+
+/// Harness-aware classifier used by the state machine and the Tauri event
+/// bridge. Returns `None` for observation-only notifications that should not
+/// change the visible working / waiting / idle state.
+#[must_use]
+pub fn classify_notification_event(
+    harness: AgentKind,
+    event_name: &str,
+    source: Option<&str>,
+    payload: &serde_json::Value,
+) -> Option<NotificationKind> {
+    match event_name {
+        "PermissionRequest" => Some(NotificationKind::PermissionNeeded),
+        "Stop" => Some(NotificationKind::TurnEnd),
+        "Error" | "ToolError" | "StopFailure" => Some(NotificationKind::Error),
+        "Notification" => classify_notification_payload(harness, source, payload),
+        // SessionStart is observed at harness boot before any real turn
+        // has begun. Returning None keeps the machine in its current state
+        // (Idle for a fresh session) while the state machine separately
+        // arms output-based recovery on this event name.
+        "SessionStart" => None,
+        _ => Some(NotificationKind::TurnStart),
+    }
+}
+
+fn classify_notification_payload(
+    harness: AgentKind,
+    source: Option<&str>,
+    payload: &serde_json::Value,
+) -> Option<NotificationKind> {
+    let decoded = decode_payload(payload);
+    match harness {
+        AgentKind::ClaudeCode => match decoded
+            .as_ref()
+            .get("notification_type")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("permission_prompt" | "idle_prompt" | "elicitation_dialog") => {
+                Some(NotificationKind::IdlePromptNeeded)
+            }
+            _ => None,
+        },
+        AgentKind::Codex => {
+            if source != Some("notify") {
+                return None;
+            }
+            match decoded
+                .as_ref()
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+            {
+                Some(kind) if kind.contains("approval-requested") => {
+                    Some(NotificationKind::PermissionNeeded)
+                }
+                Some(kind) if kind.contains("agent-turn-complete") => {
+                    Some(NotificationKind::TurnEnd)
+                }
+                _ => None,
+            }
+        }
+        AgentKind::OpenCode => {
+            if source == Some("opencode-sse") {
+                return Some(NotificationKind::IdlePromptNeeded);
+            }
+            None
+        }
+        AgentKind::Shell => None,
     }
 }
 
@@ -186,6 +296,11 @@ mod tests {
             serde_json::to_string(&Reliability::Heuristic).unwrap(),
             "\"heuristic\""
         );
+        assert_eq!(
+            Reliability::from_label("event-driven"),
+            Some(Reliability::EventDriven)
+        );
+        assert_eq!(Reliability::from_label("unknown"), None);
     }
 
     #[test]
@@ -231,34 +346,141 @@ mod tests {
             AgentState::Completed
         );
         assert_eq!(NotificationKind::Error.target_state(), AgentState::Errored);
+        assert_eq!(
+            NotificationKind::PermissionNeeded.wire_event_name(),
+            "PermissionRequest"
+        );
     }
 
     #[test]
     fn classifier_maps_known_hook_names() {
         assert_eq!(
             classify_notification_kind("Notification"),
-            NotificationKind::IdlePromptNeeded
+            Some(NotificationKind::IdlePromptNeeded)
         );
         assert_eq!(
             classify_notification_kind("PermissionRequest"),
-            NotificationKind::PermissionNeeded
+            Some(NotificationKind::PermissionNeeded)
         );
         assert_eq!(
             classify_notification_kind("Stop"),
-            NotificationKind::TurnEnd
+            Some(NotificationKind::TurnEnd)
         );
-        assert_eq!(classify_notification_kind("Error"), NotificationKind::Error);
+        assert_eq!(
+            classify_notification_kind("Error"),
+            Some(NotificationKind::Error)
+        );
         assert_eq!(
             classify_notification_kind("StopFailure"),
-            NotificationKind::Error
+            Some(NotificationKind::Error)
         );
         assert_eq!(
             classify_notification_kind("UserPromptSubmit"),
-            NotificationKind::TurnStart
+            Some(NotificationKind::TurnStart)
+        );
+        // SessionStart is observational only — must not drive state.
+        assert_eq!(classify_notification_kind("SessionStart"), None);
+    }
+
+    #[test]
+    fn classify_notification_event_ignores_session_start() {
+        assert_eq!(
+            classify_notification_event(
+                AgentKind::Codex,
+                "SessionStart",
+                None,
+                &serde_json::Value::Null,
+            ),
+            None
         );
         assert_eq!(
-            classify_notification_kind("SessionStart"),
-            NotificationKind::TurnStart
+            classify_notification_event(
+                AgentKind::ClaudeCode,
+                "SessionStart",
+                None,
+                &serde_json::Value::Null,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn decode_payload_parses_json_string_payloads() {
+        let raw = serde_json::Value::String("{\"notification_type\":\"idle_prompt\"}".into());
+        let decoded = decode_payload(&raw);
+        assert_eq!(
+            decoded
+                .as_ref()
+                .get("notification_type")
+                .and_then(serde_json::Value::as_str),
+            Some("idle_prompt")
+        );
+    }
+
+    #[test]
+    fn classify_notification_event_is_harness_aware() {
+        assert_eq!(
+            classify_notification_event(
+                AgentKind::ClaudeCode,
+                "Notification",
+                None,
+                &serde_json::json!({ "notification_type": "idle_prompt" }),
+            ),
+            Some(NotificationKind::IdlePromptNeeded)
+        );
+        assert_eq!(
+            classify_notification_event(
+                AgentKind::ClaudeCode,
+                "Notification",
+                None,
+                &serde_json::json!({ "notification_type": "auth_success" }),
+            ),
+            None
+        );
+        assert_eq!(
+            classify_notification_event(
+                AgentKind::Codex,
+                "Notification",
+                Some("notify"),
+                &serde_json::json!({ "type": "agent-turn-complete" }),
+            ),
+            Some(NotificationKind::TurnEnd)
+        );
+        assert_eq!(
+            classify_notification_event(
+                AgentKind::Codex,
+                "Notification",
+                None,
+                &serde_json::json!({ "type": "agent-turn-complete" }),
+            ),
+            None
+        );
+        assert_eq!(
+            classify_notification_event(
+                AgentKind::OpenCode,
+                "Notification",
+                Some("opencode-sse"),
+                &serde_json::Value::Null,
+            ),
+            Some(NotificationKind::IdlePromptNeeded)
+        );
+        assert_eq!(
+            classify_notification_event(
+                AgentKind::OpenCode,
+                "Notification",
+                None,
+                &serde_json::Value::Null,
+            ),
+            None
+        );
+        assert_eq!(
+            classify_notification_event(
+                AgentKind::OpenCode,
+                "PermissionRequest",
+                Some("opencode-sse"),
+                &serde_json::Value::Null,
+            ),
+            Some(NotificationKind::PermissionNeeded)
         );
     }
 

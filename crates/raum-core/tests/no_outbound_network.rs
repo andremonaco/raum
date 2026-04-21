@@ -144,12 +144,16 @@ fn waiting_burst_uses_no_network() {
     let start = HookEvent {
         harness: "claude-code".into(),
         event: "PreToolUse".into(),
+        source: None,
+        reliability: None,
         payload: serde_json::Value::Null,
     };
     let waiting = HookEvent {
         harness: "claude-code".into(),
         event: "Notification".into(),
-        payload: serde_json::Value::Null,
+        source: None,
+        reliability: None,
+        payload: serde_json::json!({ "notification_type": "idle_prompt" }),
     };
 
     let mut waiting_count = 0usize;

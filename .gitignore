@@ -17,6 +17,7 @@ target/
 node_modules/
 frontend/dist/
 frontend/.vite/
+.vite/
 frontend/coverage/
 
 # Tauri
@@ -33,6 +34,7 @@ src-tauri/gen/schemas/
 openspec/**/*
 .claude/**/*
 .opencode/**/*
+.codex/**/*
 passphrase/**/*
 .raum-updater-key.pem
 

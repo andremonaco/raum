@@ -18,7 +18,7 @@
 //!   file. The webview can't fetch arbitrary `file://` URLs, so the
 //!   notification center wraps the bytes in a `Blob` + ObjectURL.
 
-use raum_core::config::Config;
+use raum_core::config::{BadgeMode, Config};
 use tauri::{AppHandle, Runtime};
 
 use crate::notifications;
@@ -56,19 +56,21 @@ pub fn notifications_mark_hint_shown(
 }
 
 /// §11 — persist user notification preferences from the settings modal.
-/// Updates `notify_on_waiting`, `notify_on_done`, and the optional sound path
-/// atomically in a single config write.
+/// Updates `notify_on_waiting`, `notify_on_done`, the optional sound path, and
+/// the dock/taskbar `badge_mode` atomically in a single config write.
 #[tauri::command]
 pub fn config_set_notifications(
     state: tauri::State<'_, AppHandleState>,
     notify_on_waiting: bool,
     notify_on_done: bool,
     sound: Option<String>,
+    badge_mode: BadgeMode,
 ) -> Result<(), String> {
     let store = state.config_store.lock().map_err(|e| e.to_string())?;
     let mut cfg: Config = store.read_config().map_err(|e| e.to_string())?;
     cfg.notifications.notify_on_waiting = notify_on_waiting;
     cfg.notifications.notify_on_done = notify_on_done;
+    cfg.notifications.badge_mode = badge_mode;
     // Treat empty string as None (no sound file configured).
     cfg.notifications.sound = sound.filter(|s| !s.trim().is_empty());
     store.write_config(&cfg).map_err(|e| e.to_string())

@@ -1,21 +1,18 @@
 //! Permission reply command (Phase 2, per-harness notification plan).
 //!
 //! Exposes a single Tauri command `reply_permission(request_id,
-//! decision)` that the frontend invokes when the user clicks an
-//! "Allow / Allow & remember / Deny / Ask" action on a permission
-//! notification. The command resolves the parked hook connection for
-//! `(session_id, request_id)` out of [`raum_hooks::PendingRequests`]
-//! and writes the decision string back on it. The hook script then
-//! prints the Claude-Code-compatible JSON to stdout and exits, which
-//! makes Claude use the decision instead of showing its own TUI
-//! prompt.
+//! decision)` that can deliver a decision back to a parked harness
+//! permission request. The default notification UX is focus-only, so
+//! this command is currently retained as a transport surface rather
+//! than being called from desktop notifications.
 
 use raum_core::harness::Decision;
 use raum_hooks::PendingKey;
 use serde::Deserialize;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use tracing::{info, warn};
 
+use crate::commands::harness_runtime::deliver_decision;
 use crate::state::AppHandleState;
 
 /// Request body passed from the webview.
@@ -47,9 +44,73 @@ pub async fn reply_permission(
         return Err(format!("unknown decision tag: {}", args.decision));
     };
 
-    // Grab the pending-request registry from the event socket handle
-    // stashed on managed state.
     let state: tauri::State<'_, AppHandleState> = app.state();
+
+    // Demote the state machine Waiting → Working so the NEXT
+    // `PermissionRequest` produces a visible state transition. Without
+    // this, the machine gets stuck at Waiting and every follow-up
+    // request is a silent Waiting → Waiting no-op. We do this BEFORE
+    // dispatching the reply so the transition is already visible by
+    // the time the harness starts emitting new PTY output.
+    if let Some(session_id) = &args.session_id {
+        let change = {
+            let Ok(mut agents) = state.agents.lock() else {
+                warn!("reply_permission: agent registry lock poisoned");
+                return Err("agent registry lock poisoned".into());
+            };
+            agents.on_permission_reply(session_id)
+        };
+        if let Some(change) = change
+            && let Err(e) = app.emit("agent-state-changed", &change)
+        {
+            warn!(error = %e, "agent-state-changed emit on permission reply failed");
+        }
+    }
+
+    // Phase 6: prefer the harness-runtime replier when we have a
+    // session id. The replier dispatches on the adapter's configured
+    // transport (HTTP POST for OpenCode, synchronous hook for Claude
+    // Code, `None` for Codex). When no replier is registered for this
+    // session — either because the harness is observation-only or the
+    // session predates the per-session registry — fall through to the
+    // raum-hooks `PendingRequests` path so the pre-Phase-6 behaviour
+    // is preserved.
+    if let Some(session_id) = &args.session_id {
+        match deliver_decision(
+            &state.harness_runtimes,
+            session_id,
+            &args.request_id,
+            decision,
+        )
+        .await
+        {
+            Ok(true) => {
+                info!(
+                    request_id = %args.request_id,
+                    session_id = %session_id,
+                    decision = %decision.wire_tag(),
+                    "reply_permission: delivered via harness runtime replier",
+                );
+                return Ok(true);
+            }
+            Ok(false) => {
+                // No replier registered for this session; fall through
+                // to the raum-hooks socket path. This handles Claude
+                // Code (hook-response replier not yet wired through the
+                // harness runtime) and Codex (observation-only — the
+                // socket path also returns UnknownRequest, which maps
+                // to `Ok(false)` below).
+            }
+            Err(e) => {
+                warn!(error=%e, "reply_permission: harness-runtime replier failed");
+                return Err(e.to_string());
+            }
+        }
+    }
+
+    // Legacy path: walk the raum-hooks pending-request registry. This
+    // is the transport Claude Code's hook script uses (blocking on
+    // stdin for the decision line).
     let pending = {
         let Ok(slot) = state.event_socket.lock() else {
             return Err("event_socket slot poisoned".into());
@@ -67,7 +128,7 @@ pub async fn reply_permission(
                 request_id = %args.request_id,
                 session_id = ?args.session_id,
                 decision = %decision.wire_tag(),
-                "reply_permission: delivered",
+                "reply_permission: delivered via raum-hooks socket",
             );
             Ok(true)
         }

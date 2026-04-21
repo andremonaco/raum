@@ -9,6 +9,7 @@
 import { Component, For, Show, createResource, createSignal } from "solid-js";
 import { Dynamic } from "solid-js/web";
 import { invoke } from "@tauri-apps/api/core";
+import { Scrollable } from "./ui/scrollable";
 
 export interface FileTreeNode {
   name: string;
@@ -308,11 +309,10 @@ export const HydrationFileTree: Component<HydrationFileTreeProps> = (props) => {
   const copySet = () => new Set(props.copyPaths);
   const symlinkSet = () => new Set(props.symlinkPaths);
 
+  const rootClass = () =>
+    `select-none rounded-xl bg-background py-2 shadow-inner ring-1 ring-white/5 ${props.class ? "h-full" : "max-h-[240px]"}`;
   return (
-    <div
-      class="select-none overflow-y-auto rounded-xl bg-popover py-2 shadow-inner"
-      classList={{ "h-full": !!props.class, "max-h-[240px]": !props.class }}
-    >
+    <Scrollable class={rootClass()}>
       <Show
         when={props.nodes.length > 0}
         fallback={
@@ -332,6 +332,6 @@ export const HydrationFileTree: Component<HydrationFileTreeProps> = (props) => {
           )}
         </For>
       </Show>
-    </div>
+    </Scrollable>
   );
 };

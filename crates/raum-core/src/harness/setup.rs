@@ -29,6 +29,7 @@ use thiserror::Error;
 
 use crate::agent::AgentKind;
 use crate::config_io::managed_json::{atomic_write, is_raum_managed};
+use crate::config_io::managed_toml;
 
 /// Context handed to each [`crate::harness::traits::NotificationSetup`]
 /// planner. Carries paths the planner needs to decide what to do (hook
@@ -49,23 +50,75 @@ pub struct SetupContext {
     /// Project slug bound to this setup run. Adapters that write per-
     /// project config (OpenCode's future project overrides) read this.
     pub project_slug: String,
+    /// Phase 6: Absolute path to the project (worktree) root. Claude Code
+    /// and Codex adapters drop their per-project settings (`.claude/` /
+    /// `.codex/`) under this directory so two projects' hooks coexist
+    /// without clobbering each other. Empty `PathBuf` falls back to the
+    /// legacy user-global path (kept for tests that only exercise the
+    /// plan body).
+    pub project_dir: PathBuf,
+    /// Phase 6: User home directory. Adapters probe for legacy raum-
+    /// managed entries at `$HOME/.claude/settings.json` /
+    /// `$XDG_CONFIG_HOME/opencode/config.json` and emit a
+    /// `RemoveManagedJsonEntries` action so the one-time migration off
+    /// the user-global path is silent + idempotent.
+    pub home_dir: PathBuf,
+    /// Phase 6: Optional port override forwarded to the OpenCode adapter
+    /// so the setup plan + selftest + runtime channel all agree on
+    /// which port they're targeting. `None` falls through to the
+    /// adapter's default discovery chain
+    /// (`$OPENCODE_PORT` → lockfile → 4096).
+    pub opencode_port_override: Option<u16>,
 }
 
 impl SetupContext {
     /// Convenience: build a context with sensible raum-core defaults
     /// (55 s permission timeout). Paths and project slug are required.
+    ///
+    /// `project_dir` defaults to an empty path (adapters fall back to
+    /// the legacy user-global location when the field is empty — used
+    /// by the plan-body tests that do not care which path the setup
+    /// writes to). `home_dir` defaults to `$HOME` or `/` so the
+    /// migration probe always has a path to check.
     #[must_use]
     pub fn new(
         hooks_dir: PathBuf,
         event_socket_path: PathBuf,
         project_slug: impl Into<String>,
     ) -> Self {
+        let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from);
         Self {
             hooks_dir,
             event_socket_path,
             permission_timeout: Duration::from_secs(55),
             project_slug: project_slug.into(),
+            project_dir: PathBuf::new(),
+            home_dir: home,
+            opencode_port_override: None,
         }
+    }
+
+    /// Set the project (worktree) root directory for this context.
+    #[must_use]
+    pub fn with_project_dir(mut self, project_dir: PathBuf) -> Self {
+        self.project_dir = project_dir;
+        self
+    }
+
+    /// Override `$HOME`. Used only by tests that need to exercise the
+    /// legacy-config migration path under a tempdir.
+    #[must_use]
+    pub fn with_home_dir(mut self, home_dir: PathBuf) -> Self {
+        self.home_dir = home_dir;
+        self
+    }
+
+    /// Override the OpenCode port. `None` restores the default
+    /// discovery chain.
+    #[must_use]
+    pub fn with_opencode_port(mut self, port: Option<u16>) -> Self {
+        self.opencode_port_override = port;
+        self
     }
 }
 
@@ -173,6 +226,64 @@ impl SetupReport {
     pub fn is_ok(&self) -> bool {
         self.ok
     }
+}
+
+/// Scope of a managed config path — whether it lives inside the project
+/// (`.claude/settings.json`, `.codex/hooks.json`) or under the user's
+/// home directory (`~/.codex/config.toml`). Rendered next to the path in
+/// the Harness Health panel so the user knows which scope a change
+/// affects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConfigScope {
+    Project,
+    User,
+}
+
+/// One file the setup plan would write to, enriched with the "exists +
+/// currently raum-managed" snapshot so the UI can render an install /
+/// reinstall / healthy badge without re-parsing the plan client-side.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigPathEntry {
+    /// Project-local vs user-global.
+    pub kind: ConfigScope,
+    /// Short human label ("Project settings", "User config", …).
+    pub label: String,
+    /// Absolute path on disk. Rendered verbatim in the UI; click-to-reveal
+    /// opens the parent directory in Finder/Explorer.
+    pub path: PathBuf,
+    /// `true` iff the file currently exists on disk.
+    pub exists: bool,
+    /// `true` iff the file exists AND contains at least one entry tagged
+    /// with the `<raum-managed>` marker (JSON: `_raum_managed_marker`;
+    /// TOML: the `# <raum-managed>` comment sentinel).
+    pub raum_managed: bool,
+}
+
+/// Pure-read scan result for a single harness. Produced from
+/// [`crate::harness::traits::NotificationSetup::scan`] — no subprocess
+/// spawns, no disk writes, safe to call whenever the user opens the
+/// Harness Health panel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanReport {
+    pub harness: AgentKind,
+    /// Binary raum looks for on `$PATH`.
+    pub binary: String,
+    /// `true` iff `which(binary)` resolved.
+    pub binary_on_path: bool,
+    /// Summary flag: `true` when every mandatory managed config path
+    /// exists AND carries the `<raum-managed>` marker.
+    pub raum_hooks_installed: bool,
+    /// Config files raum's plan would touch for this harness, with their
+    /// current on-disk state.
+    pub config_paths: Vec<ConfigPathEntry>,
+    /// When `raum_hooks_installed` is false, a one-line reason suitable
+    /// for the panel. `None` when nothing needs attention.
+    pub reason_if_not_installed: Option<String>,
+    /// Harnesses that have no config file at all (OpenCode, Shell) emit
+    /// a one-liner instead of a paths list. Rendered underneath the
+    /// headline row.
+    pub note: Option<String>,
 }
 
 /// Selftest report returned from [`crate::harness::traits::NotificationSetup::selftest`].
@@ -377,6 +488,46 @@ fn remove_managed_entries(path: &Path) -> ActionOutcome {
             error: format!("write: {e}"),
         },
     }
+}
+
+/// Inspect `path` and decide whether it currently contains any
+/// raum-managed entries under `hooks.*`. Returns `(exists, raum_managed)`.
+/// `raum_managed` is `false` when the file does not exist or is not
+/// JSON or has no hook arrays at all — callers treat that the same as
+/// "install needed".
+#[must_use]
+pub fn inspect_json_path(path: &Path) -> (bool, bool) {
+    if !path.exists() {
+        return (false, false);
+    }
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return (true, false);
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return (true, false);
+    };
+    let managed = value
+        .get("hooks")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|hooks| {
+            hooks
+                .values()
+                .filter_map(serde_json::Value::as_array)
+                .any(|arr| arr.iter().any(is_raum_managed))
+        });
+    (true, managed)
+}
+
+/// Inspect a Codex `config.toml` for the raum `# <raum-managed>` block.
+#[must_use]
+pub fn inspect_toml_path(path: &Path) -> (bool, bool) {
+    if !path.exists() {
+        return (false, false);
+    }
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return (true, false);
+    };
+    (true, managed_toml::contains_managed_block(&raw))
 }
 
 /// `Arc` wrapper for contexts that need to share one executor across tasks.

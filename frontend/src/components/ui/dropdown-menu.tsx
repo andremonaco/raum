@@ -52,7 +52,7 @@ export const DropdownMenuContent = <T extends ValidComponent = "div">(
     <DropdownMenuPrimitive.Content
       data-slot="dropdown-menu-content"
       class={cx(
-        "bg-popover text-popover-foreground floating-surface data-[expanded]:animate-in data-[closed]:animate-out data-[closed]:fade-out-0 data-[expanded]:fade-in-0 data-[closed]:zoom-out-95 data-[expanded]:zoom-in-95 z-50 min-w-[8rem] origin-(--kb-menu-content-transform-origin) overflow-x-hidden overflow-y-auto rounded-xl border border-border p-1 outline-none",
+        "bg-popover text-popover-foreground floating-surface data-[expanded]:animate-in data-[closed]:animate-out data-[closed]:fade-out-0 data-[expanded]:fade-in-0 data-[closed]:zoom-out-95 data-[expanded]:zoom-in-95 z-50 min-w-[8rem] origin-(--kb-menu-content-transform-origin) overflow-x-hidden overflow-y-auto rounded-xl border border-border-subtle p-1 outline-none",
         "[[data-popper-positioner][style*='--kb-popper-content-transform-origin:_top']>[data-slot=dropdown-menu-content]]:slide-in-from-top-2 [[data-popper-positioner][style*='--kb-popper-content-transform-origin:_bottom']>[data-slot=dropdown-menu-content]]:slide-in-from-bottom-2 [[data-popper-positioner][style*='--kb-popper-content-transform-origin:_left']>[data-slot=dropdown-menu-content]]:slide-in-from-left-2 [[data-popper-positioner][style*='--kb-popper-content-transform-origin:_right']>[data-slot=dropdown-menu-content]]:slide-in-from-right-2",
         props.class,
       )}
@@ -79,7 +79,16 @@ export const DropdownMenuItem = <T extends ValidComponent = "div">(
       data-inset={props.inset}
       data-variant={props.variant}
       class={cx(
-        "data-[highlighted]:bg-accent data-[highlighted]:text-accent-foreground data-[variant=destructive]:text-destructive data-[variant=destructive]:data-[highlighted]:bg-destructive/10 dark:data-[variant=destructive]:data-[highlighted]:bg-destructive/20 data-[variant=destructive]:data-[highlighted]:text-destructive data-[variant=destructive]:*:[svg]:!text-destructive [&_svg:not([class*='text-'])]:text-muted-foreground relative flex cursor-default items-center gap-2 rounded-sm px-2 py-1.5 text-sm outline-hidden select-none data-[disabled]:pointer-events-none data-[disabled]:opacity-50 data-[inset]:pl-8 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
+        "relative flex cursor-default items-center gap-2 rounded-md px-2 py-1.5 text-xs outline-hidden select-none",
+        "data-[highlighted]:bg-hover data-[highlighted]:text-foreground",
+        "data-[variant=destructive]:text-destructive",
+        "data-[variant=destructive]:data-[highlighted]:bg-destructive/12 data-[variant=destructive]:data-[highlighted]:text-destructive",
+        "data-[variant=destructive]:*:[svg]:!text-destructive",
+        "[&_svg:not([class*='text-'])]:text-foreground-subtle",
+        "data-[disabled]:pointer-events-none data-[disabled]:opacity-45",
+        "data-[inset]:pl-8",
+        "[&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
+        "transition-colors duration-[var(--motion-fast)] ease-[var(--motion-ease)]",
         props.class,
       )}
       {...rest}
@@ -99,7 +108,7 @@ export const DropdownMenuSeparator = <T extends ValidComponent = "hr">(
   return (
     <DropdownMenuPrimitive.Separator
       data-slot="dropdown-menu-separator"
-      class={cx("bg-border -mx-1 my-1 h-px", props.class)}
+      class={cx("bg-border-subtle -mx-1 my-1 h-px", props.class)}
       {...rest}
     />
   );
@@ -113,7 +122,7 @@ export const DropdownMenuShortcut = (props: DropdownMenuShortcutProps) => {
   return (
     <span
       data-slot="dropdown-menu-shortcut"
-      class={cx("text-muted-foreground ml-auto text-xs tracking-widest", props.class)}
+      class={cx("text-foreground-subtle ml-auto text-[10px] tracking-widest", props.class)}
       {...rest}
     />
   );

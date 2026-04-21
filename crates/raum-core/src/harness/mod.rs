@@ -24,6 +24,7 @@ pub mod channel;
 pub mod claude_code;
 pub mod codex;
 pub mod event;
+pub mod hook_script;
 pub mod opencode;
 pub mod opencode_reply;
 pub mod opencode_sse;
@@ -36,13 +37,13 @@ pub use claude_code::ClaudeCodeAdapter;
 pub use codex::CodexAdapter;
 pub use event::{
     NotificationEvent, NotificationKind, PermissionRequestId, Reliability, SourceId,
-    classify_notification_kind,
+    classify_notification_event, classify_notification_kind, decode_payload,
 };
 pub use opencode::OpenCodeAdapter;
 pub use reply::{Decision, PermissionReplier, ReplyError, ReplyMode};
 pub use setup::{
-    ActionOutcome, ActionReport, SelftestReport, SetupAction, SetupContext, SetupError,
-    SetupExecutor, SetupPlan, SetupReport,
+    ActionOutcome, ActionReport, ConfigPathEntry, ConfigScope, ScanReport, SelftestReport,
+    SetupAction, SetupContext, SetupError, SetupExecutor, SetupPlan, SetupReport,
 };
 pub use traits::{
     HarnessIdentity, HarnessRuntime, LaunchOverrides, NotificationSetup, SessionSpec,

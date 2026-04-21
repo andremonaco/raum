@@ -1,28 +1,34 @@
 /**
- * §10 — `<TerminalGrid>` Solid component.
+ * <TerminalGrid> — BSP split-tree terminal grid with persistent panes.
  *
- * Wraps Gridstack via `lib/gridstackAdapter`. Each cell renders a
- * `<TerminalPane>` (owned by Wave 3A). Geometry is driven by
- * `runtimeLayoutStore`; drags and resizes patch that store in-memory and
- * never mutate `layouts.toml` directly (§10.6). The "Save" toolbar wires to
- * `layoutPresetStore.savePreset` which takes care of the 500 ms debounce.
+ * Architecture:
+ *   - **Pane layer** — a single flat `<For each={cells}>` keyed on pane id.
+ *     Each `<LeafFrame>` is positioned absolutely via percentage coords
+ *     derived from the tree projection (`x/y/w/h` on a 10 000-unit grid,
+ *     divided by 100 for CSS `%`). Because panes stay at the same DOM
+ *     position across any layout mutation, xterm instances persist and tmux
+ *     sessions keep streaming. Only `top/left/width/height` changes — like
+ *     gridstack did, but with arbitrary asymmetric geometry.
+ *   - **Divider layer** — `<DividerLayer>` walks the tree and overlays one
+ *     draggable divider between every pair of adjacent siblings at every
+ *     split. Coordinates also in percentage-of-root, so the browser layout
+ *     engine keeps dividers aligned with panes on window resize.
+ *   - **DnD layer** — drop zones + drag ghost rendered above both when a
+ *     drag is in flight (driven by `dragState()` in `lib/paneDnD.ts`).
  *
- * Maximize support (§10.7.1): double-clicking the pane *chrome* (the border
- * handle, NOT the xterm body) toggles maximize. When maximized, siblings are
- * hidden via `hidden` class on their gridstack item. Maximize is
- * volatile — not persisted across worktree switches — and lives in the
- * runtime store.
- *
- * Focus hotkeys (§10.7) dispatch `focus-pane-<n>` / `cycle-focus-*` actions
- * through window `CustomEvent`s that the Wave 3E keymap provider also emits;
- * we catch both paths here.
- *
- * Tmux resize (§10.8) is handled exclusively by `<TerminalPane>` via its
- * internal `ResizeObserver` + FitAddon. The grid used to also push an
- * approximate `terminal_resize` on `onResizeStop`, but that raced the pane's
- * measurement and drove Ink-based harnesses (Claude Code, Codex, OpenCode) to
- * repaint their banner at the wrong size first — stacking duplicates in
- * scrollback. Single resize path = single SIGWINCH per settle.
+ * Gestures (all drag & drop):
+ *   - Drag pane header → 5-zone overlay on the hovered target:
+ *       • outer 20% rim on each side → split in that direction
+ *       • middle 60% → swap pane contents
+ *     Drop near the grid's outer edge (within 24 px) → the whole tree gets
+ *     wrapped, so the dragged pane becomes a top-level column/row — this is
+ *     how you build the `o/u | i` layout.
+ *   - Drag divider between siblings → resize adjacent panes with rAF
+ *     throttling; double-click divider → reset to 50/50.
+ *   - Double-click pane header → maximize/restore.
+ *   - Spawn event → splits the focused pane along its longer axis; nothing
+ *     else is disturbed.
+ *   - Close pane → collapses the tree; the sibling absorbs freed space.
  */
 
 import {
@@ -39,156 +45,78 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 
 import { TerminalPane } from "./terminal-pane";
-import { initGrid, onChange, type GridHandle } from "../lib/gridstackAdapter";
+import { DividerLayer } from "./divider-layer";
 import {
   addCellTab,
   cycleFocus,
   focusedPaneId,
   focusPaneByIndex,
+  LAYOUT_UNIT,
   maximizedPaneId,
   minimizedPaneIds,
+  movePaneToEdge,
+  movePaneToRootEdge,
   nextCellId,
   nextTabId,
-  patchGeometry,
-  removeCell,
   removeCellTab,
+  removePane,
   runtimeLayoutStore,
   setActiveTabId,
   setFocusedPaneId,
   setLastSnippet,
+  setTabLabel,
+  setTabAutoLabel,
   setTabSessionId,
-  snapshotPreset,
+  splitFocusedOrRoot,
+  swapPanes,
   toggleMaximize,
   toggleMinimize,
-  upsertCell,
+  type CellKind,
   type CellTab,
+  type PaneContent,
+  type RuntimeCell,
 } from "../stores/runtimeLayoutStore";
 import { agentStore } from "../stores/agentStore";
 import type { AgentState } from "../stores/agentStore";
+import { terminalStore } from "../stores/terminalStore";
+import { worktreesByProject } from "../stores/worktreeStore";
+import { kindDisplayLabel, type AgentKind } from "../lib/agentKind";
 import { AlertCircleIcon, CheckIcon, HARNESS_ICONS, LoaderIcon } from "./icons";
 import { activeProjectSlug } from "../stores/projectStore";
-import type { CellKind } from "../stores/layoutPresetStore";
-import { createPreset, layoutPresetStore, savePreset } from "../stores/layoutPresetStore";
 import { extractSnippet } from "../lib/terminalSnippet";
-import { MinimizedDock } from "./minimized-dock";
+import { Dock } from "./dock";
+import { beginDrag, dragState, ROOT_TARGET, type DropZone } from "../lib/paneDnD";
+import {
+  projectToRects,
+  removeLeaf,
+  splitAtLeaf,
+  splitAtRoot,
+  swapLeaves,
+  type Direction,
+  type LayoutNode,
+  type Rect,
+} from "../lib/layoutTree";
+import { resolveDisplayedTabLabel, resolveHarnessAutoLabel } from "../lib/terminalTabLabel";
 
-// ---- tiling layout ---------------------------------------------------------
+const KIND_LABELS: Record<string, string> = {
+  shell: "Shell",
+  "claude-code": "Claude Code",
+  codex: "Codex",
+  opencode: "OpenCode",
+  empty: "Empty",
+};
 
-/**
- * Compute a column-first tiling layout for N cells within a 12-column grid.
- *
- * Strategy: fill columns first (one row) until cell width would drop below
- * MIN_COL_UNITS (3), then add a second row, and so on. The last row always
- * stretches its cells to fill the full 12 units even when it has fewer cells
- * than the other rows.
- *
- * Examples:
- *   1 → 12×12          4 → 3×12 × 4 cols        7 → 3×6 × 4 + 4×6 × 3
- *   2 → 6×12 × 2 cols  5 → 4×6 × 3 + 6×6 × 2   8 → 3×6 × 4 + 3×6 × 4
- *   3 → 4×12 × 3 cols  6 → 4×6 × 3 × 2 rows     9 → 4×4 × 3 × 3 rows
- */
-const MIN_COL_UNITS = 3;
-
-interface CellGeom {
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-}
-
-function computeTilingLayout(N: number): CellGeom[] {
-  if (N === 0) return [];
-
-  // Find the fewest rows such that columns are at least MIN_COL_UNITS wide.
-  let rows = 1;
-  let cols = N;
-  for (let r = 1; r <= N; r++) {
-    const c = Math.ceil(N / r);
-    if (Math.floor(12 / c) >= MIN_COL_UNITS) {
-      rows = r;
-      cols = c;
-      break;
-    }
-  }
-
-  const result: CellGeom[] = [];
-
-  for (let i = 0; i < N; i++) {
-    const row = Math.floor(i / cols);
-    const col = i % cols;
-
-    // Last row may have fewer cells — stretch them to fill 12 units.
-    const cellsInRow = row === rows - 1 ? N - row * cols : cols;
-
-    const baseW = Math.floor(12 / cellsInRow);
-    const extraW = 12 % cellsInRow;
-    const w = baseW + (col < extraW ? 1 : 0);
-    const x = col * baseW + Math.min(col, extraW);
-
-    const baseH = Math.floor(12 / rows);
-    const extraH = 12 % rows;
-    const h = baseH + (row < extraH ? 1 : 0);
-    const y = row * baseH + Math.min(row, extraH);
-
-    result.push({ x, y, w, h });
-  }
-
-  return result;
-}
-
-/**
- * Apply a column-first tiling to all *visible* (non-minimized) runtime cells,
- * updating both the Solid store (via `patchGeometry`) and the live gridstack
- * widgets. Minimized cells are excluded so the grid fills the freed space.
- */
-function redistributeGrid(handle: import("../lib/gridstackAdapter").GridHandle | null): void {
-  const minimized = minimizedPaneIds();
-  const cells = runtimeLayoutStore.cells.filter((c) => !minimized.has(c.id));
-  const layout = computeTilingLayout(cells.length);
-  layout.forEach((geom, i) => {
-    const cell = cells[i];
-    if (!cell) return;
-    patchGeometry([{ id: cell.id, ...geom }]);
-    if (handle) {
-      const el = document.querySelector(`[data-cell-id="${cell.id}"]`) as HTMLElement | null;
-      if (el) {
-        try {
-          handle.grid.update(el, geom);
-        } catch {
-          /* best-effort: new cell widget not yet registered */
-        }
-      }
-    }
-  });
-}
+// ---- TerminalGrid ---------------------------------------------------------
 
 export const TerminalGrid: Component = () => {
-  // Host is a signal so the init effect re-runs the moment the ref callback
-  // assigns the DOM node. With a plain `let` the effect fired when cells
-  // transitioned 0 → 1 but the `<Show>` child hadn't painted yet, so the
-  // first spawn into an empty grid left gridstack uninitialised.
-  const [host, setHost] = createSignal<HTMLDivElement | null>(null);
-  const [handle, setHandle] = createSignal<GridHandle | null>(null);
-  const [saveName, setSaveName] = createSignal("");
-  const [saveError, setSaveError] = createSignal<string | null>(null);
+  const [rootEl, setRootEl] = createSignal<HTMLDivElement | null>(null);
 
-  // Cells that are visible (not minimized). Used to decide when to show the
-  // spawn-button overlay — it appears both when there are no cells at all and
-  // when every cell is currently minimized to the dock.
   const visibleCells = createMemo(() => {
     const minimized = minimizedPaneIds();
     return runtimeLayoutStore.cells.filter((c) => !minimized.has(c.id));
   });
 
-  // Fetch once which harnesses are installed. Shell is always available;
-  // the backend excludes it from the report, so we prepend it manually.
   type SpawnKind = "shell" | "claude-code" | "codex" | "opencode";
-  const LABELS: Record<SpawnKind, string> = {
-    shell: "Shell",
-    "claude-code": "Claude Code",
-    codex: "Codex",
-    opencode: "OpenCode",
-  };
   const [availableKinds] = createResource<SpawnKind[]>(async () => {
     try {
       const report = await invoke<{ harnesses: { kind: SpawnKind; found: boolean }[] }>(
@@ -201,55 +129,9 @@ export const TerminalGrid: Component = () => {
     }
   });
 
-  // Gridstack lifecycle. The host div is wrapped in `<Show when=cells.length>0>`,
-  // so it unmounts when the last cell closes and remounts on the next spawn.
-  // We must tear down the grid when the host goes away — otherwise the stale
-  // `handle` blocks re-init on the fresh host, and new cells render without
-  // gridstack styles (tiny box in the top-left corner).
-  let cleanupGrid: (() => void) | null = null;
-  createEffect(() => {
-    const hasCells = runtimeLayoutStore.cells.length > 0;
-    const el = host();
-    const h = handle();
+  const canSpawnKind = (kind: SpawnKind): boolean => kind === "shell" || !!activeProjectSlug();
 
-    // Teardown: host unmounted or grid emptied while a handle is live.
-    if (h && (!hasCells || !el)) {
-      cleanupGrid?.();
-      cleanupGrid = null;
-      setHandle(null);
-      return;
-    }
-
-    // Init: first cell after empty, host is mounted, no live handle.
-    if (!hasCells || !el || h) return;
-
-    const newH = initGrid(el);
-    if (!newH) return;
-    setHandle(newH);
-
-    const unsubChange = onChange(newH, (cells) => {
-      // Runtime store is the source of truth; gridstack reports new geometry
-      // after a drag or resize settles. Patch only geometry (not kind).
-      //
-      // Resize-to-tmux lives in `<TerminalPane>`'s ResizeObserver: it measures
-      // xterm post-fit and pushes accurate cols/rows. A grid-level approximate
-      // `terminal_resize` here would race the pane's measurement and deliver
-      // wrong-size SIGWINCH to the harness — Ink-based TUIs repaint their
-      // banner on every SIGWINCH, which is how the glitchy-banner bug shows up.
-      patchGeometry(cells);
-    });
-    cleanupGrid = () => {
-      unsubChange();
-      newH.destroy();
-    };
-  });
-  onCleanup(() => {
-    cleanupGrid?.();
-    cleanupGrid = null;
-  });
-
-  // §10.7 — focus pane hotkeys via CustomEvent. Wave 3E dispatches
-  // `raum-action` with action name; we listen for the ones we own.
+  // Focus / cycle / maximize hotkeys dispatched by the keymap provider.
   onMount(() => {
     function onAction(ev: Event) {
       const action = (ev as CustomEvent<string>).detail;
@@ -270,16 +152,8 @@ export const TerminalGrid: Component = () => {
     onCleanup(() => window.removeEventListener("raum-action", onAction));
   });
 
-  // §8.2 — top-row spawn buttons dispatch `raum:spawn-requested` with the
-  // harness kind + active project/worktree context. We materialise it into a
-  // new runtime cell; `<TerminalPane>` will then call `terminal_spawn` once
-  // it mounts.
-  //
-  // Placement: column-first tiling. Cells fill horizontally first (multiple
-  // columns, one row) until the minimum column width (3 units) would be
-  // exceeded, then a second row is added. Every cell always covers the full
-  // grid area — no wasted space. The last row stretches its cells to fill
-  // the remaining 12 units even if it has fewer cells than the other rows.
+  // New-terminal spawn: split the focused pane along its longer axis, or
+  // seed the tree if empty. Never redistributes the existing layout.
   onMount(() => {
     function onSpawn(ev: Event) {
       const detail = (
@@ -290,559 +164,574 @@ export const TerminalGrid: Component = () => {
         }>
       ).detail;
       if (!detail || !detail.kind || detail.kind === "empty") return;
+      if (detail.kind !== "shell" && !detail.projectSlug) return;
 
       const id = nextCellId();
       const tabId = nextTabId();
-      // Insert new cell with a placeholder geometry first so the store
-      // includes it in the count before we compute the layout.
-      upsertCell({
+      const newPane: PaneContent = {
         id,
-        x: 0,
-        y: 0,
-        w: 12,
-        h: 1,
         kind: detail.kind,
         tabs: [{ id: tabId }],
         activeTabId: tabId,
         projectSlug: detail.projectSlug,
         worktreeId: detail.worktreeId,
-      });
-
-      redistributeGrid(handle());
+      };
+      splitFocusedOrRoot(newPane);
       setFocusedPaneId(id);
     }
     window.addEventListener("raum:spawn-requested", onSpawn);
     onCleanup(() => window.removeEventListener("raum:spawn-requested", onSpawn));
   });
 
-  // §10.7.1 — `hidden` siblings are driven by class; reflect maximize state
-  // onto the host element data attribute so CSS can hide siblings.
-  createEffect(() => {
-    const el = host();
-    if (!el) return;
-    const maxId = maximizedPaneId();
-    el.dataset.maximized = maxId ?? "";
-  });
-
-  function onSaveAsNew(): void {
-    const name = saveName().trim();
-    if (!name) {
-      setSaveError("name required");
-      return;
-    }
-    const res = createPreset(snapshotPreset(name));
-    if (!res.ok) {
-      setSaveError(res.error ?? "failed to save preset");
-      return;
-    }
-    setSaveError(null);
-    setSaveName("");
-  }
-
-  function onSaveCurrent(): void {
-    const source = runtimeLayoutStore.sourcePreset;
-    if (!source) {
-      setSaveError("no current preset — use 'Save as new'");
-      return;
-    }
-    savePreset(snapshotPreset(source));
-    setSaveError(null);
-  }
-
-  // Restore a minimized pane: mark as no longer minimized in the store first,
-  // then dispatch to GridCell (which holds the `itemRef` needed for makeWidget).
   function onRestoreFromDock(cellId: string): void {
     toggleMinimize(cellId);
-    window.dispatchEvent(new CustomEvent("raum:restore-cell", { detail: { cellId } }));
+    setFocusedPaneId(cellId);
   }
+
+  // Drive --drag-dx / --drag-dy on the grid root from the drag pointer.
+  // The source pane's transform reads these via CSS var inheritance so the
+  // pane literally follows the cursor 1:1, with zero Solid re-renders on
+  // the pane layer — only the root's inline style changes per pointermove.
+  createEffect(() => {
+    const s = dragState();
+    const root = rootEl();
+    if (!root) return;
+    if (s) {
+      root.style.setProperty("--drag-dx", `${s.pointerX - s.startPointerX}px`);
+      root.style.setProperty("--drag-dy", `${s.pointerY - s.startPointerY}px`);
+    } else {
+      root.style.removeProperty("--drag-dx");
+      root.style.removeProperty("--drag-dy");
+    }
+  });
+
+  // LIVE-PREVIEW TREE.
+  //
+  // As the user hovers over a drop zone, replay the would-be mutation
+  // *locally* using the same pure tree ops that the commit path uses. Panes
+  // then render at their projected positions, so the grid reflows under
+  // the cursor and the user sees the final layout before releasing. Nothing
+  // touches the real store until pointerup — if the user drifts away from
+  // the zone, the preview clears and the real layout is untouched.
+  //
+  // Mutation replay mirrors onDrop exactly (swap vs. split, root vs. pane).
+  const previewTree = createMemo<LayoutNode | null>(() => {
+    const s = dragState();
+    const base = runtimeLayoutStore.tree;
+    if (!s || !s.targetId || !s.zone || !base) return null;
+    if (s.sourceId === s.targetId) return null;
+
+    if (s.zone === "center") {
+      if (s.targetId === ROOT_TARGET) return null;
+      return swapLeaves(base, s.sourceId, s.targetId);
+    }
+
+    const direction = zoneToDirection(s.zone);
+    if (!direction) return null;
+    const removed = removeLeaf(base, s.sourceId);
+    if (!removed) return null;
+    const newLeaf: LayoutNode = { kind: "leaf", id: s.sourceId };
+    return s.targetId === ROOT_TARGET
+      ? splitAtRoot(removed, direction, newLeaf)
+      : splitAtLeaf(removed, s.targetId, direction, newLeaf);
+  });
+
+  // Projected cell geometry keyed by pane id. Each LeafFrame looks up its
+  // own id and renders at that position while preview is active.
+  const previewCellMap = createMemo<Map<string, Rect> | null>(() => {
+    const pt = previewTree();
+    if (!pt) return null;
+    const rects = projectToRects(pt, LAYOUT_UNIT);
+    return new Map(rects.map((r) => [r.id, r]));
+  });
+
+  // Tree passed to DividerLayer — preview while hovering a zone so dividers
+  // reflow with the panes (otherwise they'd be stuck at pre-drag positions
+  // while panes animate to projected ones). Falls back to the real tree.
+  const renderTree = createMemo<LayoutNode | null>(() => previewTree() ?? runtimeLayoutStore.tree);
 
   return (
     <div class="flex h-full w-full flex-col">
-      <Toolbar
-        saveName={saveName()}
-        onSaveNameChange={(v) => setSaveName(v)}
-        onSaveAsNew={onSaveAsNew}
-        onSaveCurrent={onSaveCurrent}
-        sourcePreset={runtimeLayoutStore.sourcePreset}
-        saveError={saveError()}
-        presetCount={layoutPresetStore.presets.length}
-      />
-      <div class="relative flex-1 min-h-0">
-        {/* Spawn-button grid: shown when there are no visible cells — either
-            because none have been created yet, or because every cell is
-            currently minimized to the dock. Rendered as an absolute overlay so
-            the gridstack host (and the xterm instances inside it) stays mounted
-            whenever cells exist, preserving live terminal sessions. */}
-        <Show when={visibleCells().length === 0}>
-          <div
-            class="absolute inset-0 z-10 grid h-full w-full gap-px bg-zinc-800/30"
-            style={{
-              "grid-template-columns": `repeat(${Math.min(availableKinds()?.length ?? 1, 2)}, 1fr)`,
-            }}
-          >
-            <For each={availableKinds() ?? []}>
-              {(kind) => {
-                const Icon = HARNESS_ICONS[kind];
-                return (
-                  <button
-                    type="button"
-                    class="group flex flex-col items-center justify-center gap-3 bg-zinc-950 text-zinc-600 transition-colors hover:bg-zinc-900 hover:text-zinc-300"
-                    onClick={() =>
-                      window.dispatchEvent(
-                        new CustomEvent("raum:spawn-requested", {
-                          detail: { kind, projectSlug: activeProjectSlug() },
-                        }),
-                      )
-                    }
-                  >
-                    <Icon class="size-7 transition-transform group-hover:scale-110" />
-                    <span class="text-[11px] uppercase tracking-widest">{LABELS[kind]}</span>
-                  </button>
-                );
+      {/* The grid canvas fills the entire main region with zero outer
+          padding — the chrome (top-row, sidebar, dock) is `bg-background`
+          and the canvas is `var(--selected)`, so the colour contrast IS the
+          visual separation, no padding moat required. This keeps the gap
+          between the top-row buttons and the canvas equal to the top-row's
+          own internal slack (≈6 px above buttons, 6 px below = canvas top),
+          and matches the canvas's left/right/bottom against sidebar/right
+          edge/dock with the same hairline contrast on every side. */}
+      <div class="flex-1 min-h-0 overflow-hidden bg-background">
+        <div
+          class="relative h-full w-full overflow-hidden rounded-xl"
+          ref={setRootEl}
+          data-dnd-root="true"
+        >
+          {/* Empty-state spawn button grid. */}
+          <Show when={visibleCells().length === 0}>
+            <div
+              class="absolute inset-0 z-10 grid h-full w-full gap-px bg-border-subtle"
+              style={{
+                "grid-template-columns": `repeat(${Math.min(availableKinds()?.length ?? 1, 2)}, 1fr)`,
+              }}
+            >
+              <For each={availableKinds() ?? []}>
+                {(kind) => {
+                  const Icon = HARNESS_ICONS[kind];
+                  const disabled = () => !canSpawnKind(kind);
+                  return (
+                    <button
+                      type="button"
+                      class="group flex flex-col items-center justify-center gap-3 bg-surface-sunken text-foreground-dim transition-colors duration-[var(--motion-base)] ease-[var(--motion-ease)] hover:bg-hover hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-surface-sunken disabled:hover:text-foreground-dim"
+                      disabled={disabled()}
+                      title={disabled() ? "Add a project before spawning a harness" : undefined}
+                      onClick={() => {
+                        if (disabled()) return;
+                        window.dispatchEvent(
+                          new CustomEvent("raum:spawn-requested", {
+                            detail: { kind, projectSlug: activeProjectSlug() },
+                          }),
+                        );
+                      }}
+                    >
+                      <Icon class="size-7 transition-transform group-hover:scale-110" />
+                      <span class="text-[11px] uppercase tracking-widest">{KIND_LABELS[kind]}</span>
+                    </button>
+                  );
+                }}
+              </For>
+            </div>
+          </Show>
+
+          {/* PANE LAYER: flat absolute-positioned leaves keyed by id. Only
+            position/size changes on layout mutations; the xterm inside each
+            stays mounted. While a drag is hovering a valid drop zone, every
+            non-dragging pane renders at its PREVIEW position; the dragging
+            pane stays anchored at its original slot so the cursor-follow
+            transform (translate by pointer-delta) stays coherent. */}
+          <Show when={runtimeLayoutStore.cells.length > 0}>
+            <For each={runtimeLayoutStore.cells}>
+              {(cell) => {
+                const effective = createMemo<RuntimeCell>(() => {
+                  const map = previewCellMap();
+                  if (!map) return cell;
+                  // The dragging pane floats at the cursor — keep its CSS
+                  // base at its original slot so translate(pointer-delta)
+                  // positions it correctly. Other panes follow the preview.
+                  if (dragState()?.sourceId === cell.id) return cell;
+                  const projected = map.get(cell.id);
+                  if (!projected) return cell;
+                  return {
+                    ...cell,
+                    x: projected.x,
+                    y: projected.y,
+                    w: projected.w,
+                    h: projected.h,
+                  };
+                });
+                return <LeafFrame cell={effective()} />;
               }}
             </For>
-          </div>
-        </Show>
-        {/* Gridstack host: kept mounted whenever cells exist (even if all are
-            minimized) so xterm instances stay alive and can be restored without
-            re-spawning a new process. */}
-        <Show when={runtimeLayoutStore.cells.length > 0}>
-          <div ref={setHost} class="grid-stack terminal-grid-host h-full w-full overflow-hidden">
-            <For each={runtimeLayoutStore.cells}>
-              {(cell) => (
-                <GridCell
-                  id={cell.id}
-                  x={cell.x}
-                  y={cell.y}
-                  w={cell.w}
-                  h={cell.h}
-                  kind={cell.kind}
-                  title={cell.title}
-                  tabs={cell.tabs}
-                  activeTabId={cell.activeTabId}
-                  projectSlug={cell.projectSlug}
-                  worktreeId={cell.worktreeId}
-                  handle={handle}
-                />
-              )}
-            </For>
-          </div>
-        </Show>
-      </div>
-      <MinimizedDock onRestore={onRestoreFromDock} />
-      <style>{`
-        .terminal-grid-host[data-maximized]:not([data-maximized=""]) .grid-stack-item:not([data-cell-id=""]) {
-          visibility: hidden;
-        }
-        .terminal-grid-host[data-maximized]:not([data-maximized=""]) .grid-stack-item[data-maximized-self="true"] {
-          visibility: visible !important;
-          position: absolute !important;
-          inset: 0 !important;
-          width: 100% !important;
-          height: 100% !important;
-          z-index: 20;
-        }
-      `}</style>
-    </div>
-  );
-};
-
-// ---- toolbar ---------------------------------------------------------------
-
-interface ToolbarProps {
-  saveName: string;
-  onSaveNameChange: (v: string) => void;
-  onSaveAsNew: () => void;
-  onSaveCurrent: () => void;
-  sourcePreset: string | null;
-  saveError: string | null;
-  presetCount: number;
-}
-
-const Toolbar: Component<ToolbarProps> = (props) => {
-  return (
-    <div class="flex shrink-0 items-center gap-2 border-b border-zinc-800 bg-zinc-950/70 px-2 py-1 text-xs text-zinc-400">
-      <span class="shrink-0 uppercase tracking-wide text-zinc-500">Grid</span>
-      <Show when={props.sourcePreset}>
-        <span class="rounded bg-zinc-900 px-1.5 py-0.5 text-[10px] text-zinc-300">
-          preset: {props.sourcePreset}
-        </span>
-      </Show>
-      <div class="ml-auto flex items-center gap-1">
-        <button
-          type="button"
-          class="rounded px-2 py-0.5 text-xs hover:bg-zinc-900 disabled:opacity-40"
-          onClick={() => props.onSaveCurrent()}
-          disabled={!props.sourcePreset}
-          title={props.sourcePreset ? `Save to '${props.sourcePreset}'` : "No current preset"}
-        >
-          Save
-        </button>
-        <input
-          type="text"
-          class="w-36 rounded border border-zinc-800 bg-zinc-900 px-1 py-0.5 text-xs text-zinc-200"
-          placeholder="New preset name…"
-          value={props.saveName}
-          onInput={(e) => props.onSaveNameChange(e.currentTarget.value)}
-        />
-        <button
-          type="button"
-          class="rounded bg-zinc-800 px-2 py-0.5 text-xs text-zinc-200 hover:bg-zinc-700 disabled:opacity-40"
-          onClick={() => props.onSaveAsNew()}
-          disabled={props.saveName.trim().length === 0}
-        >
-          Save as new
-        </button>
-        <span class="ml-1 text-[10px] text-zinc-500">({props.presetCount})</span>
-      </div>
-      <Show when={props.saveError}>
-        <span class="ml-2 text-[10px] text-red-400">{props.saveError}</span>
-      </Show>
-    </div>
-  );
-};
-
-// ---- single grid cell ------------------------------------------------------
-
-interface GridCellProps {
-  id: string;
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-  kind: string;
-  title: string | undefined;
-  tabs: CellTab[];
-  activeTabId: string;
-  projectSlug: string | undefined;
-  worktreeId: string | undefined;
-  handle: () => GridHandle | null;
-}
-
-const GridCell: Component<GridCellProps> = (props) => {
-  let itemRef: HTMLDivElement | undefined;
-
-  const isMaximized = () => maximizedPaneId() === props.id;
-  const isFocused = () => focusedPaneId() === props.id;
-
-  // Track whether this cell's DOM element is registered in gridstack.
-  let inGrid = false;
-
-  // Register with gridstack once the handle is available. We run this as an
-  // effect so the order (parent onMount → child onMount) doesn't matter.
-  createEffect(() => {
-    const h = props.handle();
-    if (!h || !itemRef || inGrid) return;
-    try {
-      h.grid.makeWidget(itemRef);
-      inGrid = true;
-    } catch (err) {
-      console.warn("[TerminalGrid] makeWidget failed", err);
-    }
-  });
-  onCleanup(() => {
-    const h = props.handle();
-    if (!h || !itemRef || !inGrid) return;
-    try {
-      // `removeDOM=false` because Solid has already removed the element.
-      h.grid.removeWidget(itemRef, false);
-    } catch {
-      /* best-effort */
-    }
-  });
-
-  // raum:minimize-cell — snapshot was already stored by PaneHeader; here we
-  // remove the widget from gridstack and hide the element imperatively so the
-  // timing is correct (Solid's reactive display update is a microtask, but
-  // gridstack must see the element still visible when removeWidget is called).
-  // raum:restore-cell  — make the element visible first, re-register with
-  // gridstack, then redistribute the layout.
-  onMount(() => {
-    function onMinimizeCell(ev: Event) {
-      const detail = (ev as CustomEvent<{ cellId: string }>).detail;
-      if (detail?.cellId !== props.id) return;
-      const h = props.handle();
-      if (h && itemRef && inGrid) {
-        try {
-          h.grid.removeWidget(itemRef, false);
-        } catch {
-          /* best-effort */
-        }
-        inGrid = false;
-      }
-      if (itemRef) itemRef.style.display = "none";
-      redistributeGrid(h);
-    }
-
-    function onRestoreCell(ev: Event) {
-      const detail = (ev as CustomEvent<{ cellId: string }>).detail;
-      if (detail?.cellId !== props.id) return;
-      const h = props.handle();
-      // Make visible before makeWidget so gridstack can measure the element.
-      if (itemRef) itemRef.style.display = "";
-      if (h && itemRef && !inGrid) {
-        // Stamp fresh gs-* attributes from the store so makeWidget reads valid
-        // geometry even if gridstack cleared them during the previous removeWidget.
-        const stored = runtimeLayoutStore.cells.find((c) => c.id === props.id);
-        if (stored) {
-          itemRef.setAttribute("gs-x", String(stored.x));
-          itemRef.setAttribute("gs-y", String(stored.y));
-          itemRef.setAttribute("gs-w", String(stored.w));
-          itemRef.setAttribute("gs-h", String(stored.h));
-        }
-        try {
-          h.grid.makeWidget(itemRef);
-          inGrid = true;
-        } catch (err) {
-          console.warn("[TerminalGrid] makeWidget on restore failed", err);
-        }
-      }
-      redistributeGrid(h);
-    }
-
-    window.addEventListener("raum:minimize-cell", onMinimizeCell);
-    window.addEventListener("raum:restore-cell", onRestoreCell);
-    onCleanup(() => {
-      window.removeEventListener("raum:minimize-cell", onMinimizeCell);
-      window.removeEventListener("raum:restore-cell", onRestoreCell);
-    });
-  });
-
-  // Mirror maximize state onto a data-attribute so the host's CSS selector
-  // above can hide siblings.
-  createEffect(() => {
-    if (!itemRef) return;
-    itemRef.dataset.maximizedSelf = isMaximized() ? "true" : "";
-    itemRef.dataset.cellId = props.id;
-  });
-
-  // §10.7.1 — capture-phase dblclick so xterm can't swallow the event.
-  // stopPropagation prevents xterm word-selection from firing simultaneously.
-  onMount(() => {
-    if (!itemRef) return;
-    const el = itemRef;
-    function handleDblClick(e: MouseEvent) {
-      e.stopPropagation();
-      e.preventDefault();
-      toggleMaximize(props.id);
-    }
-    el.addEventListener("dblclick", handleDblClick, true);
-    onCleanup(() => el.removeEventListener("dblclick", handleDblClick, true));
-  });
-
-  function onFocusCapture() {
-    setFocusedPaneId(props.id);
-  }
-
-  return (
-    <div
-      ref={(el) => (itemRef = el)}
-      class="grid-stack-item"
-      gs-id={props.id}
-      gs-x={String(props.x)}
-      gs-y={String(props.y)}
-      gs-w={String(props.w)}
-      gs-h={String(props.h)}
-      data-cell-id={props.id}
-      onFocusIn={onFocusCapture}
-      onClick={onFocusCapture}
-    >
-      <div
-        class="grid-stack-item-content flex flex-col overflow-hidden rounded-lg bg-zinc-950 shadow-lg shadow-black/60 ring-1 ring-white/[0.08]"
-        classList={{ "pane-selected": isFocused() }}
-      >
-        <PaneHeader
-          id={props.id}
-          kind={props.kind}
-          title={props.title}
-          tabs={props.tabs}
-          activeTabId={props.activeTabId}
-          isMaximized={isMaximized()}
-          handle={props.handle}
-        />
-        {/* Body is always rendered (no <Show>) so xterm stays mounted while the
-            cell is minimized. Visibility is controlled imperatively via the
-            outer grid-stack-item's display style in the event handlers above. */}
-        <div class="relative min-h-0 min-w-0 flex-1 overflow-hidden">
-          <Show
-            when={props.kind !== "empty"}
-            fallback={
-              <div class="grid h-full w-full place-items-center text-xs text-zinc-600">empty</div>
-            }
-          >
-            <For each={props.tabs}>
-              {(tab) => (
-                <div
-                  class="absolute inset-0"
-                  style={{
-                    visibility: tab.id === props.activeTabId ? "visible" : "hidden",
-                  }}
-                >
-                  <TerminalPane
-                    kind={props.kind as Parameters<typeof TerminalPane>[0]["kind"]}
-                    sessionId={tab.sessionId}
-                    projectSlug={props.projectSlug}
-                    worktreeId={props.worktreeId}
-                    borderColor="transparent"
-                    onSpawned={(sid) => setTabSessionId(props.id, tab.id, sid)}
-                    onRequestClose={async () => {
-                      try {
-                        if (tab.sessionId) {
-                          await invoke("terminal_kill", {
-                            sessionId: tab.sessionId,
-                          });
-                        }
-                      } catch (e) {
-                        console.warn("[GridCell] terminal_kill on exit failed", e);
-                      }
-                      removeCellTab(props.id, tab.id);
-                      const stillExists = runtimeLayoutStore.cells.some((c) => c.id === props.id);
-                      if (!stillExists) redistributeGrid(props.handle());
-                    }}
-                  />
-                </div>
-              )}
-            </For>
           </Show>
+
+          {/* DIVIDER LAYER: overlay that reads the tree separately. During
+            drag we feed it the preview tree so dividers reflow with the
+            panes instead of being left behind at pre-drag positions. */}
+          <DividerLayer tree={renderTree()} />
+
+          {/* No drop-zone or landing overlays. The live reflow of the grid
+            under the cursor *is* the feedback; extra overlay layers caused
+            continuous repaints on the xterm canvases beneath them. */}
         </div>
       </div>
+      <Dock onRestore={onRestoreFromDock} />
     </div>
   );
 };
 
 export default TerminalGrid;
 
-// ---- per-cell chrome header -----------------------------------------------
+// ---- AutoLabelBinder: synthesizes the tab autoLabel ------------------------
+//
+// Harness panes: react to the backend's live tmux pane/window title stream
+// and prefer the richest title the inner CLI publishes. When tmux only
+// exposes generic names (for example `node` or a bare version), fall back to
+// the existing `kind · project/branch` synthesis from raum-side state.
+//
+// Shell panes: the inner command/cwd IS the interesting signal, so this does
+// poll `terminal_pane_context` every 2 s and composes
+// `"Shell · <cwd-basename> · <command>"` (dropping the command when it equals
+// the login shell).
+//
+// Returns null — the effect is the side effect.
+
+const AUTO_LABEL_POLL_MS = 2000;
+const SHELL_IDLE_COMMANDS = new Set(["zsh", "bash", "fish", "sh", "-zsh", "-bash"]);
+
+interface AutoLabelBinderProps {
+  cellId: string;
+  tabId: string;
+  kind: CellKind;
+  projectSlug?: string;
+  worktreeId?: string;
+  sessionId?: string;
+}
+
+const AutoLabelBinder: Component<AutoLabelBinderProps> = (props) => {
+  const harnessFallbackLabel = createMemo(() => {
+    if (props.kind === "empty") return "Empty";
+    if (props.kind === "shell") return kindDisplayLabel("shell");
+    const kind = props.kind as AgentKind;
+    const slug = props.projectSlug;
+    const worktreePath = props.worktreeId;
+    const kindPart = kindDisplayLabel(kind);
+
+    let label = kindPart;
+    if (slug) {
+      const worktrees = worktreesByProject()[slug];
+      const wt = worktreePath ? worktrees?.find((w) => w.path === worktreePath) : undefined;
+      const branch =
+        wt?.branch ?? wt?.baseBranch ?? wt?.upstream?.replace(/^origin\//, "") ?? undefined;
+      return branch ? `${kindPart} · ${slug}/${branch}` : `${kindPart} · ${slug}`;
+    }
+
+    return label;
+  });
+
+  const livePaneContext = createMemo(() =>
+    props.sessionId ? terminalStore.byId[props.sessionId]?.paneContext : undefined,
+  );
+
+  // Harness-pane branch: react to the live tmux pane/window titles, but keep
+  // the raum-side project/branch label as a fallback whenever tmux only
+  // exposes generic process names.
+  createEffect(() => {
+    if (props.kind === "shell" || props.kind === "empty") return;
+    const sid = props.sessionId;
+    const fallback = harnessFallbackLabel();
+
+    if (!sid) {
+      setTabAutoLabel(props.cellId, props.tabId, fallback);
+      return;
+    }
+    const ctx = livePaneContext();
+    const label = resolveHarnessAutoLabel({
+      kind: props.kind as AgentKind,
+      paneTitle: ctx?.paneTitle,
+      windowName: ctx?.windowName,
+      currentCommand: ctx?.currentCommand,
+      fallbackLabel: fallback,
+    });
+    setTabAutoLabel(props.cellId, props.tabId, label);
+  });
+
+  // Shell-pane branch: tmux-polled context.
+  createEffect(() => {
+    if (props.kind !== "shell") return;
+    const sid = props.sessionId;
+    if (!sid) {
+      setTabAutoLabel(props.cellId, props.tabId, kindDisplayLabel("shell"));
+      return;
+    }
+
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const ctx = await invoke<{ currentCommand: string; currentPath: string }>(
+          "terminal_pane_context",
+          { sessionId: sid },
+        );
+        if (cancelled) return;
+        const basename = ctx.currentPath ? ctx.currentPath.split("/").pop() || "" : "";
+        const cmd = ctx.currentCommand.trim();
+        const showCmd = cmd && !SHELL_IDLE_COMMANDS.has(cmd);
+        const parts = ["Shell"];
+        if (basename) parts.push(basename);
+        if (showCmd) parts.push(cmd);
+        setTabAutoLabel(props.cellId, props.tabId, parts.join(" · "));
+      } catch {
+        /* non-fatal: keep the previous label */
+      }
+    };
+
+    void tick();
+    const timer = setInterval(tick, AUTO_LABEL_POLL_MS);
+    onCleanup(() => {
+      cancelled = true;
+      clearInterval(timer);
+    });
+  });
+
+  return null;
+};
+
+// ---- LeafFrame: absolute-positioned pane ----------------------------------
+
+const LeafFrame: Component<{ cell: RuntimeCell }> = (props) => {
+  const isMinimized = () => minimizedPaneIds().has(props.cell.id);
+  const isMaximized = () => maximizedPaneId() === props.cell.id;
+  const anyMaximized = () => maximizedPaneId() !== null;
+  const isFocused = () => focusedPaneId() === props.cell.id;
+  // Sample the source id once and memoize so every pointermove doesn't re-run
+  // this for every leaf. Only the source leaf toggles its .pane-dragging class.
+  const dragSourceId = createMemo(() => dragState()?.sourceId ?? null);
+  const isDragSource = () => dragSourceId() === props.cell.id;
+
+  function onFocusCapture(): void {
+    setFocusedPaneId(props.cell.id);
+  }
+
+  let cellRef: HTMLDivElement | undefined;
+
+  // Capture-phase dblclick so xterm can't swallow the event for word-selection.
+  // Covers both the header (empty space only — tabs own dblclick-to-rename)
+  // and the xterm body, so double-clicking anywhere on the pane maximizes it.
+  onMount(() => {
+    const el = cellRef;
+    if (!el) return;
+    function handleDblClick(e: MouseEvent) {
+      const target = e.target as HTMLElement | null;
+      if (target?.closest(".pane-header-tab")) return;
+      if (target?.closest(".pane-header-chrome-button")) return;
+      if (target?.closest("input")) return;
+      e.stopPropagation();
+      e.preventDefault();
+      toggleMaximize(props.cell.id);
+    }
+    el.addEventListener("dblclick", handleDblClick, true);
+    onCleanup(() => el.removeEventListener("dblclick", handleDblClick, true));
+  });
+
+  // CSS-variable positioning. The actual left/top/width/height are derived
+  // inside styles.css via `calc(var(--x-pct) + var(--inset))` so the same
+  // gutter arithmetic runs for panes, placeholders, and drop zones.
+  const style = () => {
+    const pct = 100 / LAYOUT_UNIT;
+    return {
+      "--x-pct": `${props.cell.x * pct}%`,
+      "--y-pct": `${props.cell.y * pct}%`,
+      "--w-pct": `${props.cell.w * pct}%`,
+      "--h-pct": `${props.cell.h * pct}%`,
+    };
+  };
+
+  return (
+    <div
+      ref={cellRef}
+      data-dnd-target-pane-id={props.cell.id}
+      data-cell-id={props.cell.id}
+      class="leaf-frame flex min-h-0 min-w-0 flex-col"
+      classList={{
+        "pane-selected": isFocused(),
+        "pane-dragging": isDragSource(),
+        "pane-maximized": isMaximized(),
+        hidden: isMinimized() || (anyMaximized() && !isMaximized()),
+      }}
+      style={style()}
+      onFocusIn={onFocusCapture}
+      onClick={onFocusCapture}
+    >
+      <PaneHeader
+        cellId={props.cell.id}
+        kind={props.cell.kind}
+        title={props.cell.title}
+        tabs={props.cell.tabs}
+        activeTabId={props.cell.activeTabId}
+        isMaximized={isMaximized()}
+      />
+      <div class="relative min-h-0 min-w-0 flex-1 overflow-hidden">
+        <Show
+          when={props.cell.kind !== "empty"}
+          fallback={
+            <div class="grid h-full w-full place-items-center text-xs text-foreground-dim">
+              empty
+            </div>
+          }
+        >
+          <For each={props.cell.tabs}>
+            {(tab) => (
+              <div
+                class="absolute inset-0"
+                style={{
+                  visibility: tab.id === props.cell.activeTabId ? "visible" : "hidden",
+                }}
+              >
+                <AutoLabelBinder
+                  cellId={props.cell.id}
+                  tabId={tab.id}
+                  kind={props.cell.kind}
+                  projectSlug={props.cell.projectSlug}
+                  worktreeId={props.cell.worktreeId}
+                  sessionId={tab.sessionId}
+                />
+                <TerminalPane
+                  kind={props.cell.kind as Parameters<typeof TerminalPane>[0]["kind"]}
+                  sessionId={tab.sessionId}
+                  projectSlug={props.cell.projectSlug}
+                  worktreeId={props.cell.worktreeId}
+                  borderColor="transparent"
+                  onSpawned={(sid) => setTabSessionId(props.cell.id, tab.id, sid)}
+                  onRequestClose={async () => {
+                    try {
+                      if (tab.sessionId) {
+                        await invoke("terminal_kill", { sessionId: tab.sessionId });
+                      }
+                    } catch (e) {
+                      console.warn("[LeafFrame] terminal_kill on exit failed", e);
+                    }
+                    removeCellTab(props.cell.id, tab.id);
+                  }}
+                />
+              </div>
+            )}
+          </For>
+        </Show>
+      </div>
+    </div>
+  );
+};
+
+// ---- PaneHeader: tabs + window chrome + drag source ------------------------
 
 interface PaneHeaderProps {
-  id: string;
+  cellId: string;
   kind: string;
   title: string | undefined;
   tabs: CellTab[];
   activeTabId: string;
   isMaximized: boolean;
-  handle: () => GridHandle | null;
 }
 
 const PaneHeader: Component<PaneHeaderProps> = (props) => {
-  const HarnessIcon = () => {
-    const Icon = HARNESS_ICONS[props.kind as keyof typeof HARNESS_ICONS];
-    if (!Icon) return null;
-    return <Icon class="h-3 w-3 shrink-0" />;
-  };
-
   async function killSession(sessionId: string | undefined) {
     if (!sessionId) return;
     try {
       await invoke("terminal_kill", { sessionId });
     } catch (e) {
-      console.warn("[GridCell] terminal_kill failed", e);
+      console.warn("[PaneHeader] terminal_kill failed", e);
     }
   }
 
   async function onCloseTab(ev: MouseEvent, tab: CellTab) {
     ev.stopPropagation();
     await killSession(tab.sessionId);
-    removeCellTab(props.id, tab.id);
-    // If removeCellTab removed the last tab it also calls removeCell, so we
-    // only need to redistributeGrid if the cell itself survives.
-    const stillExists = runtimeLayoutStore.cells.some((c) => c.id === props.id);
-    if (!stillExists) redistributeGrid(props.handle());
+    removeCellTab(props.cellId, tab.id);
   }
 
   async function onCloseCell(ev: MouseEvent) {
     ev.stopPropagation();
-    // Kill all live sessions before removing the cell.
-    for (const tab of props.tabs) {
-      await killSession(tab.sessionId);
-    }
-    removeCell(props.id);
-    redistributeGrid(props.handle());
+    for (const tab of props.tabs) await killSession(tab.sessionId);
+    removePane(props.cellId);
   }
 
   function onAddTab(ev: MouseEvent) {
     ev.stopPropagation();
-    addCellTab(props.id);
+    addCellTab(props.cellId);
+  }
+
+  function onHeaderPointerDown(e: PointerEvent) {
+    if (e.button !== 0) return;
+    const target = e.target as HTMLElement | null;
+    if (target?.closest(".pane-header-chrome-button")) return;
+    if (target?.closest(".pane-header-tab-close")) return;
+    if (target?.closest("input")) return;
+
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const THRESHOLD = 4;
+
+    function onMove(ev: PointerEvent) {
+      const dx = ev.clientX - startX;
+      const dy = ev.clientY - startY;
+      if (dx * dx + dy * dy < THRESHOLD * THRESHOLD) return;
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", onUp);
+      const rootEl = document.querySelector<HTMLElement>('[data-dnd-root="true"]');
+      if (!rootEl) return;
+      // Snapshot the cells so hit-testing uses the stable REAL layout
+      // throughout the drag, not the live (animating) DOM bounds. See
+      // BeginDragOptions.cells for the rationale — mixing animating rects
+      // with the cursor created a target/preview feedback loop.
+      const cellsSnapshot = runtimeLayoutStore.cells.map((c) => ({
+        id: c.id,
+        x: c.x,
+        y: c.y,
+        w: c.w,
+        h: c.h,
+      }));
+      beginDrag({
+        sourceId: props.cellId,
+        sourceKind: props.kind,
+        sourceLabel: KIND_LABELS[props.kind] ?? props.kind,
+        event: ev,
+        rootEl,
+        cells: cellsSnapshot,
+        layoutUnit: LAYOUT_UNIT,
+        onDrop: ({ sourceId, targetId, zone }) => {
+          if (!targetId || !zone || sourceId === targetId) return;
+          if (zone === "center") {
+            if (targetId !== ROOT_TARGET) swapPanes(sourceId, targetId);
+            return;
+          }
+          const direction = zoneToDirection(zone);
+          if (!direction) return;
+          if (targetId === ROOT_TARGET) {
+            movePaneToRootEdge(sourceId, direction);
+          } else {
+            movePaneToEdge(sourceId, targetId, direction);
+          }
+        },
+      });
+    }
+
+    function onUp() {
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", onUp);
+    }
+
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onUp);
   }
 
   return (
     <div
-      class="pane-drag-handle flex h-7 shrink-0 cursor-grab items-center border-b border-zinc-800 bg-zinc-950/80 active:cursor-grabbing"
-      data-testid={`pane-header-${props.id}`}
+      class="pane-drag-handle flex h-7 shrink-0 cursor-grab items-center border-b border-border-subtle active:cursor-grabbing"
+      data-testid={`pane-header-${props.cellId}`}
+      onPointerDown={onHeaderPointerDown}
     >
-      {/* ── tab strip ─────────────────────────────────────────── */}
-      <div class="no-scrollbar flex min-w-0 flex-1 items-center overflow-x-auto">
+      <div class="no-scrollbar flex min-w-0 flex-1 items-center overflow-x-auto pl-1.5">
         <For each={props.tabs}>
-          {(tab) => {
-            const tabState = (): AgentState | null =>
-              agentStore.sessions[tab.sessionId ?? ""]?.state ?? null;
-            const isActive = () => tab.id === props.activeTabId;
-
-            return (
-              <div
-                class="group flex shrink-0 cursor-pointer items-center gap-1 px-2 py-0.5 text-[10px] uppercase tracking-wide transition-colors"
-                classList={{
-                  "bg-zinc-900 text-zinc-200": isActive(),
-                  "text-zinc-500 hover:bg-zinc-900/60 hover:text-zinc-300": !isActive(),
-                }}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setActiveTabId(props.id, tab.id);
-                }}
-              >
-                <HarnessIcon />
-                <StateIndicator state={tabState()} />
-                <Show when={props.tabs.length > 1}>
-                  <button
-                    type="button"
-                    title="Close tab"
-                    aria-label="Close tab"
-                    class="ml-0.5 hidden rounded p-0.5 hover:bg-zinc-700 hover:text-zinc-100 group-hover:flex"
-                    onClick={(e) => {
-                      void onCloseTab(e, tab);
-                    }}
-                  >
-                    <CloseGlyph />
-                  </button>
-                </Show>
-              </div>
-            );
-          }}
+          {(tab) => (
+            <TabItem
+              cellId={props.cellId}
+              tab={tab}
+              kind={props.kind}
+              isActive={tab.id === props.activeTabId}
+              showClose={props.tabs.length > 1}
+              onClose={(e) => onCloseTab(e, tab)}
+            />
+          )}
         </For>
 
-        {/* add-tab button */}
         <button
           type="button"
           title="New tab"
           aria-label="New tab"
-          class="ml-1 flex shrink-0 items-center rounded p-0.5 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200"
+          class="pane-header-chrome-button ml-0.5 flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded-md text-foreground-subtle hover:bg-hover hover:text-foreground"
           onClick={onAddTab}
         >
           <PlusGlyph />
         </button>
       </div>
 
-      {/* ── window chrome ─────────────────────────────────────── */}
       <div class="flex shrink-0 items-center gap-1 px-1.5">
         <ChromeButton
           label="Minimize to dock"
           onClick={(e) => {
             e.stopPropagation();
-            // Snapshot the xterm buffer content BEFORE the pane is hidden.
             const activeTab = props.tabs.find((t) => t.id === props.activeTabId);
-            const snippet = extractSnippet(
-              activeTab?.sessionId,
-              props.kind as import("../lib/agentKind").AgentKind,
-            );
-            setLastSnippet(props.id, snippet, Date.now());
-            // Mark as minimized in the store.
-            toggleMinimize(props.id);
-            // Signal GridCell to remove from gridstack and redistribute.
-            window.dispatchEvent(
-              new CustomEvent("raum:minimize-cell", {
-                detail: { cellId: props.id },
-              }),
-            );
+            const snippet = extractSnippet(activeTab?.sessionId, props.kind as AgentKind);
+            setLastSnippet(props.cellId, snippet, Date.now());
+            toggleMinimize(props.cellId);
           }}
         >
           <MinusGlyph />
@@ -851,7 +740,7 @@ const PaneHeader: Component<PaneHeaderProps> = (props) => {
           label={props.isMaximized ? "Restore" : "Maximize"}
           onClick={(e) => {
             e.stopPropagation();
-            toggleMaximize(props.id);
+            toggleMaximize(props.cellId);
           }}
         >
           {props.isMaximized ? <RestoreGlyph /> : <MaximizeGlyph />}
@@ -870,35 +759,165 @@ const PaneHeader: Component<PaneHeaderProps> = (props) => {
   );
 };
 
-/**
- * Per-tab harness state indicator. Uses the exact same icons and colors as
- * the global top-right harness counter so users recognise the symbols
- * immediately wherever they appear.
- *
- *   working   → spinning LoaderIcon   (emerald-400)
- *   waiting   → AlertCircleIcon       (amber-400)
- *   idle      → CheckIcon             (zinc-500)
- *   completed → CheckIcon             (sky-400)
- *   errored   → AlertCircleIcon       (red-400)
- */
+function zoneToDirection(zone: DropZone): Direction | null {
+  if (zone === "top" || zone === "bottom" || zone === "left" || zone === "right") return zone;
+  return null;
+}
+
+// ---- TabItem (unchanged — rename + context menu) --------------------------
+
+const TabItem: Component<{
+  cellId: string;
+  tab: CellTab;
+  kind: string;
+  isActive: boolean;
+  showClose: boolean;
+  onClose: (e: MouseEvent) => void;
+}> = (props) => {
+  const [menuOpen, setMenuOpen] = createSignal(false);
+  const [menuX, setMenuX] = createSignal(0);
+  const [menuY, setMenuY] = createSignal(0);
+  const [editing, setEditing] = createSignal(false);
+  const [draft, setDraft] = createSignal("");
+  const tabLabel = () => resolveDisplayedTabLabel(props.tab);
+
+  const tabState = (): AgentState | null =>
+    agentStore.sessions[props.tab.sessionId ?? ""]?.state ?? null;
+
+  const HarnessIcon = () => {
+    const Icon = HARNESS_ICONS[props.kind as keyof typeof HARNESS_ICONS];
+    if (!Icon) return null;
+    return <Icon class="h-3 w-3 shrink-0" />;
+  };
+
+  function openMenu(e: MouseEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    setMenuX(e.clientX);
+    setMenuY(e.clientY);
+    setMenuOpen(true);
+  }
+
+  function startRename() {
+    setDraft(props.tab.label ?? props.tab.autoLabel ?? "");
+    setEditing(true);
+    setMenuOpen(false);
+  }
+
+  function commitRename() {
+    if (!editing()) return;
+    setTabLabel(props.cellId, props.tab.id, draft());
+    setEditing(false);
+  }
+
+  function cancelRename() {
+    setEditing(false);
+  }
+
+  return (
+    <div
+      class="pane-header-tab group relative flex h-[18px] shrink-0 cursor-pointer items-center gap-1 rounded-md px-2 text-[10px] uppercase tracking-wide transition-colors"
+      classList={{
+        "bg-selected text-foreground": props.isActive,
+        "text-foreground-subtle hover:bg-hover hover:text-foreground": !props.isActive,
+      }}
+      title={tabLabel()}
+      onClick={(e) => {
+        if (editing()) return;
+        e.stopPropagation();
+        setActiveTabId(props.cellId, props.tab.id);
+      }}
+      onContextMenu={openMenu}
+      onDblClick={(e) => {
+        e.stopPropagation();
+        startRename();
+      }}
+    >
+      <HarnessIcon />
+      <StateIndicator state={tabState()} />
+      <Show when={editing()}>
+        <input
+          type="text"
+          class="h-4 w-28 rounded-sm border border-border bg-background px-1 text-[10px] uppercase tracking-wide text-foreground outline-none focus:border-ring"
+          value={draft()}
+          onInput={(e) => setDraft(e.currentTarget.value)}
+          onClick={(e) => e.stopPropagation()}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              commitRename();
+            } else if (e.key === "Escape") {
+              e.preventDefault();
+              cancelRename();
+            }
+          }}
+          onBlur={commitRename}
+          ref={(el) => {
+            queueMicrotask(() => {
+              el.focus();
+              el.select();
+            });
+          }}
+        />
+      </Show>
+      <Show when={!editing() && tabLabel()}>
+        <span class="max-w-[14ch] truncate normal-case">{tabLabel()}</span>
+      </Show>
+      <Show when={props.showClose && !editing()}>
+        <button
+          type="button"
+          title="Close tab"
+          aria-label="Close tab"
+          class="pane-header-tab-close ml-0.5 hidden rounded-sm p-0.5 hover:bg-hover hover:text-foreground group-hover:flex"
+          onClick={(e) => {
+            props.onClose(e);
+          }}
+        >
+          <CloseGlyph />
+        </button>
+      </Show>
+
+      <Show when={menuOpen()}>
+        <div
+          class="floating-surface fixed z-50 w-40 rounded-xl border border-border bg-popover p-1 text-xs normal-case"
+          role="menu"
+          style={{ left: `${menuX()}px`, top: `${menuY()}px` }}
+          onMouseLeave={() => setMenuOpen(false)}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <button
+            type="button"
+            class="block w-full rounded px-2 py-1 text-left hover:bg-accent hover:text-accent-foreground"
+            onClick={startRename}
+          >
+            Rename…
+          </button>
+        </div>
+      </Show>
+    </div>
+  );
+};
+
+// ---- StateIndicator + ChromeButton + glyphs -------------------------------
+
 function StateIndicator(props: { state: AgentState | null }) {
   const title = () => props.state ?? "unknown";
   return (
     <span class="flex items-center" title={title()}>
       <Show when={props.state === "working"}>
-        <LoaderIcon class="h-3 w-3 animate-spin text-emerald-400" />
+        <LoaderIcon class="h-3 w-3 animate-spin text-success" />
       </Show>
       <Show when={props.state === "waiting"}>
-        <AlertCircleIcon class="h-3 w-3 text-amber-400" />
+        <AlertCircleIcon class="h-3 w-3 text-warning" />
       </Show>
       <Show when={props.state === "idle" || props.state === null}>
-        <CheckIcon class="h-3 w-3 text-zinc-500" />
+        <CheckIcon class="h-3 w-3 text-foreground-subtle" />
       </Show>
       <Show when={props.state === "completed"}>
-        <CheckIcon class="h-3 w-3 text-sky-400" />
+        <CheckIcon class="h-3 w-3 text-info" />
       </Show>
       <Show when={props.state === "errored"}>
-        <AlertCircleIcon class="h-3 w-3 text-red-400" />
+        <AlertCircleIcon class="h-3 w-3 text-destructive" />
       </Show>
     </span>
   );
@@ -915,10 +934,10 @@ function ChromeButton(props: {
       type="button"
       title={props.label}
       aria-label={props.label}
-      class="flex h-4 w-4 items-center justify-center rounded text-zinc-500"
+      class="pane-header-chrome-button flex h-4 w-4 items-center justify-center rounded-sm text-foreground-subtle transition-colors duration-[var(--motion-fast)] ease-[var(--motion-ease)]"
       classList={{
-        "hover:bg-red-900/60 hover:text-red-200": props.danger === true,
-        "hover:bg-zinc-800 hover:text-zinc-100": props.danger !== true,
+        "hover:bg-destructive/15 hover:text-destructive": props.danger === true,
+        "hover:bg-hover hover:text-foreground": props.danger !== true,
       }}
       onClick={props.onClick}
     >

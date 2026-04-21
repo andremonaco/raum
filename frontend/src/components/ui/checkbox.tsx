@@ -1,8 +1,28 @@
 import type { ComponentProps, ValidComponent } from "solid-js";
 import { splitProps } from "solid-js";
 import { Checkbox as CheckboxPrimitive } from "@kobalte/core/checkbox";
+import type { VariantProps } from "cva";
 
-import { cx } from "~/lib/cva";
+import { cva, cx } from "~/lib/cva";
+
+export const checkboxControlVariants = cva({
+  base: [
+    "shrink-0 rounded-sm border border-border bg-background shadow-[var(--shadow-xs)]",
+    "data-[checked]:border-ring data-[checked]:bg-ring data-[checked]:text-primary-foreground",
+    "data-invalid:border-destructive",
+    "data-disabled:cursor-not-allowed data-disabled:opacity-45",
+    "transition-[background-color,border-color,box-shadow] duration-[var(--motion-fast)] ease-[var(--motion-ease)]",
+    "peer-focus-visible:shadow-[0_0_0_1px_var(--background),0_0_0_3px_color-mix(in_oklab,var(--ring)_55%,transparent)]",
+    "outline-none",
+  ],
+  variants: {
+    size: {
+      sm: "size-3.5",
+      default: "size-4",
+    },
+  },
+  defaultVariants: { size: "default" },
+});
 
 export type CheckboxProps<T extends ValidComponent = "div"> = ComponentProps<
   typeof CheckboxPrimitive<T>
@@ -23,7 +43,8 @@ export const CheckboxLabel = <T extends ValidComponent = "label">(props: Checkbo
     <CheckboxPrimitive.Label
       data-slot="checkbox-label"
       class={cx(
-        "flex items-center gap-2 text-xs leading-none select-none data-[disabled]:pointer-events-none data-[disabled]:cursor-not-allowed data-[disabled]:opacity-50",
+        "flex items-center gap-2 text-xs leading-none select-none",
+        "data-[disabled]:pointer-events-none data-[disabled]:cursor-not-allowed data-[disabled]:opacity-45",
         "data-[invalid]:text-destructive",
         props.class,
       )}
@@ -44,7 +65,7 @@ export const CheckboxDescription = <T extends ValidComponent = "div">(
   return (
     <CheckboxPrimitive.Description
       data-slot="checkbox-description"
-      class={cx("text-muted-foreground text-[11px] data-[disabled]:opacity-50", props.class)}
+      class={cx("text-foreground-subtle text-[11px] data-[disabled]:opacity-45", props.class)}
       {...rest}
     />
   );
@@ -58,33 +79,24 @@ export const CheckboxInput = <T extends ValidComponent = "input">(props: Checkbo
   const [, rest] = splitProps(props as CheckboxInputProps, ["class"]);
 
   return (
-    <CheckboxPrimitive.Input
-      data-slot="checkbox-input"
-      class={cx(
-        "[&:focus-visible+div]:ring-ring/50 peer [&:focus-visible+div]:ring-[3px]",
-        props.class,
-      )}
-      {...rest}
-    />
+    <CheckboxPrimitive.Input data-slot="checkbox-input" class={cx("peer", props.class)} {...rest} />
   );
 };
 
 export type CheckboxControlProps<T extends ValidComponent = "div"> = ComponentProps<
   typeof CheckboxPrimitive.Control<T>
->;
+> &
+  VariantProps<typeof checkboxControlVariants>;
 
 export const CheckboxControl = <T extends ValidComponent = "div">(
   props: CheckboxControlProps<T>,
 ) => {
-  const [, rest] = splitProps(props as CheckboxControlProps, ["class"]);
+  const [, rest] = splitProps(props as CheckboxControlProps, ["class", "size"]);
 
   return (
     <CheckboxPrimitive.Control
       data-slot="checkbox-control"
-      class={cx(
-        "peer-focus-visible:border-ring border-input dark:bg-input/30 data-[checked]:bg-primary data-[checked]:text-primary-foreground dark:data-[checked]:bg-primary data-[checked]:border-primary data-invalid:ring-destructive/20 dark:data-invalid:ring-destructive/40 data-invalid:border-destructive size-4 shrink-0 rounded-[4px] border shadow-xs transition-shadow outline-none data-disabled:cursor-not-allowed data-disabled:opacity-50",
-        props.class,
-      )}
+      class={checkboxControlVariants({ size: props.size, class: props.class })}
       {...rest}
     >
       <CheckboxPrimitive.Indicator

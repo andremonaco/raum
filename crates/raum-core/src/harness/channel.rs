@@ -34,7 +34,14 @@ pub enum ChannelError {
 
 /// Runtime-health summary a channel exposes. The Harness Health panel
 /// renders this; the supervisor uses it to decide whether to re-spawn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// The `Unavailable` variant (Phase 3) is used by channels that depend on
+/// infrastructure the supervisor hasn't wired yet — most notably the OSC
+/// 9 scraper, which needs a tap on the tmux byte stream that Phase 2 did
+/// not expose. The variant carries a human-readable reason so the
+/// Harness Health panel can surface a "pending Phase 5 wiring" hint
+/// rather than a misleading "Failed" badge.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ChannelHealth {
     /// Channel is subscribed and delivering events.
     Live,
@@ -44,6 +51,9 @@ pub enum ChannelHealth {
     Failed,
     /// Channel has not been run yet.
     NotStarted,
+    /// Channel is defined but cannot run on this build — e.g. the OSC 9
+    /// scraper with no tmux byte-source handle (deferred to Phase 5).
+    Unavailable { reason: String },
 }
 
 /// A notification source. Each concrete impl owns exactly one async task

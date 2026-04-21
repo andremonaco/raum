@@ -18,9 +18,12 @@ import {
   createMemo,
   createSignal,
 } from "solid-js";
+import { Portal } from "solid-js/web";
 import { invoke } from "@tauri-apps/api/core";
 
 import { Button } from "./ui/button";
+import { Scrollable } from "./ui/scrollable";
+import { tildify } from "../lib/pathDisplay";
 
 export interface DiffViewerModalProps {
   open: boolean;
@@ -186,88 +189,89 @@ export const DiffViewerModal: Component<DiffViewerModalProps> = (props) => {
 
   return (
     <Show when={props.open && props.file}>
-      <div
-        class="fixed inset-0 z-[60] bg-black/60 backdrop-blur-sm"
-        onClick={() => props.onClose()}
-      />
+      <Portal>
+        <div class="fixed inset-0 z-[60] bg-scrim-strong" onClick={() => props.onClose()} />
 
-      <div
-        class="floating-surface animate-in fade-in zoom-in-95 duration-150 fixed inset-x-4 bottom-4 top-[6vh] z-[60] mx-auto flex max-w-7xl flex-col overflow-hidden rounded-2xl border border-border bg-[#282c34]"
-        onKeyDown={onKeyDown}
-        onClick={(e) => e.stopPropagation()}
-        role="dialog"
-        aria-modal="true"
-        aria-label={`Diff ${fileName()}`}
-        tabIndex={-1}
-      >
-        <header class="flex shrink-0 items-center gap-3 border-b border-white/8 bg-black/20 px-5 py-3">
-          <DiffIcon class="size-4 shrink-0 text-muted-foreground/70" />
-          <div class="min-w-0 flex-1">
-            <div class="flex items-center gap-2">
-              <span class="truncate font-mono text-xs text-foreground">{fileName()}</span>
-              <span
-                class="shrink-0 rounded border px-1 py-px font-mono text-[9px] uppercase tracking-wider"
-                classList={{
-                  "border-emerald-700/60 bg-emerald-900/20 text-emerald-300": props.staged,
-                  "border-amber-700/60 bg-amber-900/20 text-amber-300": !props.staged,
-                }}
-              >
-                {props.staged ? "staged" : "unstaged"}
-              </span>
+        <div
+          class="floating-surface animate-in fade-in zoom-in-95 duration-150 fixed inset-x-4 bottom-4 top-[6vh] z-[60] mx-auto flex max-w-7xl flex-col overflow-hidden rounded-2xl border border-border bg-terminal-bg"
+          onKeyDown={onKeyDown}
+          onClick={(e) => e.stopPropagation()}
+          role="dialog"
+          aria-modal="true"
+          aria-label={`Diff ${fileName()}`}
+          tabIndex={-1}
+        >
+          <header class="flex shrink-0 items-center gap-3 border-b border-border-subtle bg-surface-sunken/40 px-5 py-3">
+            <DiffIcon class="size-4 shrink-0 text-muted-foreground/70" />
+            <div class="min-w-0 flex-1">
+              <div class="flex items-center gap-2">
+                <span class="truncate font-mono text-xs text-foreground">{fileName()}</span>
+                <span
+                  class="shrink-0 rounded border px-1 py-px font-mono text-[9px] uppercase tracking-wider"
+                  classList={{
+                    "border-success/40 bg-success/10 text-success": props.staged,
+                    "border-warning/40 bg-warning/10 text-warning": !props.staged,
+                  }}
+                >
+                  {props.staged ? "staged" : "unstaged"}
+                </span>
+              </div>
+              <p class="truncate font-mono text-[10px] text-muted-foreground/50">
+                {tildify(dirPath())}
+              </p>
             </div>
-            <p class="truncate font-mono text-[10px] text-muted-foreground/50">{dirPath()}</p>
-          </div>
-          <ViewModeToggle />
-          <button
-            type="button"
-            class="rounded-md p-1.5 text-muted-foreground/50 transition-colors hover:bg-white/10 hover:text-foreground"
-            onClick={() => props.onClose()}
-            aria-label="Close diff"
-          >
-            <XIcon class="size-4" />
-          </button>
-        </header>
+            <ViewModeToggle />
+            <button
+              type="button"
+              class="focus-ring rounded-md p-1.5 text-foreground-subtle transition-colors hover:bg-hover hover:text-foreground"
+              onClick={() => props.onClose()}
+              aria-label="Close diff"
+            >
+              <XIcon class="size-4" />
+            </button>
+          </header>
 
-        <div class="relative min-h-0 flex-1 overflow-auto">
-          <Show when={loading()}>
-            <div class="absolute inset-0 flex items-center justify-center bg-[#282c34]">
-              <span class="text-xs text-muted-foreground/60">Loading…</span>
-            </div>
-          </Show>
-          <Show when={error() && !loading()}>
-            <div class="absolute inset-0 flex items-center justify-center bg-[#282c34]">
-              <span class="max-w-xs text-center text-xs text-destructive">{error()}</span>
-            </div>
-          </Show>
-          <Show when={!loading() && !error() && diff().length === 0}>
-            <div class="flex h-full items-center justify-center">
-              <span class="text-xs text-muted-foreground/60">No changes.</span>
-            </div>
-          </Show>
-          <Show when={!loading() && !error() && diff().length > 0}>
-            <Switch>
-              <Match when={viewMode() === "split"}>
-                <SplitView lines={lines()} />
-              </Match>
-              <Match when={viewMode() === "inline"}>
-                <InlineView lines={lines()} />
-              </Match>
-            </Switch>
-          </Show>
+          <Scrollable axis="both" class="relative min-h-0 flex-1">
+            <Show when={loading()}>
+              <div class="absolute inset-0 flex items-center justify-center bg-terminal-bg">
+                <span class="text-xs text-muted-foreground/60">Loading…</span>
+              </div>
+            </Show>
+            <Show when={error() && !loading()}>
+              <div class="absolute inset-0 flex items-center justify-center bg-terminal-bg">
+                <span class="max-w-xs text-center text-xs text-destructive">{error()}</span>
+              </div>
+            </Show>
+            <Show when={!loading() && !error() && diff().length === 0}>
+              <div class="flex h-full items-center justify-center">
+                <span class="text-xs text-muted-foreground/60">No changes.</span>
+              </div>
+            </Show>
+            <Show when={!loading() && !error() && diff().length > 0}>
+              <Switch>
+                <Match when={viewMode() === "split"}>
+                  <SplitView lines={lines()} />
+                </Match>
+                <Match when={viewMode() === "inline"}>
+                  <InlineView lines={lines()} />
+                </Match>
+              </Switch>
+            </Show>
+          </Scrollable>
+
+          <footer class="flex shrink-0 items-center justify-end gap-2 border-t border-border-subtle bg-surface-sunken/40 px-5 py-3">
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={props.onClose}
+              class="text-muted-foreground hover:text-foreground"
+            >
+              Close
+            </Button>
+          </footer>
         </div>
-
-        <footer class="flex shrink-0 items-center justify-end gap-2 border-t border-white/8 bg-black/20 px-5 py-3">
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            onClick={props.onClose}
-            class="text-muted-foreground hover:text-foreground"
-          >
-            Close
-          </Button>
-        </footer>
-      </div>
+      </Portal>
     </Show>
   );
 };
@@ -364,7 +368,7 @@ const InlineRow: Component<{ ln: DiffLine }> = (p) => {
         <div
           class="whitespace-pre px-4"
           classList={{
-            "bg-sky-500/10 text-sky-300": p.ln.kind === "hunk",
+            "bg-info/10 text-info": p.ln.kind === "hunk",
             "text-muted-foreground/60": p.ln.kind === "meta" || p.ln.kind === "header",
           }}
         >
@@ -375,8 +379,8 @@ const InlineRow: Component<{ ln: DiffLine }> = (p) => {
       <div
         class="whitespace-pre"
         classList={{
-          "bg-emerald-500/10 text-emerald-200": p.ln.kind === "add",
-          "bg-rose-500/10 text-rose-200": p.ln.kind === "del",
+          "bg-success/10 text-success": p.ln.kind === "add",
+          "bg-destructive/10 text-destructive": p.ln.kind === "del",
           "text-foreground/80": p.ln.kind === "ctx",
         }}
       >
@@ -419,7 +423,7 @@ const SplitRowView: Component<{ row: SplitRow }> = (p) => {
         <div
           class="w-full overflow-x-auto whitespace-pre px-4"
           classList={{
-            "bg-sky-500/10 text-sky-300": span().kind === "hunk",
+            "bg-info/10 text-info": span().kind === "hunk",
             "text-muted-foreground/60": span().kind === "meta" || span().kind === "header",
           }}
         >
@@ -439,8 +443,8 @@ const SplitCell: Component<{ ln: DiffLine | null; side: "left" | "right" }> = (p
       class="flex min-w-0"
       classList={{
         "border-r border-white/5": p.side === "left",
-        "bg-emerald-500/10 text-emerald-200": p.ln?.kind === "add",
-        "bg-rose-500/10 text-rose-200": p.ln?.kind === "del",
+        "bg-success/10 text-success": p.ln?.kind === "add",
+        "bg-destructive/10 text-destructive": p.ln?.kind === "del",
         "text-foreground/80": p.ln?.kind === "ctx",
         "bg-white/[0.02]": p.ln === null,
       }}

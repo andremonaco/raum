@@ -10,6 +10,16 @@
 import { Component, Show, createMemo, createResource } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 
+import { tildify } from "~/lib/pathDisplay";
+
+type PathStrategy = "sibling-group" | "nested" | "custom";
+
+const PATH_STRATEGY_LABEL: Record<PathStrategy, string> = {
+  "sibling-group": "Sibling group",
+  nested: "Nested (inside .raum/)",
+  custom: "Custom",
+};
+
 interface EffectiveProjectDto {
   slug: string;
   name: string;
@@ -18,6 +28,7 @@ interface EffectiveProjectDto {
   rootPath: string;
   hydration: { copy: string[]; symlink: string[] };
   worktree: {
+    pathStrategy: PathStrategy;
     pathPattern: string;
     branchPrefixMode: "none" | "username" | "custom";
     branchPrefixCustom: string | null;
@@ -64,7 +75,11 @@ export const ProjectSettings: Component<ProjectSettingsProps> = (props) => {
         {(eff) => (
           <dl class="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
             <dt>Root</dt>
-            <dd class="truncate font-mono text-foreground">{eff().rootPath}</dd>
+            <dd class="truncate font-mono text-foreground">{tildify(eff().rootPath)}</dd>
+            <dt>Path strategy</dt>
+            <dd class="truncate text-foreground">
+              {PATH_STRATEGY_LABEL[eff().worktree.pathStrategy]}
+            </dd>
             <dt>Path pattern</dt>
             <dd class="truncate font-mono text-foreground">{eff().worktree.pathPattern}</dd>
             <dt>Branch prefix</dt>

@@ -44,20 +44,18 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use serde_json::json;
-use tracing::{debug, info};
+use tracing::debug;
 
 #[allow(deprecated)]
 use crate::agent::AgentAdapter;
 use crate::agent::{AgentError, AgentKind, SessionId, SpawnOptions, VersionReport, semver_lite};
-use crate::config_io::managed_json::{
-    self, MARKER_BEGIN, MARKER_KEY, ManagedJsonError, ManagedJsonHooks,
-};
 use crate::harness::channel::NotificationChannel;
 use crate::harness::opencode_reply::HttpReplyReplier;
 use crate::harness::opencode_sse::{OpenCodeSseChannel, PendingRequestMap, new_pending_map};
 use crate::harness::reply::PermissionReplier;
-use crate::harness::setup::{SelftestReport, SetupAction, SetupContext, SetupError, SetupPlan};
+use crate::harness::setup::{
+    ScanReport, SelftestReport, SetupAction, SetupContext, SetupError, SetupPlan,
+};
 use crate::harness::traits::{
     HarnessIdentity, HarnessRuntime, LaunchOverrides, NotificationSetup, SessionSpec,
 };
@@ -128,6 +126,18 @@ impl OpenCodeAdapter {
         format!("http://127.0.0.1:{}", self.port())
     }
 
+    #[must_use]
+    pub fn base_url_for_port(port: u16) -> String {
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[must_use]
+    pub fn session_base_url(&self, session: &SessionSpec) -> String {
+        session
+            .opencode_port
+            .map_or_else(|| self.base_url(), Self::base_url_for_port)
+    }
+
     fn port(&self) -> u16 {
         self.port_override.unwrap_or_else(|| discover_port(&Env))
     }
@@ -148,6 +158,22 @@ fn default_settings_path() -> PathBuf {
     }
     let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from);
     home.join(".config").join("opencode").join("config.json")
+}
+
+/// Legacy OpenCode settings path keyed off an explicit `home_dir`
+/// (+ `$XDG_CONFIG_HOME`). Used for the Phase-6 migration probe so
+/// `$HOME` overrides via `SetupContext::home_dir` flow through.
+fn opencode_legacy_settings_path(home_dir: &Path) -> PathBuf {
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        let xdg = PathBuf::from(xdg);
+        if !xdg.as_os_str().is_empty() {
+            return xdg.join("opencode").join("config.json");
+        }
+    }
+    home_dir
+        .join(".config")
+        .join("opencode")
+        .join("config.json")
 }
 
 /// Abstraction around environment + home-directory lookups so the port
@@ -273,24 +299,15 @@ impl AgentAdapter for OpenCodeAdapter {
         ))
     }
 
-    /// Legacy hook install. Phase 4 deprecates this path; adapters that
-    /// still go through `AgentAdapter::install_hooks` trigger the
-    /// migration cleanup once and then no-op. Kept compiling because
-    /// `src-tauri` still invokes it during the deprecation shim window.
+    /// Legacy hook install. Phase 6 reduces this to a true no-op:
+    /// the migration cleanup is now emitted as a
+    /// [`SetupAction::RemoveManagedJsonEntries`] inside
+    /// [`NotificationSetup::plan`], so running the legacy shim would
+    /// duplicate work (and, on hosts without the new plan path, leak
+    /// into the user's real config during tests). The `install_hooks`
+    /// surface is kept for one release to preserve the deprecated
+    /// trait shape.
     async fn install_hooks(&self, _hooks_dir: &Path) -> Result<(), AgentError> {
-        let path = self.settings_path();
-        if path.exists() {
-            // Strip stale raum entries; ignore I/O errors so a read-only
-            // config does not break spawn.
-            if let Err(e) = remove_stale_managed_entries(&path) {
-                info!(?path, error=%e, "opencode migration cleanup skipped");
-            } else {
-                info!(
-                    ?path,
-                    "opencode settings.json: raum entries removed (Phase 4 migration)"
-                );
-            }
-        }
         Ok(())
     }
 
@@ -343,17 +360,24 @@ impl HarnessIdentity for OpenCodeAdapter {
 
 #[async_trait]
 impl NotificationSetup for OpenCodeAdapter {
-    /// Phase 4 plan: no config-file write. Only a migration cleanup
-    /// action that strips any stale `<raum-managed>` entries from
-    /// `config.json`.
-    async fn plan(&self, _ctx: &SetupContext) -> Result<SetupPlan, SetupError> {
+    /// Phase 4/6 plan: no config-file write. Only a migration cleanup
+    /// action that strips any stale `<raum-managed>` entries from the
+    /// OpenCode `config.json`. Path resolution prefers the adapter's
+    /// `settings_path_override` (tests), then the context's
+    /// `home_dir`, then the real environment — the last fallback keeps
+    /// the plan useful when raum-core is called outside a Tauri host
+    /// (selftest CLI, unit tests that do not construct a `SetupContext`).
+    async fn plan(&self, ctx: &SetupContext) -> Result<SetupPlan, SetupError> {
         let mut plan = SetupPlan::new(AgentKind::OpenCode);
         plan.push(SetupAction::AssertBinary {
             name: "opencode".into(),
         });
-        plan.push(SetupAction::RemoveManagedJsonEntries {
-            path: self.settings_path(),
-        });
+        let legacy = if self.settings_path_override.is_some() {
+            self.settings_path()
+        } else {
+            opencode_legacy_settings_path(&ctx.home_dir)
+        };
+        plan.push(SetupAction::RemoveManagedJsonEntries { path: legacy });
         Ok(plan)
     }
 
@@ -396,21 +420,48 @@ impl NotificationSetup for OpenCodeAdapter {
     }
 }
 
+impl OpenCodeAdapter {
+    /// Pure-read scan: OpenCode's notification transport is SSE over
+    /// HTTP, so there is no config file raum needs to write. The scan
+    /// reports "ready" iff the binary is on `$PATH` — the Harness
+    /// Health panel renders a one-liner in place of a paths list.
+    #[must_use]
+    pub fn scan(&self, _ctx: &SetupContext) -> ScanReport {
+        let binary = <Self as HarnessIdentity>::binary(self);
+        let binary_on_path = which::which(binary).is_ok();
+        let reason_if_not_installed = if binary_on_path {
+            None
+        } else {
+            Some(format!("{binary} binary not found on PATH"))
+        };
+        ScanReport {
+            harness: AgentKind::OpenCode,
+            binary: binary.into(),
+            binary_on_path,
+            raum_hooks_installed: binary_on_path,
+            config_paths: Vec::new(),
+            reason_if_not_installed,
+            note: Some("No config file required — notifications arrive live via SSE".into()),
+        }
+    }
+}
+
 impl HarnessRuntime for OpenCodeAdapter {
     fn channels(&self, session: &SessionSpec) -> Vec<Box<dyn NotificationChannel>> {
         // The `SilenceChannel` fallback is wired by the runtime
         // supervisor (out of scope for Phase 4 — see the plan's Module
         // Layout section). Phase 4 contributes just the SSE channel.
         vec![Box::new(OpenCodeSseChannel::new(
-            self.base_url(),
+            self.session_base_url(session),
             self.pending.clone(),
             session.session_id.clone(),
         ))]
     }
 
-    fn replier(&self, _session: &SessionSpec) -> Option<Box<dyn PermissionReplier>> {
+    fn replier(&self, session: &SessionSpec) -> Option<Box<dyn PermissionReplier>> {
+        let base_url = self.session_base_url(session);
         Some(Box::new(HttpReplyReplier::new(
-            self.base_url(),
+            base_url,
             self.pending.clone(),
         )))
     }
@@ -420,88 +471,12 @@ impl HarnessRuntime for OpenCodeAdapter {
     }
 }
 
-/// Legacy install helper. Kept so existing callers / tests can exercise
-/// the old write-hooks-into-config path while they migrate; new code
-/// should go through [`NotificationSetup::plan`] instead.
-#[allow(dead_code)]
-pub fn install_opencode_hooks(path: &Path, script: &Path) -> std::io::Result<()> {
-    managed_json::apply_managed_hooks(&ManagedJsonHooks {
-        path,
-        events: &["Notification", "Stop", "UserPromptSubmit"],
-        make_entry: &|event| {
-            json!({
-                MARKER_KEY: MARKER_BEGIN,
-                "_raum_event": event,
-                "matcher": ".*",
-                "hooks": [
-                    { "type": "command", "command": format!("{} {}", script.display(), event) }
-                ],
-            })
-        },
-    })
-    .map_err(managed_json_error_to_io)
-}
-
-/// Remove every `<raum-managed>` entry from the OpenCode `config.json`
-/// at `path`. Returns `Ok(())` when the file is missing or does not
-/// contain any raum entries.
-fn remove_stale_managed_entries(path: &Path) -> std::io::Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-    let raw = std::fs::read_to_string(path)?;
-    if raw.trim().is_empty() {
-        return Ok(());
-    }
-    let mut root: serde_json::Value = match serde_json::from_str(&raw) {
-        Ok(v) => v,
-        // Leave unparsable config alone — user content.
-        Err(_) => return Ok(()),
-    };
-    let mut changed = false;
-    if let Some(hooks) = root
-        .as_object_mut()
-        .and_then(|o| o.get_mut("hooks"))
-        .and_then(|v| v.as_object_mut())
-    {
-        for (_event, arr) in hooks.iter_mut() {
-            if let Some(list) = arr.as_array_mut() {
-                let before = list.len();
-                list.retain(|v| !managed_json::is_raum_managed(v));
-                if list.len() != before {
-                    changed = true;
-                }
-            }
-        }
-    }
-    if !changed {
-        return Ok(());
-    }
-    let serialized = serde_json::to_string_pretty(&root)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-    managed_json::atomic_write(path, serialized.as_bytes())?;
-    Ok(())
-}
-
-fn managed_json_error_to_io(e: ManagedJsonError) -> std::io::Error {
-    match e {
-        ManagedJsonError::Io(err) => err,
-        ManagedJsonError::InvalidJson(err) => std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("config.json is not valid JSON: {err}"),
-        ),
-        ManagedJsonError::Serialize(err) => std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("serialize config.json failed: {err}"),
-        ),
-    }
-}
-
 #[cfg(test)]
 #[allow(deprecated)]
 mod tests {
     use super::*;
-    use serde_json::Value;
+    use crate::config_io::managed_json::{MARKER_BEGIN, MARKER_KEY};
+    use serde_json::{Value, json};
     use std::collections::HashMap;
     use tempfile::tempdir;
 
@@ -605,7 +580,13 @@ mod tests {
     // ---------- Migration cleanup --------------------------------------------
 
     #[tokio::test]
-    async fn migration_cleanup_removes_raum_entries() {
+    async fn migration_cleanup_removes_raum_entries_via_plan() {
+        // Phase 6 moved the cleanup out of `install_hooks` (now a true
+        // no-op) and into `SetupAction::RemoveManagedJsonEntries`
+        // inside the plan. This test runs the plan through the
+        // executor and asserts the same behaviour on disk.
+        use crate::harness::setup::SetupExecutor;
+        use crate::harness::traits::NotificationSetup;
         let dir = tempdir().unwrap();
         let settings = dir.path().join("config.json");
         let original = json!({
@@ -619,7 +600,16 @@ mod tests {
         });
         std::fs::write(&settings, serde_json::to_string_pretty(&original).unwrap()).unwrap();
         let adapter = OpenCodeAdapter::with_settings_path(settings.clone());
-        adapter.install_hooks(dir.path()).await.unwrap();
+        let ctx = SetupContext::new(
+            dir.path().to_path_buf(),
+            dir.path().join("events.sock"),
+            "demo",
+        );
+        let plan = <OpenCodeAdapter as NotificationSetup>::plan(&adapter, &ctx)
+            .await
+            .unwrap();
+        let report = SetupExecutor::new().apply(&plan);
+        assert!(report.ok, "report: {report:?}");
         let parsed: Value =
             serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
         assert_eq!(
@@ -633,11 +623,23 @@ mod tests {
 
     #[tokio::test]
     async fn migration_cleanup_noop_when_config_missing() {
+        use crate::harness::setup::SetupExecutor;
+        use crate::harness::traits::NotificationSetup;
         let dir = tempdir().unwrap();
         let settings = dir.path().join("config.json");
         let adapter = OpenCodeAdapter::with_settings_path(settings.clone());
-        // No panic, no file created.
-        adapter.install_hooks(dir.path()).await.unwrap();
+        let ctx = SetupContext::new(
+            dir.path().to_path_buf(),
+            dir.path().join("events.sock"),
+            "demo",
+        );
+        let plan = <OpenCodeAdapter as NotificationSetup>::plan(&adapter, &ctx)
+            .await
+            .unwrap();
+        let report = SetupExecutor::new().apply(&plan);
+        // Plan is idempotent on a missing file — RemoveManagedJsonEntries
+        // returns Skipped.
+        assert!(report.ok, "report: {report:?}");
         assert!(!settings.exists());
     }
 
@@ -737,5 +739,18 @@ mod tests {
     fn base_url_honours_port_override() {
         let a = OpenCodeAdapter::default().with_port(1234);
         assert_eq!(a.base_url(), "http://127.0.0.1:1234");
+    }
+
+    #[test]
+    fn runtime_uses_session_scoped_port_override() {
+        let adapter = OpenCodeAdapter::default();
+        let spec = SessionSpec {
+            session_id: SessionId::new("raum-open"),
+            project_slug: "demo".into(),
+            worktree_id: "default".into(),
+            cwd: PathBuf::from("/tmp"),
+            opencode_port: Some(5123),
+        };
+        assert_eq!(adapter.session_base_url(&spec), "http://127.0.0.1:5123");
     }
 }

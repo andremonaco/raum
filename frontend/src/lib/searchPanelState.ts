@@ -1,6 +1,6 @@
 /**
  * §4.7 / §4.8 — shared open/close signal for the `<GlobalSearchPanel>`.
- * Kept outside the component so TopRow's button and the Cmd+Shift+F binding
+ * Kept outside the component so TopRow's button and the Cmd+F binding
  * can both toggle it without prop-drilling.
  */
 

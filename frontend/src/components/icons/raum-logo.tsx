@@ -11,11 +11,11 @@ export const RaumLogo = (props: ComponentProps<"svg">) => {
       xmlns="http://www.w3.org/2000/svg"
       viewBox="0 0 100 100"
       fill="none"
-      stroke="white"
+      stroke="currentColor"
       stroke-width="3.5"
       stroke-linecap="round"
       stroke-linejoin="round"
-      class={local.class}
+      class={`text-black dark:text-white ${local.class ?? ""}`}
       aria-hidden="true"
       {...rest}
     >

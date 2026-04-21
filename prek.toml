@@ -28,7 +28,7 @@ pass_filenames = false
 [[repos.hooks]]
 id = "cargo-machete"
 name = "cargo machete (unused deps)"
-entry = "cargo machete"
+entry = "cargo-machete"
 language = "system"
 files = "(^|/)Cargo\\.toml$"
 pass_filenames = false

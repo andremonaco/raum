@@ -109,6 +109,7 @@ pub struct EffectiveProjectDto {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorktreeConfigDto {
+    pub path_strategy: raum_core::config::PathStrategy,
     pub path_pattern: String,
     pub branch_prefix_mode: BranchPrefixMode,
     pub branch_prefix_custom: Option<String>,
@@ -145,6 +146,7 @@ impl From<EffectiveProjectConfig> for EffectiveProjectDto {
             has_raum_toml: eff.has_raum_toml,
             hydration: eff.hydration,
             worktree: WorktreeConfigDto {
+                path_strategy: eff.worktree.path_strategy,
                 path_pattern: eff.worktree.path_pattern,
                 branch_prefix_mode: eff.worktree.branch_prefix_mode,
                 branch_prefix_custom: eff.worktree.branch_prefix_custom,
@@ -289,7 +291,10 @@ pub fn project_update<R: Runtime>(
     if let Some(hydration) = update.hydration {
         project.hydration = hydration;
     }
-    if let Some(worktree) = update.worktree {
+    if let Some(mut worktree) = update.worktree {
+        // Snap pattern to canonical preset (or re-classify a stale strategy)
+        // before persisting, so on-disk TOML stays self-consistent.
+        worktree.normalize();
         project.worktree = worktree;
     }
     if let Some(agent_defaults) = update.agent_defaults {

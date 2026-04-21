@@ -264,7 +264,8 @@ export const KeymapProvider: Component<KeymapProviderProps> = (props) => {
           action !== "cheat-sheet" &&
           action !== "global-search" &&
           action !== "toggle-sidebar" &&
-          action !== "spotlight"
+          action !== "spotlight" &&
+          action !== "reload"
         ) {
           return;
         }

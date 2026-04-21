@@ -13,7 +13,7 @@
  * Output is capped at 80 characters to fit dock chips.
  */
 
-import { listTerminals } from "./terminalRegistry";
+import { listTerminalBuffers, listTerminals } from "./terminalRegistry";
 import type { AgentKind } from "./agentKind";
 
 /** Strips common ANSI CSI/OSC/escape sequences from a string.
@@ -44,22 +44,30 @@ export function extractSnippet(sessionId: string | null | undefined, kind: Agent
   const entry = listTerminals().find((e) => e.sessionId === sessionId);
   if (!entry) return "";
 
-  const buf = entry.terminal.buffer.active;
-  const startLine = Math.max(0, buf.length - SCAN_DEPTH);
-  const lines: string[] = [];
+  const activeBuffer = entry.terminal.buffer.active;
+  const normalBuffer =
+    listTerminalBuffers(entry.terminal).find((buffer) => buffer.kind === "normal")?.buffer ??
+    activeBuffer;
+  const collectLines = (buffer: typeof activeBuffer): string[] => {
+    const startLine = Math.max(0, buffer.length - SCAN_DEPTH);
+    const lines: string[] = [];
+    for (let i = buffer.length - 1; i >= startLine; i--) {
+      const raw = buffer.getLine(i)?.translateToString(true) ?? "";
+      const line = stripAnsi(raw).trim();
+      if (line) lines.unshift(line);
+      if (lines.length >= 30) break;
+    }
+    return lines;
+  };
 
-  for (let i = buf.length - 1; i >= startLine; i--) {
-    const raw = buf.getLine(i)?.translateToString(true) ?? "";
-    const line = stripAnsi(raw).trim();
-    if (line) lines.unshift(line);
-    if (lines.length >= 30) break;
-  }
+  const lines = collectLines(activeBuffer);
+  const historyLines = normalBuffer === activeBuffer ? lines : collectLines(normalBuffer);
 
   if (kind === "shell") {
     // Walk backward through collected lines; return the command after the last
     // visible shell prompt.
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const m = SHELL_PROMPT_RE.exec(lines[i]);
+    for (let i = historyLines.length - 1; i >= 0; i--) {
+      const m = SHELL_PROMPT_RE.exec(historyLines[i]);
       if (m) return m[1].slice(0, MAX_LEN);
     }
   } else {
@@ -69,8 +77,12 @@ export function extractSnippet(sessionId: string | null | undefined, kind: Agent
       const line = lines[i];
       if (!AI_CHROME_RE.test(line)) return line.slice(0, MAX_LEN);
     }
+    for (let i = historyLines.length - 1; i >= 0; i--) {
+      const line = historyLines[i];
+      if (!AI_CHROME_RE.test(line)) return line.slice(0, MAX_LEN);
+    }
   }
 
   // Fallback: join the last three non-empty lines.
-  return lines.slice(-3).join(" ↵ ").slice(0, MAX_LEN);
+  return historyLines.slice(-3).join(" ↵ ").slice(0, MAX_LEN);
 }

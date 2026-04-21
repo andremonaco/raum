@@ -1,8 +1,7 @@
 /**
- * Worktree Solid store. §6.7 "switch worktree" writes to `activeWorktreeStore`
- * without auto-applying any preset. The store is intentionally tiny: it holds
- * the currently active worktree id per project and nothing else. Preset
- * pointers are fetched lazily through the Tauri command `worktree_preset_get`.
+ * Worktree Solid store. §6.7 "switch worktree" writes to `activeWorktreeStore`.
+ * The store is intentionally tiny: it holds the currently active worktree id
+ * per project and nothing else.
  */
 
 import { createStore } from "solid-js/store";
@@ -18,6 +17,12 @@ export interface Worktree {
   detached: boolean;
   /** Upstream/base branch (e.g. "main", "origin/main"). Null when untracked. */
   upstream: string | null;
+  /**
+   * Branch this worktree was originally sprouted from, persisted on create.
+   * Null for pre-existing or main/root worktrees; the UI falls back to
+   * `upstream` (stripped of the `origin/` prefix) in that case.
+   */
+  baseBranch: string | null;
 }
 
 interface ActiveWorktreeState {
@@ -33,8 +38,7 @@ export { activeWorktreeStore };
 
 /**
  * Set the active worktree for a project. Triggers reactivity in components
- * that read `activeWorktreeStore.byProject[slug]`. Does not auto-apply any
- * preset (§6.7 requires explicit user action for that).
+ * that read `activeWorktreeStore.byProject[slug]`.
  */
 export function setActiveWorktree(projectSlug: string, worktreePath: string | undefined): void {
   setActiveWorktreeStore("byProject", projectSlug, worktreePath);

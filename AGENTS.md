@@ -74,6 +74,32 @@ task hooks:install  # wire prek pre-commit + pre-push git hooks
 task hooks          # run all prek hooks against every file (dry-run equivalent)
 ```
 
+## Target directory layout (why this matters)
+
+Every Tauri workspace has a target-dir-sharing problem: `cargo tauri dev`,
+rust-analyzer's background check, and `cargo test` / `cargo clippy` all
+default to `target/debug`. They compete for `.cargo-lock`, and each one
+that crashes or gets killed mid-compile poisons the incremental cache for
+the others. See
+[tauri-apps/tauri#2497](https://github.com/tauri-apps/tauri/issues/2497).
+
+raum splits the target dir three ways so none of them can block the
+others:
+
+| Workflow                              | `CARGO_TARGET_DIR` | Set by                         |
+| ------------------------------------- | ------------------ | ------------------------------ |
+| `task dev` / `cargo tauri dev`        | `target/debug`     | cargo default                  |
+| rust-analyzer / Claude Code LSP       | `target/rust-analyzer` | `.vscode/settings.json`    |
+| `task check`, `task clippy`, `task test:rust` | `target/test` | `Taskfile.yml` env blocks |
+
+**Never run raw `cargo check` / `cargo test` / `cargo clippy`** — they
+default to `target/debug` and will block `task dev`. Use the `task`
+wrappers, or set `CARGO_TARGET_DIR=target/test` manually.
+
+When `target/` gets too large (Tauri is heavy; 10–30 GB is normal over
+months), `rm -rf target/<subdir>` freely — the subdirs are fully
+isolated, so nuking one doesn't disturb the others.
+
 ## Code Quality & Formatting
 
 - **Rust:** `rustfmt` (edition 2024, `max_width = 100`); clippy pedantic with `unsafe` denied globally

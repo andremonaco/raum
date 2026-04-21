@@ -36,7 +36,7 @@ import {
   toggleSpotlight,
 } from "../lib/spotlightState";
 import { addRecentSearch, clearRecentSearch, recentSearches } from "../lib/recentSearchStore";
-import { terminalStore } from "../stores/terminalStore";
+import { listHarnessSessions } from "../stores/terminalStore";
 import { activeProjectSlug } from "../stores/projectStore";
 import { useKeymapAction } from "../lib/keymapContext";
 const FileEditorModal = lazy(() =>
@@ -44,6 +44,7 @@ const FileEditorModal = lazy(() =>
 );
 import { Badge } from "./ui/badge";
 import { ClockIcon, SearchIcon, HARNESS_ICONS, type HarnessIconKind } from "./icons";
+import { Scrollable } from "./ui/scrollable";
 import { FileTypeIcon } from "../lib/fileTypeIcon";
 import type { Worktree } from "../stores/worktreeStore";
 
@@ -81,8 +82,8 @@ type ResultItem = RecentItem | HarnessItem | FileItem;
 // ---------------------------------------------------------------------------
 
 function stateColor(state: string): string {
-  if (state === "working") return "bg-emerald-500/20 text-emerald-400";
-  if (state === "waiting") return "bg-amber-500/20 text-amber-400";
+  if (state === "working") return "bg-success/20 text-success";
+  if (state === "waiting") return "bg-warning/20 text-warning";
   return "bg-muted text-muted-foreground";
 }
 
@@ -233,8 +234,7 @@ export const SpotlightDock: Component = () => {
   const harnessMatches = createMemo<HarnessItem[]>(() => {
     const q = query().toLowerCase().trim();
     const slug = activeProjectSlug();
-    return Object.values(terminalStore.byId)
-      .filter((t) => !slug || t.project_slug === slug)
+    return listHarnessSessions(slug)
       .filter(
         (t) =>
           !q ||
@@ -340,7 +340,7 @@ export const SpotlightDock: Component = () => {
       <Show when={spotlightOpen()}>
         {/* Backdrop — dims the app without blurring it */}
         <div
-          class="fixed inset-0 z-50 flex items-start justify-center pt-[16vh] bg-black/50"
+          class="fixed inset-0 z-50 flex items-start justify-center pt-[16vh] bg-scrim"
           onClick={closeSpotlight}
         >
           {/* Panel — solid background so the app behind stays crisp */}
@@ -390,7 +390,7 @@ export const SpotlightDock: Component = () => {
               }
             >
               <div class="border-t border-white/5" />
-              <div class="max-h-[480px] overflow-y-auto pb-1 pt-1">
+              <Scrollable class="max-h-[480px] pb-1 pt-1">
                 {/* No-results message */}
                 <Show
                   when={
@@ -438,7 +438,7 @@ export const SpotlightDock: Component = () => {
                     );
                   }}
                 </For>
-              </div>
+              </Scrollable>
             </Show>
           </div>
         </div>

@@ -146,6 +146,31 @@ pub fn config_set_harness_flags(
     store.write_config(&cfg).map_err(|e| e.to_string())
 }
 
+/// Persist the appearance theme. Pass `theme_id` to switch to a curated
+/// catalog entry (clears any custom path) or `custom_theme_path` to point at
+/// a user-supplied VSCode theme JSON on disk (sets `theme_id` back to the
+/// default so the picker shows the BYO entry instead of stale curated
+/// selection). Both being null clears any theme override and falls back to
+/// the default at next boot.
+#[tauri::command]
+pub fn config_set_appearance_theme(
+    state: tauri::State<'_, AppHandleState>,
+    theme_id: Option<String>,
+    custom_theme_path: Option<std::path::PathBuf>,
+) -> Result<(), String> {
+    use raum_core::config::DEFAULT_THEME_ID;
+    let store = state.config_store.lock().map_err(|e| e.to_string())?;
+    let mut cfg: Config = store.read_config().map_err(|e| e.to_string())?;
+    let next_theme = theme_id.unwrap_or_else(|| DEFAULT_THEME_ID.to_string());
+    let next_custom = custom_theme_path;
+    if cfg.appearance.theme_id == next_theme && cfg.appearance.custom_theme_path == next_custom {
+        return Ok(());
+    }
+    cfg.appearance.theme_id = next_theme;
+    cfg.appearance.custom_theme_path = next_custom;
+    store.write_config(&cfg).map_err(|e| e.to_string())
+}
+
 /// Persist the global worktree `path_pattern`. Called by the Worktrees settings
 /// section when the user picks a preset or edits a custom pattern.
 ///

@@ -7,9 +7,56 @@ body {
   overflow: hidden;
 }
 
+/*
+ * Disable text selection globally so the app feels like a native desktop
+ * shell rather than a web page — no I-beam cursor, no accidental highlighting.
+ * Re-enable selection only where it carries meaning: terminal buffers (so
+ * users can copy output), editable form controls, and anything explicitly
+ * opted back in via `.selectable` or a `[data-selectable]` attribute.
+ */
+:root {
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: default;
+}
+
+.xterm,
+.xterm *,
+input,
+textarea,
+[contenteditable="true"],
+[contenteditable="true"] *,
+.cm-editor,
+.cm-editor *,
+.selectable,
+.selectable *,
+[data-selectable],
+[data-selectable] * {
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: auto;
+}
+
+/*
+ * While a pane-drag is in flight, suppress ALL user-selection. The pointer
+ * tracks over xterm viewports as the user drags, and WKWebView's native
+ * text-selection rectangle (a solid macOS-accent-blue fill) would paint
+ * over the terminal content until the drag ends. The body-level
+ * `user-select: none` set by paneDnD is overridden by `.xterm { user-select:
+ * text }` above, so we need a higher-specificity rule scoped to drag state.
+ */
+[data-dnd-root].dnd-active,
+[data-dnd-root].dnd-active *,
+[data-dnd-root].dnd-active .xterm,
+[data-dnd-root].dnd-active .xterm * {
+  user-select: none !important;
+  -webkit-user-select: none !important;
+}
+
 /* Drag region */
 [data-tauri-drag-region] {
   user-select: none;
+  -webkit-user-select: none;
   cursor: default;
 }
 
@@ -37,6 +84,40 @@ body {
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
+  /* Terminal canvas — surfaced as Tailwind colors so terminal wrappers and
+     loading skeletons can pick the right canvas tone per theme without
+     hardcoding `bg-zinc-950`. */
+  --color-terminal-bg: var(--terminal-bg);
+  --color-terminal-fg: var(--terminal-fg);
+  /* Extended surface tokens. `surface-base` is a pure alias of `background`
+     kept for future extensibility (name the concept, not the container). */
+  --color-surface-base: var(--background);
+  --color-surface-raised: var(--surface-raised);
+  --color-surface-sunken: var(--surface-sunken);
+  --color-panel: var(--panel);
+  --color-panel-foreground: var(--panel-foreground);
+  /* Text hierarchy — `foreground-muted` aliases `muted-foreground` so
+     component code can read `text-foreground-muted` and stay on-ramp
+     with the rest of the `-foreground-*` scale. */
+  --color-foreground-muted: var(--muted-foreground);
+  --color-foreground-subtle: var(--foreground-subtle);
+  --color-foreground-dim: var(--foreground-dim);
+  /* Border weights */
+  --color-border-subtle: var(--border-subtle);
+  --color-border-strong: var(--border-strong);
+  /* Feedback / state (use with `/15` for tinted backgrounds) */
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-info: var(--info);
+  --color-danger: var(--destructive);
+  /* Interactive states — one token per affordance, unifies the mix of
+     `hover:bg-accent`, `hover:bg-zinc-800`, etc. */
+  --color-hover: var(--hover);
+  --color-active: var(--active);
+  --color-selected: var(--selected);
+  /* Overlays */
+  --color-scrim: var(--scrim);
+  --color-scrim-strong: var(--scrim-strong);
 }
 
 @font-face {
@@ -63,7 +144,17 @@ body {
 
 :root {
   --radius: 0.5rem;
-  --background: oklch(0.145 0 0);
+  /*
+   * Theme palette — these vars are the source of truth for chrome colors and
+   * are overwritten at runtime by `lib/theme/applyChrome.ts` from the user's
+   * selected VSCode theme. Defaults here match `raum-default-dark` so the
+   * first frame before JS runs already carries the correct look.
+   *
+   * Tailwind v4 keeps semantic class names (`bg-background`, `text-foreground`,
+   * `border-border`, …) bound to these vars via the `@theme inline` block
+   * above, so swapping a theme retints the chrome with no rebuild.
+   */
+  --background: #141418;
   --foreground: oklch(0.985 0 0);
   --card: oklch(0.205 0 0);
   --card-foreground: oklch(0.985 0 0);
@@ -81,8 +172,97 @@ body {
   --border: oklch(1 0 0 / 10%);
   --input: oklch(1 0 0 / 15%);
   --ring: oklch(0.556 0 0);
+  /* Terminal canvas — separate from chrome `--background` so a theme can
+     dim the terminal independently from the workbench (some VSCode themes
+     pick noticeably darker `terminal.background` than `editor.background`). */
+  --terminal-bg: #141418;
+  --terminal-fg: oklch(0.985 0 0);
   --project-accent: #7dd3fc;
+  /*
+   * Extended semantic tokens. Same runtime-retint story as the chrome palette
+   * above — `applyChrome` overwrites these from the resolved `ChromePalette`
+   * once the user's VSCode theme JSON has been normalized. Defaults here
+   * match `raum-default-dark` so the first frame reads correctly.
+   */
+  /* Surfaces */
+  --surface-raised: #1f1f23;
+  --surface-sunken: #0f0f12;
+  --panel: #1a1a1e;
+  --panel-foreground: oklch(0.985 0 0);
+  /* Text hierarchy */
+  --foreground-subtle: color-mix(in oklab, oklch(0.985 0 0) 65%, transparent);
+  --foreground-dim: color-mix(in oklab, oklch(0.985 0 0) 45%, transparent);
+  /* Border weights */
+  --border-subtle: color-mix(in oklab, oklch(0.985 0 0) 8%, transparent);
+  --border-strong: color-mix(in oklab, oklch(0.985 0 0) 22%, transparent);
+  /* Feedback / state */
+  --success: #22c55e;
+  --warning: #eab308;
+  --info: #38bdf8;
+  /* Interactive states */
+  --hover: color-mix(in oklab, oklch(0.985 0 0) 6%, transparent);
+  --active: color-mix(in oklab, oklch(0.985 0 0) 12%, transparent);
+  --selected: color-mix(in oklab, oklch(0.985 0 0) 16%, transparent);
+  /* Overlays */
+  --scrim: rgb(0 0 0 / 0.55);
+  --scrim-strong: rgb(0 0 0 / 0.7);
+  /* Elevation — full `box-shadow` strings so components can opt in with
+     `shadow-[var(--shadow-md)]` (no new Tailwind utility needed). */
+  --shadow-xs: 0 1px 2px rgb(0 0 0 / 0.5);
+  --shadow-sm: 0 2px 4px rgb(0 0 0 / 0.55), 0 1px 2px rgb(0 0 0 / 0.4);
+  --shadow-md: 0 8px 16px -4px rgb(0 0 0 / 0.6), 0 2px 4px rgb(0 0 0 / 0.4);
+  --shadow-lg:
+    0 24px 64px -12px rgb(0 0 0 / 0.65),
+    0 0 0 1px color-mix(in oklab, oklch(0.985 0 0) 8%, transparent);
+  /* Motion — unified durations + easing. Theme-independent; declared once so
+     transitions across primitives stay in rhythm. */
+  --motion-fast: 120ms;
+  --motion-base: 180ms;
+  --motion-slow: 240ms;
+  --motion-ease: cubic-bezier(0.2, 0.9, 0.25, 1);
   color-scheme: dark;
+}
+
+/*
+ * Shared focus-ring recipe. Every interactive element that doesn't already
+ * carry a CVA focus style should include `.focus-ring` (or Tailwind's
+ * `focus-visible:ring-ring focus-visible:ring-[3px]` equivalent) so the
+ * focus affordance reads consistently across the app and scales with the
+ * active theme's `--ring`.
+ *
+ * The outer 1px sits on `--background` so the ring reads against any surface
+ * (a pane header gradient, a popover, the workbench canvas); the 3px halo
+ * picks up the theme's focus color at 55% so it never over-shouts.
+ */
+.focus-ring:focus-visible {
+  outline: none;
+  box-shadow:
+    0 0 0 1px var(--background),
+    0 0 0 3px color-mix(in oklab, var(--ring) 55%, transparent);
+}
+
+/*
+ * Suppress the user-agent default focus outline globally. Every interactive
+ * component in the app already opts in to a themed halo via `focus-visible:`
+ * shadow/ring utilities (see `.focus-ring` above and the CVA recipes for
+ * inputs/buttons), so the only thing this rule kills is the chromium default
+ * blue rectangle that leaks in on mouse-focus of inputs/textareas.
+ */
+*:focus {
+  outline: none;
+}
+
+/*
+ * Shared disabled treatment. Opacity alone reads as "just darker" on light
+ * themes; the saturate(0.5) drops color, and `pointer-events: none` blocks
+ * accidental clicks. Attach either via `:disabled` or `data-disabled="true"`.
+ */
+.disabled-state:disabled,
+.disabled-state[data-disabled="true"],
+[data-disabled="true"].disabled-state {
+  opacity: 0.45;
+  pointer-events: none;
+  filter: saturate(0.5);
 }
 
 html,
@@ -93,17 +273,355 @@ body,
   font-family: var(--font-mono);
 }
 
-/* Base: slow fade-out creates "was selected" lingering afterglow */
-.grid-stack-item-content {
-  outline: 1px solid transparent;
-  transition: outline-color 700ms ease;
+/*
+ * ══════════════════════════════════════════════════════════════════════
+ *  BSP terminal grid — floating windows, magnetic DnD.
+ * ══════════════════════════════════════════════════════════════════════
+ *
+ *  Design language: windows on dark felt.
+ *  Each pane is a rounded, elevated card with a built-in gutter
+ *  (--pane-gap) so the grid reads as a set of individual windows rather
+ *  than tiles. Dragging lifts the pane off the surface; split previews
+ *  are communicated by the live pane reflow itself.
+ *  Edge magnets (macOS Magnet style) fire within 72px of any outer
+ *  border and fill half the viewport with a confident snap preview.
+ */
+
+:root {
+  --pane-gap: 6px;
+  --pane-radius: 12px;
+  --accent-split: 56 189 248; /* sky-400 */
+  --accent-swap: 52 211 153; /* emerald-400 */
+  --drag-dx: 0px;
+  --drag-dy: 0px;
 }
 
-/* Selected: fast fade-in overrides transition speed */
-.pane-selected {
-  outline-color: rgba(255, 255, 255, 0.11);
-  transition: outline-color 150ms ease;
+/* ── Grid canvas ────────────────────────────────────────────────────── */
+/* Canvas is painted with `--selected` — the same token the active project
+ * tab uses — so the grid reads as a single "inner workspace" framed by
+ * the U-shape chrome (top-row / sidebar / dock, all on `--background`).
+ * The parent wrapper in TerminalGrid carries the solid `--background`
+ * that `--selected`'s transparent overlay mixes into, which keeps the
+ * effective color identical to a selected project tab on any theme. */
+
+[data-dnd-root] {
+  background-color: var(--selected);
+  /* Outer gutter is a transparent border, not a calc() subtraction on the
+     pane's `right`/`bottom`. The browser resolves the padding box once and
+     absolute children anchor against it symmetrically, so every edge is
+     pixel-snapped by the same rule — no 0.5-px drift on the right side
+     from independent percentage rounding. */
+  border: calc(var(--pane-gap) / 2) solid transparent;
+  box-sizing: border-box;
 }
+
+/* ── LeafFrame: a pane as a floating window ─────────────────────────── */
+
+.leaf-frame {
+  position: absolute;
+  /* Each frame insets by half-gap on all sides; the result is a uniform
+     gutter between panes AND between the outer panes and the grid edge.
+     Uses `left`/`right`/`top`/`bottom` instead of `left`/`width`/… so
+     every edge is anchored directly — a `width: calc(100% - 6px)` can
+     pixel-snap a fraction differently than its implied right edge and
+     make one gutter read thinner on fractional viewport widths. */
+  --inset: calc(var(--pane-gap) / 2);
+  left: calc(var(--x-pct) + var(--inset));
+  top: calc(var(--y-pct) + var(--inset));
+  right: calc(100% - var(--x-pct) - var(--w-pct) + var(--inset));
+  bottom: calc(100% - var(--y-pct) - var(--h-pct) + var(--inset));
+  border-radius: var(--pane-radius);
+  overflow: hidden;
+  /* Pane fill = terminal canvas with a hairline vertical sheen. The sheen
+     mixes a tiny bit of the foreground tone, so it reads as a soft highlight
+     in dark mode and a soft shadow in light mode (auto-adapting to theme). */
+  background: linear-gradient(
+    180deg,
+    color-mix(in oklab, var(--terminal-bg) 96%, var(--foreground)) 0%,
+    var(--terminal-bg) 100%
+  );
+  /* Real 1px border so the window edge is unmistakable against the darker
+     canvas behind. Shadow is kept inside the `--pane-gap` gutter so its
+     bleed doesn't make the canvas-to-pane gap read as uneven. Inset
+     highlight remains a subtle light glint. */
+  border: 1px solid var(--border);
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.03) inset,
+    0 1px 2px rgb(0 0 0 / 0.45);
+  /* Overshoot spring so layout changes "settle" into place. */
+  transition:
+    left 180ms cubic-bezier(0.34, 1.56, 0.64, 1),
+    right 180ms cubic-bezier(0.34, 1.56, 0.64, 1),
+    top 180ms cubic-bezier(0.34, 1.56, 0.64, 1),
+    bottom 180ms cubic-bezier(0.34, 1.56, 0.64, 1),
+    box-shadow 220ms ease,
+    transform 220ms cubic-bezier(0.2, 0.9, 0.25, 1);
+}
+
+/* While a divider is being dragged, suppress position transitions so the
+   pane tracks the pointer 1:1 instead of fighting with 180ms easing. */
+[data-dnd-root].is-resizing .leaf-frame {
+  transition: none;
+}
+
+/* Focus treatment — LUMINANCE INVERSION.
+   The 28px header strip of the focused pane flips to `--foreground`
+   (bright on dark theme, dark on light theme). No accent color, no glow,
+   no pulse — the pure-contrast inversion is the cue. Unfocused panes keep
+   their terminal body fully bright and their header dims slightly via the
+   :has() rule below, so the focused pane wins on peripheral luma.
+
+   Paint is confined to the header + its direct children, so xterm's
+   canvas path is untouched. Guarded :not(.dnd-active) so the drag state's
+   neutral treatment owns the look while a move is in flight. */
+.leaf-frame.pane-selected {
+  box-shadow:
+    inset 0 0 0 1px color-mix(in oklab, var(--foreground) 26%, transparent),
+    0 1px 2px rgb(0 0 0 / 0.45);
+}
+
+[data-dnd-root]:not(.dnd-active) .leaf-frame.pane-selected .pane-drag-handle {
+  background: var(--foreground);
+  border-bottom-color: color-mix(in oklab, var(--foreground) 40%, var(--background));
+}
+
+/* Child overrides so tabs + chrome buttons read against the inverted
+   header. Tailwind utilities resolve to 1-class selectors (0,1,0); these
+   compound selectors win on specificity without !important. */
+[data-dnd-root]:not(.dnd-active) .leaf-frame.pane-selected .pane-drag-handle .pane-header-tab {
+  color: color-mix(in oklab, var(--background) 72%, var(--foreground));
+}
+[data-dnd-root]:not(.dnd-active)
+  .leaf-frame.pane-selected
+  .pane-drag-handle
+  .pane-header-tab:hover {
+  background: color-mix(in oklab, var(--background) 14%, transparent);
+  color: var(--background);
+}
+[data-dnd-root]:not(.dnd-active)
+  .leaf-frame.pane-selected
+  .pane-drag-handle
+  .pane-header-tab.bg-selected,
+[data-dnd-root]:not(.dnd-active)
+  .leaf-frame.pane-selected
+  .pane-drag-handle
+  .pane-header-tab.text-foreground {
+  background: color-mix(in oklab, var(--background) 20%, transparent);
+  color: var(--background);
+}
+[data-dnd-root]:not(.dnd-active)
+  .leaf-frame.pane-selected
+  .pane-drag-handle
+  .pane-header-chrome-button {
+  color: color-mix(in oklab, var(--background) 58%, var(--foreground));
+}
+[data-dnd-root]:not(.dnd-active)
+  .leaf-frame.pane-selected
+  .pane-drag-handle
+  .pane-header-chrome-button:hover {
+  background: color-mix(in oklab, var(--background) 14%, transparent);
+  color: var(--background);
+}
+
+/* Dim the *header* of non-focused panes — and only when some pane IS
+   focused. The :has() guard means a grid with no focused pane (e.g.,
+   fresh app launch before any click) keeps every header at full
+   brightness; the dim only kicks in once the user has "claimed" a
+   pane. Terminal bodies are never dimmed. */
+[data-dnd-root]:has(.leaf-frame.pane-selected) .leaf-frame:not(.pane-selected) .pane-drag-handle {
+  opacity: 0.62;
+}
+.leaf-frame .pane-drag-handle {
+  transition:
+    opacity 180ms ease-out,
+    background 180ms ease-out,
+    border-bottom-color 180ms ease-out,
+    box-shadow 180ms ease-out;
+}
+
+/* While any drag is in flight, every non-dragging pane gets a subtle ring
+   so the full set of valid drop targets is visible at a glance. The
+   overshoot spring used for normal layout changes reads as "wobbly" on
+   every pointermove — swap for a flat ease-out so the live reflow under
+   the cursor feels crisp, not bouncy. Keep the spring for non-drag
+   mutations (splits, closes, divider drag) where overshoot feels good. */
+[data-dnd-root].dnd-active .leaf-frame:not(.pane-dragging) {
+  box-shadow:
+    0 0 0 1px rgba(113, 113, 122, 0.5),
+    0 10px 24px -12px rgba(0, 0, 0, 0.7);
+  transition:
+    left 160ms cubic-bezier(0.2, 0.9, 0.25, 1),
+    top 160ms cubic-bezier(0.2, 0.9, 0.25, 1),
+    width 160ms cubic-bezier(0.2, 0.9, 0.25, 1),
+    height 160ms cubic-bezier(0.2, 0.9, 0.25, 1),
+    box-shadow 220ms ease,
+    transform 220ms cubic-bezier(0.2, 0.9, 0.25, 1);
+}
+
+/* DRAGGING: the pane itself lifts and follows the cursor. No separate
+   ghost chip — the user literally grabs the window. Transform is driven
+   by --drag-dx / --drag-dy set imperatively on [data-dnd-root] (see
+   TerminalGrid createEffect). transition on transform is 0ms so tracking
+   is 1:1; box-shadow animates so the "lift" reads as a physical motion. */
+.leaf-frame.pane-dragging {
+  z-index: 60;
+  transform: translate(var(--drag-dx), var(--drag-dy)) rotate(-0.6deg) scale(1.02);
+  transition:
+    transform 0ms,
+    box-shadow 220ms ease;
+  cursor: grabbing;
+  pointer-events: none;
+  box-shadow:
+    0 0 0 1px rgba(var(--accent-split), 0.55),
+    0 0 0 3px rgba(var(--accent-split), 0.1),
+    0 30px 60px -15px rgba(0, 0, 0, 0.75),
+    0 12px 30px -6px rgba(var(--accent-split), 0.22);
+  will-change: transform;
+}
+
+/* Maximized pane fills the canvas completely (no gutter). */
+.leaf-frame.pane-maximized {
+  left: 0 !important;
+  top: 0 !important;
+  right: 0 !important;
+  bottom: 0 !important;
+  z-index: 30;
+  box-shadow:
+    0 0 0 1px rgba(var(--accent-split), 0.3),
+    0 20px 50px -10px rgba(0, 0, 0, 0.85);
+}
+
+/* Header: matches the pane's rounded top corners and the subtle gradient.
+   Background is a small top-down sheen on `--surface-raised` so the header
+   reads as a shallow lift over the pane body on any theme — replaces the
+   hardcoded `#141418 → #0d0d0f` dark-only gradient. */
+.pane-drag-handle {
+  border-top-left-radius: var(--pane-radius);
+  border-top-right-radius: var(--pane-radius);
+  background: linear-gradient(
+    180deg,
+    color-mix(in oklab, var(--surface-raised) 92%, #000) 0%,
+    var(--surface-raised) 100%
+  );
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.terminal-pane-shell {
+  background-color: var(--terminal-bg);
+}
+
+/* ── Dividers ──────────────────────────────────────────────────────── */
+/* The 6px hit zone over the pane gutter shows a small centered grip pill
+ * at rest — nuanced but discoverable, like a window-edge handle. On hover
+ * the pill blooms into a full-length sky filament; while the drag is in
+ * flight the filament intensifies. Everything is driven by ::before on
+ * the existing `.pane-divider` element so divider-layer.tsx stays pure
+ * geometry. No width change on the hit zone itself — the line only
+ * changes length/color — so pointer capture stays stable during drag. */
+
+.pane-divider::before {
+  content: "";
+  position: absolute;
+  background-color: rgba(255, 255, 255, 0.22);
+  transition:
+    background-color 180ms ease-out,
+    top 220ms cubic-bezier(0.2, 0.9, 0.25, 1),
+    bottom 220ms cubic-bezier(0.2, 0.9, 0.25, 1),
+    left 220ms cubic-bezier(0.2, 0.9, 0.25, 1),
+    right 220ms cubic-bezier(0.2, 0.9, 0.25, 1),
+    filter 180ms ease-out;
+  pointer-events: none;
+  border-radius: 999px;
+}
+
+/* Vertical pill (col-resize = row-axis split between siblings).
+ * At rest: a fixed-size centered grip (~28px tall, 2.5px wide).
+ * On hover: blooms to a near-full-length sky filament. */
+.pane-divider.cursor-col-resize::before {
+  left: 50%;
+  width: 1.5px;
+  top: calc(50% - 14px);
+  bottom: calc(50% - 14px);
+  transform: translateX(-0.75px);
+}
+.pane-divider.cursor-col-resize:hover::before {
+  top: 6%;
+  bottom: 6%;
+  background-color: rgba(var(--accent-split), 0.7);
+  filter: drop-shadow(0 0 6px rgba(var(--accent-split), 0.45));
+}
+[data-dnd-root].is-resizing .pane-divider.cursor-col-resize:hover::before {
+  background-color: rgba(var(--accent-split), 0.95);
+  filter: drop-shadow(0 0 10px rgba(var(--accent-split), 0.6));
+}
+
+/* Horizontal pill (row-resize = column-axis split between siblings).
+ * At rest: a fixed-size centered grip (~28px wide, 2.5px tall).
+ * On hover: blooms to a near-full-width sky filament. */
+.pane-divider.cursor-row-resize::before {
+  top: 50%;
+  height: 1.5px;
+  left: calc(50% - 14px);
+  right: calc(50% - 14px);
+  transform: translateY(-0.75px);
+}
+.pane-divider.cursor-row-resize:hover::before {
+  left: 6%;
+  right: 6%;
+  background-color: rgba(var(--accent-split), 0.7);
+  filter: drop-shadow(0 0 6px rgba(var(--accent-split), 0.45));
+}
+[data-dnd-root].is-resizing .pane-divider.cursor-row-resize:hover::before {
+  background-color: rgba(var(--accent-split), 0.95);
+  filter: drop-shadow(0 0 10px rgba(var(--accent-split), 0.6));
+}
+
+/* ── Sidebar resize handle ─────────────────────────────────────────── */
+/* Same visual language as pane dividers: a small vertical grip pill
+ * centered on the edge that brightens on hover. Cursor + position
+ * already cue resizability, the pill makes it discoverable at a glance. */
+
+.sidebar-resize-handle {
+  position: absolute;
+  inset: 0 -4px 0 auto;
+  width: 8px;
+  cursor: col-resize;
+  touch-action: none;
+}
+.sidebar-resize-handle::before {
+  content: "";
+  position: absolute;
+  left: 50%;
+  width: 1.5px;
+  top: calc(50% - 14px);
+  bottom: calc(50% - 14px);
+  transform: translateX(-0.75px);
+  background-color: rgba(255, 255, 255, 0.22);
+  border-radius: 999px;
+  pointer-events: none;
+  transition:
+    background-color 180ms ease-out,
+    top 220ms cubic-bezier(0.2, 0.9, 0.25, 1),
+    bottom 220ms cubic-bezier(0.2, 0.9, 0.25, 1),
+    filter 180ms ease-out;
+}
+.sidebar-resize-handle:hover::before {
+  top: 6%;
+  bottom: 6%;
+  background-color: rgba(var(--accent-split), 0.7);
+  filter: drop-shadow(0 0 6px rgba(var(--accent-split), 0.45));
+}
+.sidebar-resize-handle.is-resizing::before {
+  top: 6%;
+  bottom: 6%;
+  background-color: rgba(var(--accent-split), 0.95);
+  filter: drop-shadow(0 0 10px rgba(var(--accent-split), 0.6));
+}
+
+/* Drop-zone and snap-zone overlays are intentionally not rendered. The
+ * live reflow of the grid (see <TerminalGrid>'s previewTree memo) *is*
+ * the feedback. Additional overlay layers on top of xterm canvases
+ * caused continuous repaints and visible flicker on non-dragging panes. */
 
 @keyframes wiggle {
   0%,
@@ -135,12 +653,157 @@ body,
 }
 
 /*
+ * ──────────────────────────────────────────────────────────────────
+ *  Glow-thread scrollbar — cross-platform via OverlayScrollbars.
+ * ──────────────────────────────────────────────────────────────────
+ *  Tauri ships WKWebView on macOS and WebKitGTK on Linux, both of
+ *  which ignore `::-webkit-scrollbar` pseudo-elements (that pseudo is
+ *  effectively Chromium-only now). We render real DOM scrollbars with
+ *  OverlayScrollbars and theme them here as `.os-theme-raum`.
+ *
+ *  Apply by wrapping overflowing content with <Scrollable> (see
+ *  components/ui/scrollable.tsx), which sets this theme by default.
+ *
+ *  The visible rail is a 2px filament down the edge of the container.
+ *  Dim at rest → warm bloom on hover → full accent + drop-shadow while
+ *  scrubbing. Colour follows the live `--project-accent`.
+ */
+/* Theme class is applied directly to each `.os-scrollbar` element, so
+   all styling flows through OverlayScrollbars' own CSS variables. The
+   `background` property accepts gradients, so the dim→bright→dim fade
+   ships as the handle's own fill. */
+.os-theme-raum {
+  --os-size: 10px;
+  --os-padding-perpendicular: 4px;
+  --os-padding-axis: 3px;
+
+  --os-track-border-radius: 999px;
+  --os-track-bg: transparent;
+  --os-track-bg-hover: transparent;
+  --os-track-bg-active: transparent;
+
+  --os-handle-border-radius: 999px;
+  --os-handle-min-size: 28px;
+
+  /* Thread thickness: 2px idle, 3px hover, 3px active — keep it slim.
+     (OverlayScrollbars uses these as `width` on vertical handles and
+     `height` on horizontal, with its own transition between states.) */
+  --os-handle-perpendicular-size: 2px;
+  --os-handle-perpendicular-size-hover: 3px;
+  --os-handle-perpendicular-size-active: 3px;
+}
+
+/* Idle handle background — vertical gradient that fades out at both
+   ends so the thread softly dissolves into the panel. */
+.os-theme-raum.os-scrollbar-vertical {
+  --os-handle-bg: linear-gradient(
+    to bottom,
+    transparent 0%,
+    color-mix(in oklab, var(--foreground) 35%, transparent) 20%,
+    color-mix(in oklab, var(--foreground) 50%, transparent) 50%,
+    color-mix(in oklab, var(--foreground) 35%, transparent) 80%,
+    transparent 100%
+  );
+  --os-handle-bg-hover: linear-gradient(
+    to bottom,
+    transparent 0%,
+    color-mix(in oklab, var(--foreground) 55%, transparent) 16%,
+    color-mix(in oklab, var(--foreground) 80%, transparent) 50%,
+    color-mix(in oklab, var(--foreground) 55%, transparent) 84%,
+    transparent 100%
+  );
+  --os-handle-bg-active: linear-gradient(
+    to bottom,
+    transparent 0%,
+    color-mix(in oklab, var(--foreground) 80%, transparent) 12%,
+    var(--foreground) 50%,
+    color-mix(in oklab, var(--foreground) 80%, transparent) 88%,
+    transparent 100%
+  );
+}
+
+.os-theme-raum.os-scrollbar-horizontal {
+  --os-handle-bg: linear-gradient(
+    to right,
+    transparent 0%,
+    color-mix(in oklab, var(--foreground) 35%, transparent) 20%,
+    color-mix(in oklab, var(--foreground) 50%, transparent) 50%,
+    color-mix(in oklab, var(--foreground) 35%, transparent) 80%,
+    transparent 100%
+  );
+  --os-handle-bg-hover: linear-gradient(
+    to right,
+    transparent 0%,
+    color-mix(in oklab, var(--foreground) 55%, transparent) 16%,
+    color-mix(in oklab, var(--foreground) 80%, transparent) 50%,
+    color-mix(in oklab, var(--foreground) 55%, transparent) 84%,
+    transparent 100%
+  );
+  --os-handle-bg-active: linear-gradient(
+    to right,
+    transparent 0%,
+    color-mix(in oklab, var(--foreground) 80%, transparent) 12%,
+    var(--foreground) 50%,
+    color-mix(in oklab, var(--foreground) 80%, transparent) 88%,
+    transparent 100%
+  );
+}
+
+/* Subtle drop-shadow bloom on hover and scrubbing. Kept small so the
+   rail never overwhelms its panel. */
+.os-theme-raum .os-scrollbar-handle {
+  transition:
+    opacity 0.15s,
+    background 0.2s,
+    filter 0.2s,
+    border-color 0.15s,
+    width 0.15s,
+    height 0.15s;
+}
+.os-theme-raum:hover .os-scrollbar-handle {
+  filter: drop-shadow(0 0 3px color-mix(in oklab, var(--foreground) 22%, transparent));
+}
+.os-theme-raum.os-scrollbar-active .os-scrollbar-handle {
+  filter: drop-shadow(0 0 4px color-mix(in oklab, var(--foreground) 40%, transparent));
+}
+
+/*
+ * xterm.js renders its own `.xterm-viewport` with `overflow-y: scroll`.
+ * Hide the rail entirely — scroll still works via wheel/trackpad, and the
+ * custom "jump to bottom" button surfaces detached-viewport state.
+ */
+.xterm .xterm-viewport {
+  scrollbar-width: none;
+  scrollbar-color: transparent transparent;
+}
+.xterm .xterm-viewport::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
+}
+
+/* vscode-derived scrollbar DOM that xterm's CSS styles but rarely mounts —
+ * hide defensively in case an addon ever wires it up. */
+.xterm .xterm-scrollable-element > .scrollbar,
+.xterm .xterm-scrollable-element > .shadow {
+  display: none !important;
+}
+
+/* SearchAddon overview ruler (right-edge strip for match positions).
+ * In-buffer highlights remain; only the ruler is suppressed. */
+.xterm-decoration-overview-ruler {
+  display: none !important;
+}
+
+/*
  * Shared visual token for floating surfaces (dialogs, popovers, spotlight,
  * dropdowns, command menus, …). Kept in one place so every transient panel
  * has the same depth, rim, and corner radius — do NOT reinvent locally.
+ *
+ * Depth and rim both read from theme tokens: `--shadow-lg` carries the drop
+ * (black on dark themes, slate on light) and `--border-subtle` paints the
+ * 1px rim at the theme-appropriate contrast.
  */
 .floating-surface {
-  box-shadow:
-    0 24px 64px rgba(0, 0, 0, 0.55),
-    0 0 0 1px rgba(255, 255, 255, 0.06);
+  box-shadow: var(--shadow-lg);
 }

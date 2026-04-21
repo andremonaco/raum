@@ -82,10 +82,25 @@ pub fn run() {
             commands::terminal::terminal_resize,
             commands::terminal::terminal_list,
             commands::terminal::terminal_send_keys,
+            commands::terminal::terminal_paste_paths,
+            commands::terminal::terminal_pane_context,
             commands::terminal::terminal_reap_stale,
             commands::agent::agent_list,
             commands::agent::agent_spawn,
             commands::agent::agent_state,
+            // Atomic agents + terminals snapshot used by the top-row on
+            // mount / cmd+r to seed both stores before any memo runs.
+            commands::agent::agent_snapshot,
+            // Hook-pipeline diagnostic (Harness Health panel): returns
+            // "is the socket bound?" + "when did a hook last arrive?".
+            commands::agent::hooks_diagnostics,
+            // Synthetic round-trip probe for the UDS pipeline.
+            commands::agent::hooks_selftest,
+            // Phase 6 — on-demand per-harness selftest (Harness Health panel).
+            commands::agent::harness_selftest,
+            // Phase 7 — pure-read scan + on-demand install (Harness Health panel).
+            commands::harness::harness_scan_install_state,
+            commands::harness::harness_install,
             // §7.6 — Phase 2: reply to a parked PermissionRequest hook.
             commands::permission::reply_permission,
             // §5.4 — project command surface (Wave 3B).
@@ -102,6 +117,7 @@ pub fn run() {
             commands::worktree_create,
             commands::worktree_list,
             commands::worktree_branches,
+            commands::worktree_branch_merged,
             commands::worktree_remove,
             commands::worktree_config_write,
             // §9 — sidebar surface (Wave 3C).
@@ -109,6 +125,8 @@ pub fn run() {
             commands::git_stage,
             commands::git_unstage,
             commands::git_diff,
+            commands::git_discard,
+            commands::git_discard_all,
             commands::quickfire_history_get,
             commands::quickfire_history_push,
             commands::config_set_sidebar_width,
@@ -121,9 +139,11 @@ pub fn run() {
             commands::notifications::notifications_read_sound_bytes,
             commands::config_set_harness_flags,
             commands::config_set_worktree_path_pattern,
+            commands::config_set_appearance_theme,
             // Global search — file search over a project's root or arbitrary path.
             commands::search::project_find_files,
             commands::search::search_files_in_path,
+            commands::search::terminal_capture_text,
             // File editor — read/write files on behalf of the frontend.
             commands::files::file_read,
             commands::files::file_write,
@@ -169,12 +189,26 @@ pub fn run() {
             // silence heuristic; they never block startup.
             bootstrap_event_socket(app);
 
-            // §3.7 — boot-time reap of tmux sessions older than one day.
-            // Reattach (`terminal_reattach`) will pick up anything the user
-            // still has open; anything left after a day is an orphan from a
-            // closed project or a crashed instance and would otherwise leak
-            // memory on the `-L raum` socket indefinitely.
-            bootstrap_reap_stale(app);
+            // Silence/output fallback: periodic tick that advances
+            // Working machines to Idle after `silence_threshold` of no
+            // PTY output, and lets fresh output reclaim Working when a
+            // follow-up start hook is missed.
+            commands::agent::spawn_silence_tick(app.handle());
+
+            // Apply the server-wide tmux options that make every PTY-attached
+            // `tmux attach-session` client transparent (no prefix key, no
+            // status bar, zero ESC delay, no synthesized focus/title escapes).
+            // Idempotent — safe to re-run on every launch.
+            bootstrap_apply_server_options(app);
+
+            // Rehydrate harness state for tmux sessions that survived the
+            // previous app run. Absorbs the boot-time reap (stale tmux
+            // sessions older than one day are killed first, their tracked
+            // rows are then forgotten in `sessions.toml`, and the remaining
+            // live sessions are re-registered with a seeded state machine
+            // + terminal-registry ghost so top-row counters and hook-driven
+            // transitions work from the first frame of the webview).
+            bootstrap_rehydrate_sessions(app);
 
             Ok(())
         })
@@ -227,46 +261,183 @@ fn bootstrap_event_socket(app: &mut tauri::App) {
             "event socket: bound and RAUM_EVENT_SOCK exported",
         );
 
-        // Move the receiver into the drain loop while keeping the rest
-        // of the handle (path + listener `JoinHandle`) alive on managed
-        // state so the Phase 2 selftest UI can read it. We swap `rx`
-        // with a dummy closed receiver instead of cloning because
-        // `mpsc::Receiver` is not `Clone`; the dummy has no senders so
-        // it never yields items.
+        // Phase 6: also take ownership of the socket `rx` receiver
+        // while stashing a sibling (mpsc::Sender) that notification
+        // channels can push wire events into. We use a merger task:
+        // the socket's native rx + a secondary rx fed by the channel
+        // tasks both converge on `drive_event_socket`. Implementation:
+        // swap the handle's `rx` with a dummy, then create a brand-new
+        // merged channel (`merged_tx`/`merged_rx`); forward the
+        // original rx into `merged_tx` in a task, and publish
+        // `merged_tx` on managed state so channels can push into the
+        // same drain loop.
         let (_dummy_tx, dummy_rx) = tokio::sync::mpsc::channel::<raum_hooks::HookEvent>(1);
-        let rx = std::mem::replace(&mut handle.rx, dummy_rx);
+        let mut original_rx = std::mem::replace(&mut handle.rx, dummy_rx);
+
+        let (merged_tx, merged_rx) =
+            tokio::sync::mpsc::channel::<raum_hooks::HookEvent>(raum_hooks::PER_AGENT_BACKLOG);
+        let channel_tx = merged_tx.clone();
         {
             let state: tauri::State<'_, state::AppHandleState> = app_handle.state();
             if let Ok(mut slot) = state.event_socket.lock() {
                 *slot = Some(handle);
             }
+            if let Ok(mut slot) = state.channel_event_tx.lock() {
+                *slot = Some(channel_tx);
+            }
         }
+
+        // Forward native socket events into the merged stream. If the
+        // merged consumer closes, just drop the forwarder.
+        let merged_forward = merged_tx.clone();
+        tauri::async_runtime::spawn(async move {
+            while let Some(ev) = original_rx.recv().await {
+                if merged_forward.send(ev).await.is_err() {
+                    break;
+                }
+            }
+        });
+
         let bus = commands::agent::AgentEventBus { tx: bus_tx };
-        commands::agent::drive_event_socket(rx, bus, app_handle).await;
+        commands::agent::drive_event_socket(merged_rx, bus, app_handle).await;
     });
 }
 
-/// Reap tmux sessions older than one day on the `-L raum` socket. Runs
-/// once at app start on the tokio blocking pool so it can't delay the UI.
-/// Reattach (`terminal_reattach`) will have already picked up anything the
-/// user still has open in `active-layout.toml`; what's left is either from
-/// a closed project, a crashed instance, or an abandoned dev iteration —
-/// those would otherwise accumulate forever (we've observed 100+ orphans
-/// after a few days of development).
-fn bootstrap_reap_stale(app: &mut tauri::App) {
+/// Apply the transparent-client server options to the `-L raum` tmux server.
+/// Runs once at app start on the tokio blocking pool. tmux lazily spawns the
+/// server when the first session is created, so this call may emit "no server
+/// running" warnings on a clean launch — those are absorbed silently.
+fn bootstrap_apply_server_options(app: &mut tauri::App) {
     let state: tauri::State<'_, state::AppHandleState> = app.state();
     let tmux = state.tmux.clone();
     tauri::async_runtime::spawn(async move {
-        let killed = match tokio::task::spawn_blocking(move || tmux.reap_stale(1)).await {
+        let result = tokio::task::spawn_blocking(move || tmux.apply_server_options()).await;
+        match result {
+            Ok(Ok(())) => {
+                info!("tmux server options applied");
+            }
+            Ok(Err(e)) => {
+                warn!(error = %e, "tmux apply_server_options failed");
+            }
+            Err(e) => {
+                warn!(error = %e, "tmux apply_server_options join failed");
+            }
+        }
+    });
+}
+
+/// Maximum time `bootstrap_rehydrate_sessions` waits for the event
+/// socket bootstrap to publish a `channel_event_tx` before proceeding
+/// without one. 1 s is short enough that the UI never notices; if
+/// binding failed entirely we fall back to silence-only machines (same
+/// behaviour as before rehydrate existed).
+const REHYDRATE_EVENT_SOCKET_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Per-attempt sleep while polling for `channel_event_tx`. 20 ms keeps
+/// the total wait a handful of ticks in the happy path.
+const REHYDRATE_EVENT_SOCKET_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Rehydrate harness state on app launch.
+///
+/// Sequence (all on the tokio runtime, non-blocking for setup):
+///
+/// 1. `tmux.reap_stale(1)` — kill any session older than one day on
+///    the `-L raum` socket. Absorbs the previous `bootstrap_reap_stale`
+///    so reap happens BEFORE we classify live vs. dead tracked rows.
+/// 2. Bounded wait (≤ `REHYDRATE_EVENT_SOCKET_WAIT`) for the event
+///    socket bootstrap to publish `channel_event_tx`. When it's live,
+///    `infer_reattach_hook_fallback` can tell hook-installed sessions
+///    apart from silence-only ones; when it isn't, every session gets
+///    the silence fallback (matches the pre-rehydrate behaviour).
+/// 3. List live tmux sessions, read `state/sessions.toml`, feed both
+///    into the pure `rehydrate_plan`, then hand the plan to
+///    `apply_rehydrate_plan`. Per-session failures are logged but
+///    don't abort the rest of the rehydrate.
+fn bootstrap_rehydrate_sessions(app: &mut tauri::App) {
+    let app_handle = app.handle().clone();
+    let state: tauri::State<'_, state::AppHandleState> = app.state();
+    let tmux = state.tmux.clone();
+
+    tauri::async_runtime::spawn(async move {
+        // 1. Reap stale tmux sessions first so they disappear from
+        // `list_sessions()` before we build the plan.
+        let killed = match tokio::task::spawn_blocking({
+            let tmux = tmux.clone();
+            move || tmux.reap_stale(1)
+        })
+        .await
+        {
             Ok(v) => v,
             Err(e) => {
-                warn!(error = %e, "reap_stale: join failed");
-                return;
+                warn!(error = %e, "rehydrate: reap_stale join failed");
+                Vec::new()
             }
         };
         if !killed.is_empty() {
-            info!(count = killed.len(), ids = ?killed, "reap_stale: killed orphan tmux sessions");
+            info!(
+                count = killed.len(),
+                ids = ?killed,
+                "rehydrate: killed orphan tmux sessions",
+            );
         }
+
+        // 2. Wait (bounded) for the event-socket bootstrap to publish
+        // `channel_event_tx`.
+        let deadline = std::time::Instant::now() + REHYDRATE_EVENT_SOCKET_WAIT;
+        loop {
+            let ready = {
+                let state: tauri::State<'_, state::AppHandleState> = app_handle.state();
+                state
+                    .channel_event_tx
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.clone())
+                    .is_some()
+            };
+            if ready || std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(REHYDRATE_EVENT_SOCKET_POLL).await;
+        }
+
+        // 3. Build the plan.
+        let live_ids: std::collections::HashSet<String> = match tokio::task::spawn_blocking({
+            let tmux = tmux.clone();
+            move || tmux.list_sessions()
+        })
+        .await
+        {
+            Ok(Ok(sessions)) => sessions.into_iter().map(|s| s.id).collect(),
+            Ok(Err(e)) => {
+                warn!(error = %e, "rehydrate: tmux list_sessions failed; skipping");
+                return;
+            }
+            Err(e) => {
+                warn!(error = %e, "rehydrate: list_sessions join failed");
+                return;
+            }
+        };
+
+        let tracked = {
+            let state: tauri::State<'_, state::AppHandleState> = app_handle.state();
+            let Ok(store) = state.config_store.lock() else {
+                warn!("rehydrate: config_store lock poisoned");
+                return;
+            };
+            store.read_sessions().unwrap_or_default().sessions
+        };
+
+        let plan = commands::agent_hydrate::rehydrate_plan(&tracked, &live_ids);
+        if plan.is_empty() {
+            info!("rehydrate: nothing to do");
+            return;
+        }
+
+        // 4. Apply. The applier spawns inside the same task; it runs
+        // quickly because all per-session work is in-memory registry
+        // mutation + a couple of Tauri emits.
+        let state: tauri::State<'_, state::AppHandleState> = app_handle.state();
+        let _report = commands::agent_hydrate::apply_rehydrate_plan(&app_handle, &state, plan);
     });
 }
 

@@ -38,19 +38,20 @@ tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-bytes = "1"
 which = "8"
 ignore = "0.4"
 notify = "6"
+dirs = "6"
 
 [dev-dependencies]
 tempfile = "3"
 tracing-test = "0.2"
 
 [package.metadata.cargo-machete]
-ignored = ["raum-hooks", "tracing-subscriber"]
+ignored = ["tracing-subscriber"]
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

@@ -1,13 +1,21 @@
-//! File search command — walks a registered project's root (honoring
-//! `.gitignore`) and returns ranked filename matches for the UI's global
-//! search panel. Scrollback search lives in the frontend; this complements it
-//! so the ⌘⇧F overlay can surface both source files and terminal output.
+//! File + terminal-text search commands for the UI's global ⌘⇧F panel.
+//!
+//! - `project_find_files` / `search_files_in_path` walk a directory honoring
+//!   `.gitignore` and return ranked filename matches.
+//! - `terminal_capture_text` hands the frontend the plain-text contents of
+//!   every live tmux pane so the scrollback walk can include content that
+//!   xterm.js has already lost — notably harness TUIs that live in
+//!   alternate-screen (which has no scrollback) while their history is kept
+//!   only in tmux's `history-limit`.
 
 use std::path::{Path, PathBuf};
 
 use ignore::WalkBuilder;
 use raum_core::store::ConfigStore;
 use serde::Serialize;
+use tokio::task::JoinSet;
+
+use crate::state::AppHandleState;
 
 /// One file match returned to the UI.
 #[derive(Debug, Serialize)]
@@ -126,6 +134,55 @@ pub fn search_files_in_path(path: String, query: String) -> Result<Vec<FileHit>,
         return Err(format!("not a directory: {}", root.display()));
     }
     Ok(find_files_in(&root, &query))
+}
+
+/// Plain-text scrollback for one tmux session. Fields are already UTF-8 and
+/// free of ANSI escapes, so the frontend can split on `\n` and run its
+/// matcher directly.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaneTextHit {
+    /// The tmux session id the capture came from.
+    pub session_id: String,
+    /// Full normal-buffer history as plain text.
+    pub normal: String,
+    /// Current alternate-screen frame as plain text, when one is active.
+    pub alternate: Option<String>,
+}
+
+/// Capture plain-text scrollback for a batch of tmux sessions. Each id is
+/// captured in its own blocking task (tmux CLI is sync) so a slow pane
+/// doesn't serialise the whole batch; ids that error out (stale session,
+/// killed pane, socket gone) are dropped silently rather than failing the
+/// request — the frontend just won't see a result for them.
+#[tauri::command]
+pub async fn terminal_capture_text(
+    session_ids: Vec<String>,
+    state: tauri::State<'_, AppHandleState>,
+) -> Result<Vec<PaneTextHit>, String> {
+    if session_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let tmux = state.tmux.clone();
+    let mut set: JoinSet<Option<PaneTextHit>> = JoinSet::new();
+    for id in session_ids {
+        let tmux = tmux.clone();
+        set.spawn_blocking(move || match tmux.capture_pane_text(&id) {
+            Ok(snap) => Some(PaneTextHit {
+                session_id: id,
+                normal: snap.normal,
+                alternate: snap.alternate,
+            }),
+            Err(_) => None,
+        });
+    }
+    let mut out = Vec::new();
+    while let Some(res) = set.join_next().await {
+        if let Ok(Some(hit)) = res {
+            out.push(hit);
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

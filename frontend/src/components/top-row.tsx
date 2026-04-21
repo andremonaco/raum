@@ -47,14 +47,22 @@ import {
   upsertProject,
   type ProjectListItem,
 } from "../stores/projectStore";
-import { refreshAgents, subscribeAgentEvents, type AgentState } from "../stores/agentStore";
+import {
+  refreshAgents,
+  setAdapters,
+  subscribeAgentEvents,
+  type AgentListItem,
+} from "../stores/agentStore";
 import {
   activeCount,
-  applyAgentStateToTerminal,
   idleCount,
   refreshTerminals,
+  setTerminals,
+  subscribeTerminalEvents,
   waitingCount,
+  type TerminalListItem,
 } from "../stores/terminalStore";
+import { subscribePaneActivity } from "../stores/runtimeLayoutStore";
 import { useKeymap } from "../lib/keymapContext";
 import { PROJECT_COLOR_PALETTE } from "../lib/projectColors";
 import { PROJECT_SIGIL_PALETTE, SIGIL_RESET, deriveSigilFromSlug } from "../lib/projectSigils";
@@ -78,7 +86,7 @@ import {
   DialogTitle,
 } from "./ui/dialog";
 import { Popover, PopoverContent, PopoverPortal, PopoverTrigger } from "./ui/popover";
-import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
+import { Tooltip, TooltipContent, TooltipPortal, TooltipTrigger } from "./ui/tooltip";
 import {
   ActivityIcon,
   AlertCircleIcon,
@@ -147,9 +155,9 @@ async function fetchGlobalSearchAccel(): Promise<string> {
   try {
     const entries = await invoke<KeymapEntry[]>("keymap_get_effective");
     const gs = entries.find((e) => e.action === "global-search");
-    return gs?.accelerator ?? "CmdOrCtrl+Shift+F";
+    return gs?.accelerator ?? "CmdOrCtrl+F";
   } catch {
-    return "CmdOrCtrl+Shift+F";
+    return "CmdOrCtrl+F";
   }
 }
 
@@ -210,7 +218,17 @@ const ProjectTab: Component<ProjectTabProps> = (props) => {
   }
 
   return (
-    <div class="relative flex items-center">
+    <div
+      class="group relative flex h-7 items-stretch rounded-md transition-colors duration-150"
+      classList={{
+        "bg-selected": props.active,
+        "hover:bg-selected/40": !props.active,
+      }}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        setMenuOpen(true);
+      }}
+    >
       {/* The color swatch owns its own Popover for quick color changes.
           Clicking the tab text itself (when active) opens the full settings
           dialog with color, hydration, and in-repo toggle. */}
@@ -218,7 +236,7 @@ const ProjectTab: Component<ProjectTabProps> = (props) => {
         <PopoverTrigger
           as="button"
           type="button"
-          class="absolute left-1.5 top-1/2 z-10 inline-flex h-4 w-4 -translate-y-1/2 select-none items-center justify-center font-mono text-[13px] leading-none tabular-nums hover:opacity-80"
+          class="inline-flex select-none items-center pl-2.5 pr-1 font-mono text-[13px] leading-none tabular-nums hover:opacity-70 rounded-l-md"
           style={{ color: props.project.color }}
           aria-label={`Project sigil ${props.project.sigil} — click to edit color and sigil`}
           onClick={(e: MouseEvent) => e.stopPropagation()}
@@ -297,10 +315,10 @@ const ProjectTab: Component<ProjectTabProps> = (props) => {
 
       <button
         type="button"
-        class="group flex items-center gap-2 rounded-t py-1.5 pl-7 pr-3 text-xs"
+        class="flex items-center gap-1.5 pl-0.5 pr-3 text-xs transition-colors rounded-r-md"
         classList={{
-          "bg-muted text-foreground": props.active,
-          "text-muted-foreground hover:text-foreground": !props.active,
+          "text-foreground font-medium": props.active,
+          "text-muted-foreground group-hover:text-foreground": !props.active,
         }}
         onClick={() => {
           if (props.active) {
@@ -309,14 +327,10 @@ const ProjectTab: Component<ProjectTabProps> = (props) => {
             props.onSelect();
           }
         }}
-        onContextMenu={(e) => {
-          e.preventDefault();
-          setMenuOpen(true);
-        }}
       >
         <span class="truncate">{props.project.name || props.project.slug}</span>
         <Show when={branch()}>
-          <span class="inline-flex items-center gap-0.5 rounded-full bg-background/60 px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
+          <span class="inline-flex items-center gap-0.5 rounded bg-muted/60 px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
             <GitBranchIcon class="size-2.5" />
             <span class="max-w-[12ch] truncate">{branch()}</span>
           </span>
@@ -378,7 +392,7 @@ export const TopRow: Component = () => {
   });
 
   const onKeydown = (e: KeyboardEvent): void => {
-    const a = accel() ?? "CmdOrCtrl+Shift+F";
+    const a = accel() ?? "CmdOrCtrl+F";
     if (matchesAccelerator(e, a)) {
       e.preventDefault();
       toggleSearchPanel();
@@ -395,12 +409,22 @@ export const TopRow: Component = () => {
   onMount(() => {
     let unlistenProject: UnlistenFn | undefined;
     let unlistenAgent: UnlistenFn | undefined;
-    let unlistenAgentState: UnlistenFn | undefined;
+    let unlistenTerminal: UnlistenFn | undefined;
     let unlistenBranches: UnlistenFn | undefined;
+    let unlistenMenu: UnlistenFn | undefined;
+    let unlistenPaneActivity: UnlistenFn | undefined;
 
-    void refreshProjects();
-    void refreshAgents();
-    void refreshTerminals();
+    listen<string>("menu-action", (ev) => {
+      if (ev.payload === "open-settings") {
+        setAppSettingsOpen(true);
+      }
+    })
+      .then((u) => {
+        unlistenMenu = u;
+      })
+      .catch(() => {
+        /* Tauri context unavailable (tests). */
+      });
 
     subscribeProjectEvents()
       .then((u) => {
@@ -416,6 +440,47 @@ export const TopRow: Component = () => {
       .catch(() => {
         /* Tauri context unavailable (tests). */
       });
+    subscribeTerminalEvents()
+      .then((u) => {
+        unlistenTerminal = u;
+      })
+      .catch(() => {
+        /* Tauri context unavailable (tests). */
+      });
+    subscribePaneActivity()
+      .then((u) => {
+        unlistenPaneActivity = u;
+      })
+      .catch(() => {
+        /* Tauri context unavailable (tests). */
+      });
+
+    void refreshProjects();
+    // Atomic rehydration: seed both stores from a single snapshot so
+    // memos don't render `0 0 0` for the window between `refreshAgents`
+    // and `refreshTerminals` settling. Subscriptions above attach
+    // first, so any `agent-state-changed` / `terminal-session-upserted`
+    // event that races the snapshot still lands on the fresh state
+    // (listeners apply the transition; `reconcile` in setAdapters /
+    // setTerminals is idempotent when the snapshot repeats it).
+    void invoke<{ agents: AgentListItem[]; terminals: TerminalListItem[] }>("agent_snapshot")
+      .then((snap) => {
+        setAdapters(snap.agents);
+        setTerminals(snap.terminals);
+      })
+      .catch((e) => {
+        // Fallback for older backends / test harnesses without the
+        // snapshot command: fall back to the two-invoke path.
+        console.warn("agent_snapshot failed, falling back", e);
+        void refreshAgents()
+          .catch(() => {
+            /* fall through to terminal refresh */
+          })
+          .then(() => refreshTerminals())
+          .catch(() => {
+            /* Tauri context unavailable (tests). */
+          });
+      });
     subscribeWorktreeBranchEvents()
       .then((u) => {
         unlistenBranches = u;
@@ -424,33 +489,13 @@ export const TopRow: Component = () => {
         /* Tauri context unavailable (tests). */
       });
 
-    listen<{
-      session_id: string | Record<string, unknown>;
-      to: string;
-    }>("agent-state-changed", (ev) => {
-      const raw = ev.payload.session_id;
-      let id = "";
-      if (typeof raw === "string") {
-        id = raw;
-      } else if (raw && typeof raw === "object") {
-        const inner = (raw as Record<string, unknown>)["0"];
-        if (typeof inner === "string") id = inner;
-      }
-      if (!id) return;
-      applyAgentStateToTerminal(id, ev.payload.to as AgentState);
-    })
-      .then((u) => {
-        unlistenAgentState = u;
-      })
-      .catch(() => {
-        /* Tauri context unavailable (tests). */
-      });
-
     onCleanup(() => {
       unlistenProject?.();
       unlistenAgent?.();
-      unlistenAgentState?.();
+      unlistenTerminal?.();
       unlistenBranches?.();
+      unlistenMenu?.();
+      unlistenPaneActivity?.();
     });
   });
 
@@ -504,9 +549,10 @@ export const TopRow: Component = () => {
   }
 
   function spawn(kind: SpawnKind) {
-    // Project slug is optional — a raw Shell works fine without an active
-    // project. The backend accepts `Option<String>`. TerminalGrid materialises
-    // a new runtime cell on receipt.
+    if (kind !== "shell" && !activeProjectSlug()) {
+      setModalOpen(true);
+      return;
+    }
     window.dispatchEvent(
       new CustomEvent("raum:spawn-requested", {
         detail: { kind, projectSlug: activeProjectSlug() },
@@ -549,10 +595,13 @@ export const TopRow: Component = () => {
     <>
       <header
         data-tauri-drag-region
-        class="grid h-10 shrink-0 select-none grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-2 border-b border-border bg-background px-3 text-sm"
+        class="grid h-10 shrink-0 select-none grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-2 bg-background px-3 text-sm"
       >
         {/* LEFT — window controls + brand + spawn icons */}
-        <div class={`flex items-center gap-1.5 justify-self-start${isMacOS ? " pl-[72px]" : ""}`}>
+        <div
+          data-tauri-drag-region
+          class={`flex items-center gap-1.5 justify-self-start${isMacOS ? " pl-[72px]" : ""}`}
+        >
           <Show when={!isMacOS}>
             <div class="group mr-1.5 flex items-center gap-2">
               <button
@@ -619,7 +668,7 @@ export const TopRow: Component = () => {
           <button
             type="button"
             aria-label="Open settings"
-            class="rounded p-1 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200"
+            class="focus-ring rounded-sm p-1 text-foreground-subtle hover:bg-hover hover:text-foreground"
             onClick={() => setAppSettingsOpen(true)}
           >
             <svg
@@ -639,7 +688,7 @@ export const TopRow: Component = () => {
           <button
             type="button"
             aria-label="Edit keyboard shortcuts"
-            class="rounded p-1 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200"
+            class="focus-ring rounded-sm p-1 text-foreground-subtle hover:bg-hover hover:text-foreground"
             onClick={() => setKeymapSettingsOpen(true)}
           >
             <KeyboardIcon class="size-3.5" />
@@ -647,7 +696,7 @@ export const TopRow: Component = () => {
           <button
             type="button"
             aria-label="Toggle sidebar"
-            class="rounded p-1 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200"
+            class="focus-ring rounded-sm p-1 text-foreground-subtle hover:bg-hover hover:text-foreground"
             onClick={() => toggleSidebarHidden()}
           >
             <svg
@@ -664,7 +713,7 @@ export const TopRow: Component = () => {
               <path d="M9 3v18" />
             </svg>
           </button>
-          <div class="mx-1 h-5 w-px bg-border" aria-hidden="true" />
+          <div aria-hidden="true" class="mx-1 h-4 w-px shrink-0 bg-border" />
           <For each={SPAWN_DEFS}>
             {(def) => {
               const Icon = HARNESS_ICONS[def.kind];
@@ -682,23 +731,35 @@ export const TopRow: Component = () => {
                   >
                     <Icon class="size-3.5" />
                   </TooltipTrigger>
-                  <TooltipContent>
-                    Spawn {def.label}
-                    <Show when={keymap.accelerator(def.action)}>
-                      <span class="ml-1 opacity-70">
-                        ({prettifyAccel(keymap.accelerator(def.action))})
-                      </span>
-                    </Show>
-                  </TooltipContent>
+                  <TooltipPortal>
+                    <TooltipContent>
+                      Spawn {def.label}
+                      <Show when={keymap.accelerator(def.action)}>
+                        <span class="ml-1 opacity-70">
+                          ({prettifyAccel(keymap.accelerator(def.action))})
+                        </span>
+                      </Show>
+                    </TooltipContent>
+                  </TooltipPortal>
                 </Tooltip>
               );
             }}
           </For>
         </div>
 
-        {/* CENTER — project tabs + add + view filter icons */}
-        <div class="flex items-center gap-1 justify-self-center overflow-x-auto">
-          <nav class="flex items-stretch gap-0.5" aria-label="Projects" data-testid="project-tabs">
+        {/* CENTER — project tabs + add + view filter icons.
+            py-1 keeps the Waiting-badge overhang inside the padding-box so
+            overflow-x-auto (which also clips vertically) doesn't crop it. */}
+        <div
+          data-tauri-drag-region
+          class="flex items-center gap-1 justify-self-center overflow-x-auto py-1"
+        >
+          <nav
+            data-tauri-drag-region
+            class="flex items-stretch gap-0.5"
+            aria-label="Projects"
+            data-testid="project-tabs"
+          >
             <For each={projectStore.items}>
               {(project) => (
                 <ProjectTab
@@ -725,13 +786,18 @@ export const TopRow: Component = () => {
               >
                 <PlusIcon class="size-3.5" />
               </TooltipTrigger>
-              <TooltipContent>Add project</TooltipContent>
+              <TooltipPortal>
+                <TooltipContent>Add project</TooltipContent>
+              </TooltipPortal>
             </Tooltip>
           </nav>
 
-          <div class="mx-1 h-5 w-px bg-border" aria-hidden="true" />
-
-          <nav class="flex items-stretch gap-0.5" aria-label="Views" data-testid="filter-tabs">
+          <nav
+            data-tauri-drag-region
+            class="flex items-stretch gap-0.5"
+            aria-label="Views"
+            data-testid="filter-tabs"
+          >
             <For each={filters()}>
               {(filter) => {
                 const Icon = filter.icon;
@@ -742,7 +808,7 @@ export const TopRow: Component = () => {
                       type="button"
                       class="relative flex h-7 w-7 items-center justify-center rounded"
                       classList={{
-                        "bg-muted text-foreground": selectedFilter() === filter.id,
+                        "bg-selected text-foreground": selectedFilter() === filter.id,
                         "text-muted-foreground hover:text-foreground":
                           selectedFilter() !== filter.id,
                       }}
@@ -753,14 +819,16 @@ export const TopRow: Component = () => {
                       <Icon class="size-3.5" />
                       <Show when={filter.id === "needs-input" && waitingCount() > 0}>
                         <Badge
-                          class="absolute -top-1 -right-1 h-3.5 min-w-3.5 justify-center rounded-full border border-background bg-amber-500 px-0.5 text-[9px] font-semibold text-zinc-950 hover:bg-amber-500"
+                          class="absolute -top-1 -right-1 h-3.5 min-w-3.5 justify-center rounded-full border border-background bg-warning px-0.5 text-[9px] font-semibold text-background hover:bg-warning"
                           data-testid="needs-input-count"
                         >
                           {waitingCount()}
                         </Badge>
                       </Show>
                     </TooltipTrigger>
-                    <TooltipContent>{filter.label}</TooltipContent>
+                    <TooltipPortal>
+                      <TooltipContent>{filter.label}</TooltipContent>
+                    </TooltipPortal>
                   </Tooltip>
                 );
               }}
@@ -769,9 +837,9 @@ export const TopRow: Component = () => {
         </div>
 
         {/* RIGHT — search input + status counters */}
-        <div class="flex items-center gap-2 justify-self-end">
+        <div data-tauri-drag-region class="flex items-center gap-2 justify-self-end">
           {/* Inline search affordance — clicking or typing opens the spotlight */}
-          <div class="flex items-center gap-1.5 h-7 rounded-md border border-border bg-transparent px-2 cursor-text hover:border-border/80 transition-colors">
+          <div class="flex items-center gap-1.5 h-7 rounded-md bg-selected px-2 cursor-text transition-colors">
             <SearchIcon class="size-3 shrink-0 text-muted-foreground/40" />
             <input
               ref={(el) => (topBarInputEl = el)}
@@ -801,7 +869,8 @@ export const TopRow: Component = () => {
           </div>
 
           <div
-            class="flex items-center gap-0.5 rounded-md border border-border bg-card/50 px-1 py-0.5 text-[10px]"
+            data-tauri-drag-region
+            class="flex items-center gap-0.5 rounded-md px-1 py-0.5 text-[10px]"
             data-testid="harness-counters"
           >
             <Tooltip>
@@ -809,7 +878,7 @@ export const TopRow: Component = () => {
                 as="span"
                 class="inline-flex items-center gap-1 rounded px-1 py-0.5 font-mono"
                 classList={{
-                  "text-emerald-400": activeCount() > 0,
+                  "text-success": activeCount() > 0,
                   "text-muted-foreground": activeCount() === 0,
                 }}
                 data-testid="active-count"
@@ -819,16 +888,18 @@ export const TopRow: Component = () => {
                 </Show>
                 {activeCount()}
               </TooltipTrigger>
-              <TooltipContent>
-                {activeCount()} active harness{activeCount() === 1 ? "" : "es"}
-              </TooltipContent>
+              <TooltipPortal>
+                <TooltipContent>
+                  {activeCount()} active harness{activeCount() === 1 ? "" : "es"}
+                </TooltipContent>
+              </TooltipPortal>
             </Tooltip>
             <Tooltip>
               <TooltipTrigger
                 as="span"
                 class="inline-flex items-center gap-1 rounded px-1 py-0.5 font-mono"
                 classList={{
-                  "text-amber-400": waitingCount() > 0,
+                  "text-warning": waitingCount() > 0,
                   "text-muted-foreground": waitingCount() === 0,
                 }}
                 data-testid="waiting-count"
@@ -836,7 +907,9 @@ export const TopRow: Component = () => {
                 <AlertCircleIcon class="size-3" />
                 {waitingCount()}
               </TooltipTrigger>
-              <TooltipContent>{waitingCount()} waiting for input</TooltipContent>
+              <TooltipPortal>
+                <TooltipContent>{waitingCount()} waiting for input</TooltipContent>
+              </TooltipPortal>
             </Tooltip>
             <Tooltip>
               <TooltipTrigger
@@ -847,9 +920,11 @@ export const TopRow: Component = () => {
                 <CheckIcon class="size-3" />
                 {idleCount()}
               </TooltipTrigger>
-              <TooltipContent>
-                {idleCount()} idle harness{idleCount() === 1 ? "" : "es"}
-              </TooltipContent>
+              <TooltipPortal>
+                <TooltipContent>
+                  {idleCount()} idle harness{idleCount() === 1 ? "" : "es"}
+                </TooltipContent>
+              </TooltipPortal>
             </Tooltip>
           </div>
         </div>

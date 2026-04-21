@@ -11,9 +11,10 @@ use serde::de::DeserializeOwned;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
+use crate::agent::{AgentKind, AgentState};
 use crate::config::{
     ActiveLayoutState, Config, EffectiveProjectConfig, Keybindings, ProjectConfig,
-    QuickfireHistory, RaumToml, SessionState,
+    QuickfireHistory, RaumToml, SessionState, TrackedSession,
 };
 use crate::paths;
 
@@ -160,6 +161,110 @@ impl ConfigStore {
     pub fn write_sessions(&self, state: &SessionState) -> Result<(), StoreError> {
         ensure_dir_0700(&self.root.join("state"))?;
         write_toml(&self.root.join("state").join("sessions.toml"), state)
+    }
+
+    /// Upsert the last-known `AgentState` for `session_id`. If a tracked row
+    /// for the session already exists its `last_state` + timestamp are
+    /// overwritten; otherwise a minimal row is inserted so reattach can find
+    /// it on the next app launch. Used by the agent-event bridge task to
+    /// persist every state transition.
+    pub fn update_session_last_state(
+        &self,
+        session_id: &str,
+        harness: AgentKind,
+        state: AgentState,
+        at_unix_ms: u64,
+    ) -> Result<(), StoreError> {
+        let mut st = self.read_sessions().unwrap_or_default();
+        if let Some(row) = st.sessions.iter_mut().find(|s| s.session_id == session_id) {
+            row.last_state = Some(state);
+            row.last_state_at_unix_ms = Some(at_unix_ms);
+        } else {
+            st.sessions.push(TrackedSession {
+                session_id: session_id.to_string(),
+                project_slug: None,
+                worktree_id: None,
+                opencode_port: None,
+                kind: harness,
+                created_at_unix_ms: at_unix_ms,
+                last_state: Some(state),
+                last_state_at_unix_ms: Some(at_unix_ms),
+            });
+        }
+        self.write_sessions(&st)
+    }
+
+    /// Fetch the last persisted `AgentState` for `session_id`, if any.
+    /// Cheap convenience for the reattach seed path.
+    pub fn last_session_state(&self, session_id: &str) -> Option<AgentState> {
+        self.read_sessions()
+            .ok()?
+            .sessions
+            .into_iter()
+            .find(|s| s.session_id == session_id)
+            .and_then(|s| s.last_state)
+    }
+
+    /// Write-once metadata registration for a session. Called once per session
+    /// from the per-session registration path (`register_harness_session_runtime`)
+    /// so `state/sessions.toml` carries the `project_slug` / `worktree_id`
+    /// pairing that `update_session_last_state` doesn't know about. Safe to
+    /// call repeatedly: existing metadata is preserved, only a filled-in
+    /// `project_slug` / `worktree_id` can fill a previously `None` slot
+    /// (first writer wins).
+    pub fn upsert_tracked_session(
+        &self,
+        session_id: &str,
+        harness: AgentKind,
+        project_slug: Option<&str>,
+        worktree_id: Option<&str>,
+        opencode_port: Option<u16>,
+        created_at_unix_ms: u64,
+    ) -> Result<(), StoreError> {
+        let mut st = self.read_sessions().unwrap_or_default();
+        if let Some(row) = st.sessions.iter_mut().find(|s| s.session_id == session_id) {
+            // Metadata is write-once. A later caller that only has `None`
+            // must never clobber an existing `Some`; a later caller with
+            // `Some` only wins if the current value is `None`.
+            if row.project_slug.is_none()
+                && let Some(slug) = project_slug
+            {
+                row.project_slug = Some(slug.to_string());
+            }
+            if row.worktree_id.is_none()
+                && let Some(wt) = worktree_id
+            {
+                row.worktree_id = Some(wt.to_string());
+            }
+            if row.opencode_port.is_none() {
+                row.opencode_port = opencode_port;
+            }
+        } else {
+            st.sessions.push(TrackedSession {
+                session_id: session_id.to_string(),
+                project_slug: project_slug.map(str::to_string),
+                worktree_id: worktree_id.map(str::to_string),
+                opencode_port,
+                kind: harness,
+                created_at_unix_ms,
+                last_state: None,
+                last_state_at_unix_ms: None,
+            });
+        }
+        self.write_sessions(&st)
+    }
+
+    /// Drop the tracked row for `session_id`. Called when the session is
+    /// torn down so the next launch doesn't try to re-hydrate a state for a
+    /// tmux window that no longer exists.
+    pub fn forget_session(&self, session_id: &str) -> Result<(), StoreError> {
+        let mut st = self.read_sessions().unwrap_or_default();
+        let before = st.sessions.len();
+        st.sessions.retain(|s| s.session_id != session_id);
+        if st.sessions.len() == before {
+            return Ok(());
+        }
+        self.write_sessions(&st)
     }
 
     // ---- state/quickfire-history.toml --------------------------------------
@@ -573,13 +678,215 @@ mod tests {
                 session_id: "raum-abc".into(),
                 project_slug: Some("acme".into()),
                 worktree_id: None,
+                opencode_port: None,
                 kind: AgentKind::Shell,
                 created_at_unix_ms: 42,
+                last_state: None,
+                last_state_at_unix_ms: None,
             }],
         };
         store.write_sessions(&st).unwrap();
         let back = store.read_sessions().unwrap();
         assert_eq!(back.sessions.len(), 1);
+    }
+
+    #[test]
+    fn sessions_legacy_file_without_last_state_deserialises() {
+        // Existing `state/sessions.toml` files on disk pre-date the
+        // `last_state` field. They must keep deserialising to `None` so
+        // upgrades don't drop user sessions.
+        let dir = tempdir().unwrap();
+        let store = ConfigStore::new(dir.path());
+        store.ensure_layout().unwrap();
+        let legacy = r#"
+[[session]]
+session_id = "raum-legacy"
+project_slug = "acme"
+kind = "shell"
+created_at_unix_ms = 1
+"#;
+        std::fs::write(dir.path().join("state").join("sessions.toml"), legacy).unwrap();
+        let back = store.read_sessions().unwrap();
+        assert_eq!(back.sessions.len(), 1);
+        assert_eq!(back.sessions[0].last_state, None);
+        assert_eq!(back.sessions[0].last_state_at_unix_ms, None);
+    }
+
+    #[test]
+    fn update_session_last_state_upserts_and_overwrites() {
+        let dir = tempdir().unwrap();
+        let store = ConfigStore::new(dir.path());
+        store.ensure_layout().unwrap();
+
+        // First call creates a minimal row.
+        store
+            .update_session_last_state("raum-sess", AgentKind::ClaudeCode, AgentState::Working, 100)
+            .unwrap();
+        assert_eq!(
+            store.last_session_state("raum-sess"),
+            Some(AgentState::Working)
+        );
+
+        // Second call overwrites the state and timestamp.
+        store
+            .update_session_last_state("raum-sess", AgentKind::ClaudeCode, AgentState::Waiting, 200)
+            .unwrap();
+        let back = store.read_sessions().unwrap();
+        assert_eq!(back.sessions.len(), 1);
+        assert_eq!(back.sessions[0].last_state, Some(AgentState::Waiting));
+        assert_eq!(back.sessions[0].last_state_at_unix_ms, Some(200));
+    }
+
+    #[test]
+    fn upsert_tracked_session_inserts_with_full_metadata() {
+        let dir = tempdir().unwrap();
+        let store = ConfigStore::new(dir.path());
+        store.ensure_layout().unwrap();
+
+        store
+            .upsert_tracked_session(
+                "raum-sess",
+                AgentKind::ClaudeCode,
+                Some("acme"),
+                Some("wt-main"),
+                None,
+                42,
+            )
+            .unwrap();
+
+        let back = store.read_sessions().unwrap();
+        assert_eq!(back.sessions.len(), 1);
+        let row = &back.sessions[0];
+        assert_eq!(row.session_id, "raum-sess");
+        assert_eq!(row.kind, AgentKind::ClaudeCode);
+        assert_eq!(row.project_slug.as_deref(), Some("acme"));
+        assert_eq!(row.worktree_id.as_deref(), Some("wt-main"));
+        assert_eq!(row.created_at_unix_ms, 42);
+        assert_eq!(row.last_state, None);
+    }
+
+    #[test]
+    fn upsert_tracked_session_is_metadata_write_once() {
+        let dir = tempdir().unwrap();
+        let store = ConfigStore::new(dir.path());
+        store.ensure_layout().unwrap();
+
+        // Seed with full metadata.
+        store
+            .upsert_tracked_session(
+                "raum-sess",
+                AgentKind::ClaudeCode,
+                Some("acme"),
+                Some("wt-main"),
+                None,
+                42,
+            )
+            .unwrap();
+
+        // A later call with different metadata must NOT overwrite.
+        store
+            .upsert_tracked_session(
+                "raum-sess",
+                AgentKind::ClaudeCode,
+                Some("other"),
+                Some("wt-other"),
+                None,
+                99,
+            )
+            .unwrap();
+
+        let back = store.read_sessions().unwrap();
+        assert_eq!(back.sessions.len(), 1);
+        let row = &back.sessions[0];
+        assert_eq!(row.project_slug.as_deref(), Some("acme"));
+        assert_eq!(row.worktree_id.as_deref(), Some("wt-main"));
+        // `created_at_unix_ms` is insert-only; later calls don't touch it.
+        assert_eq!(row.created_at_unix_ms, 42);
+    }
+
+    #[test]
+    fn upsert_tracked_session_fills_missing_metadata() {
+        let dir = tempdir().unwrap();
+        let store = ConfigStore::new(dir.path());
+        store.ensure_layout().unwrap();
+
+        // A hook fires before the spawn path persists metadata: row exists
+        // with `None` project_slug/worktree_id (via the bridge task path).
+        store
+            .update_session_last_state("raum-sess", AgentKind::Codex, AgentState::Working, 100)
+            .unwrap();
+
+        // Then the spawn path catches up and fills metadata.
+        store
+            .upsert_tracked_session(
+                "raum-sess",
+                AgentKind::Codex,
+                Some("acme"),
+                Some("wt-dev"),
+                None,
+                50,
+            )
+            .unwrap();
+
+        let back = store.read_sessions().unwrap();
+        assert_eq!(back.sessions.len(), 1);
+        let row = &back.sessions[0];
+        assert_eq!(row.project_slug.as_deref(), Some("acme"));
+        assert_eq!(row.worktree_id.as_deref(), Some("wt-dev"));
+        // last_state was already set by `update_session_last_state`, preserved.
+        assert_eq!(row.last_state, Some(AgentState::Working));
+    }
+
+    #[test]
+    fn update_session_last_state_preserves_metadata() {
+        let dir = tempdir().unwrap();
+        let store = ConfigStore::new(dir.path());
+        store.ensure_layout().unwrap();
+
+        // Spawn path seeds full metadata.
+        store
+            .upsert_tracked_session(
+                "raum-sess",
+                AgentKind::OpenCode,
+                Some("acme"),
+                Some("wt-main"),
+                Some(4444),
+                42,
+            )
+            .unwrap();
+
+        // Later hook transitions only know session_id + state; they must
+        // not null out project_slug / worktree_id.
+        store
+            .update_session_last_state("raum-sess", AgentKind::OpenCode, AgentState::Waiting, 200)
+            .unwrap();
+
+        let back = store.read_sessions().unwrap();
+        assert_eq!(back.sessions.len(), 1);
+        let row = &back.sessions[0];
+        assert_eq!(row.project_slug.as_deref(), Some("acme"));
+        assert_eq!(row.worktree_id.as_deref(), Some("wt-main"));
+        assert_eq!(row.opencode_port, Some(4444));
+        assert_eq!(row.last_state, Some(AgentState::Waiting));
+    }
+
+    #[test]
+    fn forget_session_drops_the_row() {
+        let dir = tempdir().unwrap();
+        let store = ConfigStore::new(dir.path());
+        store.ensure_layout().unwrap();
+        store
+            .update_session_last_state("raum-a", AgentKind::Codex, AgentState::Working, 1)
+            .unwrap();
+        store
+            .update_session_last_state("raum-b", AgentKind::Shell, AgentState::Idle, 2)
+            .unwrap();
+        store.forget_session("raum-a").unwrap();
+        let back = store.read_sessions().unwrap();
+        assert_eq!(back.sessions.len(), 1);
+        assert_eq!(back.sessions[0].session_id, "raum-b");
+        // Forgetting a non-existent session is a no-op.
+        store.forget_session("not-there").unwrap();
     }
 
     #[test]
