@@ -210,9 +210,15 @@ async fn capture_pane_snapshot_returns_normal_buffer_with_crlf() {
     let mgr = TmuxManager::with_socket(socket.clone());
     mgr.new_session(&session_id, &PathBuf::from("/tmp"), None, Some((80, 24)))
         .expect("new-session");
+    // `sleep 5` keeps the pane (and therefore the session, and the
+    // whole tmux server on this socket) alive for the entire test run.
+    // A shorter sleep raced the test on slow CI: the pane exited, the
+    // last session closed, the server quit, and capture-pane returned
+    // "no server running". Cleanup at the end still kills the session
+    // and server explicitly so the sleep duration is unobservable.
     mgr.respawn_with(
         &session_id,
-        "sh -lc \"printf 'raum-capture-marker-0xFEED\\n'; sleep 1\"",
+        "sh -lc \"printf 'raum-capture-marker-0xFEED\\n'; sleep 5\"",
     )
     .expect("respawn_with");
 
@@ -266,9 +272,12 @@ async fn capture_pane_snapshot_separates_normal_history_from_live_alt_screen() {
     let mgr = TmuxManager::with_socket(socket.clone());
     mgr.new_session(&session_id, &PathBuf::from("/tmp"), None, Some((80, 24)))
         .expect("new-session");
+    // `sleep 5` for the same reason as the sibling test above: keep
+    // the pane, session, and server alive for the full run instead of
+    // racing the 1-second lifetime on slow CI.
     mgr.respawn_with(
         &session_id,
-        "sh -lc \"printf 'raum-main-marker\\n'; tput smcup; printf 'raum-alt-marker\\n'; sleep 1\"",
+        "sh -lc \"printf 'raum-main-marker\\n'; tput smcup; printf 'raum-alt-marker\\n'; sleep 5\"",
     )
     .expect("respawn_with");
 
