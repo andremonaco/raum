@@ -1,14 +1,18 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
   <!--
-    Squircle background: 824x824 centered in 1024x1024 canvas.
-    100px transparent margin on all sides — Apple HIG spec.
-    rx="184" = 22.37% of 824px (standard Apple squircle proportion).
+    Squircle background: 900x900 centered in 1024x1024 canvas.
+    62px transparent margin on all sides — tighter than Apple's
+    minimum 100px gutter (used by Safari/Finder) so the overall
+    icon reads at the same visual weight as other Dock icons.
+    rx="201" ≈ 22.37% of 900px (standard Apple squircle proportion).
   -->
-  <rect x="100" y="100" width="824" height="824" rx="184" ry="184" fill="#0a0a0a"/>
+  <rect x="62" y="62" width="900" height="900" rx="201" ry="201" fill="#0a0a0a"/>
 
   <!--
-    Logo art: 420x420 centered at (512,512) inside the 824x824 squircle.
-    Fill ratio: 420/824 = 51% — more breathing room on all sides.
+    Logo art: 420x420 centered at (512,512) inside the 900x900 squircle.
+    Mark kept at its canonical 420px size — only the *background* grows
+    so the Dock icon's opaque area matches native apps without
+    inflating the key-visual itself.
     Grid corners: TL=(302,302)  TR=(722,302)  BR=(722,722)  BL=(302,722)
     2x2 grid midpoints: center=(512,512)
   -->
