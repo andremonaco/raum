@@ -212,15 +212,17 @@ async fn claude_code_permission_request_replies_with_allow_decision_json() {
 
     let script = prepare_hook_scripts(&tmp, "claude-code.sh").await;
 
-    // Spawn the script with a short timeout so a transport bug does
-    // not wedge the test for 55 s. The test timeout is bounded by
-    // `STEP_TIMEOUT`; this belt-and-braces keeps the subprocess from
-    // hanging after the test asserts.
+    // Pin the subprocess timeout above `STEP_TIMEOUT` so it can't expire
+    // before the test's own timeout kicks in — otherwise a slow CI runner
+    // can race the hook script's socket-recv deadline, the script closes
+    // the connection, and the parked writer EPIPEs before the test gets a
+    // chance to reply. `STEP_TIMEOUT` remains the authoritative bound on
+    // wedges.
     let mut child = Command::new(&script)
         .arg("PermissionRequest")
         .env("RAUM_EVENT_SOCK", &sock_path)
         .env("RAUM_SESSION", "raum-session-1")
-        .env("RAUM_HOOK_TIMEOUT_SECS", "10")
+        .env("RAUM_HOOK_TIMEOUT_SECS", "45")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
