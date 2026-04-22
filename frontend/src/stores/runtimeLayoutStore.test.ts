@@ -15,6 +15,7 @@ import {
   focusedPaneId,
   focusPaneByIndex,
   LAYOUT_UNIT,
+  layoutRev,
   maximizedPaneId,
   removePane,
   removeCellTab,
@@ -196,6 +197,49 @@ describe("runtimeLayoutStore (BSP)", () => {
     expect(c.activeTabId).toBe(newTabId);
   });
 
+  it("addCellTab stores per-tab projectSlug/worktreeId init values", async () => {
+    vi.useFakeTimers();
+    splitPane(
+      pane("a", { kind: "claude-code", projectSlug: "stale", worktreeId: "/tmp/stale" }),
+      null,
+      "right",
+    );
+    const newTabId = addCellTab("a", {
+      projectSlug: "current",
+      worktreeId: "/tmp/current",
+    });
+    const c = runtimeLayoutStore.cells[0];
+    const newTab = c.tabs.find((t) => t.id === newTabId);
+    expect(newTab?.projectSlug).toBe("current");
+    expect(newTab?.worktreeId).toBe("/tmp/current");
+
+    // First tab untouched: still inherits from the pane (so its running
+    // session doesn't claim to be in a different worktree).
+    expect(c.tabs[0].projectSlug).toBeUndefined();
+    expect(c.tabs[0].worktreeId).toBeUndefined();
+
+    // Per-tab binding round-trips through active_layout_save.
+    await vi.advanceTimersByTimeAsync(500);
+    expect(invoke).toHaveBeenCalledWith(
+      "active_layout_save",
+      expect.objectContaining({
+        layout: expect.objectContaining({
+          cells: [
+            expect.objectContaining({
+              tabs: expect.arrayContaining([
+                expect.objectContaining({
+                  id: newTabId,
+                  project_slug: "current",
+                  worktree_id: "/tmp/current",
+                }),
+              ]),
+            }),
+          ],
+        }),
+      }),
+    );
+  });
+
   it("removeCellTab keeps active when removing a non-active tab", () => {
     splitPane(pane("a"), null, "right");
     const firstTabId = runtimeLayoutStore.cells[0].tabs[0].id;
@@ -352,5 +396,34 @@ describe("runtimeLayoutStore (BSP)", () => {
     setTabLabel("ghost-cell", tabId, "nope");
     setTabLabel("a", "ghost-tab", "nope");
     expect(runtimeLayoutStore.cells[0].tabs[0].label).toBeUndefined();
+  });
+
+  it("layoutRev monotonically bumps on every real mutation", () => {
+    expect(layoutRev()).toBe(0);
+
+    splitPane(pane("a"), null, "right");
+    const afterSplit = layoutRev();
+    expect(afterSplit).toBeGreaterThan(0);
+
+    splitPane(pane("b"), "a", "right");
+    expect(layoutRev()).toBeGreaterThan(afterSplit);
+
+    const beforeSetTab = layoutRev();
+    const tabId = runtimeLayoutStore.cells[0].tabs[0].id;
+    setTabLabel("a", tabId, "labeled");
+    expect(layoutRev()).toBeGreaterThan(beforeSetTab);
+
+    const beforeRemove = layoutRev();
+    removePane("a");
+    expect(layoutRev()).toBeGreaterThan(beforeRemove);
+  });
+
+  it("setTabAutoLabel does not bump layoutRev when the value is unchanged", () => {
+    splitPane(pane("a"), null, "right");
+    const tabId = runtimeLayoutStore.cells[0].tabs[0].id;
+    setTabAutoLabel("a", tabId, "label");
+    const stable = layoutRev();
+    setTabAutoLabel("a", tabId, "label");
+    expect(layoutRev()).toBe(stable);
   });
 });

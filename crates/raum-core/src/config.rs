@@ -580,6 +580,13 @@ pub struct ActiveLayoutTab {
     /// the UI falls back to the harness icon + state indicator only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Per-tab project binding, captured at tab-spawn time. Lets a tab stay
+    /// pointed at the worktree it was created under even if the pane's
+    /// pane-level `project_slug` later moves or the sidebar scope changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_slug: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_id: Option<String>,
 }
 
 impl QuickfireHistory {
@@ -783,11 +790,15 @@ mod tests {
                         id: "tab-1".into(),
                         session_id: Some("raum-claude-123".into()),
                         label: Some("Main agent".into()),
+                        project_slug: Some("acme".into()),
+                        worktree_id: Some("/path/to/wt".into()),
                     },
                     ActiveLayoutTab {
                         id: "tab-2".into(),
                         session_id: None,
                         label: None,
+                        project_slug: None,
+                        worktree_id: None,
                     },
                 ],
             }],

@@ -115,6 +115,8 @@ async function hydrateActiveLayout(): Promise<void> {
         id: t.id,
         sessionId: t.session_id,
         label: t.label,
+        projectSlug: t.project_slug,
+        worktreeId: t.worktree_id,
       })),
     }));
 

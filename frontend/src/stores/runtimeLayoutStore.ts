@@ -63,6 +63,8 @@ export interface ActiveLayoutTab {
   id: string;
   session_id?: string;
   label?: string;
+  project_slug?: string;
+  worktree_id?: string;
 }
 
 export interface ActiveLayoutCell {
@@ -99,6 +101,13 @@ export interface CellTab {
    *  displayed when the user hasn't set an explicit `label`. Polled by the
    *  pane; not persisted to the saved layout. */
   autoLabel?: string;
+  /** Per-tab project binding, captured at tab-spawn time. When set, a tab
+   *  spawns into this worktree instead of inheriting the pane-level value —
+   *  lets `+` open new tabs in the current sidebar-scoped worktree without
+   *  rewriting the owning pane's `projectSlug`/`worktreeId` (which would
+   *  break the pane-pruning filter). */
+  projectSlug?: string;
+  worktreeId?: string;
 }
 
 /** Everything we track per pane that ISN'T layout geometry. Keyed by pane id
@@ -143,7 +152,21 @@ const [maximizedPaneId, setMaximizedPaneId] = createSignal<string | null>(null);
 const [focusedPaneId, setFocusedPaneId] = createSignal<string | null>(null);
 const [minimizedPaneIds, setMinimizedPaneIds] = createSignal<ReadonlySet<string>>(new Set());
 
-export { runtimeLayoutStore, maximizedPaneId, focusedPaneId, setFocusedPaneId, minimizedPaneIds };
+// Monotonic layout revision, bumped inside `rebuildCells()` after every
+// tree or pane mutation. Consumers that cache layout-derived projections
+// (e.g. the scoped-projection cache in `terminal-grid.tsx`) key entries
+// on the value so a single signal read tells them whether their cached
+// value is still valid.
+const [layoutRev, setLayoutRev] = createSignal(0);
+
+export {
+  runtimeLayoutStore,
+  maximizedPaneId,
+  focusedPaneId,
+  setFocusedPaneId,
+  minimizedPaneIds,
+  layoutRev,
+};
 
 // ---- derived cells recompute ----------------------------------------------
 
@@ -162,6 +185,7 @@ function currentTree(): LayoutNode | null {
  *  mutation. Projects the tree to rectangles on the LAYOUT_UNIT grid and
  *  stitches in pane content. */
 function rebuildCells(): void {
+  setLayoutRev((prev) => prev + 1);
   const tree = currentTree();
   if (!tree) {
     setRuntimeLayoutStore("cells", []);
@@ -333,6 +357,8 @@ function scheduleActiveSave(): void {
           id: t.id,
           session_id: t.sessionId,
           ...(t.label ? { label: t.label } : {}),
+          ...(t.projectSlug ? { project_slug: t.projectSlug } : {}),
+          ...(t.worktreeId ? { worktree_id: t.worktreeId } : {}),
         })),
       })),
     };
@@ -599,11 +625,17 @@ export function setSessionId(cellId: string, sessionId: string | undefined): voi
   setTabSessionId(cellId, pane.activeTabId, sessionId);
 }
 
-export function addCellTab(cellId: string): string {
+export function addCellTab(
+  cellId: string,
+  init?: { projectSlug?: string; worktreeId?: string },
+): string {
   const pane = runtimeLayoutStore.panes[cellId];
   if (!pane) return "";
   const tabId = nextTabId();
-  setRuntimeLayoutStore("panes", cellId, "tabs", (prev) => [...prev, { id: tabId }]);
+  const newTab: CellTab = { id: tabId };
+  if (init?.projectSlug !== undefined) newTab.projectSlug = init.projectSlug;
+  if (init?.worktreeId !== undefined) newTab.worktreeId = init.worktreeId;
+  setRuntimeLayoutStore("panes", cellId, "tabs", (prev) => [...prev, newTab]);
   setRuntimeLayoutStore("panes", cellId, "activeTabId", tabId);
   rebuildCells();
   scheduleActiveSave();
@@ -755,6 +787,7 @@ export function __resetRuntimeLayoutForTests(): void {
   setMaximizedPaneId(null);
   setFocusedPaneId(null);
   setMinimizedPaneIds(new Set<string>());
+  setLayoutRev(0);
   idCounter = 0;
   tabIdCounter = 0;
   if (_saveTimer !== null) {

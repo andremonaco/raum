@@ -35,6 +35,7 @@ import {
   Component,
   For,
   Show,
+  createDeferred,
   createEffect,
   createMemo,
   createResource,
@@ -52,13 +53,13 @@ import {
   focusedPaneId,
   focusPaneByIndex,
   LAYOUT_UNIT,
+  layoutRev,
   maximizedPaneId,
   minimizedPaneIds,
   movePaneToEdge,
   movePaneToRootEdge,
   nextCellId,
   nextTabId,
-  pruneTreeByScope,
   removeCellTab,
   removePane,
   runtimeLayoutStore,
@@ -79,20 +80,48 @@ import {
 } from "../stores/runtimeLayoutStore";
 import { agentStore } from "../stores/agentStore";
 import type { AgentState } from "../stores/agentStore";
-import { terminalStore } from "../stores/terminalStore";
+import {
+  harnessIds,
+  lastOutputBySession,
+  terminalStore,
+  waitingIds,
+  workingIds,
+} from "../stores/terminalStore";
 import {
   activeWorktreeStore,
   ALL_WORKTREES_SCOPE,
   worktreesByProject,
 } from "../stores/worktreeStore";
 import { kindDisplayLabel, type AgentKind } from "../lib/agentKind";
+import { resolveSpawnWorktree } from "../lib/resolveSpawnWorktree";
 import { AlertCircleIcon, CheckIcon, ClockIcon, HARNESS_ICONS, LoaderIcon } from "./icons";
+import { activeProjectSlug, projectBySlug, setActiveProjectSlug } from "../stores/projectStore";
+import { timeMemoSettle } from "../lib/perf";
+import { projectStore } from "../stores/projectStore";
 import {
-  activeProjectSlug,
-  projectColor,
-  projectStore,
-  setActiveProjectSlug,
-} from "../stores/projectStore";
+  getScopedProjection as getScopedProjectionCached,
+  setProjectionCacheMaxSize,
+  type ScopedProjection,
+} from "../lib/scopedProjection";
+
+function getScopedProjection(
+  rev: number,
+  slug: string | undefined,
+  scope: import("../stores/worktreeStore").WorktreeScope,
+  mainPath: string | undefined,
+): ScopedProjection {
+  // Scale the cache to a reasonable multiple of the project count so a
+  // user juggling 10 projects × 2 worktree scopes doesn't thrash.
+  setProjectionCacheMaxSize(Math.max(16, projectStore.items.length * 2));
+  return getScopedProjectionCached({
+    layoutRev: rev,
+    tree: runtimeLayoutStore.tree,
+    panes: runtimeLayoutStore.panes,
+    slug,
+    scope,
+    mainPath,
+  });
+}
 import { crossProjectViewMode, setCrossProjectViewMode } from "./top-row";
 import type { CrossProjectViewMode } from "./top-row";
 import { extractSnippet } from "../lib/terminalSnippet";
@@ -127,34 +156,21 @@ export const TerminalGrid: Component = () => {
   // the fallback bucket for panes that carry no `worktreeId` (pre-change
   // terminals — see `pruneTreeByScope`).
   const activeMainPath = createMemo<string | undefined>(
-    () => projectStore.items.find((p) => p.slug === activeProjectSlug())?.rootPath,
+    () => projectBySlug().get(activeProjectSlug() ?? "")?.rootPath,
   );
   const activeScope = createMemo(
     () => activeWorktreeStore.byProject[activeProjectSlug() ?? ""] ?? ALL_WORKTREES_SCOPE,
   );
 
-  // Pruned tree for the active project tab — drops every leaf whose pane
-  // belongs to a different project, then narrows further to the sidebar's
-  // selected worktree scope. Shell panes (no projectSlug) survive. The full
-  // tree in the store is untouched, so per-project layouts persist across
-  // tab switches.
-  const activeTree = createMemo<LayoutNode | null>(() =>
-    pruneTreeByScope(
-      runtimeLayoutStore.tree,
-      activeProjectSlug(),
-      activeScope(),
-      runtimeLayoutStore.panes,
-      activeMainPath(),
-    ),
+  // Pruned tree + rect projection for the active project tab. Both drop
+  // every leaf whose pane belongs to a different project or worktree.
+  // Results are keyed on the layout revision + scope, so repeat tab
+  // switches to the same project are a single map lookup.
+  const projection = createMemo<ScopedProjection>(() =>
+    getScopedProjection(layoutRev(), activeProjectSlug(), activeScope(), activeMainPath()),
   );
-
-  // Projection of `activeTree` to rects, keyed by leaf id. Each LeafFrame
-  // reads its own rect from this map so geometry reflects the pruned view.
-  const activeRectMap = createMemo<Map<string, Rect>>(() => {
-    const tree = activeTree();
-    if (!tree) return new Map();
-    return new Map(projectToRects(tree, LAYOUT_UNIT).map((r) => [r.id, r]));
-  });
+  const activeTree = createMemo<LayoutNode | null>(() => projection().tree);
+  const activeRectMap = createMemo<ReadonlyMap<string, Rect>>(() => projection().rects);
 
   // Cells that belong to the active tree, preserving store identity so xterm
   // instances stay mounted across `activeTree` recomputes.
@@ -162,10 +178,21 @@ export const TerminalGrid: Component = () => {
     const map = activeRectMap();
     return runtimeLayoutStore.cells.filter((c) => map.has(c.id));
   });
+  timeMemoSettle("project-switch:active", activeCells);
 
   const visibleCells = createMemo(() => {
     const minimized = minimizedPaneIds();
     return activeCells().filter((c) => !minimized.has(c.id));
+  });
+
+  // Maximize is global runtime state but must only affect the active project's
+  // view. If the maximized pane isn't in the current project's active cells,
+  // treat it as "no maximize" for render purposes — without clearing the
+  // signal, so switching back to that project restores the maximized state.
+  const effectiveMaximizedPaneId = createMemo<string | null>(() => {
+    const id = maximizedPaneId();
+    if (!id) return null;
+    return activeCells().some((c) => c.id === id) ? id : null;
   });
 
   type SpawnKind = "shell" | "claude-code" | "codex" | "opencode";
@@ -400,7 +427,9 @@ export const TerminalGrid: Component = () => {
                       h: active.h,
                     };
                   });
-                  return <LeafFrame cell={effective()} />;
+                  return (
+                    <LeafFrame cell={effective()} maximizedPaneId={effectiveMaximizedPaneId()} />
+                  );
                 }}
               </For>
             </Show>
@@ -539,10 +568,10 @@ const AutoLabelBinder: Component<AutoLabelBinderProps> = (props) => {
 
 // ---- LeafFrame: absolute-positioned pane ----------------------------------
 
-const LeafFrame: Component<{ cell: RuntimeCell }> = (props) => {
+const LeafFrame: Component<{ cell: RuntimeCell; maximizedPaneId: string | null }> = (props) => {
   const isMinimized = () => minimizedPaneIds().has(props.cell.id);
-  const isMaximized = () => maximizedPaneId() === props.cell.id;
-  const anyMaximized = () => maximizedPaneId() !== null;
+  const isMaximized = () => props.maximizedPaneId === props.cell.id;
+  const anyMaximized = () => props.maximizedPaneId !== null;
   const isFocused = () => focusedPaneId() === props.cell.id;
   // Sample the source id once and memoize so every pointermove doesn't re-run
   // this for every leaf. Only the source leaf toggles its .pane-dragging class.
@@ -632,15 +661,15 @@ const LeafFrame: Component<{ cell: RuntimeCell }> = (props) => {
                   cellId={props.cell.id}
                   tabId={tab.id}
                   kind={props.cell.kind}
-                  projectSlug={props.cell.projectSlug}
-                  worktreeId={props.cell.worktreeId}
+                  projectSlug={tab.projectSlug ?? props.cell.projectSlug}
+                  worktreeId={tab.worktreeId ?? props.cell.worktreeId}
                   sessionId={tab.sessionId}
                 />
                 <TerminalPane
                   kind={props.cell.kind as Parameters<typeof TerminalPane>[0]["kind"]}
                   sessionId={tab.sessionId}
-                  projectSlug={props.cell.projectSlug}
-                  worktreeId={props.cell.worktreeId}
+                  projectSlug={tab.projectSlug ?? props.cell.projectSlug}
+                  worktreeId={tab.worktreeId ?? props.cell.worktreeId}
                   borderColor="transparent"
                   onSpawned={(sid) => setTabSessionId(props.cell.id, tab.id, sid)}
                   onRequestClose={async () => {
@@ -698,7 +727,14 @@ const PaneHeader: Component<PaneHeaderProps> = (props) => {
 
   function onAddTab(ev: MouseEvent) {
     ev.stopPropagation();
-    addCellTab(props.cellId);
+    // Mirror the top-row spawn path: new tabs land in the *current*
+    // sidebar-scoped worktree, not the pane's original worktree. Falls back
+    // to the pane's stored slug only if no project is active — which
+    // shouldn't happen for a visible harness pane.
+    const pane = runtimeLayoutStore.panes[props.cellId];
+    const slug = activeProjectSlug() ?? pane?.projectSlug;
+    const worktreeId = slug ? resolveSpawnWorktree(slug) : pane?.worktreeId;
+    addCellTab(props.cellId, { projectSlug: slug, worktreeId });
   }
 
   function onHeaderPointerDown(e: PointerEvent) {
@@ -727,20 +763,14 @@ const PaneHeader: Component<PaneHeaderProps> = (props) => {
       // snapshot to the active project's pruned tree so DnD can't target
       // panes from other tabs that aren't in the DOM.
       const slug = activeProjectSlug();
-      const mainPath = projectStore.items.find((p) => p.slug === slug)?.rootPath;
+      const mainPath = projectBySlug().get(slug ?? "")?.rootPath;
       const scope = activeWorktreeStore.byProject[slug ?? ""] ?? ALL_WORKTREES_SCOPE;
-      const prunedTree = pruneTreeByScope(
-        runtimeLayoutStore.tree,
-        slug,
-        scope,
-        runtimeLayoutStore.panes,
-        mainPath,
-      );
-      const prunedRects = prunedTree
-        ? new Map(projectToRects(prunedTree, LAYOUT_UNIT).map((r) => [r.id, r]))
-        : new Map<string, Rect>();
+      // Reuse the active-projection cache — the pointerdown path reads
+      // the same (layoutRev, slug, scope, mainPath) key that the grid's
+      // `projection()` memo just populated, so this is a map hit.
+      const projected = getScopedProjection(layoutRev(), slug, scope, mainPath);
       const cellsSnapshot = runtimeLayoutStore.cells.flatMap((c) => {
-        const r = prunedRects.get(c.id);
+        const r = projected.rects.get(c.id);
         return r ? [{ id: c.id, x: r.x, y: r.y, w: r.w, h: r.h }] : [];
       });
       beginDrag({
@@ -1134,17 +1164,6 @@ interface MatchedSession {
   lastActivity: number;
 }
 
-function filterMatches(mode: CrossProjectViewMode, state: AgentState | null | undefined): boolean {
-  if (mode === "awaiting") return state === "waiting";
-  if (mode === "working") return state === "working";
-  return true; // recent — any state
-}
-
-function projectNameFor(slug: string | null | undefined): string {
-  if (!slug) return "unknown";
-  return projectStore.items.find((p) => p.slug === slug)?.name ?? slug;
-}
-
 function stateChip(state: AgentState | null): { label: string; tone: string } {
   if (state === "working") return { label: "Working", tone: "bg-success/15 text-success" };
   if (state === "waiting") return { label: "Waiting", tone: "bg-warning/15 text-warning" };
@@ -1180,27 +1199,55 @@ interface CrossProjectViewProps {
 }
 
 const CrossProjectView: Component<CrossProjectViewProps> = (props) => {
-  const matched = createMemo<MatchedSession[]>(() => {
+  // Membership: the set of session ids that satisfy the filter mode.
+  // Depends on the index signals (membership) and agentStore.sessions,
+  // but NOT on `lastOutputBySession` — so a PTY-output storm doesn't
+  // invalidate this memo.
+  const matchedIds = createMemo<string[]>(() => {
+    const hs = harnessIds();
+    const pickBucket = (bucket: ReadonlySet<string>): string[] => {
+      const out: string[] = [];
+      for (const id of bucket) if (hs.has(id)) out.push(id);
+      return out;
+    };
+    if (props.mode === "awaiting") return pickBucket(waitingIds());
+    if (props.mode === "working") return pickBucket(workingIds());
+    // Recent: any project-scoped harness.
+    return [...hs];
+  });
+
+  // Projection: shape each id into a tile. `lastOutputBySession` enters
+  // here (for the sort key) and `projectBySlug` is an O(1) map lookup.
+  // Wrapped in `createDeferred` so rapid PTY updates let the browser
+  // paint between re-sorts — the membership is already stable by the
+  // time this settles.
+  const rawMatched = createMemo<MatchedSession[]>(() => {
+    const ids = matchedIds();
+    const lo = lastOutputBySession();
+    const pm = projectBySlug();
+    const sessions = agentStore.sessions;
     const out: MatchedSession[] = [];
-    for (const terminal of Object.values(terminalStore.byId)) {
-      if (!terminal.project_slug) continue;
-      const state = agentStore.sessions[terminal.session_id]?.state ?? null;
-      if (!filterMatches(props.mode, state)) continue;
+    for (const id of ids) {
+      const terminal = terminalStore.byId[id];
+      if (!terminal || !terminal.project_slug) continue;
+      const proj = pm.get(terminal.project_slug);
       out.push({
-        sessionId: terminal.session_id,
+        sessionId: id,
         kind: terminal.kind,
         projectSlug: terminal.project_slug,
         worktreeId: terminal.worktree_id,
-        projectName: projectNameFor(terminal.project_slug),
-        projectColor: projectColor(terminal.project_slug) ?? "#6b7280",
-        state,
-        lastActivity: terminal.lastOutputMs || terminal.created_unix * 1000,
+        projectName: proj?.name ?? terminal.project_slug,
+        projectColor: proj?.color ?? "#6b7280",
+        state: sessions[id]?.state ?? null,
+        lastActivity: lo.get(id) ?? terminal.created_unix * 1000,
       });
     }
     out.sort((a, b) => b.lastActivity - a.lastActivity);
     if (props.mode === "recent") return out.slice(0, RECENT_CAP);
     return out;
   });
+  const matched = createDeferred(rawMatched, { timeoutMs: 200 });
+  timeMemoSettle(() => `filter-click:${props.mode}`, matched);
 
   onMount(() => {
     function onKey(ev: KeyboardEvent): void {

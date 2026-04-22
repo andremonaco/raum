@@ -66,6 +66,7 @@ import { agentStore, type AgentListItem } from "../stores/agentStore";
 import {
   harnessCountsForProject,
   harnessCountsForWorktree,
+  idsByWorktreeId,
   terminalStore,
 } from "../stores/terminalStore";
 import { ActivityIcon, AlertCircleIcon, CheckIcon, LoaderIcon, PlusIcon } from "./icons";
@@ -406,15 +407,18 @@ const WorktreeRow: Component<WorktreeRowProps> = (rowProps) => {
   });
 
   const agentsForWorktree = createMemo<AgentListItem[]>(() => {
-    const path = rowProps.worktree.path;
-    return Object.values(agentStore.sessions).filter((a) => {
-      // `session_id` carries the originating worktree in raum's naming
-      // convention (`raum-<slug>-<worktree-id>-<harness>`), but the
-      // authoritative mapping is the terminal store. We fall back to a
-      // cheap substring match here because the sidebar only needs a
-      // best-effort grouping; the TerminalGrid owns the canonical wiring.
-      return a.session_id?.includes(path) === true;
-    });
+    // The terminal store owns the authoritative worktree → session
+    // mapping via `idsByWorktreeId`; that index is O(1) per row and
+    // updates incrementally, so a PTY-output storm doesn't force the
+    // sidebar to re-scan every agent session.
+    const ids = idsByWorktreeId().get(rowProps.worktree.path);
+    if (!ids || ids.size === 0) return [];
+    const out: AgentListItem[] = [];
+    for (const id of ids) {
+      const agent = agentStore.sessions[id];
+      if (agent) out.push(agent);
+    }
+    return out;
   });
 
   const dirty = createMemo(() => status().dirty);
@@ -539,13 +543,21 @@ const WorktreeRow: Component<WorktreeRowProps> = (rowProps) => {
   createEffect(() => {
     const pending = pendingCommit();
     if (!pending) return;
-    const sessions = Object.values(terminalStore.byId);
-    const match = sessions.find(
-      (t) =>
-        t.worktree_id === rowProps.worktree.path &&
-        t.kind === "shell" &&
-        t.created_unix * 1000 >= pending.since,
-    );
+    // Scan only the (typically tiny) set of sessions attached to this
+    // worktree instead of the whole terminal store.
+    const ids = idsByWorktreeId().get(rowProps.worktree.path);
+    const match = ids
+      ? [...ids]
+          .map((id) => terminalStore.byId[id])
+          .find(
+            (t) => t !== undefined && t.kind === "shell" && t.created_unix * 1000 >= pending.since,
+          )
+      : Object.values(terminalStore.byId).find(
+          (t) =>
+            t.worktree_id === rowProps.worktree.path &&
+            t.kind === "shell" &&
+            t.created_unix * 1000 >= pending.since,
+        );
     if (!match) return;
     setPendingCommit(null);
     const sessionId = match.session_id;

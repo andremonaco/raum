@@ -40,6 +40,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   activeProjectSlug,
+  projectBySlug,
   projectStore,
   refreshProjects,
   setActiveProjectSlug,
@@ -47,6 +48,7 @@ import {
   upsertProject,
   type ProjectListItem,
 } from "../stores/projectStore";
+import { markStart } from "../lib/perf";
 import {
   refreshAgents,
   setAdapters,
@@ -98,13 +100,11 @@ import {
   SearchIcon,
 } from "./icons";
 import {
-  activeWorktreeStore,
-  ALL_WORKTREES_SCOPE,
   subscribeWorktreeBranchEvents,
   useBranchesVersion,
-  worktreesByProject,
   type Worktree,
 } from "../stores/worktreeStore";
+import { resolveSpawnWorktree } from "../lib/resolveSpawnWorktree";
 import { ProjectSettingsDialog } from "./project-settings-dialog";
 
 // Internal value kept as "needs-input" so the keymap wiring (§8.5) and the
@@ -481,7 +481,7 @@ export const TopRow: Component = () => {
 
   createEffect(() => {
     const slug = activeProjectSlug();
-    const color = slug ? projectStore.items.find((p) => p.slug === slug)?.color : undefined;
+    const color = slug ? projectBySlug().get(slug)?.color : undefined;
     if (color) {
       document.documentElement.style.setProperty("--project-accent", color);
     }
@@ -540,20 +540,6 @@ export const TopRow: Component = () => {
         detail: { kind, projectSlug: slug, worktreeId },
       }),
     );
-  }
-
-  // Resolve the worktree cwd that a new spawn should land in. When the
-  // sidebar is pinned to a specific worktree, use that path; when "All
-  // terminals" is active (or the scope is unset), fall back to the project's
-  // main worktree path. Returns `undefined` when the worktree list cache is
-  // cold — the backend then defaults to the project root (same as today).
-  function resolveSpawnWorktree(projectSlug: string): string | undefined {
-    const scope = activeWorktreeStore.byProject[projectSlug] ?? ALL_WORKTREES_SCOPE;
-    if (scope.mode === "worktree") return scope.path;
-    const project = projectStore.items.find((p) => p.slug === projectSlug);
-    if (project?.rootPath) return project.rootPath;
-    const cached = worktreesByProject()[projectSlug];
-    return cached?.[0]?.path;
   }
 
   async function removeProjectFlow(project: ProjectListItem) {
@@ -773,6 +759,7 @@ export const TopRow: Component = () => {
                     project={project}
                     active={activeProjectSlug() === project.slug}
                     onSelect={() => {
+                      markStart("project-switch:active");
                       setActiveProjectSlug(project.slug);
                       setSelectedFilter("active");
                       setCrossProjectViewMode(null);
@@ -822,7 +809,11 @@ export const TopRow: Component = () => {
                         "bg-selected text-foreground": active(),
                         "text-muted-foreground hover:text-foreground": !active(),
                       }}
-                      onClick={() => setCrossProjectViewMode(active() ? null : filter.mode)}
+                      onClick={() => {
+                        const nextMode = active() ? null : filter.mode;
+                        if (nextMode) markStart(`filter-click:${nextMode}`);
+                        setCrossProjectViewMode(nextMode);
+                      }}
                       aria-label={filter.label}
                       aria-pressed={active()}
                       data-testid={`filter-${filter.mode}`}

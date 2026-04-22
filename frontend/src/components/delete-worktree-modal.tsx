@@ -10,7 +10,7 @@
 import { Component, For, Show, createEffect, createMemo, createSignal } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { clearWorktreeListCache, type Worktree } from "../stores/worktreeStore";
-import { terminalStore, type TerminalRecord } from "../stores/terminalStore";
+import { idsByWorktreeId, terminalStore, type TerminalRecord } from "../stores/terminalStore";
 import {
   AlertCircleIcon,
   FolderIcon,
@@ -67,9 +67,12 @@ const HARNESS_LABEL: Record<HarnessIconKind, string> = {
 function groupTerminalsByKind(
   worktreePath: string,
 ): { kind: HarnessIconKind; sessions: TerminalRecord[] }[] {
+  const ids = idsByWorktreeId().get(worktreePath);
+  if (!ids || ids.size === 0) return [];
   const bucket = new Map<HarnessIconKind, TerminalRecord[]>();
-  for (const t of Object.values(terminalStore.byId)) {
-    if (t.worktree_id !== worktreePath) continue;
+  for (const id of ids) {
+    const t = terminalStore.byId[id];
+    if (!t) continue;
     const kind = t.kind as HarnessIconKind;
     const list = bucket.get(kind) ?? [];
     list.push(t);

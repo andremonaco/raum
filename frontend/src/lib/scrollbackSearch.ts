@@ -24,7 +24,7 @@ import type { AgentKind } from "./agentKind";
 import { resolveHarnessAutoLabel } from "./terminalTabLabel";
 import { listTerminalBuffers, listTerminals } from "./terminalRegistry";
 import type { TerminalBufferKind } from "./terminalRegistry";
-import { isHarnessKind, terminalStore } from "../stores/terminalStore";
+import { harnessIds, terminalStore, type TerminalRecord } from "../stores/terminalStore";
 
 export type ScrollbackBuffer = TerminalBufferKind | "tmux-history" | "tmux-live";
 
@@ -100,8 +100,16 @@ export async function runScrollbackSearch(
   const match = buildMatcher(query);
   if (!match) return [];
 
-  // Restrict to harness sessions that the frontend knows about.
-  const harnesses = Object.values(terminalStore.byId).filter((t) => isHarnessKind(t.kind));
+  // Restrict to harness sessions that the frontend knows about. The
+  // `harnessIds` index already excludes shells and null-slug sessions, so
+  // we skip the `Object.values(byId).filter(...)` scan.
+  const harnessSet = harnessIds();
+  if (harnessSet.size === 0) return [];
+  const harnesses: TerminalRecord[] = [];
+  for (const id of harnessSet) {
+    const record = terminalStore.byId[id];
+    if (record) harnesses.push(record);
+  }
   if (harnesses.length === 0) return [];
 
   const sessionIds = harnesses.map((t) => t.session_id);

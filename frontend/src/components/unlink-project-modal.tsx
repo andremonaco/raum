@@ -10,7 +10,7 @@
 import { Component, For, Show, createMemo, createSignal } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import type { ProjectListItem } from "../stores/projectStore";
-import { terminalStore, type TerminalRecord } from "../stores/terminalStore";
+import { idsByProjectSlug, terminalStore, type TerminalRecord } from "../stores/terminalStore";
 import { FolderIcon, GitBranchIcon, HARNESS_ICONS, ShellIcon, type HarnessIconKind } from "./icons";
 import { Alert, AlertDescription } from "./ui/alert";
 import { Button } from "./ui/button";
@@ -54,9 +54,16 @@ export const UnlinkProjectModal: Component<UnlinkProjectModalProps> = (props) =>
   const [submitting, setSubmitting] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
 
-  const runningSessions = createMemo(() =>
-    Object.values(terminalStore.byId).filter((t) => t.project_slug === props.project.slug),
-  );
+  const runningSessions = createMemo<TerminalRecord[]>(() => {
+    const ids = idsByProjectSlug().get(props.project.slug);
+    if (!ids || ids.size === 0) return [];
+    const out: TerminalRecord[] = [];
+    for (const id of ids) {
+      const t = terminalStore.byId[id];
+      if (t) out.push(t);
+    }
+    return out;
+  });
   const runningCount = () => runningSessions().length;
   const runningByKind = createMemo(() => groupSessionsByKind(runningSessions()));
 
