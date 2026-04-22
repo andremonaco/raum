@@ -33,7 +33,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["app", "appimage", "deb"],
+    "targets": ["app", "dmg", "appimage", "deb"],
     "category": "DeveloperTool",
     "shortDescription": "Lightning-fast, recoverable terminals for AI agent harnesses.",
     "longDescription": "raum orchestrates terminals and agent CLIs (Claude Code, Codex, OpenCode) on macOS and Linux. Every pty lives inside a tmux session, so agents survive app restarts and crashes.",
