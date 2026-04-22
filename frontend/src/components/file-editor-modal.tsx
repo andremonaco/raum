@@ -16,11 +16,8 @@ import { invoke } from "@tauri-apps/api/core";
 // CodeMirror 6 core
 import { basicSetup } from "codemirror";
 import { EditorView, keymap } from "@codemirror/view";
-import { EditorState } from "@codemirror/state";
+import { EditorState, type Extension } from "@codemirror/state";
 import { defaultKeymap, historyKeymap } from "@codemirror/commands";
-
-// Theme
-import { oneDark } from "@codemirror/theme-one-dark";
 
 // Languages
 import { javascript } from "@codemirror/lang-javascript";
@@ -32,6 +29,9 @@ import { json } from "@codemirror/lang-json";
 import { python } from "@codemirror/lang-python";
 
 import { Button } from "./ui/button";
+import { loadCodeMirrorTheme } from "../lib/theme/cmTheme";
+import { tildify } from "../lib/pathDisplay";
+import { getCurrentTheme, subscribeThemeChange } from "../lib/theme/themeController";
 
 // ---------------------------------------------------------------------------
 // Language detection
@@ -118,11 +118,35 @@ export const FileEditorModal: Component<FileEditorModalProps> = (props) => {
   const [error, setError] = createSignal<string | null>(null);
   const [savedFlash, setSavedFlash] = createSignal(false);
   const [dirty, setDirty] = createSignal(false);
+  // CodeMirror theme extension — derived from the currently-applied raum
+  // theme via `lib/theme/cmTheme.ts`. `null` until the first resolve
+  // completes (the editor still mounts with CodeMirror's bare defaults so
+  // the modal renders immediately on open).
+  const [cmTheme, setCmTheme] = createSignal<Extension | null>(null);
 
   let editorContainerRef: HTMLDivElement | undefined;
   let editorView: EditorView | undefined;
   let initialContent = "";
   let flashTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // Resolve the active raum theme into a CodeMirror `Extension` (lazy-import
+  // the matching `@uiw/codemirror-theme-...` package, or fall through to the
+  // generic builder for BYO themes). Re-runs whenever the user picks a
+  // different theme so the open editor retints in place.
+  const resolveCmTheme = async (): Promise<void> => {
+    const raum = getCurrentTheme();
+    if (!raum) return;
+    try {
+      const ext = await loadCodeMirrorTheme(raum);
+      setCmTheme(() => ext);
+    } catch (e) {
+      console.warn("[file-editor] CodeMirror theme load failed", e);
+    }
+  };
+  void resolveCmTheme();
+  const unsubscribeTheme = subscribeThemeChange(() => {
+    void resolveCmTheme();
+  });
 
   // Load file when path changes
   createEffect(() => {
@@ -143,11 +167,14 @@ export const FileEditorModal: Component<FileEditorModalProps> = (props) => {
       });
   });
 
-  // Build/rebuild CodeMirror when content is loaded and container is ready
+  // Build/rebuild CodeMirror when content is loaded, container is ready, or
+  // the resolved theme changes. Also re-runs when the user switches to a
+  // different VSCode theme so the editor retints without unmounting.
   createEffect(() => {
     if (!props.open || loading() || !editorContainerRef) return;
     const path = props.path ?? "";
     const text = content();
+    const themeExt = cmTheme();
 
     // Destroy previous instance
     if (editorView) {
@@ -156,10 +183,9 @@ export const FileEditorModal: Component<FileEditorModalProps> = (props) => {
     }
 
     const langExt = getLanguageExtension(path);
-    const extensions = [
+    const extensions: Extension[] = [
       basicSetup,
       keymap.of([...defaultKeymap, ...historyKeymap]),
-      oneDark,
       raumEditorTheme,
       EditorView.lineWrapping,
       EditorView.updateListener.of((update) => {
@@ -168,6 +194,7 @@ export const FileEditorModal: Component<FileEditorModalProps> = (props) => {
         }
       }),
     ];
+    if (themeExt) extensions.push(themeExt);
     if (langExt) extensions.push(langExt);
 
     editorView = new EditorView({
@@ -177,6 +204,7 @@ export const FileEditorModal: Component<FileEditorModalProps> = (props) => {
   });
 
   onCleanup(() => {
+    unsubscribeTheme();
     editorView?.destroy();
     editorView = undefined;
     if (flashTimer !== null) clearTimeout(flashTimer);
@@ -225,7 +253,7 @@ export const FileEditorModal: Component<FileEditorModalProps> = (props) => {
     <Show when={props.open && props.path}>
       {/* Backdrop */}
       <div
-        class="fixed inset-0 z-[60] bg-black/60 backdrop-blur-sm"
+        class="fixed inset-0 z-[60] bg-scrim-strong"
         onClick={() => {
           if (!dirty()) props.onClose();
         }}
@@ -233,8 +261,7 @@ export const FileEditorModal: Component<FileEditorModalProps> = (props) => {
 
       {/* Modal panel */}
       <div
-        class="animate-in fade-in zoom-in-95 duration-150 fixed inset-x-4 bottom-4 top-[6vh] z-[60] mx-auto flex max-w-5xl flex-col overflow-hidden rounded-2xl border border-white/10 bg-[#282c34] shadow-2xl"
-        style={{ "box-shadow": "0 30px 80px rgba(0,0,0,0.7), 0 0 0 1px rgba(255,255,255,0.06)" }}
+        class="floating-surface animate-in fade-in zoom-in-95 duration-150 fixed inset-x-4 bottom-4 top-[6vh] z-[60] mx-auto flex max-w-5xl flex-col overflow-hidden rounded-2xl border border-border bg-card"
         onKeyDown={onKeyDown}
         // Prevent backdrop click from closing when clicking panel
         onClick={(e) => e.stopPropagation()}
@@ -245,20 +272,22 @@ export const FileEditorModal: Component<FileEditorModalProps> = (props) => {
         tabIndex={-1}
       >
         {/* Header */}
-        <header class="flex shrink-0 items-center gap-3 border-b border-white/8 bg-black/20 px-5 py-3">
+        <header class="flex shrink-0 items-center gap-3 border-b border-border-subtle bg-surface-sunken/40 px-5 py-3">
           <FileIcon class="size-4 shrink-0 text-muted-foreground/70" />
           <div class="min-w-0 flex-1">
             <div class="flex items-center gap-2">
               <span class="truncate font-mono text-xs text-foreground">{fileName()}</span>
               <Show when={dirty()}>
-                <span class="size-2 shrink-0 rounded-full bg-amber-400" title="Unsaved changes" />
+                <span class="size-2 shrink-0 rounded-full bg-warning" title="Unsaved changes" />
               </Show>
             </div>
-            <p class="truncate font-mono text-[10px] text-muted-foreground/50">{dirPath()}</p>
+            <p class="truncate font-mono text-[10px] text-muted-foreground/50">
+              {tildify(dirPath())}
+            </p>
           </div>
           <button
             type="button"
-            class="rounded-md p-1.5 text-muted-foreground/50 transition-colors hover:bg-white/10 hover:text-foreground"
+            class="focus-ring rounded-md p-1.5 text-foreground-subtle transition-colors hover:bg-hover hover:text-foreground"
             onClick={() => props.onClose()}
             aria-label="Close editor"
           >
@@ -269,12 +298,12 @@ export const FileEditorModal: Component<FileEditorModalProps> = (props) => {
         {/* Editor body */}
         <div class="relative min-h-0 flex-1 overflow-hidden">
           <Show when={loading()}>
-            <div class="absolute inset-0 flex items-center justify-center bg-[#282c34]">
+            <div class="absolute inset-0 flex items-center justify-center bg-card">
               <span class="text-xs text-muted-foreground/60">Loading…</span>
             </div>
           </Show>
           <Show when={error() && !loading()}>
-            <div class="absolute inset-0 flex items-center justify-center bg-[#282c34]">
+            <div class="absolute inset-0 flex items-center justify-center bg-card">
               <span class="max-w-xs text-center text-xs text-destructive">{error()}</span>
             </div>
           </Show>
@@ -287,9 +316,9 @@ export const FileEditorModal: Component<FileEditorModalProps> = (props) => {
         </div>
 
         {/* Footer */}
-        <footer class="flex shrink-0 items-center gap-3 border-t border-white/8 bg-black/20 px-5 py-3">
+        <footer class="flex shrink-0 items-center gap-3 border-t border-border-subtle bg-surface-sunken/40 px-5 py-3">
           <Show when={savedFlash()}>
-            <span class="animate-in fade-in text-xs text-emerald-400 duration-150">Saved</span>
+            <span class="animate-in fade-in text-xs text-success duration-150">Saved</span>
           </Show>
           <Show when={error()}>
             <span class="min-w-0 flex-1 truncate text-xs text-destructive">{error()}</span>

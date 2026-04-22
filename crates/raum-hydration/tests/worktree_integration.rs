@@ -34,8 +34,7 @@ fn seed_repo(repo: &Path) -> bool {
         .current_dir(repo)
         .args(["init", "-q", "-b", "main"])
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .is_ok_and(|s| s.success())
     {
         return false;
     }
@@ -44,8 +43,7 @@ fn seed_repo(repo: &Path) -> bool {
             .current_dir(repo)
             .args(["config", "--local", k, v])
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+            .is_ok_and(|s| s.success())
         {
             return false;
         }
@@ -74,8 +72,7 @@ symlink = ["node_modules"]
             .current_dir(repo)
             .args(args)
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+            .is_ok_and(|s| s.success())
         {
             return false;
         }
@@ -108,6 +105,7 @@ fn worktree_creation_respects_pattern_prefix_and_hydration() {
             path_pattern: "project-should-be-overridden/{branch-slug}".into(),
             branch_prefix_mode: BranchPrefixMode::None,
             branch_prefix_custom: None,
+            ..WorktreeConfig::default()
         },
         hydration: HydrationManifest {
             copy: vec!["should-be-overridden".into()],

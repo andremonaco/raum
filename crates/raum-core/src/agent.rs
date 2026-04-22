@@ -124,7 +124,24 @@ pub enum AgentError {
     Io(#[from] std::io::Error),
 }
 
+/// Unified harness adapter trait.
+///
+/// **Deprecated** — Phase 2 of the per-harness notification plan splits
+/// this into three focused traits in [`crate::harness::traits`]:
+///
+/// * [`crate::harness::traits::HarnessIdentity`] — kind / binary /
+///   version probing.
+/// * [`crate::harness::traits::NotificationSetup`] — plan + selftest.
+/// * [`crate::harness::traits::HarnessRuntime`] — channel + replier
+///   factories.
+///
+/// The shim is kept for one release so `src-tauri` compiles unchanged
+/// while callsites migrate. New code should prefer the split traits.
 #[async_trait]
+#[deprecated(
+    since = "0.2.0",
+    note = "use HarnessIdentity + NotificationSetup + HarnessRuntime from raum_core::harness::traits"
+)]
 pub trait AgentAdapter: Send + Sync {
     fn kind(&self) -> AgentKind;
     /// The executable name to look up on `$PATH` when spawning the harness.
@@ -141,8 +158,9 @@ pub trait AgentAdapter: Send + Sync {
 /// Order is stable: Claude Code, OpenCode, Codex — used for deterministic
 /// iteration in the app-shell initialisation path.
 #[must_use]
+#[allow(deprecated)]
 pub fn build_default_adapters() -> Vec<Arc<dyn AgentAdapter>> {
-    crate::adapters::default_registry()
+    crate::harness::default_registry()
 }
 
 #[cfg(test)]
@@ -285,6 +303,7 @@ mod tests {
 
     #[test]
     fn default_adapter_registry_has_three_real_adapters() {
+        #[allow(deprecated)]
         let r = super::build_default_adapters();
         assert_eq!(r.len(), 3);
     }

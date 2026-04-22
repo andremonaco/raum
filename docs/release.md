@@ -183,9 +183,9 @@ install-path wiring, recovery, presets, and search.
       Confirm each pane streams output and the agent-state dots update.
 - [ ] `⌘Q` to quit raum (leaving tmux running), reopen. All sessions
       should still be listed + attached; output replays correctly.
-- [ ] Open the grid builder (`⌘⇧G`), create a 2-cell preset, save, apply
-      from the sidebar chooser. Confirm the keep/replace/merge prompt
-      fires when the worktree already has running agents.
+- [ ] Minimize a running harness, confirm it surfaces as a chip in the
+      bottom dock, try each of the Working / Recent / Attention sort pills
+      and restore the pane by clicking its chip.
 - [ ] Run `⌘⇧F` global search. Confirm it queries every mounted pane and
       the *scroll-to-match* behaviour works on click.
 - [ ] Trigger the updater check (relaunch app after the version is cut).

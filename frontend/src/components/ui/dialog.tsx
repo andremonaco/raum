@@ -51,12 +51,12 @@ export const DialogContent = <T extends ValidComponent = "div">(props: DialogCon
     <>
       <DialogPrimitive.Overlay
         data-slot="dialog-overlay"
-        class="data-[expanded]:animate-in data-[closed]:animate-out data-[closed]:fade-out-0 data-[expanded]:fade-in-0 fixed inset-0 z-50 bg-black/50"
+        class="data-[expanded]:animate-in data-[closed]:animate-out data-[closed]:fade-out-0 data-[expanded]:fade-in-0 fixed inset-0 z-50 bg-scrim"
       />
       <DialogPrimitive.Content
         data-slot="dialog-content"
         class={cx(
-          "bg-background data-[expanded]:animate-in data-[closed]:animate-out data-[closed]:fade-out-0 data-[expanded]:fade-in-0 data-[closed]:zoom-out-95 data-[expanded]:zoom-in-95 fixed top-[50%] left-[50%] z-50 grid w-full max-w-[calc(100%-2rem)] translate-x-[-50%] translate-y-[-50%] gap-4 rounded-lg border p-6 shadow-lg duration-200 sm:max-w-lg",
+          "bg-popover text-popover-foreground floating-surface data-[expanded]:animate-in data-[closed]:animate-out data-[closed]:fade-out-0 data-[expanded]:fade-in-0 data-[closed]:zoom-out-95 data-[expanded]:zoom-in-95 fixed top-[50%] left-[50%] z-50 grid w-full max-w-[calc(100%-2rem)] translate-x-[-50%] translate-y-[-50%] gap-4 overflow-hidden rounded-xl border border-border-subtle p-6 duration-200 sm:max-w-lg [&>*]:min-w-0",
           props.class,
         )}
         {...rest}
@@ -65,7 +65,7 @@ export const DialogContent = <T extends ValidComponent = "div">(props: DialogCon
         <Show when={props.showCloseButton}>
           <DialogPrimitive.CloseButton
             aria-label="Close"
-            class="focus-visible:ring-ring absolute top-4 right-4 rounded-xs opacity-70 transition-[opacity,box-shadow] duration-200 hover:opacity-100 focus-visible:ring-2 focus-visible:outline-none [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4"
+            class="focus-ring absolute top-4 right-4 rounded-sm p-1 text-foreground-subtle hover:bg-hover hover:text-foreground transition-[color,background-color,box-shadow] duration-[var(--motion-fast)] ease-[var(--motion-ease)] [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4"
           >
             <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
               <path
@@ -140,7 +140,7 @@ export const DialogDescription = <T extends ValidComponent = "p">(
   return (
     <DialogPrimitive.Description
       data-slot="dialog-description"
-      class={cx("text-muted-foreground text-[11px]", props.class)}
+      class={cx("text-foreground-subtle text-[11px]", props.class)}
       {...rest}
     />
   );

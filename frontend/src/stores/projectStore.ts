@@ -7,10 +7,15 @@
  * Subscribes to the `project-color-changed` Tauri event (emitted from the
  * color-picker flow in §5.2) so any component reading `projectStore.items`
  * re-renders as soon as a color is persisted.
+ *
+ * `projectBySlug` mirrors `projectStore.items` as a `Map<slug, item>` for
+ * O(1) lookups. Every mutator that writes to `items` MUST also update the
+ * map — the helper `rebuildBySlug` consolidates both writes so the two
+ * can't drift.
  */
 
+import { batch, createSignal } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
-import { createSignal } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
@@ -37,47 +42,77 @@ const [projectStore, setProjectStore] = createStore<ProjectState>({
 
 export { projectStore };
 
+const [projectBySlug, setProjectBySlug] = createSignal<ReadonlyMap<string, ProjectListItem>>(
+  new Map(),
+);
+
+export { projectBySlug };
+
 const [activeProjectSlug, setActiveProjectSlug] = createSignal<string | undefined>(undefined);
 
 export { activeProjectSlug, setActiveProjectSlug };
+
+function buildBySlug(items: ProjectListItem[]): ReadonlyMap<string, ProjectListItem> {
+  const next = new Map<string, ProjectListItem>();
+  for (const item of items) next.set(item.slug, item);
+  return next;
+}
 
 /**
  * Replace the project list. Uses `reconcile` so the store keeps referential
  * identity for unchanged entries (the top-row tab strip re-mounts otherwise).
  */
 export function setProjects(items: ProjectListItem[]): void {
-  setProjectStore("items", reconcile(items, { key: "slug" }));
-  setProjectStore("loaded", true);
-  const current = activeProjectSlug();
-  if (current && !items.some((p) => p.slug === current)) {
-    setActiveProjectSlug(items[0]?.slug);
-  } else if (!current && items.length > 0) {
-    setActiveProjectSlug(items[0]!.slug);
-  }
+  batch(() => {
+    setProjectStore("items", reconcile(items, { key: "slug" }));
+    setProjectStore("loaded", true);
+    setProjectBySlug(buildBySlug(items));
+    const current = activeProjectSlug();
+    if (current && !items.some((p) => p.slug === current)) {
+      setActiveProjectSlug(items[0]?.slug);
+    } else if (!current && items.length > 0) {
+      setActiveProjectSlug(items[0]!.slug);
+    }
+  });
 }
 
 /** Upsert a single project (after `project_register` / `project_update`). */
 export function upsertProject(item: ProjectListItem): void {
-  const idx = projectStore.items.findIndex((p) => p.slug === item.slug);
-  if (idx === -1) {
-    setProjectStore("items", (prev) => [...prev, item]);
-    if (!activeProjectSlug()) setActiveProjectSlug(item.slug);
-  } else {
-    setProjectStore("items", idx, item);
-  }
+  batch(() => {
+    const idx = projectStore.items.findIndex((p) => p.slug === item.slug);
+    if (idx === -1) {
+      setProjectStore("items", (prev) => [...prev, item]);
+      if (!activeProjectSlug()) setActiveProjectSlug(item.slug);
+    } else {
+      setProjectStore("items", idx, item);
+    }
+    setProjectBySlug((prev) => {
+      const next = new Map(prev);
+      next.set(item.slug, item);
+      return next;
+    });
+  });
 }
 
 export function removeProject(slug: string): void {
-  setProjectStore("items", (prev) => prev.filter((p) => p.slug !== slug));
-  if (activeProjectSlug() === slug) {
-    setActiveProjectSlug(projectStore.items[0]?.slug);
-  }
+  batch(() => {
+    setProjectStore("items", (prev) => prev.filter((p) => p.slug !== slug));
+    setProjectBySlug((prev) => {
+      if (!prev.has(slug)) return prev;
+      const next = new Map(prev);
+      next.delete(slug);
+      return next;
+    });
+    if (activeProjectSlug() === slug) {
+      setActiveProjectSlug(projectStore.items[0]?.slug);
+    }
+  });
 }
 
 /** Convenience selector (for the color swatch + the CSS `--project-accent`). */
 export function projectColor(slug: string | undefined): string | undefined {
   if (!slug) return undefined;
-  return projectStore.items.find((p) => p.slug === slug)?.color;
+  return projectBySlug().get(slug)?.color;
 }
 
 /** Fetch from the backend and hydrate the store. */
@@ -95,6 +130,25 @@ export async function refreshProjects(): Promise<ProjectListItem[]> {
   }
 }
 
+function patchProjectField<K extends keyof ProjectListItem>(
+  slug: string,
+  field: K,
+  value: ProjectListItem[K],
+): void {
+  const idx = projectStore.items.findIndex((p) => p.slug === slug);
+  if (idx < 0) return;
+  batch(() => {
+    setProjectStore("items", idx, field, value);
+    const existing = projectBySlug().get(slug);
+    if (!existing) return;
+    setProjectBySlug((prev) => {
+      const next = new Map(prev);
+      next.set(slug, { ...existing, [field]: value });
+      return next;
+    });
+  });
+}
+
 /**
  * Subscribe to backend events that mutate the project store.
  *
@@ -106,25 +160,23 @@ export async function subscribeProjectEvents(): Promise<UnlistenFn> {
   const unlistenColor = await listen<{ slug: string; color: string }>(
     "project-color-changed",
     (ev) => {
-      const { slug, color } = ev.payload;
-      const idx = projectStore.items.findIndex((p) => p.slug === slug);
-      if (idx >= 0) {
-        setProjectStore("items", idx, "color", color);
-      }
+      patchProjectField(ev.payload.slug, "color", ev.payload.color);
     },
   );
   const unlistenSigil = await listen<{ slug: string; sigil: string }>(
     "project-sigil-changed",
     (ev) => {
-      const { slug, sigil } = ev.payload;
-      const idx = projectStore.items.findIndex((p) => p.slug === slug);
-      if (idx >= 0) {
-        setProjectStore("items", idx, "sigil", sigil);
-      }
+      patchProjectField(ev.payload.slug, "sigil", ev.payload.sigil);
     },
   );
   return () => {
     unlistenColor();
     unlistenSigil();
   };
+}
+
+export function __resetProjectStoreForTests(): void {
+  setProjectStore({ items: [], loaded: false });
+  setProjectBySlug(new Map());
+  setActiveProjectSlug(undefined);
 }

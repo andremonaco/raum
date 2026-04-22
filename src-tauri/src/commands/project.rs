@@ -25,13 +25,14 @@ use std::path::PathBuf;
 
 use raum_core::config::{
     AgentDefaults, BranchPrefixMode, EffectiveProjectConfig, HydrationManifest, ProjectConfig,
-    WorktreeConfig,
+    WorktreeConfig, WorktreeHooks,
 };
 use raum_core::project::project_with_defaults;
 use raum_core::sigil::{is_valid_sigil, resolve_sigil};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Runtime};
 
+use crate::commands::git_watcher::GitHeadWatcher;
 use crate::state::AppHandleState;
 
 /// UI-facing projection of a `ProjectConfig`. Mirrors the canonical fields the
@@ -108,9 +109,29 @@ pub struct EffectiveProjectDto {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorktreeConfigDto {
+    pub path_strategy: raum_core::config::PathStrategy,
     pub path_pattern: String,
     pub branch_prefix_mode: BranchPrefixMode,
     pub branch_prefix_custom: Option<String>,
+    pub hooks: WorktreeHooksDto,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeHooksDto {
+    pub pre_create: Option<String>,
+    pub post_create: Option<String>,
+    pub timeout_secs: u32,
+}
+
+impl From<WorktreeHooks> for WorktreeHooksDto {
+    fn from(h: WorktreeHooks) -> Self {
+        Self {
+            pre_create: h.pre_create,
+            post_create: h.post_create,
+            timeout_secs: h.timeout_secs,
+        }
+    }
 }
 
 impl From<EffectiveProjectConfig> for EffectiveProjectDto {
@@ -125,9 +146,11 @@ impl From<EffectiveProjectConfig> for EffectiveProjectDto {
             has_raum_toml: eff.has_raum_toml,
             hydration: eff.hydration,
             worktree: WorktreeConfigDto {
+                path_strategy: eff.worktree.path_strategy,
                 path_pattern: eff.worktree.path_pattern,
                 branch_prefix_mode: eff.worktree.branch_prefix_mode,
                 branch_prefix_custom: eff.worktree.branch_prefix_custom,
+                hooks: eff.worktree.hooks.into(),
             },
             agent_defaults: eff.agent_defaults,
         }
@@ -141,7 +164,8 @@ impl From<EffectiveProjectConfig> for EffectiveProjectDto {
 /// `project_with_defaults` and flips `in_repo_settings` on when the project
 /// root already carries a `.raum.toml`.
 #[tauri::command]
-pub fn project_register(
+pub fn project_register<R: Runtime>(
+    app: AppHandle<R>,
     state: tauri::State<'_, AppHandleState>,
     root_path: String,
     name: String,
@@ -176,6 +200,19 @@ pub fn project_register(
         .write_project(&project)
         .map_err(|e| format!("write_project: {e}"))?;
 
+    drop(store);
+
+    match GitHeadWatcher::start(project.slug.clone(), &project.root_path, app) {
+        Ok(watcher) => {
+            if let Ok(mut watchers) = state.git_watchers.lock() {
+                watchers.insert(project.slug.clone(), watcher);
+            }
+        }
+        Err(e) => {
+            tracing::warn!(slug = %project.slug, error = %e, "git_watcher: start failed");
+        }
+    }
+
     Ok(ProjectListItem::from_project(&project, has_raum_toml))
 }
 
@@ -197,8 +234,7 @@ pub fn project_list(
             Ok(Some(project)) => {
                 let has_raum_toml = store
                     .read_raum_toml(&project.root_path)
-                    .map(|o| o.is_some())
-                    .unwrap_or(false);
+                    .is_ok_and(|o| o.is_some());
                 out.push(ProjectListItem::from_project(&project, has_raum_toml));
             }
             Ok(None) => {}
@@ -255,7 +291,10 @@ pub fn project_update<R: Runtime>(
     if let Some(hydration) = update.hydration {
         project.hydration = hydration;
     }
-    if let Some(worktree) = update.worktree {
+    if let Some(mut worktree) = update.worktree {
+        // Snap pattern to canonical preset (or re-classify a stale strategy)
+        // before persisting, so on-disk TOML stays self-consistent.
+        worktree.normalize();
         project.worktree = worktree;
     }
     if let Some(agent_defaults) = update.agent_defaults {
@@ -308,7 +347,13 @@ pub fn project_remove(state: tauri::State<'_, AppHandleState>, slug: String) -> 
         .map_err(|e| format!("config_store lock: {e}"))?;
     store
         .delete_project(&slug)
-        .map_err(|e| format!("delete_project: {e}"))
+        .map_err(|e| format!("delete_project: {e}"))?;
+    drop(store);
+
+    if let Ok(mut watchers) = state.git_watchers.lock() {
+        watchers.remove(&slug);
+    }
+    Ok(())
 }
 
 /// §5.4 — merged `project.toml` + `.raum.toml` view.

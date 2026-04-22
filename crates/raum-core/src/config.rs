@@ -6,13 +6,25 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use toml::Value;
 
-use crate::agent::AgentKind;
+use crate::agent::{AgentKind, AgentState};
 
 pub const DEFAULT_PATH_PATTERN: &str = "{parent-dir}/{base-folder}-worktrees/{branch-slug}";
+/// Pattern for the `Nested` strategy — worktrees live inside the project at
+/// `<root>/.raum/<branch>`. The backend auto-`.gitignore`s `.raum/` when this
+/// shape is detected (see `target_is_inside_raum_dir`).
+pub const NESTED_PATH_PATTERN: &str = "{root}/.raum/{branch-slug}";
+/// Pattern for the `SiblingGroup` strategy — alias of `DEFAULT_PATH_PATTERN`,
+/// kept as a separate name so call sites that mean "the sibling preset"
+/// don't read as "whatever the default happens to be".
+pub const SIBLING_GROUP_PATH_PATTERN: &str = DEFAULT_PATH_PATTERN;
 pub const DEFAULT_MULTIPLEXER: &str = "tmux";
 pub const DEFAULT_COALESCE_INTERVAL_MS: u64 = 12;
 pub const DEFAULT_COALESCE_BYTES: usize = 16 * 1024;
-pub const DEFAULT_SILENCE_THRESHOLD_MS: u64 = 500;
+/// Silence fallback threshold. Applied to every live session as the
+/// backstop for `Working -> Idle` when a deterministic turn-end signal
+/// is missed. The value is deliberately generous so a silent think
+/// doesn't get flipped to Idle too early.
+pub const DEFAULT_SILENCE_THRESHOLD_MS: u64 = 10_000;
 pub const DEFAULT_DEBOUNCE_MS: u64 = 500;
 pub const XTERM_SCROLLBACK_LINES: u32 = 10_000;
 pub const QUICKFIRE_HISTORY_LIMIT: usize = 100;
@@ -29,10 +41,12 @@ pub struct Config {
     #[serde(rename = "worktreeConfig")]
     pub worktree_config: WorktreeConfig,
     pub rendering: RenderingConfig,
+    pub appearance: AppearanceConfig,
     pub notifications: NotificationsConfig,
     pub sidebar: SidebarConfig,
     pub keybindings: Keybindings,
     pub harnesses: HarnessesConfig,
+    pub updater: UpdaterConfig,
     /// Catch-all for forward-compatible keys so unknown user-added settings
     /// survive a round-trip. Logged at INFO by the store when populated.
     #[serde(flatten, skip_serializing_if = "BTreeMap::is_empty")]
@@ -46,10 +60,12 @@ impl Default for Config {
             multiplexer: DEFAULT_MULTIPLEXER.to_string(),
             worktree_config: WorktreeConfig::default(),
             rendering: RenderingConfig::default(),
+            appearance: AppearanceConfig::default(),
             notifications: NotificationsConfig::default(),
             sidebar: SidebarConfig::default(),
             keybindings: Keybindings::default(),
             harnesses: HarnessesConfig::default(),
+            updater: UpdaterConfig::default(),
             unknown: BTreeMap::new(),
         }
     }
@@ -87,24 +103,81 @@ impl HarnessConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WorktreeConfig {
+    /// High-level path preset. `Custom` means `path_pattern` is the source of
+    /// truth; `SiblingGroup`/`Nested` map to fixed pattern constants and the
+    /// pattern is normalized server-side on write.
+    #[serde(rename = "pathStrategy", default = "PathStrategy::default_for_serde")]
+    pub path_strategy: PathStrategy,
     #[serde(rename = "pathPattern")]
     pub path_pattern: String,
     #[serde(rename = "branchPrefixMode")]
     pub branch_prefix_mode: BranchPrefixMode,
     #[serde(rename = "branchPrefixCustom", skip_serializing_if = "Option::is_none")]
     pub branch_prefix_custom: Option<String>,
+    /// Optional executable scripts that run before / after worktree creation.
+    /// Defaults omit the entire table from serialized TOML.
+    #[serde(default, skip_serializing_if = "WorktreeHooks::is_default")]
+    pub hooks: WorktreeHooks,
 }
 
 impl Default for WorktreeConfig {
     fn default() -> Self {
         Self {
+            path_strategy: PathStrategy::default(),
             path_pattern: DEFAULT_PATH_PATTERN.to_string(),
             branch_prefix_mode: BranchPrefixMode::None,
             branch_prefix_custom: None,
+            hooks: WorktreeHooks::default(),
         }
+    }
+}
+
+/// User-defined executable scripts run around worktree creation.
+///
+/// * `pre_create` runs before `git worktree add` (cwd = project root); failure aborts creation.
+/// * `post_create` runs after hydration completes (cwd = new worktree); failure leaves the
+///   worktree in place so the user can inspect partial state.
+///
+/// Hook paths may be absolute or relative; relative paths resolve against the project root.
+/// Scripts receive context via env vars: `RAUM_PHASE`, `RAUM_PROJECT_SLUG`, `RAUM_PROJECT_ROOT`,
+/// `RAUM_WORKTREE_PATH`, `RAUM_BRANCH`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WorktreeHooks {
+    #[serde(rename = "preCreate", skip_serializing_if = "Option::is_none")]
+    pub pre_create: Option<String>,
+    #[serde(rename = "postCreate", skip_serializing_if = "Option::is_none")]
+    pub post_create: Option<String>,
+    /// Per-hook timeout in seconds. `0` disables the timeout.
+    #[serde(rename = "timeoutSecs", default = "default_hook_timeout_secs")]
+    pub timeout_secs: u32,
+}
+
+pub const DEFAULT_HOOK_TIMEOUT_SECS: u32 = 300;
+
+fn default_hook_timeout_secs() -> u32 {
+    DEFAULT_HOOK_TIMEOUT_SECS
+}
+
+impl Default for WorktreeHooks {
+    fn default() -> Self {
+        Self {
+            pre_create: None,
+            post_create: None,
+            timeout_secs: DEFAULT_HOOK_TIMEOUT_SECS,
+        }
+    }
+}
+
+impl WorktreeHooks {
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        self.pre_create.is_none()
+            && self.post_create.is_none()
+            && self.timeout_secs == DEFAULT_HOOK_TIMEOUT_SECS
     }
 }
 
@@ -117,10 +190,135 @@ pub enum BranchPrefixMode {
     Custom,
 }
 
+/// Worktree path preset. `Custom` keeps `path_pattern` as the source of truth.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PathStrategy {
+    /// Group all worktrees in a sibling folder next to the project root.
+    #[default]
+    SiblingGroup,
+    /// Nest worktrees inside the project at `<root>/.raum/<branch>`.
+    Nested,
+    /// Freeform — `path_pattern` controls the layout.
+    Custom,
+}
+
+impl PathStrategy {
+    /// Pattern constant for non-custom presets. `None` for `Custom`.
+    #[must_use]
+    pub fn preset_pattern(self) -> Option<&'static str> {
+        match self {
+            Self::SiblingGroup => Some(SIBLING_GROUP_PATH_PATTERN),
+            Self::Nested => Some(NESTED_PATH_PATTERN),
+            Self::Custom => None,
+        }
+    }
+
+    /// Reverse map: classify a pattern string back into its preset, or
+    /// `Custom` when it doesn't match a known one. Used to derive the
+    /// strategy for legacy configs that predate the field.
+    #[must_use]
+    pub fn infer_from_pattern(pattern: &str) -> Self {
+        match pattern {
+            SIBLING_GROUP_PATH_PATTERN => Self::SiblingGroup,
+            NESTED_PATH_PATTERN => Self::Nested,
+            _ => Self::Custom,
+        }
+    }
+
+    /// Serde default: when the field is absent in legacy TOML the inference
+    /// happens in `WorktreeConfig` after deserialization (see
+    /// `WorktreeConfig::normalize`). At serde-default time we don't yet have
+    /// the pattern in scope, so fall back to the type default.
+    fn default_for_serde() -> Self {
+        Self::default()
+    }
+}
+
+impl WorktreeConfig {
+    /// Reconcile `path_strategy` and `path_pattern`:
+    ///
+    /// * Non-`Custom` strategy → force `path_pattern` to the preset constant
+    ///   so the two never drift out of sync after a write.
+    /// * Legacy configs (where `path_strategy` defaulted to `SiblingGroup`
+    ///   but the pattern is something else) → flip strategy to whatever the
+    ///   pattern infers to. This keeps the UI honest for users who never
+    ///   touched the new field.
+    pub fn normalize(&mut self) {
+        match self.path_strategy {
+            PathStrategy::Custom => { /* freeform — leave pattern as-is. */ }
+            preset => {
+                let expected = preset.preset_pattern().expect("non-custom has pattern");
+                if self.path_pattern != expected {
+                    // If the user-typed pattern doesn't match the chosen
+                    // preset, the pattern wins and we re-classify.
+                    let inferred = PathStrategy::infer_from_pattern(&self.path_pattern);
+                    if inferred == preset {
+                        // Strategy is consistent; just snap pattern to the
+                        // canonical constant (no-op for already-equal).
+                        self.path_pattern = expected.to_string();
+                    } else {
+                        self.path_strategy = inferred;
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RenderingConfig {
     pub webgl_on_linux: bool,
+}
+
+/// Cosmetic / chrome-only preferences. Kept separate from `RenderingConfig`
+/// (which gates GPU paths) because these knobs are purely visual and don't
+/// affect terminal rendering correctness.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AppearanceConfig {
+    /// Curated VSCode theme id (e.g. "dracula", "tokyo-night"). The runtime
+    /// catalog lives in `frontend/src/themes/catalog/`. Defaults to
+    /// `raum-default-dark` so a fresh install matches today's look.
+    #[serde(default = "default_theme_id")]
+    pub theme_id: String,
+    /// Path to a user-supplied VSCode theme JSON. When `Some`, takes
+    /// precedence over `theme_id` so a BYO theme survives across launches
+    /// without hijacking the curated picker selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_theme_path: Option<PathBuf>,
+}
+pub const DEFAULT_THEME_ID: &str = "raum-default-dark";
+
+fn default_theme_id() -> String {
+    DEFAULT_THEME_ID.to_string()
+}
+
+impl Default for AppearanceConfig {
+    fn default() -> Self {
+        Self {
+            theme_id: DEFAULT_THEME_ID.to_string(),
+            custom_theme_path: None,
+        }
+    }
+}
+
+/// Dock / taskbar badge verbosity. Independent of the OS-notification
+/// toggles — a user can silence notifications but still want the glance
+/// value of a badge, or vice versa.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BadgeMode {
+    /// Never set a badge count. The app clears the badge on every update.
+    Off,
+    /// Count only open permission requests (the subset of `waiting` that
+    /// blocks on user approval).
+    Critical,
+    /// Count every agent currently in `waiting`, `completed`, or `errored`.
+    /// Default — strict superset of the pre-verbosity behavior.
+    #[default]
+    AllUnread,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,6 +339,9 @@ pub struct NotificationsConfig {
     /// or `errored` (agent is done). Defaults to `true`.
     #[serde(default = "default_true")]
     pub notify_on_done: bool,
+    /// §11.3 — dock/taskbar badge verbosity. Defaults to [`BadgeMode::AllUnread`].
+    #[serde(default)]
+    pub badge_mode: BadgeMode,
 }
 
 fn default_true() -> bool {
@@ -154,6 +355,27 @@ impl Default for NotificationsConfig {
             notifications_hint_shown: false,
             notify_on_waiting: true,
             notify_on_done: true,
+            badge_mode: BadgeMode::default(),
+        }
+    }
+}
+
+/// Auto-updater preferences. The signing key + endpoint live in
+/// `tauri.conf.json`; this struct only captures per-user toggles.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdaterConfig {
+    /// Run a background `check()` a few seconds after launch and surface a
+    /// non-blocking toast if a newer release is available. On by default;
+    /// the frontend still skips the check in dev builds.
+    #[serde(default = "default_true")]
+    pub check_on_launch: bool,
+}
+
+impl Default for UpdaterConfig {
+    fn default() -> Self {
+        Self {
+            check_on_launch: true,
         }
     }
 }
@@ -277,46 +499,6 @@ pub struct EffectiveProjectConfig {
     pub has_raum_toml: bool,
 }
 
-/// User-global `layouts.toml` — named layout presets.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct LayoutLibrary {
-    #[serde(rename = "preset", default)]
-    pub presets: Vec<LayoutPreset>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct LayoutPreset {
-    // Primitives first — `cells` is an array-of-tables which must come last.
-    pub name: String,
-    /// Seconds since UNIX epoch (UTC). Optional for forward compatibility
-    /// with presets authored before this field existed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub created_at: Option<u64>,
-    pub cells: Vec<LayoutCell>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct LayoutCell {
-    pub x: u32,
-    pub y: u32,
-    pub w: u32,
-    pub h: u32,
-    pub kind: AgentKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-}
-
-/// `state/worktree-presets.toml` — per-worktree last-used preset pointer map.
-///
-/// Serializes as a flat `{worktree-id → preset-name}` TOML (keys at root),
-/// matching the on-disk shape declared in design D5.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct WorktreePresetPointer {
-    pub map: BTreeMap<String, String>,
-}
-
 /// `state/sessions.toml` — transient cross-project session index.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -332,8 +514,18 @@ pub struct TrackedSession {
     pub project_slug: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opencode_port: Option<u16>,
     pub kind: AgentKind,
     pub created_at_unix_ms: u64,
+    /// Last harness state observed for this session. Written by the agent
+    /// event bridge on every transition; read on reattach to seed the fresh
+    /// `AgentStateMachine` so reloaded panes retain their waiting/working
+    /// indicators instead of resetting to `Idle`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_state: Option<AgentState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_state_at_unix_ms: Option<u64>,
 }
 
 /// `state/quickfire-history.toml` — bounded ring of recent quick-fire commands.
@@ -351,15 +543,12 @@ pub struct QuickfireHistory {
 pub struct ActiveLayoutState {
     /// Unix seconds when this snapshot was last written.
     pub saved_at: u64,
-    /// Name of the preset this layout was derived from, if any.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_preset: Option<String>,
     /// Project / worktree context at the time of save.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_slug: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_id: Option<String>,
-    #[serde(rename = "cell", default)]
+    #[serde(default, alias = "cell")]
     pub cells: Vec<ActiveLayoutCell>,
 }
 
@@ -373,8 +562,12 @@ pub struct ActiveLayoutCell {
     pub kind: AgentKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_slug: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_id: Option<String>,
     pub active_tab_id: String,
-    #[serde(rename = "tab", default)]
+    #[serde(default, alias = "tab")]
     pub tabs: Vec<ActiveLayoutTab>,
 }
 
@@ -383,6 +576,17 @@ pub struct ActiveLayoutTab {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// User-chosen display label shown in the pane's tab strip. When unset,
+    /// the UI falls back to the harness icon + state indicator only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Per-tab project binding, captured at tab-spawn time. Lets a tab stay
+    /// pointed at the worktree it was created under even if the pane's
+    /// pane-level `project_slug` later moves or the sidebar scope changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_slug: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_id: Option<String>,
 }
 
 impl QuickfireHistory {
@@ -425,6 +629,7 @@ mod tests {
                 notifications_hint_shown: true,
                 notify_on_waiting: true,
                 notify_on_done: false,
+                badge_mode: BadgeMode::Critical,
             },
             keybindings: Keybindings { overrides },
             sidebar: SidebarConfig {
@@ -435,10 +640,40 @@ mod tests {
                 path_pattern: DEFAULT_PATH_PATTERN.into(),
                 branch_prefix_mode: BranchPrefixMode::Custom,
                 branch_prefix_custom: Some("feature/".into()),
+                ..WorktreeConfig::default()
             },
             ..Config::default()
         };
         roundtrip(cfg);
+    }
+
+    #[test]
+    fn notifications_badge_mode_default_is_all_unread() {
+        let cfg = NotificationsConfig::default();
+        assert_eq!(cfg.badge_mode, BadgeMode::AllUnread);
+    }
+
+    #[test]
+    fn notifications_badge_mode_serializes_snake_case() {
+        let cfg = NotificationsConfig {
+            badge_mode: BadgeMode::AllUnread,
+            ..NotificationsConfig::default()
+        };
+        let raw = toml::to_string(&cfg).expect("serialize");
+        assert!(
+            raw.contains("badge_mode = \"all_unread\""),
+            "expected snake_case badge_mode, got:\n{raw}"
+        );
+    }
+
+    #[test]
+    fn notifications_missing_badge_mode_defaults() {
+        let raw = r"
+            notify_on_waiting = true
+            notify_on_done = true
+        ";
+        let cfg: NotificationsConfig = toml::from_str(raw).expect("deserialize");
+        assert_eq!(cfg.badge_mode, BadgeMode::AllUnread);
     }
 
     #[test]
@@ -473,11 +708,50 @@ mod tests {
                 path_pattern: "{parent-dir}/wt/{branch-slug}".into(),
                 branch_prefix_mode: BranchPrefixMode::Username,
                 branch_prefix_custom: None,
+                ..WorktreeConfig::default()
             }),
             agent_defaults: None,
             unknown: BTreeMap::new(),
         };
         roundtrip(rt);
+    }
+
+    #[test]
+    fn appearance_config_roundtrip_default() {
+        // Default → TOML → struct should preserve theme_id and leave
+        // custom_theme_path as None (skip_serializing_if guarantees the
+        // field doesn't even appear in the serialized form).
+        let cfg = AppearanceConfig::default();
+        let raw = toml::to_string_pretty(&cfg).expect("serialize");
+        assert!(
+            raw.contains(DEFAULT_THEME_ID),
+            "raw missing default theme_id: {raw}"
+        );
+        assert!(
+            !raw.contains("custom_theme_path"),
+            "default should omit custom_theme_path: {raw}"
+        );
+        let back: AppearanceConfig = toml::from_str(&raw).expect("deserialize");
+        assert_eq!(cfg, back);
+    }
+
+    #[test]
+    fn appearance_config_roundtrip_custom() {
+        let cfg = AppearanceConfig {
+            theme_id: "dracula".into(),
+            custom_theme_path: Some(PathBuf::from("/tmp/custom-theme.json")),
+        };
+        roundtrip(cfg);
+    }
+
+    #[test]
+    fn appearance_config_back_compat_missing_fields() {
+        // Older configs may still carry removed appearance keys. Make sure
+        // deserialization ignores them cleanly and keeps the current defaults.
+        let raw = "glass_intensity = 50";
+        let parsed: AppearanceConfig = toml::from_str(raw).expect("parse");
+        assert_eq!(parsed.theme_id, DEFAULT_THEME_ID);
+        assert!(parsed.custom_theme_path.is_none());
     }
 
     #[test]
@@ -495,39 +769,9 @@ mod tests {
     }
 
     #[test]
-    fn layout_library_roundtrip() {
-        let lib = LayoutLibrary {
-            presets: vec![LayoutPreset {
-                name: "two-agents".into(),
-                cells: vec![
-                    LayoutCell {
-                        x: 0,
-                        y: 0,
-                        w: 6,
-                        h: 10,
-                        kind: AgentKind::ClaudeCode,
-                        title: Some("main".into()),
-                    },
-                    LayoutCell {
-                        x: 6,
-                        y: 0,
-                        w: 6,
-                        h: 10,
-                        kind: AgentKind::Codex,
-                        title: None,
-                    },
-                ],
-                created_at: Some(1_714_000_000),
-            }],
-        };
-        roundtrip(lib);
-    }
-
-    #[test]
     fn active_layout_state_roundtrip() {
         let state = ActiveLayoutState {
             saved_at: 1_714_000_001,
-            source_preset: Some("two-agents".into()),
             project_slug: Some("acme".into()),
             worktree_id: Some("/path/to/wt".into()),
             cells: vec![ActiveLayoutCell {
@@ -538,15 +782,23 @@ mod tests {
                 h: 10,
                 kind: AgentKind::ClaudeCode,
                 title: Some("Main".into()),
+                project_slug: Some("acme".into()),
+                worktree_id: Some("/path/to/wt".into()),
                 active_tab_id: "tab-1".into(),
                 tabs: vec![
                     ActiveLayoutTab {
                         id: "tab-1".into(),
                         session_id: Some("raum-claude-123".into()),
+                        label: Some("Main agent".into()),
+                        project_slug: Some("acme".into()),
+                        worktree_id: Some("/path/to/wt".into()),
                     },
                     ActiveLayoutTab {
                         id: "tab-2".into(),
                         session_id: None,
+                        label: None,
+                        project_slug: None,
+                        worktree_id: None,
                     },
                 ],
             }],
@@ -566,19 +818,14 @@ mod tests {
                 session_id: "raum-abc".into(),
                 project_slug: Some("acme".into()),
                 worktree_id: Some("acme/main".into()),
+                opencode_port: None,
                 kind: AgentKind::Shell,
                 created_at_unix_ms: 1_714_000_000_000,
+                last_state: None,
+                last_state_at_unix_ms: None,
             }],
         };
         roundtrip(st);
-    }
-
-    #[test]
-    fn worktree_preset_pointer_roundtrip() {
-        let mut map = BTreeMap::new();
-        map.insert("acme/main".into(), "two-agents".into());
-        let p = WorktreePresetPointer { map };
-        roundtrip(p);
     }
 
     #[test]
@@ -593,6 +840,95 @@ mod tests {
             h.push(format!("cmd {i}"));
         }
         assert_eq!(h.entries.len(), QUICKFIRE_HISTORY_LIMIT);
+    }
+
+    #[test]
+    fn path_strategy_default_is_sibling_group() {
+        assert_eq!(PathStrategy::default(), PathStrategy::SiblingGroup);
+    }
+
+    #[test]
+    fn path_strategy_serializes_kebab_case() {
+        // Wire-format check: multi-word variant uses kebab-case.
+        assert_eq!(
+            serde_json::to_string(&PathStrategy::SiblingGroup).expect("ser"),
+            "\"sibling-group\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PathStrategy::Nested).expect("ser"),
+            "\"nested\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PathStrategy::Custom).expect("ser"),
+            "\"custom\""
+        );
+    }
+
+    #[test]
+    fn path_strategy_infers_from_pattern() {
+        assert_eq!(
+            PathStrategy::infer_from_pattern(SIBLING_GROUP_PATH_PATTERN),
+            PathStrategy::SiblingGroup
+        );
+        assert_eq!(
+            PathStrategy::infer_from_pattern(NESTED_PATH_PATTERN),
+            PathStrategy::Nested
+        );
+        assert_eq!(
+            PathStrategy::infer_from_pattern("anything-else/{branch-slug}"),
+            PathStrategy::Custom
+        );
+    }
+
+    #[test]
+    fn worktree_normalize_snaps_pattern_to_preset() {
+        // Strategy=Nested but pattern wandered → snap pattern back to canonical.
+        let mut wc = WorktreeConfig {
+            path_strategy: PathStrategy::Nested,
+            path_pattern: "stale/{branch-slug}".into(),
+            ..WorktreeConfig::default()
+        };
+        wc.normalize();
+        assert_eq!(wc.path_strategy, PathStrategy::Custom);
+        // (We deliberately demote to Custom rather than overwriting a hand-typed pattern.)
+        assert_eq!(wc.path_pattern, "stale/{branch-slug}");
+
+        // Already-canonical pair is a no-op.
+        let mut wc2 = WorktreeConfig {
+            path_strategy: PathStrategy::Nested,
+            path_pattern: NESTED_PATH_PATTERN.into(),
+            ..WorktreeConfig::default()
+        };
+        wc2.normalize();
+        assert_eq!(wc2.path_strategy, PathStrategy::Nested);
+        assert_eq!(wc2.path_pattern, NESTED_PATH_PATTERN);
+
+        // Custom strategy never touches the pattern.
+        let mut wc3 = WorktreeConfig {
+            path_strategy: PathStrategy::Custom,
+            path_pattern: "freeform/{branch-slug}".into(),
+            ..WorktreeConfig::default()
+        };
+        wc3.normalize();
+        assert_eq!(wc3.path_strategy, PathStrategy::Custom);
+        assert_eq!(wc3.path_pattern, "freeform/{branch-slug}");
+    }
+
+    #[test]
+    fn worktree_config_legacy_toml_omits_path_strategy() {
+        // Older configs predate the field; serde default + normalize should
+        // recover a sensible strategy from the pattern alone.
+        let raw = format!(
+            r#"pathPattern = "{NESTED_PATH_PATTERN}"
+branchPrefixMode = "none"
+"#
+        );
+        let mut cfg: WorktreeConfig = toml::from_str(&raw).expect("deserialize");
+        // Field absent → falls back to type default (SiblingGroup) until normalize.
+        assert_eq!(cfg.path_strategy, PathStrategy::SiblingGroup);
+        cfg.normalize();
+        // The pattern matches the Nested constant, so normalize re-classifies.
+        assert_eq!(cfg.path_strategy, PathStrategy::Nested);
     }
 
     #[test]

@@ -43,8 +43,17 @@ const OUTBOUND_NETWORK_CRATES: &[&str] =
     &["reqwest", "hyper", "ureq", "isahc", "curl", "surf", "awc"];
 
 /// Crates that are allowed to pull in outbound-network dependencies, because
-/// their purpose *is* to make a network call. Today this is only the updater.
-const ALLOWED_NETWORK_DEP_PACKAGES: &[&str] = &["tauri-plugin-updater"];
+/// their purpose *is* to make a network call. The entries are:
+///
+/// * `tauri-plugin-updater` — the auto-update boundary (single whitelisted
+///   internet call per `docs/privacy.md`).
+/// * `raum-core` — the OpenCode harness integration (Phase 4) talks to
+///   `http://127.0.0.1:<port>` over `reqwest`. This is loopback-only
+///   (127.0.0.1 / `/global/health`, `/event`, `/permission/:id/reply`) and
+///   never hits the public network. The harness-layer selftest + channel
+///   code refuses any non-loopback base URL construction; see
+///   `harness::opencode::OpenCodeAdapter::base_url`.
+const ALLOWED_NETWORK_DEP_PACKAGES: &[&str] = &["tauri-plugin-updater", "raum-core"];
 
 fn workspace_root() -> PathBuf {
     // `CARGO_MANIFEST_DIR` points at `crates/raum-core`; walk up twice.
@@ -135,12 +144,16 @@ fn waiting_burst_uses_no_network() {
     let start = HookEvent {
         harness: "claude-code".into(),
         event: "PreToolUse".into(),
+        source: None,
+        reliability: None,
         payload: serde_json::Value::Null,
     };
     let waiting = HookEvent {
         harness: "claude-code".into(),
         event: "Notification".into(),
-        payload: serde_json::Value::Null,
+        source: None,
+        reliability: None,
+        payload: serde_json::json!({ "notification_type": "elicitation_dialog" }),
     };
 
     let mut waiting_count = 0usize;

@@ -7,18 +7,30 @@
  * soon as a harness transitions between states.
  */
 
+import { type Accessor, createMemo, createRoot } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 export type AgentKind = "shell" | "claude-code" | "codex" | "opencode";
 export type AgentState = "idle" | "working" | "waiting" | "completed" | "errored";
+/**
+ * How confident the backend is in the state transition. Mirrors
+ * `raum_core::harness::Reliability` (serialised as kebab-case).
+ *
+ * `deterministic` — the harness told us directly (hook / SSE).
+ * `event-driven` — structured event stream with a heuristic mapping.
+ * `heuristic` — inferred from an indirect signal (e.g. output silence).
+ */
+export type Reliability = "deterministic" | "event-driven" | "heuristic";
 
 export interface AgentListItem {
   session_id: string | null;
   harness: AgentKind;
   state: AgentState;
   supports_native_events: boolean;
+  /** Latest `reliability` seen for this session, or `null` until a transition arrives. */
+  reliability?: Reliability | null;
 }
 
 interface AgentStoreState {
@@ -47,18 +59,56 @@ export function setAdapters(items: AgentListItem[]): void {
   setAgentStore("sessions", reconcile(liveSessions));
 }
 
-export function updateSessionState(sessionId: string, harness: AgentKind, state: AgentState): void {
+export function updateSessionState(
+  sessionId: string,
+  harness: AgentKind,
+  state: AgentState,
+  reliability?: Reliability | null,
+): void {
   const existing = agentStore.sessions[sessionId];
   const next: AgentListItem = existing
-    ? { ...existing, state }
+    ? { ...existing, state, reliability: reliability ?? existing.reliability ?? null }
     : {
         session_id: sessionId,
         harness,
         state,
         supports_native_events: false,
+        reliability: reliability ?? null,
       };
   setAgentStore("sessions", sessionId, next);
 }
+
+export function removeSession(sessionId: string): void {
+  const next = { ...agentStore.sessions };
+  delete next[sessionId];
+  setAgentStore("sessions", reconcile(next));
+}
+
+// ---- derived selectors ---------------------------------------------------
+//
+// Detached `createRoot` so memos have a tracking owner and live for the
+// lifetime of the app (matches the pattern in `terminalStore.ts`).
+
+interface AgentSelectors {
+  /** Agents in states the user has yet to "read": waiting, completed, or errored. */
+  unreadAgentCount: Accessor<number>;
+}
+
+const agentSelectors: AgentSelectors = createRoot(() => {
+  const unread = createMemo(
+    () =>
+      Object.values(agentStore.sessions).filter(
+        (s) => s.state === "waiting" || s.state === "completed" || s.state === "errored",
+      ).length,
+  );
+  return { unreadAgentCount: unread };
+});
+
+/**
+ * §11.3 — count of agents whose last state transition still demands attention.
+ * Drives the "All unread" dock-badge mode.
+ */
+export const unreadAgentCount = agentSelectors.unreadAgentCount;
 
 /** Fetch the full adapter + session list from the backend. */
 export async function refreshAgents(): Promise<void> {
@@ -75,6 +125,12 @@ interface AgentStateChanged {
   harness: AgentKind;
   from: AgentState;
   to: AgentState;
+  /** Per-harness notification plan, Phase 1: replaces `via_silence_heuristic`. */
+  reliability?: Reliability;
+}
+
+interface AgentSessionRemoved {
+  session_id: string;
 }
 
 function sessionIdFromPayload(id: AgentStateChanged["session_id"]): string {
@@ -93,12 +149,24 @@ function sessionIdFromPayload(id: AgentStateChanged["session_id"]): string {
  * Listen for `agent-state-changed` events. Returns an unsubscribe function.
  */
 export async function subscribeAgentEvents(): Promise<UnlistenFn> {
-  const unlisten = await listen<AgentStateChanged>("agent-state-changed", (ev) => {
+  const unlistenChanged = await listen<AgentStateChanged>("agent-state-changed", (ev) => {
     const id = sessionIdFromPayload(ev.payload.session_id);
     if (!id) return;
-    updateSessionState(id, ev.payload.harness, ev.payload.to);
+    updateSessionState(id, ev.payload.harness, ev.payload.to, ev.payload.reliability ?? null);
+  });
+  const unlistenRemoved = await listen<AgentSessionRemoved>("agent-session-removed", (ev) => {
+    if (!ev.payload.session_id) return;
+    removeSession(ev.payload.session_id);
   });
   return () => {
-    unlisten();
+    unlistenChanged();
+    unlistenRemoved();
   };
+}
+
+export function __resetAgentStoreForTests(): void {
+  setAgentStore({
+    adapters: [],
+    sessions: {},
+  });
 }

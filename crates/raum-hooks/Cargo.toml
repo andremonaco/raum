@@ -7,13 +7,12 @@ authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 rust-version.workspace = true
-description = "raum hook-script writer + Unix domain event socket server."
+description = "raum Unix domain event socket server for hook-script dispatchers."
 
 [lints]
 workspace = true
 
 [dependencies]
-raum-core = { path = "../raum-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

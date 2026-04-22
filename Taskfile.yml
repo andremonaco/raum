@@ -27,6 +27,11 @@ tasks:
       - sh scripts/fetch-fonts.sh
       - echo "Done."
 
+  themes:sync:
+    desc: Refresh the curated VSCode theme catalog from tm-themes (run on demand)
+    dir: frontend
+    cmd: bun run themes:sync
+
   # ---------------------------------------------------------------------------
   # Hooks (prek orchestrates everything below in one shot)
   # ---------------------------------------------------------------------------
@@ -52,6 +57,12 @@ tasks:
 
   check:
     desc: Cargo check (all workspace crates)
+    env:
+      # Isolate from `task dev`'s target/debug so running a check while dev
+      # is live never contends for the build lock (same rationale as
+      # `test:rust`). Killing a contending rustc mid-compile corrupts the
+      # incremental cache and leaves dev wedged.
+      CARGO_TARGET_DIR: target/test
     cmd: cargo check --workspace --locked
 
   lint:
@@ -88,6 +99,10 @@ tasks:
 
   clippy:
     desc: cargo clippy (all workspace crates, all targets)
+    env:
+      # Isolated from `target/debug` so `task dev` keeps running while
+      # clippy compiles every test target. Same reasoning as `test:rust`.
+      CARGO_TARGET_DIR: target/test
     cmd: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   # ---------------------------------------------------------------------------
@@ -106,6 +121,8 @@ tasks:
 
   test:rust:
     desc: Run Rust tests (all workspace crates)
+    env:
+      CARGO_TARGET_DIR: target/test
     cmd: cargo test --workspace --locked
 
   test:all:

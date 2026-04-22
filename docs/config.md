@@ -8,9 +8,6 @@ key, every default, and every accelerator action.
 - [`projects/<slug>/project.toml`](#projectsslugprojecttoml) — per-project
   registration.
 - [`.raum.toml`](#raumtoml) — optional, committed repo-level overrides.
-- [`layouts.toml`](#layoutstoml) — named layout presets.
-- [`state/worktree-presets.toml`](#stateworktree-presetstoml) — per-worktree
-  last-used preset pointer.
 - [`keybindings.toml`](#keybindingstoml) — accelerator overrides.
 - [Action reference](#action-reference) — every accelerator action name.
 
@@ -38,7 +35,7 @@ branchPrefixMode  = "none"          # "none" | "username" | "custom"
 webgl_on_linux = false   # opt-in: WebGL on WebKitGTK is off by default (§4.3)
 
 [notifications]
-# sound = "/path/to/bell.wav"      # optional; played on `waiting` (§11.5)
+# sound = "/System/Library/Sounds/Glass.aiff"  # optional; OS sound or custom path (§11.5)
 notifications_hint_shown = false   # set true after the "permission denied" banner
 
 [sidebar]
@@ -61,7 +58,7 @@ collapsed = false
 | `worktreeConfig.branchPrefixMode`         | `"none"`                                                         | `none` / `username` / `custom`. |
 | `worktreeConfig.branchPrefixCustom`       | _unset_                                                          | Required when `branchPrefixMode = "custom"`. |
 | `rendering.webgl_on_linux`                | `false`                                                          | Opt-in WebGL on WebKitGTK (§4.3). |
-| `notifications.sound`                     | _unset_                                                          | Path to an audio file played on `waiting` (§11.5). |
+| `notifications.sound`                     | _unset_                                                          | Path to an audio file played on `waiting`. Settings UI offers a dropdown of OS-bundled sounds (`/System/Library/Sounds/*.aiff` on macOS, `/usr/share/sounds/freedesktop/stereo/*.oga` on Linux) or a custom path (§11.5). |
 | `notifications.notifications_hint_shown`  | `false`                                                          | Marks the one-time in-app banner as shown. |
 | `sidebar.width_px`                        | `280`                                                            | Persisted drag width (§9.7). |
 | `sidebar.collapsed`                       | `false`                                                          | Persisted collapse toggle. |
@@ -100,6 +97,13 @@ symlink = []    # files / dirs symlinked (win over duplicates in `copy`)
 pathPattern       = "{parent-dir}/{base-folder}-worktrees/{branch-slug}"
 branchPrefixMode  = "none"
 
+# Optional executable scripts that run around worktree creation.
+# Default timeoutSecs is 300 (5 min); 0 disables the timeout.
+# [worktree.hooks]
+# preCreate   = "scripts/pre-worktree.sh"
+# postCreate  = "scripts/post-worktree.sh"
+# timeoutSecs = 300
+
 [agent_defaults]
 # default = "claude-code"
 # [agent_defaults.silence_threshold_ms]
@@ -126,6 +130,10 @@ symlink = ["node_modules"]
 pathPattern      = "../{base-folder}-trees/{branch-slug}"
 branchPrefixMode = "username"
 
+[worktree.hooks]
+preCreate  = "scripts/pre-worktree.sh"
+postCreate = "scripts/post-worktree.sh"
+
 [agent_defaults]
 default = "claude-code"
 ```
@@ -133,46 +141,6 @@ default = "claude-code"
 Unknown keys at the top level are tolerated and logged at INFO (§2.6).
 raum only writes to `.raum.toml` when `in_repo_settings = true` is set on
 the project.
-
----
-
-## `layouts.toml`
-
-Array-of-tables of named presets (§10.2).
-
-```toml
-[[preset]]
-name       = "pair"
-created_at = 1731500000   # optional, unix seconds
-  [[preset.cells]]
-  x = 0
-  y = 0
-  w = 6
-  h = 12
-  kind = "claude-code"
-  title = "planner"
-  [[preset.cells]]
-  x = 6
-  y = 0
-  w = 6
-  h = 12
-  kind = "shell"
-```
-
-`kind` is one of `shell`, `claude-code`, `codex`, `opencode`, `empty`.
-Preset names are unique.
-
----
-
-## `state/worktree-presets.toml`
-
-Flat `worktree-id -> preset-name` map (§10.5). Cleared entries are removed
-when the referenced preset is deleted.
-
-```toml
-"acme:feat-auth"  = "pair"
-"acme:feat-billing" = "solo"
-```
 
 ---
 
@@ -257,9 +225,9 @@ an app-level handler.
 | `toggle-sidebar`      | `CmdOrCtrl+B`           | Collapse/expand sidebar |
 | `toggle-quick-fire`   | `CmdOrCtrl+Shift+K`     | Toggle quick-fire input |
 | `focus-quick-fire`    | `CmdOrCtrl+K`           | Focus quick-fire input |
-| `global-search`       | `CmdOrCtrl+Shift+F`     | Global scrollback search |
-| `open-grid-builder`   | `CmdOrCtrl+Shift+G`     | Open the grid builder |
+| `global-search`       | `CmdOrCtrl+F`           | Global search |
 | `cheat-sheet`         | `CmdOrCtrl+/`           | Show keymap cheat-sheet |
+| `reload`              | `CmdOrCtrl+R`           | Reload the app |
 
 ### Worktrees
 
@@ -267,7 +235,6 @@ an app-level handler.
 | ------------------------ | ----------------------- | ----------- |
 | `new-worktree`           | `CmdOrCtrl+Shift+N`     | Create a new worktree |
 | `switch-worktree`        | `CmdOrCtrl+P`           | Switch worktree |
-| `apply-last-used-preset` | `CmdOrCtrl+Shift+L`     | Apply last-used preset |
 
 ### Global (OS-level)
 
@@ -286,15 +253,36 @@ default is `"{parent-dir}/{base-folder}-worktrees/{branch-slug}"`.
 
 Substitutions:
 
-| Token             | Expands to                                          |
-| ----------------- | --------------------------------------------------- |
-| `{parent-dir}`    | parent directory of the project root                |
-| `{base-folder}`   | basename of the project root                        |
-| `{branch-slug}`   | slugified branch name (`/` → `-`, non-alnum dropped)|
-| `{branch-name}`   | raw branch name (no slugging)                       |
-| `{project-slug}`  | project slug from `project.toml`                    |
+| Token             | Expands to                                           |
+| ----------------- | ---------------------------------------------------- |
+| `{parent-dir}`    | parent directory of the project root                 |
+| `{base-folder}`   | basename of the project root                         |
+| `{repo-name}`     | alias of `{base-folder}`                             |
+| `{repo-root}`     | full project root path (`{parent-dir}/{base-folder}`)|
+| `{branch-slug}`   | slugified branch name (`/` → `-`, non-alnum dropped) |
+| `{worktree-slug}` | alias of `{branch-slug}`                             |
+| `{branch-name}`   | raw branch name (no slugging)                        |
+| `{project-slug}`  | project slug from `project.toml`                     |
 
-Validation rejects any pattern without a branch token.
+Validation rejects any pattern without a branch token
+(`{branch-slug}`, `{worktree-slug}`, or `{branch-name}`).
+
+### Built-in presets
+
+The Worktrees pane in Settings exposes two ready-made patterns plus a Custom
+mode. Picking a preset writes to `worktreeConfig.pathPattern` in
+`config.toml`; the per-project override in `project.toml` / `.raum.toml` still
+wins when set.
+
+| Preset          | Pattern                                                      |
+| --------------- | ------------------------------------------------------------ |
+| Inside project  | `{repo-root}/.raum/{worktree-slug}`                          |
+| Sibling folder  | `{parent-dir}/{repo-name}-worktrees/{worktree-slug}` (default) |
+
+When a worktree gets created under `<project-root>/.raum/` for the first time,
+raum appends `.raum/` to the project's `.gitignore` so the worktree doesn't
+appear in the main repo's index. Existing `.gitignore` entries are respected;
+raum only writes the line when it's missing.
 
 ## Hydration manifests
 
@@ -302,3 +290,35 @@ The `hydration` table accepts two lists. `copy` duplicates files or
 directories into the new worktree; `symlink` links them instead. If the
 same path appears in both, `symlink` wins. Paths are relative to the
 project root and must not escape it.
+
+## Worktree lifecycle hooks
+
+`[worktree.hooks]` holds two optional executable script paths that run
+around worktree creation, plus a shared per-hook timeout. Absolute paths
+pass through unchanged; relative paths resolve against the project root.
+
+| Field         | Phase                                                                                                   |
+| ------------- | ------------------------------------------------------------------------------------------------------- |
+| `preCreate`   | Before `git worktree add`. cwd = project root. Non-zero exit aborts creation (no worktree on disk).     |
+| `postCreate`  | After hydration finishes. cwd = new worktree. Non-zero exit leaves the worktree for manual inspection.  |
+| `timeoutSecs` | Per-hook timeout in seconds. Default `300`. Set to `0` to disable the timeout.                          |
+
+Every hook is invoked with stdin closed; stdout and stderr are captured
+and the last ~8 KB of each is surfaced to the UI on failure or timeout.
+Scripts must be executable and carry a shebang — raum exec's them
+directly rather than routing through a shell.
+
+Context is passed via environment variables:
+
+| Env var              | Value                                                  |
+| -------------------- | ------------------------------------------------------ |
+| `RAUM_PHASE`         | `"pre-create"` or `"post-create"`                      |
+| `RAUM_PROJECT_SLUG`  | The project slug                                       |
+| `RAUM_PROJECT_ROOT`  | Absolute path of the project root                      |
+| `RAUM_WORKTREE_PATH` | Absolute path of the target worktree (may not exist during `pre-create`) |
+| `RAUM_BRANCH`        | Final branch name (after branch-prefix resolution)     |
+
+Hooks run synchronously, blocking the "Create worktree" flow. Use them
+for quick setup (`pnpm install`, `.env` materialization, venv bootstrap)
+rather than long-running background work — or raise the timeout
+accordingly.

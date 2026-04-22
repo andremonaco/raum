@@ -7,7 +7,9 @@
  */
 
 import { Component, For, Show, createResource, createSignal } from "solid-js";
+import { Dynamic } from "solid-js/web";
 import { invoke } from "@tauri-apps/api/core";
+import { Scrollable } from "./ui/scrollable";
 
 export interface FileTreeNode {
   name: string;
@@ -22,6 +24,89 @@ export interface FileTreeNode {
 }
 
 export type HydrationChoice = "copy" | "symlink" | "none";
+
+// ---- icons ------------------------------------------------------------------
+
+export interface HydrationIconProps {
+  class?: string;
+}
+
+export const HydrationCopyIcon: Component<HydrationIconProps> = (props) => (
+  <svg
+    class={props.class ?? "h-3 w-3"}
+    viewBox="0 0 16 16"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="1.5"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    aria-hidden="true"
+  >
+    <rect x="5.5" y="5.5" width="8.5" height="8.5" rx="1" />
+    <path d="M3 10.5V3a1 1 0 0 1 1-1h7" />
+  </svg>
+);
+
+export const HydrationSymlinkIcon: Component<HydrationIconProps> = (props) => (
+  <svg
+    class={props.class ?? "h-3 w-3"}
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="2"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    aria-hidden="true"
+  >
+    <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
+    <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
+  </svg>
+);
+
+export const HydrationSkipIcon: Component<HydrationIconProps> = (props) => (
+  <svg
+    class={props.class ?? "h-3 w-3"}
+    viewBox="0 0 16 16"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="1.5"
+    stroke-linecap="round"
+    aria-hidden="true"
+  >
+    <circle cx="8" cy="8" r="5" />
+    <path d="M4.5 11.5 11.5 4.5" />
+  </svg>
+);
+
+export const HYDRATION_CHOICE_META: Record<
+  HydrationChoice,
+  { label: string; icon: Component<HydrationIconProps> }
+> = {
+  copy: { label: "Copy", icon: HydrationCopyIcon },
+  symlink: { label: "Symlink", icon: HydrationSymlinkIcon },
+  none: { label: "Skip", icon: HydrationSkipIcon },
+};
+
+const HYDRATION_CHOICE_COLOR: Record<
+  HydrationChoice,
+  { icon: string; text: string; button: string }
+> = {
+  copy: {
+    icon: "text-emerald-400",
+    text: "text-emerald-200",
+    button: "bg-emerald-500/20 text-emerald-200",
+  },
+  symlink: {
+    icon: "text-sky-400",
+    text: "text-sky-200",
+    button: "bg-sky-500/20 text-sky-200",
+  },
+  none: {
+    icon: "text-muted-foreground",
+    text: "",
+    button: "",
+  },
+};
 
 // ---- row component ----------------------------------------------------------
 
@@ -131,7 +216,11 @@ const FileTreeRow: Component<FileTreeRowProps> = (props) => {
           </span>
 
           {/* Icon */}
-          <span class="shrink-0 text-muted-foreground" aria-hidden="true">
+          <span
+            class="shrink-0 transition-colors"
+            classList={{ [HYDRATION_CHOICE_COLOR[currentChoice()].icon]: true }}
+            aria-hidden="true"
+          >
             <Show
               when={props.node.isDir}
               fallback={
@@ -165,7 +254,12 @@ const FileTreeRow: Component<FileTreeRowProps> = (props) => {
           </span>
 
           {/* Name */}
-          <span class="min-w-0 flex-1 truncate font-mono text-[11px]">
+          <span
+            class="min-w-0 flex-1 truncate font-mono text-[11px] transition-colors"
+            classList={{
+              [HYDRATION_CHOICE_COLOR[currentChoice()].text]: currentChoice() !== "none",
+            }}
+          >
             {props.node.name}
             <Show when={props.node.isDir}>
               <span class="text-muted-foreground">/</span>
@@ -173,23 +267,27 @@ const FileTreeRow: Component<FileTreeRowProps> = (props) => {
           </span>
         </button>
 
-        {/* Copy / Symlink / — buttons */}
+        {/* Copy / Symlink / Skip icon toggles */}
         <div class="flex shrink-0 gap-px">
           <For each={["copy", "symlink", "none"] as HydrationChoice[]}>
-            {(choice) => (
-              <button
-                type="button"
-                class="rounded px-1.5 py-0.5 text-[9px] font-medium uppercase transition-colors"
-                classList={{
-                  "bg-accent text-accent-foreground": currentChoice() === choice,
-                  "text-muted-foreground hover:text-foreground": currentChoice() !== choice,
-                }}
-                onClick={() => handleToggle(choice)}
-                aria-label={`${choice} ${props.node.path}`}
-              >
-                {choice === "none" ? "—" : choice}
-              </button>
-            )}
+            {(choice) => {
+              const meta = HYDRATION_CHOICE_META[choice];
+              return (
+                <button
+                  type="button"
+                  class="flex h-5 w-5 items-center justify-center rounded transition-colors"
+                  classList={{
+                    [HYDRATION_CHOICE_COLOR[choice].button]: currentChoice() === choice,
+                    "text-muted-foreground hover:text-foreground": currentChoice() !== choice,
+                  }}
+                  onClick={() => handleToggle(choice)}
+                  aria-label={`${meta.label} ${props.node.path}`}
+                  title={meta.label}
+                >
+                  <Dynamic component={meta.icon} class="h-3 w-3" />
+                </button>
+              );
+            }}
           </For>
         </div>
       </div>
@@ -241,11 +339,10 @@ export const HydrationFileTree: Component<HydrationFileTreeProps> = (props) => {
   const copySet = () => new Set(props.copyPaths);
   const symlinkSet = () => new Set(props.symlinkPaths);
 
+  const rootClass = () =>
+    `select-none rounded-xl bg-background py-2 shadow-inner ring-1 ring-white/5 ${props.class ? "h-full" : "max-h-[240px]"}`;
   return (
-    <div
-      class="select-none overflow-y-auto rounded-xl bg-popover py-2 shadow-inner"
-      classList={{ "h-full": !!props.class, "max-h-[240px]": !props.class }}
-    >
+    <Scrollable class={rootClass()}>
       <Show
         when={props.nodes.length > 0}
         fallback={
@@ -265,6 +362,6 @@ export const HydrationFileTree: Component<HydrationFileTreeProps> = (props) => {
           )}
         </For>
       </Show>
-    </div>
+    </Scrollable>
   );
 };

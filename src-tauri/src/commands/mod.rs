@@ -3,14 +3,20 @@
 //! All commands are registered via `register` in `src-tauri/src/lib.rs`.
 
 pub mod agent;
+pub mod agent_hydrate;
 pub mod config;
+pub mod devtools;
 pub mod files;
+pub mod git_watcher;
+pub mod harness;
+pub mod harness_runtime;
 pub mod hotkeys;
-pub mod layouts;
 pub mod notifications;
+pub mod permission;
 pub mod project;
 pub mod search;
 pub mod terminal;
+pub mod updater;
 pub mod worktree;
 
 // Each submodule's `#[tauri::command]` items are referenced fully-qualified from

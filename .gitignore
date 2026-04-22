@@ -17,6 +17,7 @@ target/
 node_modules/
 frontend/dist/
 frontend/.vite/
+.vite/
 frontend/coverage/
 
 # Tauri
@@ -31,8 +32,11 @@ src-tauri/gen/schemas/
 .env.local
 
 openspec/**/*
-[.]claude/**/*
-[.]opencode/**/*
+.claude/**/*
+.opencode/**/*
+.codex/**/*
+passphrase/**/*
+.raum-updater-key.pem
 
 # Bun
 bun.lockb

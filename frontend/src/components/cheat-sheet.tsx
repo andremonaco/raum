@@ -27,6 +27,7 @@ import {
   DialogTitle,
 } from "./ui/dialog";
 import { Kbd } from "./ui/kbd";
+import { Scrollable } from "./ui/scrollable";
 
 interface Row {
   action: string;
@@ -135,7 +136,7 @@ export const CheatSheet: Component = () => {
             </Alert>
           </Show>
 
-          <div class="flex-1 overflow-auto">
+          <Scrollable axis="both" class="min-h-0 flex-1">
             <table class="w-full text-left text-sm">
               <thead class="sticky top-0 bg-card text-xs uppercase text-muted-foreground">
                 <tr>
@@ -173,7 +174,7 @@ export const CheatSheet: Component = () => {
                 </For>
               </tbody>
             </table>
-          </div>
+          </Scrollable>
 
           <footer class="border-t border-border px-4 py-2 text-right text-xs text-muted-foreground">
             Press <Kbd>Esc</Kbd> or click outside to close.

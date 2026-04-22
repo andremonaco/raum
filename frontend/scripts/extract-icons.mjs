@@ -17,10 +17,10 @@ const full = require("@iconify-json/vscode-icons/icons.json");
 const NEEDED = new Set([
   // EXT_MAP values
   "file-type-typescript",
-  "file-type-typescript-official",
   "file-type-typescriptdef",
   "file-type-js-official",
   "file-type-reactjs",
+  "file-type-reactts",
   "file-type-rust",
   "file-type-python",
   "file-type-go",
@@ -72,8 +72,7 @@ const NEEDED = new Set([
   "file-type-tailwind",
   "file-type-config",
   "file-type-cargo",
-  // fallback
-  "default-file",
+  // fallback is rendered inline in FileTypeIcon — no icon name needed.
 ]);
 
 const missing = [...NEEDED].filter((n) => !full.icons[n]);

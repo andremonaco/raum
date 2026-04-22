@@ -3,10 +3,15 @@
  *
  * Triggered by `⌘F` (or `⌘.` for backwards compatibility). Shows recent
  * searches and all project harnesses when the input is empty; as the user
- * types, shows matching harness sessions (click → focus pane) and project
- * files (click → open in FileEditorModal) across ALL worktrees of the active
- * project — each result carries a worktree badge so duplicates are
- * distinguishable.
+ * types, shows:
+ *   - matching harness sessions (click → focus pane),
+ *   - scrollback matches across every live harness on every project — each
+ *     row shows `<harness icon> <tab-label> <line-with-highlighted-match>`
+ *     and activating one jumps to the owning project, focuses the pane,
+ *     and scrolls xterm to the match when the hit came from xterm's own
+ *     buffer (tmux-only hits just focus the pane),
+ *   - project file matches across all worktrees of the active project
+ *     (click → open in FileEditorModal).
  *
  * Keyboard nav: ↑/↓ to select, Enter to activate, Escape to close.
  */
@@ -36,14 +41,21 @@ import {
   toggleSpotlight,
 } from "../lib/spotlightState";
 import { addRecentSearch, clearRecentSearch, recentSearches } from "../lib/recentSearchStore";
-import { terminalStore } from "../stores/terminalStore";
-import { activeProjectSlug } from "../stores/projectStore";
+import { listHarnessSessions } from "../stores/terminalStore";
+import { activeProjectSlug, setActiveProjectSlug } from "../stores/projectStore";
 import { useKeymapAction } from "../lib/keymapContext";
+import {
+  buildPreviewParts,
+  runScrollbackSearch,
+  type ScrollbackMatch,
+} from "../lib/scrollbackSearch";
+import { listTerminals, type TerminalBufferKind } from "../lib/terminalRegistry";
 const FileEditorModal = lazy(() =>
   import("./file-editor-modal").then((m) => ({ default: m.FileEditorModal })),
 );
 import { Badge } from "./ui/badge";
 import { ClockIcon, SearchIcon, HARNESS_ICONS, type HarnessIconKind } from "./icons";
+import { Scrollable } from "./ui/scrollable";
 import { FileTypeIcon } from "../lib/fileTypeIcon";
 import type { Worktree } from "../stores/worktreeStore";
 
@@ -74,15 +86,16 @@ type HarnessItem = {
   worktreeLabel: string | null;
 };
 type FileItem = { type: "file"; hit: WorktreeFileHit };
-type ResultItem = RecentItem | HarnessItem | FileItem;
+type ScrollbackItem = { type: "scrollback"; match: ScrollbackMatch };
+type ResultItem = RecentItem | HarnessItem | FileItem | ScrollbackItem;
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 function stateColor(state: string): string {
-  if (state === "working") return "bg-emerald-500/20 text-emerald-400";
-  if (state === "waiting") return "bg-amber-500/20 text-amber-400";
+  if (state === "working") return "bg-success/20 text-success";
+  if (state === "waiting") return "bg-warning/20 text-warning";
   return "bg-muted text-muted-foreground";
 }
 
@@ -106,12 +119,15 @@ function worktreeLabel(worktreeId: string | null): string | null {
 export const SpotlightDock: Component = () => {
   const [query, setQuery] = createSignal("");
   const [fileHits, setFileHits] = createSignal<WorktreeFileHit[]>([]);
+  const [scrollbackHits, setScrollbackHits] = createSignal<ScrollbackMatch[]>([]);
   const [selectedIdx, setSelectedIdx] = createSignal(-1);
   const [editorPath, setEditorPath] = createSignal<string | null>(null);
 
   let inputRef: HTMLInputElement | undefined;
   let fileSearchTimer: ReturnType<typeof setTimeout> | null = null;
   let fileToken = 0;
+  let scrollbackSearchTimer: ReturnType<typeof setTimeout> | null = null;
+  let scrollbackCancel: { aborted: boolean } | null = null;
 
   // ⌘. — backwards-compat shortcut via keymap system
   useKeymapAction("spotlight", toggleSpotlight);
@@ -134,14 +150,16 @@ export const SpotlightDock: Component = () => {
       if (spotlightTopBarDriven()) {
         // Query comes from the top-bar; just reset the result lists.
         setFileHits([]);
+        setScrollbackHits([]);
         setSelectedIdx(-1);
       } else {
         const initial = spotlightPendingQuery();
         clearSpotlightPendingQuery();
         setQuery(initial);
         setFileHits([]);
+        setScrollbackHits([]);
         setSelectedIdx(-1);
-        if (initial) scheduleFileSearch(initial);
+        if (initial) scheduleSearch(initial);
         requestAnimationFrame(() => {
           inputRef?.focus();
           if (initial) {
@@ -159,19 +177,45 @@ export const SpotlightDock: Component = () => {
     const q = spotlightTopBarQuery();
     setQuery(q);
     setSelectedIdx(-1);
-    scheduleFileSearch(q);
+    scheduleSearch(q);
   });
 
   // ---------------------------------------------------------------------------
   // Worktree-aware file search
   // ---------------------------------------------------------------------------
 
-  function scheduleFileSearch(q: string): void {
+  function scheduleSearch(q: string): void {
     if (fileSearchTimer !== null) clearTimeout(fileSearchTimer);
     fileSearchTimer = setTimeout(() => {
       fileSearchTimer = null;
       void runWorktreeFileSearch(q);
     }, 120);
+
+    // Scrollback walk is heavier (tmux IPC + per-line scan), so debounce it
+    // a bit longer to avoid thrashing while the user is still typing.
+    if (scrollbackSearchTimer !== null) clearTimeout(scrollbackSearchTimer);
+    if (scrollbackCancel) scrollbackCancel.aborted = true;
+    scrollbackSearchTimer = setTimeout(() => {
+      scrollbackSearchTimer = null;
+      void runScrollback(q);
+    }, 180);
+  }
+
+  async function runScrollback(q: string): Promise<void> {
+    if (!q.trim()) {
+      setScrollbackHits([]);
+      return;
+    }
+    const cancel = { aborted: false };
+    scrollbackCancel = cancel;
+    try {
+      const hits = await runScrollbackSearch({ query: q, cancel });
+      if (!cancel.aborted) setScrollbackHits(hits);
+    } catch {
+      if (!cancel.aborted) setScrollbackHits([]);
+    } finally {
+      if (scrollbackCancel === cancel) scrollbackCancel = null;
+    }
   }
 
   async function runWorktreeFileSearch(q: string): Promise<void> {
@@ -223,7 +267,7 @@ export const SpotlightDock: Component = () => {
   function handleQueryChange(v: string): void {
     setQuery(v);
     setSelectedIdx(-1);
-    scheduleFileSearch(v);
+    scheduleSearch(v);
   }
 
   // ---------------------------------------------------------------------------
@@ -233,8 +277,7 @@ export const SpotlightDock: Component = () => {
   const harnessMatches = createMemo<HarnessItem[]>(() => {
     const q = query().toLowerCase().trim();
     const slug = activeProjectSlug();
-    return Object.values(terminalStore.byId)
-      .filter((t) => !slug || t.project_slug === slug)
+    return listHarnessSessions(slug)
       .filter(
         (t) =>
           !q ||
@@ -259,6 +302,10 @@ export const SpotlightDock: Component = () => {
   // Flat navigation list
   // ---------------------------------------------------------------------------
 
+  const scrollbackItems = createMemo<ScrollbackItem[]>(() =>
+    scrollbackHits().map((match): ScrollbackItem => ({ type: "scrollback", match })),
+  );
+
   const allItems = createMemo<ResultItem[]>(() => {
     const q = query().trim();
     if (!q) {
@@ -266,14 +313,18 @@ export const SpotlightDock: Component = () => {
       const recents = recentSearches().map((r): RecentItem => ({ type: "recent", query: r }));
       return [...recents, ...harnessMatches()];
     }
-    return [...harnessMatches(), ...fileHits().map((hit): FileItem => ({ type: "file", hit }))];
+    return [
+      ...harnessMatches(),
+      ...scrollbackItems(),
+      ...fileHits().map((hit): FileItem => ({ type: "file", hit })),
+    ];
   });
 
   function activateItem(item: ResultItem): void {
     if (item.type === "recent") {
       setQuery(item.query);
       setSelectedIdx(-1);
-      scheduleFileSearch(item.query);
+      scheduleSearch(item.query);
       return;
     }
     if (item.type === "harness") {
@@ -285,10 +336,49 @@ export const SpotlightDock: Component = () => {
       closeSpotlight();
       return;
     }
+    if (item.type === "scrollback") {
+      addRecentSearch(query());
+      activateScrollbackMatch(item.match);
+      closeSpotlight();
+      return;
+    }
     // file
     addRecentSearch(query());
     setEditorPath(item.hit.path);
     closeSpotlight();
+  }
+
+  function activateScrollbackMatch(m: ScrollbackMatch): void {
+    // Cross-project jump: switching `activeProjectSlug` remounts the grid
+    // and the target pane's `<TerminalPane>`, which then reacts to the
+    // `terminal-focus-requested` event we dispatch below (same pattern the
+    // notification toasts and cross-project overlay use).
+    const needsProjectSwitch = Boolean(m.projectSlug && m.projectSlug !== activeProjectSlug());
+    if (needsProjectSwitch) setActiveProjectSlug(m.projectSlug!);
+
+    const finish = (): void => {
+      const reg = listTerminals().find((t) => t.sessionId === m.sessionId);
+      // Tmux-sourced matches live outside xterm.js's scrollback (their row
+      // indices don't map 1:1 into xterm's buffer), so we only scroll for
+      // xterm-sourced hits — otherwise we'd snap the viewport somewhere
+      // misleading.
+      if (reg && (m.buffer === "normal" || m.buffer === "alternate")) {
+        reg.revealBufferLine(m.buffer as TerminalBufferKind, m.row);
+      }
+      reg?.focus();
+      try {
+        window.dispatchEvent(
+          new CustomEvent("terminal-focus-requested", {
+            detail: { sessionId: m.sessionId },
+          }),
+        );
+      } catch {
+        /* non-DOM env (tests / SSR) */
+      }
+    };
+
+    if (needsProjectSwitch) queueMicrotask(finish);
+    else finish();
   }
 
   function onKeyDown(e: KeyboardEvent): void {
@@ -320,6 +410,8 @@ export const SpotlightDock: Component = () => {
   onCleanup(() => {
     window.removeEventListener("keydown", onKeyDown, { capture: true });
     if (fileSearchTimer !== null) clearTimeout(fileSearchTimer);
+    if (scrollbackSearchTimer !== null) clearTimeout(scrollbackSearchTimer);
+    if (scrollbackCancel) scrollbackCancel.aborted = true;
   });
 
   // ---------------------------------------------------------------------------
@@ -332,7 +424,15 @@ export const SpotlightDock: Component = () => {
     const hasRecent = !q && recentSearches().length > 0;
     const hasHarnesses = harnessMatches().length > 0;
     const fileCount = fileHits().length;
-    return { hasRecent, hasHarnesses, harnessCount: harnessMatches().length, fileCount, items };
+    const scrollbackCount = scrollbackHits().length;
+    return {
+      hasRecent,
+      hasHarnesses,
+      harnessCount: harnessMatches().length,
+      fileCount,
+      scrollbackCount,
+      items,
+    };
   });
 
   return (
@@ -340,15 +440,12 @@ export const SpotlightDock: Component = () => {
       <Show when={spotlightOpen()}>
         {/* Backdrop — dims the app without blurring it */}
         <div
-          class="fixed inset-0 z-50 flex items-start justify-center pt-[16vh] bg-black/50"
+          class="fixed inset-0 z-50 flex items-start justify-center pt-[16vh] bg-scrim"
           onClick={closeSpotlight}
         >
           {/* Panel — solid background so the app behind stays crisp */}
           <div
-            class="animate-in fade-in zoom-in-95 duration-150 w-full max-w-[640px] mx-4 overflow-hidden rounded-2xl border border-border bg-popover shadow-2xl"
-            style={{
-              "box-shadow": "0 24px 64px rgba(0,0,0,0.55), 0 0 0 1px rgba(255,255,255,0.06)",
-            }}
+            class="floating-surface animate-in fade-in zoom-in-95 duration-150 w-full max-w-[640px] mx-4 overflow-hidden rounded-2xl border border-border bg-popover"
             onClick={(e) => e.stopPropagation()}
           >
             {/* Search input — hidden when the top-bar input is driving the query */}
@@ -370,6 +467,7 @@ export const SpotlightDock: Component = () => {
                     onClick={() => {
                       setQuery("");
                       setFileHits([]);
+                      setScrollbackHits([]);
                       setSelectedIdx(-1);
                     }}
                     aria-label="Clear"
@@ -389,16 +487,18 @@ export const SpotlightDock: Component = () => {
                 sections().items.length > 0 ||
                 (query().trim().length > 0 &&
                   sections().harnessCount === 0 &&
+                  sections().scrollbackCount === 0 &&
                   sections().fileCount === 0)
               }
             >
               <div class="border-t border-white/5" />
-              <div class="max-h-[480px] overflow-y-auto pb-1 pt-1">
+              <Scrollable class="max-h-[480px] pb-1 pt-1">
                 {/* No-results message */}
                 <Show
                   when={
                     query().trim().length > 0 &&
                     sections().harnessCount === 0 &&
+                    sections().scrollbackCount === 0 &&
                     sections().fileCount === 0
                   }
                 >
@@ -425,8 +525,16 @@ export const SpotlightDock: Component = () => {
                         item.type === "file" &&
                         (idx() === 0 || sections().items[idx() - 1]?.type !== "file"),
                     );
+                    const isFirstScrollback = createMemo(
+                      () =>
+                        item.type === "scrollback" &&
+                        (idx() === 0 || sections().items[idx() - 1]?.type !== "scrollback"),
+                    );
                     return (
                       <>
+                        <Show when={isFirstScrollback()}>
+                          <SectionHeader label="Scrollback" count={sections().scrollbackCount} />
+                        </Show>
                         <Show when={isFirstFile()}>
                           <SectionHeader label="Files" count={sections().fileCount} />
                         </Show>
@@ -441,7 +549,7 @@ export const SpotlightDock: Component = () => {
                     );
                   }}
                 </For>
-              </div>
+              </Scrollable>
             </Show>
           </div>
         </div>
@@ -552,6 +660,37 @@ const ItemContent: Component<{
           </Badge>
         </>
       )}
+    </Match>
+    <Match when={props.item.type === "scrollback" && (props.item as ScrollbackItem)}>
+      {(sb) => {
+        const Icon =
+          HARNESS_ICONS[sb().match.kind as HarnessIconKind] ??
+          HARNESS_ICONS["shell" as HarnessIconKind];
+        const parts = createMemo(() =>
+          buildPreviewParts(sb().match.line, sb().match.col, sb().match.length),
+        );
+        return (
+          <>
+            <Icon class="size-3.5 shrink-0 text-muted-foreground" />
+            <span class="shrink-0 max-w-[30%] truncate text-foreground/90">
+              {sb().match.tabLabel}
+            </span>
+            <span class="min-w-0 flex-1 truncate font-mono text-[11px] text-muted-foreground/80">
+              <Show when={parts().leadingEllipsis}>
+                <span class="text-muted-foreground/40">…</span>
+              </Show>
+              {parts().before}
+              <mark class="rounded-sm bg-yellow-300/30 px-0.5 text-foreground">
+                {parts().match}
+              </mark>
+              {parts().after}
+              <Show when={parts().trailingEllipsis}>
+                <span class="text-muted-foreground/40">…</span>
+              </Show>
+            </span>
+          </>
+        );
+      }}
     </Match>
   </Switch>
 );

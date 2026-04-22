@@ -7,7 +7,7 @@
  * no network requests.
  */
 
-import { type Component } from "solid-js";
+import { Show, type Component } from "solid-js";
 import { Icon, addCollection } from "@iconify-icon/solid";
 // Only the 55 icons actually referenced below — 94 kB vs the full 3.6 MB
 // collection. If you add an icon to EXT_MAP/FILENAME_MAP/SUFFIX_RULES, run:
@@ -27,7 +27,7 @@ const PREFIX = "vscode-icons:";
 const EXT_MAP: Record<string, string> = {
   // TypeScript
   ts: "file-type-typescript",
-  tsx: "file-type-typescript-official",
+  tsx: "file-type-reactts",
   mts: "file-type-typescript",
   cts: "file-type-typescript",
   // TypeScript declaration
@@ -167,12 +167,15 @@ const SUFFIX_RULES: Array<[RegExp, string]> = [
 
 /**
  * Return the full Iconify icon ID (e.g. `"vscode-icons:file-type-typescript"`)
- * for a given filename. Falls back to the generic file icon.
+ * for a given filename, or `null` when no rule matches — the caller should
+ * render a generic inline file glyph in that case (vscode-icons' own
+ * `default-file` is a filled badge that collapses to an ugly square under
+ * `mode="mask"`).
  *
  * The `filename` may be a bare name or a relative path — only the basename is
  * inspected.
  */
-export function getFileIconId(filename: string): string {
+export function getFileIconId(filename: string): string | null {
   // Use only the basename so paths like "src/foo.ts" work correctly.
   const base = filename.split("/").pop() ?? filename;
 
@@ -191,7 +194,7 @@ export function getFileIconId(filename: string): string {
     if (ext in EXT_MAP) return PREFIX + EXT_MAP[ext]!;
   }
 
-  return PREFIX + "default-file";
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -209,20 +212,44 @@ interface FileTypeIconProps {
 /**
  * Renders a 14×14 px file-type icon for the given filename.
  *
- * Uses `mode="mask"` so the icon is rendered as a CSS mask over
- * `background-color: currentColor` — giving a clean single-color (monochrome)
- * icon that inherits whatever text color the parent sets. Control the icon
- * color via a Tailwind text-color class, e.g.:
- *   `<FileTypeIcon name="foo.ts" class="text-zinc-400" />`
- *
- * Drop-in usage: `<FileTypeIcon name={file} />`
+ * Icons render in their native vscode-icons colors (JS yellow, CSS violet, TS
+ * blue, …). We deliberately do NOT use `mode="mask"` — most vscode-icons are
+ * badge-style with a full-canvas background rectangle, which under a CSS mask
+ * collapses every icon to a solid square. When no rule matches the filename,
+ * we fall back to a generic stroke-based "paper" glyph that inherits
+ * `currentColor`.
  */
-export const FileTypeIcon: Component<FileTypeIconProps> = (props) => (
-  <Icon
-    icon={getFileIconId(props.name)}
-    mode="mask"
-    width={props.width ?? 14}
-    height={props.height ?? 14}
-    class={props.class}
-  />
-);
+export const FileTypeIcon: Component<FileTypeIconProps> = (props) => {
+  const iconId = () => getFileIconId(props.name);
+  return (
+    <Show
+      when={iconId()}
+      fallback={
+        <svg
+          xmlns="http://www.w3.org/2000/svg"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          width={props.width ?? 14}
+          height={props.height ?? 14}
+          class={props.class}
+        >
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+          <polyline points="14 2 14 8 20 8" />
+        </svg>
+      }
+    >
+      {(id) => (
+        <Icon
+          icon={id()}
+          width={props.width ?? 14}
+          height={props.height ?? 14}
+          class={props.class}
+        />
+      )}
+    </Show>
+  );
+};

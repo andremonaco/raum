@@ -29,8 +29,8 @@ export const TabsList = <T extends ValidComponent = "div">(props: TabsListProps<
     <TabsPrimitive.List
       data-slot="tabs-list"
       class={cx(
-        "bg-muted text-muted-foreground ring-muted relative flex h-[calc(var(--spacing)*7.5)] w-fit items-center justify-center rounded-lg ring-[3px]",
-        "data-[orientation=vertical]:mt-[3px] data-[orientation=vertical]:size-full data-[orientation=vertical]:flex-col",
+        "bg-panel text-foreground-subtle relative flex h-[calc(var(--spacing)*7)] w-fit items-center justify-center rounded-lg border border-border-subtle p-[3px]",
+        "data-[orientation=vertical]:size-full data-[orientation=vertical]:flex-col",
         props.class,
       )}
       {...rest}
@@ -49,7 +49,10 @@ export const TabsTrigger = <T extends ValidComponent = "button">(props: TabsTrig
     <TabsPrimitive.Trigger
       data-slot="tabs-trigger"
       class={cx(
-        "text-foreground dark:text-muted-foreground dark:data-[selected]:text-foreground peer relative z-10 inline-flex h-[calc(100%-1px)] flex-1 items-center justify-center gap-1.5 px-2 py-1 text-xs whitespace-nowrap transition-[color] focus-visible:outline-none disabled:pointer-events-none disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
+        "text-foreground-subtle data-[selected]:text-foreground peer relative z-10 inline-flex h-full flex-1 items-center justify-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium whitespace-nowrap",
+        "hover:text-foreground transition-colors duration-[var(--motion-fast)] ease-[var(--motion-ease)]",
+        "focus-visible:outline-none disabled:pointer-events-none disabled:opacity-45",
+        "[&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
         props.class,
       )}
       {...rest}
@@ -84,7 +87,8 @@ export const TabsIndicator = <T extends ValidComponent = "div">(props: TabsIndic
     <TabsPrimitive.Indicator
       data-slot="tabs-indicator"
       class={cx(
-        "bg-background dark:bg-input/30 dark:border-input peer-focus-visible:border-ring peer-focus-visible:ring-ring/50 peer-focus-visible:outline-ring absolute inset-0 rounded-lg border border-transparent shadow-sm transition-[box-shadow,transform,width,height] duration-200 peer-focus-visible:ring-[3px] peer-focus-visible:outline-1",
+        "bg-surface-raised border border-border-subtle shadow-[var(--shadow-xs)] absolute inset-[3px] rounded-md transition-[transform,width,height] duration-[var(--motion-base)] ease-[var(--motion-ease)]",
+        "peer-focus-visible:shadow-[var(--shadow-xs),0_0_0_1px_var(--background),0_0_0_3px_color-mix(in_oklab,var(--ring)_55%,transparent)]",
         props.class,
       )}
       {...rest}

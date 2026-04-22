@@ -8,81 +8,152 @@ event hook.
 
 ## Event socket + hook scripts
 
-On startup raum:
+On startup raum binds a Unix domain socket at
+`~/.config/raum/state/events.sock` (§7.6). Every spawned harness gets
+`RAUM_EVENT_SOCK=<path>` in its environment.
 
-1. Binds a Unix domain socket at
-   `~/.config/raum/state/events.sock` (§7.6). Every spawned harness gets
-   `RAUM_EVENT_SOCK=<path>` in its environment.
-2. Regenerates one hook script per harness under
-   `~/.config/raum/hooks/`:
-   - `hooks/claude-code.sh`
-   - `hooks/opencode.sh`
-   - `hooks/codex.sh`
-   Each script is `0700`, starts with the header comment
-   `# raum-managed — do not edit; regenerated on launch`, opens
-   `$RAUM_EVENT_SOCK`, writes exactly one JSON line, and exits.
+The shell-script dispatchers that talk to that socket are written **per
+harness install**, not at startup. Every adapter's
+`NotificationSetup::plan()` emits a `SetupAction::WriteShellScript` for
+each dispatcher it needs; `SetupExecutor::apply()` drops them under
+`~/.config/raum/hooks/` as part of the same atomic plan that writes the
+harness config entries referencing them:
 
-If `~/.config/raum/hooks/` is not writable (§7.11), raum disables
-hook-based detection for affected harnesses, falls back to the silence
-heuristic, and shows a single notification explaining the degradation.
+| Harness      | Script(s) written                                             |
+| ------------ | ------------------------------------------------------------- |
+| Claude Code  | `hooks/claude-code.sh`                                        |
+| Codex        | `hooks/codex.sh` + `hooks/codex-notify.sh`                    |
+| OpenCode     | *(none — notifications arrive live via SSE, see below)*       |
+
+Each script is `0700`, starts with the header comment
+`# raum-managed — do not edit; regenerated on launch`, opens
+`$RAUM_EVENT_SOCK`, writes exactly one JSON line, and exits. The
+`PermissionRequest` path keeps the connection open long enough to
+read a decision back (`allow` / `deny` / `ask`) so Claude Code and
+Codex can block their own tool call until raum's UI has decided.
+
+If `~/.config/raum/hooks/` is not writable (§7.11), the install plan
+reports failed actions in the Harness Health panel; detection for the
+affected harness falls back to the silence heuristic.
 
 ## Claude Code adapter
 
-`ClaudeCodeAdapter` reads `~/.claude/settings.json` and installs a raum
-block delimited by marker sentinels. The markers are encoded as JSON
-**keys**, not inline comments, so the file stays valid JSON:
+`ClaudeCodeAdapter` writes the hook block into the project's
+`<project>/.claude/settings.local.json` — the officially-documented
+personal, auto-gitignored settings layer. This keeps raum's
+machine-specific hook paths out of the repo's shared
+`.claude/settings.json`, which is the team-checked-in layer. Prior
+raum versions wrote into `settings.json`; the plan now sweeps any
+stale raum-managed entries out of both `.claude/settings.json` and
+`~/.claude/settings.json` on every install so upgrading is silent.
+
+Every raum-managed entry is tagged with a `_raum_managed_marker`
+sentinel. Re-running the install replaces them in place without
+touching user-authored entries:
 
 ```json
 {
   "hooks": {
-    "<raum-managed>":  "do-not-edit",
     "PostToolUse": [
-      { "type": "command", "command": "/Users/you/.config/raum/hooks/claude-code.sh" }
-    ],
-    "Stop": [
-      { "type": "command", "command": "/Users/you/.config/raum/hooks/claude-code.sh" }
-    ],
-    "</raum-managed>": "do-not-edit"
+      {
+        "_raum_managed_marker": "<raum-managed>",
+        "matcher": ".*",
+        "hooks": [
+          { "type": "command", "command": "/Users/you/.config/raum/hooks/claude-code.sh PostToolUse" }
+        ]
+      }
+    ]
   }
 }
 ```
 
-The two `"<raum-managed>"` / `"</raum-managed>"` keys are the
-**JSON-sentinel-key encoding workaround** — a pair of otherwise-unused
-object keys that stand in for the XML-style comment markers used by
-adapters whose config files support them (TOML/YAML). raum parses the file,
-locates the key pair, replaces every entry between them, and writes atomic.
-Nothing outside the sentinels is touched, so user-managed hooks, MCP
-servers, models, and permissions are preserved byte-for-byte.
-
-The install is idempotent: running raum twice produces the same file.
-
-## OpenCode adapter
-
-`OpenCodeAdapter` writes an analogous block into OpenCode's hooks config
-location, pointing at `~/.config/raum/hooks/opencode.sh`. The same
-sentinel-key scheme is used for JSON configs; YAML/TOML variants use
-`# <raum-managed>` / `# </raum-managed>` comment markers.
+The install is idempotent and project-scoped: running the plan twice
+produces the same file, and two projects' settings coexist without
+clobbering each other. Any user-authored entry without the sentinel
+is preserved byte-for-byte.
 
 ## Codex adapter
 
-Codex doesn't support external hooks, so `CodexAdapter` sets the flags and
-environment variables that enable Codex's own stdout JSON event stream,
-then parses those events from the pane's output. No config file is
-modified. Detection works without touching any shared config.
+`CodexAdapter` wires three complementary observation channels:
+
+1. **Hooks** (`<project>/.codex/hooks.json`, gated on `[features]
+   codex_hooks = true` in `~/.codex/config.toml`). Event-driven; each
+   managed entry points at `~/.config/raum/hooks/codex.sh <Event>`.
+   Requires Codex ≥ 0.119 — on older builds the plan skips the hooks
+   write and leans on the notify script below. The released hook set raum
+   installs is intentionally coarse: `UserPromptSubmit` and `Stop` only.
+   `SessionStart` is deliberately *not* subscribed — it would arm the
+   silence heuristic at harness boot and promote `Idle → Working` off
+   Codex's TUI startup redraw. `PreToolUse` and `PostToolUse` are
+   Bash-scoped and are not used for visible session status.
+2. **`notify` script** (top-level `notify = [...]` in
+   `~/.codex/config.toml`). Codex invokes `codex-notify.sh` with the
+   payload as `argv[1]`; the script forwards it to
+   `$RAUM_EVENT_SOCK` tagged `source: "notify"`. The current managed
+   mapping treats this as a turn-end signal (`agent-turn-complete`) and
+   ignores unknown notify payloads.
+3. **OSC 9 scrape**. Codex's TUI emits `\x1b]9;<payload>\x07` on
+   approval / turn-complete when `tui.notifications` is enabled; raum
+   parses those escapes out of the live PTY byte stream of the attached
+   pane. `approval-requested*` drives waiting-state; `agent-turn-complete`
+   drives turn-end.
+
+The managed `config.toml` block also enables `tui.notifications = true`
+and sets `tui.notification_method = "osc9"` so the attention-needed
+signal comes from Codex's supported TUI notification surface rather than
+tool-level hooks.
+
+Codex has no replier today: the hook runtime accepts a
+`permissionDecision` field, but the upstream enforcement path is not
+wired yet. Observation only — click on the notification focuses the
+pane and the user answers in Codex's native TUI.
+
+## OpenCode adapter
+
+`OpenCodeAdapter` does **not** install a shell hook. OpenCode exposes
+its internal event bus directly over HTTP as a Server-Sent Events
+stream (`GET /event`) on the local OpenCode server, so raum subscribes
+to that stream in-process via `OpenCodeSseChannel`. Replies (allow /
+deny) go back over the same HTTP server through `HttpReplyReplier`.
+raum currently keeps the request-scoped compatibility POST
+(`/permission/:id/reply`) even though the public docs describe a newer
+session-scoped permissions route.
+
+The only disk action in OpenCode's install plan is a
+`RemoveManagedJsonEntries` cleanup that strips any stale
+`<raum-managed>` entries a previous raum version wrote into the
+OpenCode `config.json`. No raum block is installed in the config — the
+SSE bus is the live transport.
+
+Port discovery chains
+`$OPENCODE_PORT → $XDG_STATE_HOME/opencode/lockfile → 4096`, so
+out-of-band tooling can pin the port via env var or a one-line lockfile.
 
 ## Agent state machine
 
 Every session moves through `idle → working → waiting → completed` (or
 `errored`). Transitions are driven by:
 
-- Hook events delivered through `RAUM_EVENT_SOCK` (for hooks-capable
-  harnesses).
-- Parsed stdout events (Codex).
+- Hook events delivered through `RAUM_EVENT_SOCK` (Claude Code, Codex).
+- SSE events from the OpenCode HTTP server.
+- OSC 9 payloads scraped from the live attached-pane PTY stream (Codex).
 - A silence-heuristic fallback: per-harness threshold in ms (default 500;
   overridable via `agent_defaults.silence_threshold_ms`). If the pane has
-  been silent longer than the threshold and the agent isn't explicitly in
-  `waiting`, raum infers `waiting` from silence alone.
+  been silent longer than the threshold and the harness has no live event
+  path, raum falls back to `working → idle` on silence alone.
+
+The waiting-state classifier is payload-aware:
+
+- Claude Code `Notification` only counts as waiting when
+  `notification_type` is `elicitation_dialog` (MCP elicitation prompt,
+  no synchronous counterpart). `permission_prompt` is a non-blocking
+  echo of the synchronous `PermissionRequest` hook that already drives
+  waiting, and `idle_prompt` (the prompt has been idle waiting for
+  input) is observational — it must not flip a finished pane back to
+  waiting. `auth_success` and anything else is ignored.
+- Codex `notify` payloads are not treated as generic waiting-state.
+- Unknown notifications are ignored rather than being collapsed into
+  `waiting`.
 
 State transitions emit `agent-state-changed` on the Tauri event bus, where
 the notifications subsystem (§11), the top-row filters (§8), and the
@@ -101,7 +172,7 @@ non-blocking warning toast and spawns anyway (§7.10).
 To remove raum's hooks from a harness config cleanly:
 
 1. Quit raum.
-2. Open the harness' config file (e.g. `~/.claude/settings.json`).
+2. Open the harness' config file (e.g. `<project>/.claude/settings.local.json`).
 3. Delete the `"<raum-managed>"` key, the `"</raum-managed>"` key, and
    every entry between them. For comment-based configs (YAML/TOML), delete
    the `# <raum-managed>` line, the `# </raum-managed>` line, and

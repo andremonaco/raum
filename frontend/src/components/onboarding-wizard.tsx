@@ -27,6 +27,7 @@ import { Component, For, Match, Show, Switch, createResource, createSignal } fro
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { upsertProject, type ProjectListItem } from "../stores/projectStore";
+import { tildify } from "../lib/pathDisplay";
 import { Alert, AlertDescription } from "./ui/alert";
 import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
@@ -210,7 +211,7 @@ function StatusDot(props: { ok: boolean }) {
     <span
       class="inline-block h-2 w-2 rounded-full"
       classList={{
-        "bg-emerald-400": props.ok,
+        "bg-success": props.ok,
         "bg-destructive": !props.ok,
       }}
       aria-hidden="true"
@@ -370,10 +371,7 @@ function HarnessCard(props: {
           </Button>
         }
       >
-        <Badge
-          variant="secondary"
-          class="justify-center bg-emerald-900/30 text-[11px] text-emerald-300"
-        >
+        <Badge variant="secondary" class="justify-center bg-success/15 text-[11px] text-success">
           Live
         </Badge>
       </Show>
@@ -524,7 +522,7 @@ export const OnboardingWizard: Component<OnboardingWizardProps> = (props) => {
   const [spawningKinds, setSpawningKinds] = createSignal<Set<Harness>>(new Set());
   const [spawnErrors, setSpawnErrors] = createSignal<Partial<Record<Harness, string>>>({});
   const availableHarnesses = (): HarnessStatus[] =>
-    (harnessReport()?.harnesses ?? []).filter((h) => h.found);
+    (harnessReport()?.harnesses ?? []).filter((h) => h.found && h.kind !== ("shell" as Harness));
 
   async function spawnHarness(kind: Harness) {
     setSpawningKinds((prev) => new Set(prev).add(kind));
@@ -533,18 +531,30 @@ export const OnboardingWizard: Component<OnboardingWizardProps> = (props) => {
       delete next[kind];
       return next;
     });
+    const rp = registered();
+    if (!rp) {
+      setSpawnErrors((prev) => ({
+        ...prev,
+        [kind]: "Add a project first, then launch a harness.",
+      }));
+      setSpawningKinds((prev) => {
+        const next = new Set(prev);
+        next.delete(kind);
+        return next;
+      });
+      return;
+    }
     try {
       const channel = new Channel<ArrayBuffer>();
       channel.onmessage = () => {
         /* discarded until <TerminalPane> attaches */
       };
-      const rp = registered();
       const id = await invoke<string>("terminal_spawn", {
         args: {
-          project_slug: rp?.slug,
+          project_slug: rp.slug,
           worktree_id: null,
           kind,
-          cwd: rp?.rootPath,
+          cwd: rp.rootPath,
         },
         onData: channel,
       });
@@ -710,11 +720,11 @@ export const OnboardingWizard: Component<OnboardingWizardProps> = (props) => {
                   <Show when={registered()}>
                     {(item) => (
                       <div
-                        class="rounded-md bg-emerald-900/20 p-2 text-xs text-emerald-300"
+                        class="rounded-md bg-success/10 p-2 text-xs text-success"
                         data-testid="onboarding-project-registered"
                       >
                         Registered <strong>{item().name || item().slug}</strong> at{" "}
-                        <code>{item().rootPath}</code>.
+                        <code>{tildify(item().rootPath)}</code>.
                       </div>
                     )}
                   </Show>
@@ -750,7 +760,9 @@ export const OnboardingWizard: Component<OnboardingWizardProps> = (props) => {
                         aria-label="Harness availability"
                         data-testid="onboarding-harness"
                       >
-                        <For each={report().harnesses}>
+                        <For
+                          each={report().harnesses.filter((h) => h.kind !== ("shell" as Harness))}
+                        >
                           {(status) => <HarnessRow status={status} />}
                         </For>
                       </ul>
@@ -801,7 +813,7 @@ export const OnboardingWizard: Component<OnboardingWizardProps> = (props) => {
                     </div>
                   </Show>
 
-                  <div class="mt-3 rounded-md border border-sky-900/40 bg-sky-950/30 p-2 text-[11px] text-sky-200">
+                  <div class="mt-3 rounded-md border border-info/30 bg-info/10 p-2 text-[11px] text-info">
                     Sessions survive app and OS restarts — close the window whenever, raum
                     reattaches on next launch.
                   </div>

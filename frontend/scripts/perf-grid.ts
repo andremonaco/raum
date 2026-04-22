@@ -116,27 +116,22 @@ async function measureDragWrites(durationMs: number): Promise<number> {
   // We can't actually drive Gridstack drag from this harness without the
   // DOM. Instead, we simulate the worst-case by dispatching synthetic
   // `terminal_resize` calls at 60 Hz for the duration, routing everything
-  // through the frontend debouncer. The assertion is that *layouts.toml*
+  // through the frontend debouncer. The assertion is that *active-layout.toml*
   // writes still get debounced into ≤ DRAG_WRITE_BUDGET hits.
   const writesObserved = { count: 0 };
   const origFetch = globalThis.fetch;
-  // Intercept layouts_save invokes via a monkey-patch of `invoke` — we do so
-  // at the module level.
   const originalInvoke = (globalThis as unknown as { __rawInvoke?: typeof invoke }).__rawInvoke;
-  // We cannot easily swap `invoke`; instead, count Rust-side writes by
-  // querying a dedicated diagnostics command if available. Falling back to
-  // a best-effort count via `layouts_list` deltas.
   const startedAt = performance.now();
   let syntheticDrags = 0;
-  const before = await invoke<unknown[]>("layouts_list").catch(() => []);
+  const before = await invoke<unknown>("active_layout_get").catch(() => null);
   while (performance.now() - startedAt < durationMs) {
     syntheticDrags += 1;
     await new Promise((r) => setTimeout(r, 16));
   }
   await new Promise((r) => setTimeout(r, 600)); // let debounce window close
-  const after = await invoke<unknown[]>("layouts_list").catch(() => []);
-  // Crude proxy: length/identity change counts as one write; we can't diff
-  // TOML content here. This mostly verifies the layouts file was *not*
+  const after = await invoke<unknown>("active_layout_get").catch(() => null);
+  // Crude proxy: identity change counts as one write; we can't diff TOML
+  // content here. This mostly verifies the active-layout file was *not*
   // thrashed during the synthetic drag burst.
   writesObserved.count = JSON.stringify(before) === JSON.stringify(after) ? 0 : 1;
   console.log(`[perf:grid] synthetic drag frames: ${syntheticDrags}`);
