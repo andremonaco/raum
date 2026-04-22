@@ -179,21 +179,20 @@ jobs:
         env:
           VERSION: ${{ steps.tag.outputs.version }}
           TAG: ${{ steps.tag.outputs.tag }}
+          # `gh release download` hits the REST API
+          # `/repos/.../releases/assets/{id}` endpoint with this token,
+          # which is required for *draft* releases. The public
+          # `releases/download/<tag>/<asset>` URL 404s until the release
+          # is published, so the previous `curl`-based approach broke
+          # for every release here (we publish the draft only after a
+          # smoke test).
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          base="https://github.com/andremonaco/raum/releases/download/${TAG}"
           arm_dmg="raum_${VERSION}_aarch64.dmg"
           x64_dmg="raum_${VERSION}_x64.dmg"
-          # Retry a few times — the release draft may not be published yet.
-          for url in "${base}/${arm_dmg}" "${base}/${x64_dmg}"; do
-            for attempt in 1 2 3 4 5; do
-              if curl -fL --retry 3 -o "$(basename "$url")" "$url"; then
-                break
-              fi
-              echo "attempt ${attempt} failed for ${url}" >&2
-              sleep 20
-            done
-          done
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern "$arm_dmg" --pattern "$x64_dmg" --clobber
           arm_sha=$(sha256sum "$arm_dmg" | cut -d' ' -f1)
           x64_sha=$(sha256sum "$x64_dmg" | cut -d' ' -f1)
           echo "arm=${arm_sha}" >> "$GITHUB_OUTPUT"
