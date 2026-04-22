@@ -226,25 +226,28 @@ pub async fn spawn_event_socket(path: &Path) -> Result<EventSocketHandle, std::i
                     match serde_json::from_str::<HookEvent>(line.trim()) {
                         Ok(ev) => {
                             debug!(?ev, "hook event");
-                            // Park the writer if this is a PermissionRequest
-                            // carrying a request_id; otherwise drop the write
-                            // half *immediately* so fire-and-forget hook
-                            // scripts using `nc -U` or `socat - UNIX-CONNECT`
-                            // (neither of which half-closes after stdin EOF by
-                            // default) observe a peer-close on their read side
-                            // and exit. Without this, the shell script hangs
-                            // until the client aborts it — which on CI runners
-                            // manifests as a test timeout.
+                            let has_request_id = ev.request_id.is_some();
                             if let Some(req_id) = ev.request_id.as_deref() {
                                 if let Some(wh) = write_half_slot.take() {
                                     let key =
                                         PendingKey::new(ev.session_id.clone(), req_id.to_string());
                                     pending.park(key, wh);
                                 }
-                            } else {
-                                drop(write_half_slot.take());
                             }
-                            if tx.send(ev).await.is_err() {
+                            let send_ok = tx.send(ev).await.is_ok();
+                            // Fire-and-forget (no request_id): close the whole
+                            // connection from the server side. Shell hooks use
+                            // `nc -U` / `socat - UNIX-CONNECT` which, without
+                            // `-N` / `-u`, keep the socket open after stdin
+                            // EOF; the client only exits once the peer closes
+                            // *both* halves. Dropping our write half alone
+                            // leaves the connection half-open and the script
+                            // hangs. Breaking out drops the read half too,
+                            // closing the socket and letting the script exit.
+                            if !has_request_id {
+                                break;
+                            }
+                            if !send_ok {
                                 break;
                             }
                         }
