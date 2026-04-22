@@ -25,9 +25,18 @@ export interface Worktree {
   baseBranch: string | null;
 }
 
+/**
+ * Per-project sidebar selection. `all` is the aggregate "show every terminal
+ * in this project across every worktree" view; `worktree` pins the view to a
+ * single worktree (and narrows spawn cwd to that worktree path).
+ */
+export type WorktreeScope = { mode: "all" } | { mode: "worktree"; path: string };
+
+export const ALL_WORKTREES_SCOPE: WorktreeScope = { mode: "all" };
+
 interface ActiveWorktreeState {
-  /** Map of projectSlug → active worktree path ("id"). */
-  byProject: Record<string, string | undefined>;
+  /** Map of projectSlug → active scope. Missing entries default to `all`. */
+  byProject: Record<string, WorktreeScope | undefined>;
 }
 
 const [activeWorktreeStore, setActiveWorktreeStore] = createStore<ActiveWorktreeState>({
@@ -36,16 +45,50 @@ const [activeWorktreeStore, setActiveWorktreeStore] = createStore<ActiveWorktree
 
 export { activeWorktreeStore };
 
-/**
- * Set the active worktree for a project. Triggers reactivity in components
- * that read `activeWorktreeStore.byProject[slug]`.
- */
-export function setActiveWorktree(projectSlug: string, worktreePath: string | undefined): void {
-  setActiveWorktreeStore("byProject", projectSlug, worktreePath);
+export function getWorktreeScope(projectSlug: string): WorktreeScope {
+  return activeWorktreeStore.byProject[projectSlug] ?? ALL_WORKTREES_SCOPE;
 }
 
+/**
+ * Pin the sidebar selection to a single worktree. Triggers reactivity in
+ * components that read `activeWorktreeStore.byProject[slug]`.
+ */
+export function setActiveWorktree(projectSlug: string, worktreePath: string | undefined): void {
+  if (worktreePath === undefined) {
+    setActiveWorktreeStore("byProject", projectSlug, ALL_WORKTREES_SCOPE);
+    return;
+  }
+  setActiveWorktreeStore("byProject", projectSlug, { mode: "worktree", path: worktreePath });
+}
+
+/** Switch the sidebar selection to the cross-worktree aggregate view. */
+export function setActiveWorktreeAll(projectSlug: string): void {
+  setActiveWorktreeStore("byProject", projectSlug, ALL_WORKTREES_SCOPE);
+}
+
+/** Legacy reader — returns the pinned worktree path, or `undefined` when "all". */
 export function getActiveWorktree(projectSlug: string): string | undefined {
-  return activeWorktreeStore.byProject[projectSlug];
+  const scope = activeWorktreeStore.byProject[projectSlug];
+  return scope?.mode === "worktree" ? scope.path : undefined;
+}
+
+/**
+ * Does a pane with `worktreeId` match the current scope? `mainPath` is the
+ * project's root/main-worktree path — panes spawned before the worktree-id
+ * plumbing landed carry `worktreeId === undefined` and are treated as main
+ * so they don't disappear when the user selects the main row.
+ */
+export function matchesWorktreeScope(
+  scope: WorktreeScope,
+  paneWorktreeId: string | undefined,
+  mainPath: string | undefined,
+): boolean {
+  if (scope.mode === "all") return true;
+  if (paneWorktreeId === scope.path) return true;
+  if (paneWorktreeId === undefined && mainPath !== undefined && scope.path === mainPath) {
+    return true;
+  }
+  return false;
 }
 
 /**

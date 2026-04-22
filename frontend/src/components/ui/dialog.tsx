@@ -56,7 +56,7 @@ export const DialogContent = <T extends ValidComponent = "div">(props: DialogCon
       <DialogPrimitive.Content
         data-slot="dialog-content"
         class={cx(
-          "bg-popover text-popover-foreground floating-surface data-[expanded]:animate-in data-[closed]:animate-out data-[closed]:fade-out-0 data-[expanded]:fade-in-0 data-[closed]:zoom-out-95 data-[expanded]:zoom-in-95 fixed top-[50%] left-[50%] z-50 grid w-full max-w-[calc(100%-2rem)] translate-x-[-50%] translate-y-[-50%] gap-4 overflow-hidden rounded-xl border border-border-subtle p-6 duration-200 sm:max-w-lg",
+          "bg-popover text-popover-foreground floating-surface data-[expanded]:animate-in data-[closed]:animate-out data-[closed]:fade-out-0 data-[expanded]:fade-in-0 data-[closed]:zoom-out-95 data-[expanded]:zoom-in-95 fixed top-[50%] left-[50%] z-50 grid w-full max-w-[calc(100%-2rem)] translate-x-[-50%] translate-y-[-50%] gap-4 overflow-hidden rounded-xl border border-border-subtle p-6 duration-200 sm:max-w-lg [&>*]:min-w-0",
           props.class,
         )}
         {...rest}

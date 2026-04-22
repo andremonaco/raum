@@ -152,13 +152,15 @@ async fn claude_code_notification_roundtrip_over_hook_script() {
     // stdin. The script should build the envelope + forward over the
     // event socket. `RAUM_SESSION` is exported so `session_id` arrives
     // populated on the wire.
-    let mut child = Command::new(&script)
+    let mut child = Command::new("sh")
+        .arg("-x")
+        .arg(&script)
         .arg("Notification")
         .env("RAUM_EVENT_SOCK", &sock_path)
         .env("RAUM_SESSION", "raum-session-1")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     if let Some(mut stdin) = child.stdin.take() {
@@ -168,11 +170,34 @@ async fn claude_code_notification_roundtrip_over_hook_script() {
             .unwrap();
         stdin.shutdown().await.ok();
     }
-    let status = timeout(STEP_TIMEOUT, child.wait())
-        .await
-        .expect("script did not exit in time")
-        .unwrap();
-    assert!(status.success(), "hook script exited non-zero: {status:?}");
+    // Drain stderr concurrently so a blocked script can't fill the pipe.
+    let mut child_stderr = child.stderr.take();
+    let stderr_handle = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(s) = child_stderr.as_mut() {
+            let _ = tokio::io::AsyncReadExt::read_to_end(s, &mut buf).await;
+        }
+        buf
+    });
+    let status = match timeout(STEP_TIMEOUT, child.wait()).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => panic!("child wait error: {e}"),
+        Err(_) => {
+            child.kill().await.ok();
+            let err_bytes = stderr_handle.await.unwrap_or_default();
+            panic!(
+                "script did not exit in time\nsh -x trace:\n{}",
+                String::from_utf8_lossy(&err_bytes)
+            );
+        }
+    };
+    let err_bytes = stderr_handle.await.unwrap_or_default();
+    assert!(
+        status.success(),
+        "hook script exited non-zero: {:?}\nsh -x trace:\n{}",
+        status,
+        String::from_utf8_lossy(&err_bytes)
+    );
 
     let ev = timeout(STEP_TIMEOUT, handle.rx.recv())
         .await
@@ -218,14 +243,16 @@ async fn claude_code_permission_request_replies_with_allow_decision_json() {
     // the connection, and the parked writer EPIPEs before the test gets a
     // chance to reply. `STEP_TIMEOUT` remains the authoritative bound on
     // wedges.
-    let mut child = Command::new(&script)
+    let mut child = Command::new("sh")
+        .arg("-x")
+        .arg(&script)
         .arg("PermissionRequest")
         .env("RAUM_EVENT_SOCK", &sock_path)
         .env("RAUM_SESSION", "raum-session-1")
         .env("RAUM_HOOK_TIMEOUT_SECS", "45")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     if let Some(mut stdin) = child.stdin.take() {
@@ -236,12 +263,31 @@ async fn claude_code_permission_request_replies_with_allow_decision_json() {
         stdin.shutdown().await.ok();
     }
 
+    // Drain stderr concurrently so a blocked hook script can't fill the
+    // 64 KiB pipe and deadlock. Buffered for diagnostics if the test fails.
+    let mut child_stderr = child.stderr.take();
+    let stderr_handle = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(s) = child_stderr.as_mut() {
+            let _ = tokio::io::AsyncReadExt::read_to_end(s, &mut buf).await;
+        }
+        buf
+    });
+
     // Wait for the PermissionRequest event on the socket. Grab the
     // generated request_id so we can reply on the same parked writer.
-    let ev = timeout(STEP_TIMEOUT, handle.rx.recv())
-        .await
-        .expect("timed out waiting for PermissionRequest event")
-        .expect("socket rx closed");
+    let ev = match timeout(STEP_TIMEOUT, handle.rx.recv()).await {
+        Ok(Some(ev)) => ev,
+        Ok(None) => panic!("socket rx closed"),
+        Err(_) => {
+            child.kill().await.ok();
+            let err_bytes = stderr_handle.await.unwrap_or_default();
+            panic!(
+                "timed out waiting for PermissionRequest event\nsh -x trace:\n{}",
+                String::from_utf8_lossy(&err_bytes)
+            );
+        }
+    };
     assert_eq!(ev.event, "PermissionRequest");
     let request_id = ev.request_id.clone().expect("request_id must be set");
     assert_eq!(ev.session_id.as_deref(), Some("raum-session-1"));
@@ -264,16 +310,20 @@ async fn claude_code_permission_request_replies_with_allow_decision_json() {
         .await
         .expect("reply delivered");
 
+    // We already took stderr for concurrent draining, so use
+    // wait_with_output only for stdout + status and merge the buffered
+    // stderr back in for diagnostics.
     let out = timeout(STEP_TIMEOUT, child.wait_with_output())
         .await
         .expect("script did not exit in time")
         .unwrap();
+    let err_bytes = stderr_handle.await.unwrap_or_default();
     assert!(
         out.status.success(),
         "hook script exited non-zero: {:?}\nstdout={}\nstderr={}",
         out.status,
         String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
+        String::from_utf8_lossy(&err_bytes)
     );
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stdout_json: serde_json::Value =
@@ -471,9 +521,11 @@ async fn codex_notify_script_forwards_argv_payload_to_event_socket() {
     // EOF and closes its write side — without that, the codex-notify
     // script can block on nc waiting for stdin that never closes.
     let payload = "{\"type\":\"agent-turn-complete\"}";
-    let out = timeout(
+    let out = match timeout(
         STEP_TIMEOUT,
-        Command::new(&script)
+        Command::new("sh")
+            .arg("-x")
+            .arg(&script)
             .arg(payload)
             .env("RAUM_EVENT_SOCK", &sock_path)
             .env("RAUM_SESSION", "raum-codex-1")
@@ -483,14 +535,19 @@ async fn codex_notify_script_forwards_argv_payload_to_event_socket() {
             .output(),
     )
     .await
-    .expect("codex-notify timed out")
-    .unwrap();
+    {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => panic!("codex-notify spawn failed: {e}"),
+        Err(elapsed) => panic!(
+            "codex-notify timed out (no sh -x trace available: Command::output drops stderr on timeout): {elapsed}"
+        ),
+    };
     assert!(
         out.status.success(),
-        "codex-notify failed: status={:?} stdout={:?} stderr={:?}",
+        "codex-notify failed: status={:?}\nsh -x trace:\n{}\nstdout:\n{}",
         out.status,
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
     );
 
     let ev = timeout(STEP_TIMEOUT, handle.rx.recv())
@@ -531,26 +588,47 @@ async fn codex_hook_dispatcher_forwards_lifecycle_events_to_event_socket() {
             "Stop" => "{\"last_assistant_message\":\"done\"}",
             other => panic!("unexpected event name {other}"),
         };
-        let mut child = Command::new(&script)
+        let mut child = Command::new("sh")
+            .arg("-x")
+            .arg(&script)
             .arg(event_name)
             .env("RAUM_EVENT_SOCK", &sock_path)
             .env("RAUM_SESSION", "raum-codex-1")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap();
         if let Some(mut stdin) = child.stdin.take() {
             stdin.write_all(payload.as_bytes()).await.unwrap();
             stdin.shutdown().await.ok();
         }
-        let status = timeout(STEP_TIMEOUT, child.wait())
-            .await
-            .expect("codex hook script did not exit in time")
-            .unwrap();
+        let mut child_stderr = child.stderr.take();
+        let stderr_handle = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            if let Some(s) = child_stderr.as_mut() {
+                let _ = tokio::io::AsyncReadExt::read_to_end(s, &mut buf).await;
+            }
+            buf
+        });
+        let status = match timeout(STEP_TIMEOUT, child.wait()).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => panic!("child wait error: {e}"),
+            Err(_) => {
+                child.kill().await.ok();
+                let err_bytes = stderr_handle.await.unwrap_or_default();
+                panic!(
+                    "codex hook script did not exit in time\nsh -x trace:\n{}",
+                    String::from_utf8_lossy(&err_bytes)
+                );
+            }
+        };
+        let err_bytes = stderr_handle.await.unwrap_or_default();
         assert!(
             status.success(),
-            "codex hook script exited non-zero: {status:?}"
+            "codex hook script exited non-zero: {:?}\nsh -x trace:\n{}",
+            status,
+            String::from_utf8_lossy(&err_bytes)
         );
 
         let ev = timeout(STEP_TIMEOUT, handle.rx.recv())

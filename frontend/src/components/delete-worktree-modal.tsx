@@ -241,23 +241,21 @@ export const DeleteWorktreeModal: Component<DeleteWorktreeModalProps> = (props) 
       <DialogPortal>
         <DialogContent class="sm:max-w-[540px]">
           <DialogHeader>
-            <DialogTitle class="text-sm">
+            <DialogTitle class="flex flex-wrap items-center gap-1.5 text-sm">
               <Show when={branch() !== null} fallback={<>Delete this worktree?</>}>
-                <span class="inline-flex items-center gap-1.5">
-                  Delete worktree
-                  <span class="inline-flex items-center gap-1 rounded bg-muted px-1.5 py-px font-mono text-xs text-foreground">
-                    <GitBranchIcon class="size-3" />
-                    {worktreeLabel()}
-                  </span>
-                  ?
+                <span>Delete worktree</span>
+                <span class="inline-flex min-w-0 items-center gap-1 rounded bg-muted px-1.5 py-px font-mono text-xs text-foreground [word-break:break-all]">
+                  <GitBranchIcon class="size-3 shrink-0" />
+                  <span class="min-w-0 [word-break:break-all]">{worktreeLabel()}</span>
                 </span>
+                <span>?</span>
               </Show>
             </DialogTitle>
           </DialogHeader>
 
-          <div class="space-y-3 text-xs">
+          <div class="min-w-0 space-y-3 text-xs">
             {/* Path chip */}
-            <div class="truncate rounded-md border border-border bg-muted/40 px-2 py-2 font-mono text-[11px] text-muted-foreground">
+            <div class="min-w-0 truncate rounded-md border border-border bg-muted/40 px-2 py-2 font-mono text-[11px] text-muted-foreground">
               {props.worktree.path}
             </div>
 
@@ -325,9 +323,9 @@ export const DeleteWorktreeModal: Component<DeleteWorktreeModalProps> = (props) 
               <ul class="space-y-1 text-muted-foreground">
                 <li class="flex items-start gap-2">
                   <FolderIcon class="mt-[1px] size-3.5 shrink-0 text-destructive/80" />
-                  <span class="flex-1 text-foreground">
+                  <span class="min-w-0 flex-1 text-foreground">
                     Worktree folder{" "}
-                    <span class="rounded bg-muted px-1 py-px font-mono text-[11px]">
+                    <span class="rounded bg-muted px-1 py-px font-mono text-[11px] [word-break:break-all]">
                       {props.worktree.path}
                     </span>
                   </span>
@@ -336,9 +334,9 @@ export const DeleteWorktreeModal: Component<DeleteWorktreeModalProps> = (props) 
                 <Show when={branch() !== null && deleteBranch()}>
                   <li class="flex items-start gap-2">
                     <GitBranchIcon class="mt-[1px] size-3.5 shrink-0 text-destructive/80" />
-                    <span class="flex-1 text-foreground">
+                    <span class="min-w-0 flex-1 text-foreground">
                       Branch{" "}
-                      <span class="rounded bg-muted px-1 py-px font-mono text-[11px]">
+                      <span class="rounded bg-muted px-1 py-px font-mono text-[11px] [word-break:break-all]">
                         {branch()}
                       </span>
                     </span>
@@ -348,7 +346,7 @@ export const DeleteWorktreeModal: Component<DeleteWorktreeModalProps> = (props) 
                 <Show when={hasUncommitted()}>
                   <li class="flex items-start gap-2">
                     <AlertCircleIcon class="mt-[1px] size-3.5 shrink-0 text-destructive/80" />
-                    <span class="flex-1 text-destructive">
+                    <span class="min-w-0 flex-1 text-destructive">
                       {changedFileCount()} uncommitted file
                       {changedFileCount() === 1 ? "" : "s"}
                       <Show when={insertions() > 0 || deletions() > 0}>
@@ -366,12 +364,12 @@ export const DeleteWorktreeModal: Component<DeleteWorktreeModalProps> = (props) 
                 <Show when={hasStash()}>
                   <li class="flex items-start gap-2">
                     <GitBranchIcon class="mt-[1px] size-3.5 shrink-0 text-destructive/80" />
-                    <span class="flex-1">
+                    <span class="min-w-0 flex-1">
                       {stashCount()} stash entr{stashCount() === 1 ? "y" : "ies"}
                       <Show when={branch() !== null}>
                         <>
                           {" on "}
-                          <span class="rounded bg-muted px-1 py-px font-mono text-[11px] text-foreground">
+                          <span class="rounded bg-muted px-1 py-px font-mono text-[11px] text-foreground [word-break:break-all]">
                             {branch()}
                           </span>
                         </>
@@ -383,7 +381,7 @@ export const DeleteWorktreeModal: Component<DeleteWorktreeModalProps> = (props) 
                 <Show when={runningCount() > 0}>
                   <li class="flex items-start gap-2">
                     <ShellIcon class="mt-[1px] size-3.5 shrink-0 text-destructive/80" />
-                    <span class="flex-1">
+                    <span class="min-w-0 flex-1">
                       <div class="text-foreground">
                         {runningCount()} running terminal{runningCount() === 1 ? "" : "s"} will be
                         closed
@@ -445,9 +443,9 @@ export const DeleteWorktreeModal: Component<DeleteWorktreeModalProps> = (props) 
                 <Show when={branch() !== null && !deleteBranch()}>
                   <li class="flex items-start gap-2">
                     <GitBranchIcon class="mt-[1px] size-3.5 shrink-0 text-success/70" />
-                    <span>
+                    <span class="min-w-0">
                       Branch{" "}
-                      <span class="rounded bg-muted px-1 py-px font-mono text-[11px] text-foreground">
+                      <span class="rounded bg-muted px-1 py-px font-mono text-[11px] text-foreground [word-break:break-all]">
                         {branch()}
                       </span>{" "}
                       (kept; only the worktree is removed)
@@ -470,11 +468,11 @@ export const DeleteWorktreeModal: Component<DeleteWorktreeModalProps> = (props) 
             <Show when={branch() !== null}>
               <div class="rounded-md border border-border bg-panel/40 px-3 py-2">
                 <div class="flex items-center justify-between gap-3">
-                  <div class="flex items-center gap-1.5 text-foreground">
-                    <GitBranchIcon class="size-3.5 text-muted-foreground" />
-                    <span>
+                  <div class="flex min-w-0 items-center gap-1.5 text-foreground">
+                    <GitBranchIcon class="size-3.5 shrink-0 text-muted-foreground" />
+                    <span class="min-w-0">
                       Branch{" "}
-                      <span class="rounded bg-muted px-1 py-px font-mono text-[11px]">
+                      <span class="rounded bg-muted px-1 py-px font-mono text-[11px] [word-break:break-all]">
                         {branch()}
                       </span>
                     </span>

@@ -58,7 +58,7 @@ import {
   movePaneToRootEdge,
   nextCellId,
   nextTabId,
-  pruneTreeByProject,
+  pruneTreeByScope,
   removeCellTab,
   removePane,
   runtimeLayoutStore,
@@ -80,7 +80,11 @@ import {
 import { agentStore } from "../stores/agentStore";
 import type { AgentState } from "../stores/agentStore";
 import { terminalStore } from "../stores/terminalStore";
-import { worktreesByProject } from "../stores/worktreeStore";
+import {
+  activeWorktreeStore,
+  ALL_WORKTREES_SCOPE,
+  worktreesByProject,
+} from "../stores/worktreeStore";
 import { kindDisplayLabel, type AgentKind } from "../lib/agentKind";
 import { AlertCircleIcon, CheckIcon, ClockIcon, HARNESS_ICONS, LoaderIcon } from "./icons";
 import {
@@ -119,12 +123,29 @@ const KIND_LABELS: Record<string, string> = {
 export const TerminalGrid: Component = () => {
   const [rootEl, setRootEl] = createSignal<HTMLDivElement | null>(null);
 
+  // Main-worktree path for the active project. Used by the scope prune as
+  // the fallback bucket for panes that carry no `worktreeId` (pre-change
+  // terminals — see `pruneTreeByScope`).
+  const activeMainPath = createMemo<string | undefined>(
+    () => projectStore.items.find((p) => p.slug === activeProjectSlug())?.rootPath,
+  );
+  const activeScope = createMemo(
+    () => activeWorktreeStore.byProject[activeProjectSlug() ?? ""] ?? ALL_WORKTREES_SCOPE,
+  );
+
   // Pruned tree for the active project tab — drops every leaf whose pane
-  // belongs to a different project. Shell panes (no projectSlug) survive.
-  // The full tree in the store is untouched, so per-project layouts persist
-  // across tab switches.
+  // belongs to a different project, then narrows further to the sidebar's
+  // selected worktree scope. Shell panes (no projectSlug) survive. The full
+  // tree in the store is untouched, so per-project layouts persist across
+  // tab switches.
   const activeTree = createMemo<LayoutNode | null>(() =>
-    pruneTreeByProject(runtimeLayoutStore.tree, activeProjectSlug(), runtimeLayoutStore.panes),
+    pruneTreeByScope(
+      runtimeLayoutStore.tree,
+      activeProjectSlug(),
+      activeScope(),
+      runtimeLayoutStore.panes,
+      activeMainPath(),
+    ),
   );
 
   // Projection of `activeTree` to rects, keyed by leaf id. Each LeafFrame
@@ -705,10 +726,15 @@ const PaneHeader: Component<PaneHeaderProps> = (props) => {
       // with the cursor created a target/preview feedback loop. Scope the
       // snapshot to the active project's pruned tree so DnD can't target
       // panes from other tabs that aren't in the DOM.
-      const prunedTree = pruneTreeByProject(
+      const slug = activeProjectSlug();
+      const mainPath = projectStore.items.find((p) => p.slug === slug)?.rootPath;
+      const scope = activeWorktreeStore.byProject[slug ?? ""] ?? ALL_WORKTREES_SCOPE;
+      const prunedTree = pruneTreeByScope(
         runtimeLayoutStore.tree,
-        activeProjectSlug(),
+        slug,
+        scope,
         runtimeLayoutStore.panes,
+        mainPath,
       );
       const prunedRects = prunedTree
         ? new Map(projectToRects(prunedTree, LAYOUT_UNIT).map((r) => [r.id, r]))

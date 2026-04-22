@@ -1322,16 +1322,18 @@ pub async fn harness_selftest<R: Runtime>(
 
 /// Resolve the absolute project/worktree directory for a spawn.
 ///
-/// Reads the project record via [`raum_core::store::ConfigStore`].
-/// Returns an empty `PathBuf` when the project is not registered or
-/// the store is unreachable — the adapter's `plan()` treats an empty
-/// `project_dir` as "legacy user-global path", which is the right
-/// fallback for first-run / shell-only paths where there's nothing
-/// per-project to scope to yet.
+/// Reads the project record via [`raum_core::store::ConfigStore`]. When the
+/// caller supplies a `worktree_id` that resolves to an existing directory it
+/// wins over the project root — this is what lets the sidebar's selected
+/// worktree drive the cwd of hotkey-spawned harnesses. Returns an empty
+/// `PathBuf` when the project is not registered or the store is unreachable
+/// — the adapter's `plan()` treats an empty `project_dir` as "legacy
+/// user-global path", which is the right fallback for first-run / shell-only
+/// paths where there's nothing per-project to scope to yet.
 pub(crate) fn resolve_project_dir(
     state: &AppHandleState,
     project_slug: Option<&str>,
-    _worktree_id: Option<&str>,
+    worktree_id: Option<&str>,
 ) -> PathBuf {
     let Some(slug) = project_slug else {
         return PathBuf::new();
@@ -1339,10 +1341,17 @@ pub(crate) fn resolve_project_dir(
     let Ok(store) = state.config_store.lock() else {
         return PathBuf::new();
     };
-    match store.read_project(slug) {
-        Ok(Some(project)) => project.root_path,
-        _ => PathBuf::new(),
+    let project = match store.read_project(slug) {
+        Ok(Some(project)) => project,
+        _ => return PathBuf::new(),
+    };
+    if let Some(id) = worktree_id {
+        let candidate = PathBuf::from(id);
+        if candidate.is_dir() {
+            return candidate;
+        }
     }
+    project.root_path
 }
 
 fn emit_missing_binary_notification<R: Runtime>(

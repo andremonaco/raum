@@ -98,8 +98,11 @@ import {
   SearchIcon,
 } from "./icons";
 import {
+  activeWorktreeStore,
+  ALL_WORKTREES_SCOPE,
   subscribeWorktreeBranchEvents,
   useBranchesVersion,
+  worktreesByProject,
   type Worktree,
 } from "../stores/worktreeStore";
 import { ProjectSettingsDialog } from "./project-settings-dialog";
@@ -526,15 +529,31 @@ export const TopRow: Component = () => {
   }
 
   function spawn(kind: SpawnKind) {
-    if (kind !== "shell" && !activeProjectSlug()) {
+    const slug = activeProjectSlug();
+    if (kind !== "shell" && !slug) {
       setModalOpen(true);
       return;
     }
+    const worktreeId = slug ? resolveSpawnWorktree(slug) : undefined;
     window.dispatchEvent(
       new CustomEvent("raum:spawn-requested", {
-        detail: { kind, projectSlug: activeProjectSlug() },
+        detail: { kind, projectSlug: slug, worktreeId },
       }),
     );
+  }
+
+  // Resolve the worktree cwd that a new spawn should land in. When the
+  // sidebar is pinned to a specific worktree, use that path; when "All
+  // terminals" is active (or the scope is unset), fall back to the project's
+  // main worktree path. Returns `undefined` when the worktree list cache is
+  // cold — the backend then defaults to the project root (same as today).
+  function resolveSpawnWorktree(projectSlug: string): string | undefined {
+    const scope = activeWorktreeStore.byProject[projectSlug] ?? ALL_WORKTREES_SCOPE;
+    if (scope.mode === "worktree") return scope.path;
+    const project = projectStore.items.find((p) => p.slug === projectSlug);
+    if (project?.rootPath) return project.rootPath;
+    const cached = worktreesByProject()[projectSlug];
+    return cached?.[0]?.path;
   }
 
   async function removeProjectFlow(project: ProjectListItem) {

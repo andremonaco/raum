@@ -96,18 +96,22 @@ export const UnlinkProjectModal: Component<UnlinkProjectModalProps> = (props) =>
       <DialogPortal>
         <DialogContent class="sm:max-w-[500px]">
           <DialogHeader>
-            <DialogTitle class="text-sm">
-              Unlink project <span class="font-mono text-foreground">{props.project.name}</span>?
+            <DialogTitle class="flex flex-wrap items-baseline gap-1 text-sm">
+              <span>Unlink project</span>
+              <span class="min-w-0 font-mono text-foreground [word-break:break-all]">
+                {props.project.name}
+              </span>
+              <span>?</span>
             </DialogTitle>
           </DialogHeader>
 
-          <div class="space-y-3 text-xs">
+          <div class="min-w-0 space-y-3 text-xs">
             <p class="text-foreground">
               <span class="font-semibold">Unlinking never deletes files from your disk.</span> raum
               only stops tracking this project and clears its own settings.
             </p>
 
-            <div class="truncate rounded-md border border-border bg-muted/40 px-2 py-2 font-mono text-[11px] text-muted-foreground">
+            <div class="min-w-0 truncate rounded-md border border-border bg-muted/40 px-2 py-2 font-mono text-[11px] text-muted-foreground">
               {props.project.rootPath}
             </div>
 
@@ -118,27 +122,27 @@ export const UnlinkProjectModal: Component<UnlinkProjectModalProps> = (props) =>
               <ul class="space-y-1 text-muted-foreground">
                 <li class="flex items-start gap-2">
                   <FolderIcon class="mt-[1px] size-3.5 shrink-0 text-warning/80" />
-                  <span class="flex-1 text-foreground">
+                  <span class="min-w-0 flex-1 text-foreground">
                     Per-project settings folder{" "}
-                    <span class="rounded bg-muted px-1 py-px font-mono text-[11px]">
+                    <span class="rounded bg-muted px-1 py-px font-mono text-[11px] [word-break:break-all]">
                       ~/.config/raum/projects/{props.project.slug}/
                     </span>
                   </span>
                 </li>
                 <li class="flex items-start gap-2">
                   <span class="mt-[5px] inline-block size-1 shrink-0 rounded-full bg-warning/70" />
-                  <span class="flex-1">
+                  <span class="min-w-0 flex-1">
                     Custom harness settings, layouts and keymaps for this project
                   </span>
                 </li>
                 <li class="flex items-start gap-2">
                   <span class="mt-[5px] inline-block size-1 shrink-0 rounded-full bg-warning/70" />
-                  <span class="flex-1">This project's entry in raum's project list</span>
+                  <span class="min-w-0 flex-1">This project's entry in raum's project list</span>
                 </li>
                 <Show when={runningCount() > 0}>
                   <li class="flex items-start gap-2">
                     <ShellIcon class="mt-[1px] size-3.5 shrink-0 text-warning/80" />
-                    <span class="flex-1">
+                    <span class="min-w-0 flex-1">
                       <div class="text-foreground">
                         {runningCount()} running terminal{runningCount() === 1 ? "" : "s"} attached
                         to this project will be closed

@@ -26,6 +26,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import type { AgentKind } from "../lib/agentKind";
+import { matchesWorktreeScope, type WorktreeScope } from "./worktreeStore";
 import {
   buildFromRects,
   compact,
@@ -254,18 +255,23 @@ export async function subscribePaneActivity(): Promise<UnlistenFn> {
 
 /**
  * Return a pruned copy of `tree` that contains only leaves whose owning pane
- * either has no `projectSlug` (shell panes — unowned, visible across every
- * project tab) or whose `projectSlug === activeSlug`. Returns `null` when
- * every leaf ends up pruned.
+ * matches the active project + the sidebar's worktree scope. Shell panes
+ * (no `projectSlug`) always survive — unowned, visible across every project
+ * tab. Panes whose `worktreeId` is `undefined` are treated as the main
+ * worktree so terminals spawned before the worktree-id plumbing landed don't
+ * disappear when the user picks the main row. Returns `null` when every leaf
+ * ends up pruned.
  *
- * Used by the grid render layer to scope the visible BSP tree to the active
- * project tab. Pure — does not touch the store; `runtimeLayoutStore.tree`
- * still holds every project's layout so switching tabs restores geometry.
+ * Used by the grid render layer to scope the visible BSP tree. Pure — does
+ * not touch the store; `runtimeLayoutStore.tree` still holds every project's
+ * layout so switching tabs restores geometry.
  */
-export function pruneTreeByProject(
+export function pruneTreeByScope(
   tree: LayoutNode | null,
   activeSlug: string | undefined,
+  scope: WorktreeScope,
   panes: Record<string, PaneContent>,
+  mainPath: string | undefined,
 ): LayoutNode | null {
   if (!tree) return null;
   let result: LayoutNode | null = tree;
@@ -273,9 +279,15 @@ export function pruneTreeByProject(
     const pane = panes[id];
     if (!pane) continue;
     if (pane.projectSlug === undefined) continue;
-    if (pane.projectSlug === activeSlug) continue;
-    result = removeLeaf(result, id);
-    if (!result) return null;
+    if (pane.projectSlug !== activeSlug) {
+      result = removeLeaf(result, id);
+      if (!result) return null;
+      continue;
+    }
+    if (!matchesWorktreeScope(scope, pane.worktreeId, mainPath)) {
+      result = removeLeaf(result, id);
+      if (!result) return null;
+    }
   }
   return result;
 }
