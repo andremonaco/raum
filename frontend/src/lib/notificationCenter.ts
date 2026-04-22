@@ -656,15 +656,14 @@ async function dispatchPermissionNotification(payload: NotificationEventPayload)
 
   void playWaitingSound();
 
-  // Permission toasts stay visible until the user acts on them — auto-
-  // dismissal is unsafe because the session stays in `Waiting` forever if
-  // the user misses both the OS and in-app signals. A manual dismiss
-  // (close button or swipe) is treated as "ignore this request" and
-  // aborts the session; the "Open" action just focuses the pane so the
-  // user can answer inside the harness.
+  // Auto-close uses the Toaster's default duration; the dock badge and OS
+  // notification keep the request visible after the toast fades. A manual
+  // dismiss (close button or swipe) is treated as "ignore this request"
+  // and aborts the session — sonner routes that through `onDismiss`,
+  // while the timer path fires `onAutoClose`, so auto-hiding the toast
+  // does not abort.
   toast.warning(title, {
     description: summary,
-    duration: Number.POSITIVE_INFINITY,
     action: { label: "Open", onClick: () => focusSession(sessionId) },
     onDismiss: () => {
       if (!sessionId) return;

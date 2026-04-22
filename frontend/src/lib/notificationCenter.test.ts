@@ -140,15 +140,18 @@ describe("notification center badge modes", () => {
       extra: { sessionId: "codex-1" },
     });
     expect(mockSendNotification.mock.calls[0]?.[0]).not.toHaveProperty("actions");
-    // Permission toasts route through toast.warning with an infinite duration.
+    // Permission toasts route through toast.warning and inherit the
+    // Toaster's default auto-close duration rather than pinning to
+    // infinity — the dock badge keeps the request visible after the
+    // toast fades.
     expect(mockToastWarning).toHaveBeenCalledTimes(1);
     const [title, opts] = mockToastWarning.mock.calls[0] as [
       string,
-      { description: string; duration: number; onDismiss: () => void } | undefined,
+      { description: string; duration?: number; onDismiss: () => void } | undefined,
     ];
     expect(title).toBe("Permission requested");
     expect(opts?.description).toBe("Codex needs permission for shell.");
-    expect(opts?.duration).toBe(Number.POSITIVE_INFINITY);
+    expect(opts?.duration).toBeUndefined();
   });
 
   it("manual dismiss on a permission toast aborts the owning session", async () => {
