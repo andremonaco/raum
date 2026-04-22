@@ -42,7 +42,11 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 
-const STEP_TIMEOUT: Duration = Duration::from_secs(5);
+// 30s rather than a tighter bound so slow CI runners (Linux ARM, cold
+// subprocess spawns, python3 startup in the hook-script fallback chain)
+// don't trip these tests on timing alone — locally the full suite
+// finishes in ~1s, so timeouts only trigger on real hangs.
+const STEP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Sanity check: the default registry returns the three adapters the
 /// plan covers. If a new harness is added, this list has to change and

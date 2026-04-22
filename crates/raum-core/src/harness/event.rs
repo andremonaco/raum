@@ -117,9 +117,11 @@ pub enum NotificationKind {
     /// must make. `NotificationEvent::request_id` is set when the
     /// channel can deliver a reply back to the harness.
     PermissionNeeded,
-    /// The harness is idle and waiting for the user to type something,
-    /// but no specific permission is pending (e.g. Claude Code
-    /// `Notification` event without a decision).
+    /// The harness is blocked on a prompt the user must answer, but the
+    /// prompt is not a tool permission decision (e.g. a Claude Code MCP
+    /// `elicitation_dialog` Notification, or an OpenCode SSE question).
+    /// Claude's generic `idle_prompt` and `permission_prompt` subtypes
+    /// are deliberately excluded — see `classify_notification_payload`.
     IdlePromptNeeded,
     /// The turn completed; state returns to `Completed` / `Idle`.
     TurnEnd,
@@ -245,9 +247,16 @@ fn classify_notification_payload(
             .get("notification_type")
             .and_then(serde_json::Value::as_str)
         {
-            Some("permission_prompt" | "idle_prompt" | "elicitation_dialog") => {
-                Some(NotificationKind::IdlePromptNeeded)
-            }
+            // MCP elicitation is the only Notification subtype that
+            // warrants Waiting: it has no synchronous PermissionRequest
+            // counterpart, so raum would otherwise miss the blocked state.
+            Some("elicitation_dialog") => Some(NotificationKind::IdlePromptNeeded),
+            // permission_prompt is a non-blocking echo of the synchronous
+            // `PermissionRequest` hook (already drives Waiting on its own);
+            // idle_prompt just means the prompt has been idle — if Stop
+            // already landed the pane is Completed and must stay there,
+            // otherwise the silence heuristic demotes Working → Idle;
+            // auth_success / anything else is observational.
             _ => None,
         },
         AgentKind::Codex => {
@@ -424,9 +433,33 @@ mod tests {
                 AgentKind::ClaudeCode,
                 "Notification",
                 None,
-                &serde_json::json!({ "notification_type": "idle_prompt" }),
+                &serde_json::json!({ "notification_type": "elicitation_dialog" }),
             ),
             Some(NotificationKind::IdlePromptNeeded)
+        );
+        // idle_prompt is observational — Claude is just idle at the
+        // prompt, the harness is not blocked on anything the user has
+        // to answer.
+        assert_eq!(
+            classify_notification_event(
+                AgentKind::ClaudeCode,
+                "Notification",
+                None,
+                &serde_json::json!({ "notification_type": "idle_prompt" }),
+            ),
+            None
+        );
+        // permission_prompt is a non-blocking echo of the synchronous
+        // `PermissionRequest` hook and must not drive a transition on
+        // its own.
+        assert_eq!(
+            classify_notification_event(
+                AgentKind::ClaudeCode,
+                "Notification",
+                None,
+                &serde_json::json!({ "notification_type": "permission_prompt" }),
+            ),
+            None
         );
         assert_eq!(
             classify_notification_event(

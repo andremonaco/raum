@@ -54,8 +54,12 @@ use super::hook_script_path;
 ///   raum blocks the script on a socket reply line.
 /// * `Notification` — fire-and-forget. Carries a `notification_type`
 ///   subtype (`permission_prompt`, `idle_prompt`, `auth_success`,
-///   `elicitation_dialog`) that [`crate::harness::event::classify_notification_kind`]
-///   consumes.
+///   `elicitation_dialog`). Only `elicitation_dialog` drives a state
+///   change (→ Waiting); the others are observational. `permission_prompt`
+///   is a non-blocking echo of the synchronous `PermissionRequest` hook
+///   that already drives Waiting, and `idle_prompt` (prompt has been idle)
+///   must not flip a Completed pane back to Waiting.
+///   See [`crate::harness::event::classify_notification_payload`].
 /// * `Stop` — turn completed cleanly.
 /// * `UserPromptSubmit` — user submitted a prompt (Working edge).
 /// * `StopFailure` — turn ended due to an API error (rate limit, auth,

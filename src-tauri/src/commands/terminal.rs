@@ -626,6 +626,14 @@ pub async fn terminal_spawn<R: Runtime>(
     if args.kind != AgentKind::Shell
         && (args.project_slug.as_deref().is_none() || project_dir.as_os_str().is_empty())
     {
+        tracing::warn!(
+            kind = ?args.kind,
+            project_slug = ?args.project_slug,
+            worktree_id = ?args.worktree_id,
+            project_dir = %project_dir.display(),
+            config_root = %raum_core::paths::config_root().display(),
+            "terminal_spawn: rejecting — no registered project resolved"
+        );
         return Err("harness spawns require a registered project".to_string());
     }
     let cwd = resolve_spawn_cwd(
@@ -1054,6 +1062,45 @@ pub struct ReattachArgs {
     pub rows: Option<u32>,
 }
 
+fn preferred_context_value(values: [Option<&str>; 4]) -> Option<String> {
+    values
+        .into_iter()
+        .flatten()
+        .find(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+type ContextPair<'a> = (Option<&'a str>, Option<&'a str>);
+
+fn resolve_reattach_context(
+    from_args: ContextPair<'_>,
+    from_registry: ContextPair<'_>,
+    from_ghost: ContextPair<'_>,
+    from_tracked: ContextPair<'_>,
+) -> (Option<String>, Option<String>) {
+    (
+        preferred_context_value([from_args.0, from_registry.0, from_ghost.0, from_tracked.0]),
+        preferred_context_value([from_args.1, from_registry.1, from_ghost.1, from_tracked.1]),
+    )
+}
+
+fn tracked_session_context(
+    state: &AppHandleState,
+    session_id: &str,
+) -> (Option<String>, Option<String>) {
+    let Ok(store) = state.config_store.lock() else {
+        return (None, None);
+    };
+    let Ok(sessions) = store.read_sessions() else {
+        return (None, None);
+    };
+    sessions
+        .sessions
+        .into_iter()
+        .find(|row| row.session_id == session_id)
+        .map_or((None, None), |row| (row.project_slug, row.worktree_id))
+}
+
 /// §3.6 — reattach to a pre-existing tmux session that survived a previous
 /// raum run. Verifies the session still exists on the `-L raum` socket, then
 /// opens a fresh PTY-attached client the same way `terminal_spawn` does (minus
@@ -1124,14 +1171,15 @@ pub async fn terminal_reattach<R: Runtime>(
     // rehydrate task registered an identity-only row; we remove it from
     // the ghost map so the subsequent `reg.insert(TerminalEntry { … })`
     // lands a real bridged entry instead of duplicating the session id.
-    let (had_entry, promoted_ghost) = {
+    let (existing_item, had_entry, promoted_ghost) = {
         let mut reg = state
             .terminals
             .lock()
             .map_err(|e| format!("terminals lock: {e}"))?;
+        let existing = reg.item(&session_id);
         let detached = reg.detach_bridge(&session_id);
         let ghost = reg.promote_ghost(&session_id);
-        (detached, ghost)
+        (existing, detached, ghost)
     };
     if had_entry {
         tracing::info!(session_id = %session_id, "terminal_reattach: tearing down stale bridge");
@@ -1140,14 +1188,38 @@ pub async fn terminal_reattach<R: Runtime>(
         tracing::info!(session_id = %session_id, "terminal_reattach: promoted rehydrate ghost");
     }
 
+    let (tracked_project_slug, tracked_worktree_id) = tracked_session_context(&state, &session_id);
+    let (effective_project_slug, effective_worktree_id) = resolve_reattach_context(
+        (args.project_slug.as_deref(), args.worktree_id.as_deref()),
+        (
+            existing_item
+                .as_ref()
+                .and_then(|item| item.project_slug.as_deref()),
+            existing_item
+                .as_ref()
+                .and_then(|item| item.worktree_id.as_deref()),
+        ),
+        (
+            promoted_ghost
+                .as_ref()
+                .and_then(|ghost| ghost.project_slug.as_deref()),
+            promoted_ghost
+                .as_ref()
+                .and_then(|ghost| ghost.worktree_id.as_deref()),
+        ),
+        (
+            tracked_project_slug.as_deref(),
+            tracked_worktree_id.as_deref(),
+        ),
+    );
     let (cols, rows) = match args.cols.zip(args.rows) {
         Some((c, r)) => clamp_pty_dims(c, r),
         None => (200, 50),
     };
     let project_dir = resolve_project_dir(
         &state,
-        args.project_slug.as_deref(),
-        args.worktree_id.as_deref(),
+        effective_project_slug.as_deref(),
+        effective_worktree_id.as_deref(),
     );
 
     if !matches!(args.kind, AgentKind::Shell) {
@@ -1155,7 +1227,7 @@ pub async fn terminal_reattach<R: Runtime>(
         let hook_fallback = infer_reattach_hook_fallback(
             &state,
             args.kind,
-            args.project_slug.as_deref(),
+            effective_project_slug.as_deref(),
             project_dir.clone(),
         );
         // Skip both channel re-registration and the seed emit so any
@@ -1169,8 +1241,8 @@ pub async fn terminal_reattach<R: Runtime>(
             &state,
             args.kind,
             &session_id,
-            args.project_slug.as_deref(),
-            args.worktree_id.as_deref(),
+            effective_project_slug.as_deref(),
+            effective_worktree_id.as_deref(),
             project_dir.clone(),
             hook_fallback,
             RegisterOptions {
@@ -1314,8 +1386,8 @@ pub async fn terminal_reattach<R: Runtime>(
             };
             reg.insert(TerminalEntry {
                 session_id: session_id.clone(),
-                project_slug: args.project_slug.clone().or(ghost_project),
-                worktree_id: args.worktree_id.clone().or(ghost_worktree),
+                project_slug: effective_project_slug.clone().or(ghost_project),
+                worktree_id: effective_worktree_id.clone().or(ghost_worktree),
                 kind: args.kind,
                 created_unix,
                 bridge,
@@ -1633,7 +1705,7 @@ mod ghost_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        PaneContextPayload, contains_abort_input, contains_submit_input,
+        PaneContextPayload, contains_abort_input, contains_submit_input, resolve_reattach_context,
         should_emit_pane_context_change,
     };
     use raum_core::agent::AgentState;
@@ -1723,6 +1795,45 @@ mod tests {
             Some(&previous),
             &renamed_window
         ));
+    }
+
+    #[test]
+    fn reattach_context_prefers_args_then_registry_then_ghost_then_tracked() {
+        let (project, worktree) = resolve_reattach_context(
+            (Some("args-project"), Some("args-worktree")),
+            (Some("registry-project"), Some("registry-worktree")),
+            (Some("ghost-project"), Some("ghost-worktree")),
+            (Some("tracked-project"), Some("tracked-worktree")),
+        );
+        assert_eq!(project.as_deref(), Some("args-project"));
+        assert_eq!(worktree.as_deref(), Some("args-worktree"));
+
+        let (project, worktree) = resolve_reattach_context(
+            (None, None),
+            (Some("registry-project"), Some("registry-worktree")),
+            (Some("ghost-project"), Some("ghost-worktree")),
+            (Some("tracked-project"), Some("tracked-worktree")),
+        );
+        assert_eq!(project.as_deref(), Some("registry-project"));
+        assert_eq!(worktree.as_deref(), Some("registry-worktree"));
+
+        let (project, worktree) = resolve_reattach_context(
+            (None, None),
+            (None, None),
+            (Some("ghost-project"), Some("ghost-worktree")),
+            (Some("tracked-project"), Some("tracked-worktree")),
+        );
+        assert_eq!(project.as_deref(), Some("ghost-project"));
+        assert_eq!(worktree.as_deref(), Some("ghost-worktree"));
+
+        let (project, worktree) = resolve_reattach_context(
+            (None, None),
+            (None, None),
+            (None, None),
+            (Some("tracked-project"), Some("tracked-worktree")),
+        );
+        assert_eq!(project.as_deref(), Some("tracked-project"));
+        assert_eq!(worktree.as_deref(), Some("tracked-worktree"));
     }
 }
 

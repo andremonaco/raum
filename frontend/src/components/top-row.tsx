@@ -66,11 +66,8 @@ import { subscribePaneActivity } from "../stores/runtimeLayoutStore";
 import { useKeymap } from "../lib/keymapContext";
 import { PROJECT_COLOR_PALETTE } from "../lib/projectColors";
 import { PROJECT_SIGIL_PALETTE, SIGIL_RESET, deriveSigilFromSlug } from "../lib/projectSigils";
-import { closeSearchPanel, searchPanelOpen, toggleSearchPanel } from "../lib/searchPanelState";
 import { toggleSidebarHidden } from "../lib/sidebarVisibility";
 import { closeSpotlight, setTopBarQuery, spotlightOpen } from "../lib/spotlightState";
-import { matchesAccelerator } from "../lib/accelerator";
-import { GlobalSearchPanel } from "./global-search-panel";
 import { AddProjectModal } from "./add-project-modal";
 import { KeymapSettingsModal } from "./keymap-settings-modal";
 import { SettingsModal } from "./settings-modal";
@@ -114,6 +111,19 @@ export type TopRowFilter = "active" | "needs-input" | "recent";
 const [selectedFilter, setSelectedFilter] = createSignal<TopRowFilter>("recent");
 export { selectedFilter, setSelectedFilter };
 
+/**
+ * Cross-project "spotlight" view. When non-null, raum paints only the panes
+ * matching this mode (awaiting / recent / working) across every project and
+ * each pane's header glows with its owning project's color. `null` = normal
+ * single-project grid. Mutually exclusive with `selectedFilter`, which stays
+ * project-scoped.
+ */
+export type CrossProjectViewMode = "awaiting" | "recent" | "working";
+const [crossProjectViewMode, setCrossProjectViewMode] = createSignal<CrossProjectViewMode | null>(
+  null,
+);
+export { crossProjectViewMode, setCrossProjectViewMode };
+
 // On macOS decorum sets TitleBarStyle::Overlay — native traffic lights, drag,
 // and zoom animation are all handled by the OS. On Linux/Windows we use our
 // own buttons and startDragging().
@@ -142,23 +152,6 @@ function prettifyAccel(accel: string | undefined): string {
     .replace(/Alt/g, "⌥")
     .replace(/Option/g, "⌥")
     .replace(/\+/g, "");
-}
-
-interface KeymapEntry {
-  action: string;
-  accelerator: string;
-  description: string;
-  global: boolean;
-}
-
-async function fetchGlobalSearchAccel(): Promise<string> {
-  try {
-    const entries = await invoke<KeymapEntry[]>("keymap_get_effective");
-    const gs = entries.find((e) => e.action === "global-search");
-    return gs?.accelerator ?? "CmdOrCtrl+F";
-  } catch {
-    return "CmdOrCtrl+F";
-  }
 }
 
 // ---- Project tab -----------------------------------------------------------
@@ -367,7 +360,6 @@ const ProjectTab: Component<ProjectTabProps> = (props) => {
 
 export const TopRow: Component = () => {
   const keymap = useKeymap();
-  const [accel] = createResource(fetchGlobalSearchAccel);
   const [modalOpen, setModalOpen] = createSignal(false);
   const [appSettingsOpen, setAppSettingsOpen] = createSignal(false);
   const [keymapSettingsOpen, setKeymapSettingsOpen] = createSignal(false);
@@ -389,21 +381,6 @@ export const TopRow: Component = () => {
 
   onCleanup(() => {
     if (topBarBlurTimer !== null) clearTimeout(topBarBlurTimer);
-  });
-
-  const onKeydown = (e: KeyboardEvent): void => {
-    const a = accel() ?? "CmdOrCtrl+F";
-    if (matchesAccelerator(e, a)) {
-      e.preventDefault();
-      toggleSearchPanel();
-    }
-  };
-
-  onMount(() => {
-    window.addEventListener("keydown", onKeydown);
-  });
-  onCleanup(() => {
-    window.removeEventListener("keydown", onKeydown);
   });
 
   onMount(() => {
@@ -582,14 +559,27 @@ export const TopRow: Component = () => {
   }
 
   interface FilterDef {
-    id: TopRowFilter;
+    mode: CrossProjectViewMode;
     label: string;
     icon: typeof AlertCircleIcon;
   }
+  // Header filters open a cross-project spotlight view — mapping awaiting /
+  // recent / working to the agent-state buckets. The project-scoped
+  // `selectedFilter` is a separate concern, kept for keymap back-compat.
   const filters = createMemo<FilterDef[]>(() => [
-    { id: "needs-input", label: "Waiting", icon: AlertCircleIcon },
-    { id: "recent", label: "Recent", icon: ClockIcon },
+    { mode: "awaiting", label: "Awaiting across projects", icon: AlertCircleIcon },
+    { mode: "recent", label: "Recent across projects", icon: ClockIcon },
+    { mode: "working", label: "Working across projects", icon: LoaderIcon },
   ]);
+
+  // Badge value rendered on each filter button. `waitingCount` and
+  // `activeCount` are already cross-project totals from terminalStore; the
+  // recent view is always capped at 9 and doesn't warrant a count pill.
+  function crossProjectBadgeCount(mode: CrossProjectViewMode): number {
+    if (mode === "awaiting") return waitingCount();
+    if (mode === "working") return activeCount();
+    return 0;
+  }
 
   return (
     <>
@@ -747,60 +737,62 @@ export const TopRow: Component = () => {
           </For>
         </div>
 
-        {/* CENTER — project tabs + add + view filter icons.
-            py-1 keeps the Waiting-badge overhang inside the padding-box so
-            overflow-x-auto (which also clips vertically) doesn't crop it. */}
-        <div
-          data-tauri-drag-region
-          class="flex items-center gap-1 justify-self-center overflow-x-auto py-1"
-        >
-          <nav
-            data-tauri-drag-region
-            class="flex items-stretch gap-0.5"
-            aria-label="Projects"
-            data-testid="project-tabs"
-          >
-            <For each={projectStore.items}>
-              {(project) => (
-                <ProjectTab
-                  project={project}
-                  active={activeProjectSlug() === project.slug}
-                  onSelect={() => {
-                    setActiveProjectSlug(project.slug);
-                    setSelectedFilter("active");
-                  }}
-                  onRemove={() => setConfirmRemove(project)}
-                />
-              )}
-            </For>
-            <Tooltip>
-              <TooltipTrigger
-                as={Button}
-                type="button"
-                variant="ghost"
-                size="icon-sm"
-                class="h-7 w-7 text-muted-foreground hover:text-foreground"
-                onClick={() => setModalOpen(true)}
-                aria-label="Add project"
-                data-testid="add-project-button"
-              >
-                <PlusIcon class="size-3.5" />
-              </TooltipTrigger>
-              <TooltipPortal>
-                <TooltipContent>Add project</TooltipContent>
-              </TooltipPortal>
-            </Tooltip>
-          </nav>
+        {/* CENTER — project tabs (scrollable) + view filter icons (not
+            scrollable, so the badge overhang on the filter buttons is not
+            clipped by `overflow: hidden` on the scroll axis). */}
+        <div data-tauri-drag-region class="flex items-center gap-1 justify-self-center">
+          <div data-tauri-drag-region class="flex items-center overflow-x-auto">
+            <nav
+              data-tauri-drag-region
+              class="flex items-stretch gap-0.5"
+              aria-label="Projects"
+              data-testid="project-tabs"
+            >
+              <For each={projectStore.items}>
+                {(project) => (
+                  <ProjectTab
+                    project={project}
+                    active={activeProjectSlug() === project.slug}
+                    onSelect={() => {
+                      setActiveProjectSlug(project.slug);
+                      setSelectedFilter("active");
+                      setCrossProjectViewMode(null);
+                    }}
+                    onRemove={() => setConfirmRemove(project)}
+                  />
+                )}
+              </For>
+              <Tooltip>
+                <TooltipTrigger
+                  as={Button}
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  class="h-7 w-7 text-muted-foreground hover:text-foreground"
+                  onClick={() => setModalOpen(true)}
+                  aria-label="Add project"
+                  data-testid="add-project-button"
+                >
+                  <PlusIcon class="size-3.5" />
+                </TooltipTrigger>
+                <TooltipPortal>
+                  <TooltipContent>Add project</TooltipContent>
+                </TooltipPortal>
+              </Tooltip>
+            </nav>
+          </div>
 
           <nav
             data-tauri-drag-region
             class="flex items-stretch gap-0.5"
-            aria-label="Views"
+            aria-label="Cross-project views"
             data-testid="filter-tabs"
           >
             <For each={filters()}>
               {(filter) => {
                 const Icon = filter.icon;
+                const badge = () => crossProjectBadgeCount(filter.mode);
+                const active = () => crossProjectViewMode() === filter.mode;
                 return (
                   <Tooltip>
                     <TooltipTrigger
@@ -808,21 +800,21 @@ export const TopRow: Component = () => {
                       type="button"
                       class="relative flex h-7 w-7 items-center justify-center rounded"
                       classList={{
-                        "bg-selected text-foreground": selectedFilter() === filter.id,
-                        "text-muted-foreground hover:text-foreground":
-                          selectedFilter() !== filter.id,
+                        "bg-selected text-foreground": active(),
+                        "text-muted-foreground hover:text-foreground": !active(),
                       }}
-                      onClick={() => setSelectedFilter(filter.id)}
+                      onClick={() => setCrossProjectViewMode(active() ? null : filter.mode)}
                       aria-label={filter.label}
-                      data-testid={`filter-${filter.id}`}
+                      aria-pressed={active()}
+                      data-testid={`filter-${filter.mode}`}
                     >
                       <Icon class="size-3.5" />
-                      <Show when={filter.id === "needs-input" && waitingCount() > 0}>
+                      <Show when={badge() > 0}>
                         <Badge
                           class="absolute -top-1 -right-1 h-3.5 min-w-3.5 justify-center rounded-full border border-background bg-warning px-0.5 text-[9px] font-semibold text-background hover:bg-warning"
-                          data-testid="needs-input-count"
+                          data-testid={`cross-project-count-${filter.mode}`}
                         >
-                          {waitingCount()}
+                          {badge()}
                         </Badge>
                       </Show>
                     </TooltipTrigger>
@@ -975,8 +967,6 @@ export const TopRow: Component = () => {
           </DialogContent>
         </DialogPortal>
       </Dialog>
-
-      <GlobalSearchPanel open={searchPanelOpen()} onClose={() => closeSearchPanel()} />
 
       <SettingsModal open={appSettingsOpen()} onClose={() => setAppSettingsOpen(false)} />
 

@@ -35,6 +35,7 @@ import type { AgentState, Reliability } from "../stores/agentStore";
 import {
   AlertCircleIcon,
   CheckIcon,
+  ClockIcon,
   CompactIcon,
   GridEqualIcon,
   GridTileIcon,
@@ -44,30 +45,43 @@ import {
 import { Button } from "./ui/button";
 import { Tooltip, TooltipContent, TooltipPortal, TooltipTrigger } from "./ui/tooltip";
 
-// ── Sort mode persisted across reloads ───────────────────────────────────────
+// ── Filter mode persisted across reloads ─────────────────────────────────────
+//
+// Each icon in the Filter group narrows the minimized chip list to chips
+// whose agent is in a matching state. `null` means "show everything, sorted
+// by working priority" — the default on first launch.
 
-export type DockSortMode = "working" | "recent" | "attention";
+export type DockFilterMode = "awaiting" | "recent" | "working";
 
-const DOCK_SORT_KEY = "raum:dock-sort";
+const DOCK_FILTER_KEY = "raum:dock-filter";
 
-function loadInitialSort(): DockSortMode {
+function loadInitialFilter(): DockFilterMode | null {
   try {
-    const v = localStorage.getItem(DOCK_SORT_KEY);
-    if (v === "working" || v === "recent" || v === "attention") return v;
+    const v = localStorage.getItem(DOCK_FILTER_KEY);
+    if (v === "awaiting" || v === "recent" || v === "working") return v;
   } catch {
     /* non-browser / blocked storage */
   }
-  return "working";
+  return null;
 }
 
-const [dockSortMode, setDockSortMode] = createSignal<DockSortMode>(loadInitialSort());
+const [dockFilterMode, setDockFilterMode] = createSignal<DockFilterMode | null>(
+  loadInitialFilter(),
+);
 
-export { dockSortMode };
+export { dockFilterMode };
 
-export function setSortMode(mode: DockSortMode): void {
-  setDockSortMode(mode);
+/**
+ * Toggle a filter icon. Clicking the active filter clears it (mode → null),
+ * so the same icon acts as both "on" and "off". Persisted to localStorage so
+ * the choice survives a reload.
+ */
+export function toggleFilterMode(mode: DockFilterMode): void {
+  const next = dockFilterMode() === mode ? null : mode;
+  setDockFilterMode(next);
   try {
-    localStorage.setItem(DOCK_SORT_KEY, mode);
+    if (next === null) localStorage.removeItem(DOCK_FILTER_KEY);
+    else localStorage.setItem(DOCK_FILTER_KEY, next);
   } catch {
     /* ignore — the signal still drives the UI for this session */
   }
@@ -154,16 +168,34 @@ export const Dock: Component<DockProps> = (props) => {
   const minimizedCells = createMemo(() => {
     void tick(); // refresh timestamps
     const ids = minimizedPaneIds();
-    const list = runtimeLayoutStore.cells.filter((c) => ids.has(c.id)).slice();
-    const mode = dockSortMode();
-    if (mode === "recent") {
-      return list.sort((a, b) => (b.lastActivityMs ?? 0) - (a.lastActivityMs ?? 0));
-    }
-    if (mode === "attention") {
-      return list.sort(
+    let list = runtimeLayoutStore.cells.filter((c) => ids.has(c.id)).slice();
+    const mode = dockFilterMode();
+
+    // Filter first, then apply the mode-specific ordering. When no filter is
+    // active the list keeps its original working-priority order so the most
+    // interesting chips sit left — matching the pre-filter behaviour.
+    if (mode === "awaiting") {
+      list = list.filter((c) => resolvedCellState(c) === "waiting");
+      list.sort(
         (a, b) => attentionPriority(resolvedCellState(a)) - attentionPriority(resolvedCellState(b)),
       );
+      return list;
     }
+    if (mode === "working") {
+      list = list.filter((c) => resolvedCellState(c) === "working");
+      list.sort(
+        (a, b) => workingPriority(resolvedCellState(a)) - workingPriority(resolvedCellState(b)),
+      );
+      return list;
+    }
+    if (mode === "recent") {
+      // "Recent" is a sort + cap, not a state filter — show the most recent
+      // 9 chips regardless of state so the user can jump back to whatever
+      // they touched last.
+      list.sort((a, b) => (b.lastActivityMs ?? 0) - (a.lastActivityMs ?? 0));
+      return list.slice(0, 9);
+    }
+
     return list.sort(
       (a, b) => workingPriority(resolvedCellState(a)) - workingPriority(resolvedCellState(b)),
     );
@@ -171,9 +203,9 @@ export const Dock: Component<DockProps> = (props) => {
 
   return (
     <div class="flex h-8 shrink-0 items-center bg-background" aria-label="Dock">
-      <div class="flex shrink-0 items-center gap-1.5 px-2">
-        <SortPills />
-        <LayoutActions />
+      <div class="flex shrink-0 items-center gap-2 px-2">
+        <FilterGroup />
+        <SortGroup />
       </div>
       <div class="flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto pr-0.5">
         <For each={minimizedCells()}>
@@ -184,49 +216,66 @@ export const Dock: Component<DockProps> = (props) => {
   );
 };
 
-// ── Sort pills ────────────────────────────────────────────────────────────────
+// ── Filter icons ─────────────────────────────────────────────────────────────
 
-interface PillConfig {
-  mode: DockSortMode;
-  label: string;
+interface FilterConfig {
+  mode: DockFilterMode;
   title: string;
+  icon: typeof AlertCircleIcon;
 }
 
-const PILLS: PillConfig[] = [
-  { mode: "working", label: "Working", title: "Currently working first" },
-  { mode: "recent", label: "Recent", title: "Most recent activity first" },
-  { mode: "attention", label: "Attention", title: "Waiting / errored first" },
+const FILTERS: FilterConfig[] = [
+  { mode: "awaiting", title: "Show only waiting (project)", icon: AlertCircleIcon },
+  { mode: "recent", title: "Show 9 most recent (project)", icon: ClockIcon },
+  { mode: "working", title: "Show only working (project)", icon: LoaderIcon },
 ];
 
-const SortPills: Component = () => {
+const FilterGroup: Component = () => {
   return (
-    <div class="flex shrink-0 items-center gap-1" role="tablist" aria-label="Sort dock">
-      <For each={PILLS}>
-        {(pill) => {
-          const active = () => dockSortMode() === pill.mode;
-          return (
-            <button
-              type="button"
-              role="tab"
-              aria-selected={active()}
-              title={pill.title}
-              class="rounded px-2 py-0.5 text-[10px] uppercase tracking-wide transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-              classList={{
-                "bg-active text-foreground": active(),
-                "text-foreground-subtle hover:text-foreground hover:bg-hover": !active(),
-              }}
-              onClick={() => setSortMode(pill.mode)}
-            >
-              {pill.label}
-            </button>
-          );
-        }}
-      </For>
+    <div class="flex shrink-0 items-center gap-1" aria-label="Filter chips">
+      <span class="text-[10px] uppercase tracking-wide text-foreground-subtle">Filter</span>
+      <div class="flex items-center gap-0.5" role="group">
+        <For each={FILTERS}>
+          {(f) => {
+            const active = () => dockFilterMode() === f.mode;
+            const Icon = f.icon;
+            return (
+              <Tooltip>
+                <TooltipTrigger
+                  as="button"
+                  type="button"
+                  aria-pressed={active()}
+                  class="flex h-6 w-6 items-center justify-center rounded transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                  classList={{
+                    "bg-active text-foreground": active(),
+                    "text-foreground-subtle hover:text-foreground hover:bg-hover": !active(),
+                  }}
+                  onClick={() => toggleFilterMode(f.mode)}
+                >
+                  <Icon class="size-3" />
+                </TooltipTrigger>
+                <TooltipPortal>
+                  <TooltipContent>{f.title}</TooltipContent>
+                </TooltipPortal>
+              </Tooltip>
+            );
+          }}
+        </For>
+      </div>
     </div>
   );
 };
 
-// ── Layout actions (grid fix-up buttons) ─────────────────────────────────────
+// ── Sort / layout actions (grid fix-up buttons) ──────────────────────────────
+
+const SortGroup: Component = () => {
+  return (
+    <div class="flex shrink-0 items-center gap-1" aria-label="Sort layout">
+      <span class="text-[10px] uppercase tracking-wide text-foreground-subtle">Sort</span>
+      <LayoutActions />
+    </div>
+  );
+};
 
 const LayoutActions: Component = () => {
   const leafCount = createMemo(() => treeLeafIds(runtimeLayoutStore.tree).length);

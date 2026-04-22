@@ -1,14 +1,11 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 
-// Focused-window variant of the notification center tests. The default
-// test file mocks `isFocused` as `false` (unfocused); this file flips the
-// mock to `true` to prove that:
-//
-//   - OS notifications are suppressed while the window is focused
-//     (behavior preserved), AND
-//   - the in-app Sonner toast still fires while the window is focused
-//     (previously we only pushed a banner on OS-unavailable paths, which
-//     meant dev-mode users on `tauri dev` never saw anything).
+// OS-denied variant of the notification center tests. The default test
+// file exercises the happy path (probe → granted, OS notification fires);
+// this file flips the probe to `"denied"` to prove the toast fallback
+// covers every dispatcher. Window focus is intentionally NOT consulted by
+// the dispatchers (raum fires notifications whenever the user has enabled
+// them, foreground or not), so these tests don't mock focus state either.
 const mockInvoke = vi.fn();
 const mockSendNotification = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
@@ -17,12 +14,6 @@ vi.mock("@tauri-apps/api/core", () => ({
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn().mockResolvedValue(() => undefined),
 }));
-vi.mock("@tauri-apps/api/window", () => ({
-  getCurrentWindow: () => ({ isFocused: async () => true }),
-}));
-// `isPermissionGranted` returns `false` and `requestPermission` throws so
-// the center ends up in the "OS notifications unavailable" state, which
-// is exactly the dev-mode scenario we are protecting.
 vi.mock("@tauri-apps/plugin-notification", () => ({
   isPermissionGranted: vi.fn().mockResolvedValue(false),
   onAction: vi.fn().mockResolvedValue({ unregister: () => undefined }),
@@ -64,11 +55,25 @@ import {
   ensureNotificationPermission,
 } from "./notificationCenter";
 
-describe("notification center — focus gate split", () => {
+describe("notification center — OS-denied fallback", () => {
   beforeEach(async () => {
     vi.useFakeTimers();
     mockInvoke.mockReset();
-    mockInvoke.mockResolvedValue(undefined);
+    // Simulate a user who has explicitly denied notifications for the raum
+    // bundle. That is the only state that forces the toast fallback —
+    // `"unknown"` is treated as "try the OS path" so the first real send
+    // can trigger macOS's authorization prompt.
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "notifications_check_authorization") {
+        return {
+          status: "denied",
+          bundle_id: "de.raum.desktop",
+          is_dev_mode: false,
+          note: null,
+        };
+      }
+      return undefined;
+    });
     mockSendNotification.mockReset();
     mockToastFn.mockReset();
     mockToastSuccess.mockReset();
@@ -78,7 +83,7 @@ describe("notification center — focus gate split", () => {
     await ensureNotificationPermission();
   });
 
-  it("shows an in-app toast on waiting even when the window is focused", async () => {
+  it("shows an in-app toast on waiting when OS is denied", async () => {
     __handleAgentStateChangedForTests({
       session_id: "s-1",
       harness: "claude-code",
@@ -86,16 +91,20 @@ describe("notification center — focus gate split", () => {
       to: "waiting",
     });
 
-    // Waiting dispatch is now synchronous; just flush microtasks so the
-    // async body runs.
+    // Waiting dispatch is synchronous; just flush microtasks so the async
+    // body runs.
     await Promise.resolve();
     await Promise.resolve();
 
     expect(mockToastFn).toHaveBeenCalledTimes(1);
+    expect(mockToastFn.mock.calls[0]?.[0]).toBe("Interactive Question");
+    expect(mockToastFn.mock.calls[0]?.[1]).toMatchObject({
+      description: "Claude is asking for feedback.",
+    });
     expect(mockSendNotification).not.toHaveBeenCalled();
   });
 
-  it("shows an in-app toast on completed even when the window is focused", async () => {
+  it("shows an in-app toast on completed when OS is denied", async () => {
     __handleAgentStateChangedForTests({
       session_id: "s-2",
       harness: "codex",
@@ -110,6 +119,10 @@ describe("notification center — focus gate split", () => {
     await Promise.resolve();
 
     expect(mockToastSuccess).toHaveBeenCalledTimes(1);
+    expect(mockToastSuccess.mock.calls[0]?.[0]).toBe("Finished");
+    expect(mockToastSuccess.mock.calls[0]?.[1]).toMatchObject({
+      description: "Codex finished successfully.",
+    });
     expect(mockSendNotification).not.toHaveBeenCalled();
   });
 });

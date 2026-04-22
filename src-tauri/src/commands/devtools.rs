@@ -8,7 +8,9 @@
 //! command is a no-op and a warning is emitted so the user sees *something*
 //! in the log rather than silently nothing.
 
-use tauri::{AppHandle, Manager, Runtime};
+#[cfg(any(debug_assertions, feature = "devtools"))]
+use tauri::Manager;
+use tauri::{AppHandle, Runtime};
 
 #[tauri::command]
 pub fn open_devtools<R: Runtime>(app: AppHandle<R>) {

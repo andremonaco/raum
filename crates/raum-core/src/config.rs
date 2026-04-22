@@ -562,6 +562,10 @@ pub struct ActiveLayoutCell {
     pub kind: AgentKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_slug: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_id: Option<String>,
     pub active_tab_id: String,
     #[serde(default, alias = "tab")]
     pub tabs: Vec<ActiveLayoutTab>,
@@ -771,6 +775,8 @@ mod tests {
                 h: 10,
                 kind: AgentKind::ClaudeCode,
                 title: Some("Main".into()),
+                project_slug: Some("acme".into()),
+                worktree_id: Some("/path/to/wt".into()),
                 active_tab_id: "tab-1".into(),
                 tabs: vec![
                     ActiveLayoutTab {

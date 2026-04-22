@@ -7,13 +7,16 @@
  * dispatches three side effects:
  *
  *   1. An in-app toast via `solid-sonner` (mounted as `<Toaster />`
- *      from `components/ui/sonner.tsx`). Always fires — it's the only
- *      signal that's guaranteed visible in dev builds where the OS
- *      notification plugin silently no-ops, and doubles as a focused-
- *      window reminder in bundled builds.
- *   2. An OS notification via `@tauri-apps/plugin-notification`, only
- *      when the raum window is unfocused (§11.1). Permission is
- *      requested on first launch; on denial we set a one-time flag in
+ *      from `components/ui/sonner.tsx`). Fires only when the OS
+ *      notification path is unavailable (permission not granted, or the
+ *      plugin itself is unreachable — e.g. unbundled `tauri dev` on
+ *      macOS). When the OS path works it is authoritative; we don't
+ *      stack a toast on top.
+ *   2. An OS notification via `@tauri-apps/plugin-notification`. Fires
+ *      regardless of window focus — if the user has enabled notifications
+ *      in settings they should see every event. Clicking the notification
+ *      focuses the owning pane. Permission is requested on first launch;
+ *      on denial we set a one-time flag in
  *      `Config.notifications.notifications_hint_shown` (§11.4).
  *   3. An optional sound played via the `Audio` element, reading the
  *      file path from `Config.notifications.sound` (§11.5).
@@ -28,16 +31,11 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { getCurrentWindow, type Window as TauriWindow } from "@tauri-apps/api/window";
-import {
-  isPermissionGranted,
-  onAction,
-  requestPermission,
-  sendNotification,
-} from "@tauri-apps/plugin-notification";
+import { onAction, sendNotification } from "@tauri-apps/plugin-notification";
 import { createEffect, createRoot, createSignal } from "solid-js";
 import { toast } from "solid-sonner";
 
+import { kindDisplayLabel } from "./agentKind";
 import { unreadAgentCount } from "../stores/agentStore";
 import type { AgentKind, AgentState, Reliability } from "../stores/agentStore";
 
@@ -106,15 +104,41 @@ const [permissionState, setPermissionState] = createSignal<"granted" | "denied" 
 export { permissionState };
 
 /**
- * True when `requestPermission()` threw (plugin could not reach the OS
- * notification center). On macOS this is the normal outcome for
- * unbundled `tauri dev` builds — the system only registers apps that
- * were launched from a signed `.app` bundle. Surfaced so the UI can
- * show a one-time "System notifications unavailable in dev build"
- * hint that is distinct from a user-initiated denial.
+ * The bundle id (macOS) or DBus service name (Linux) the OS attributes our
+ * notifications to. On macOS dev builds this is `com.apple.Terminal` because
+ * `notify_rust` masquerades as Terminal — the badge in the settings UI
+ * surfaces this so the user knows which app's permission to toggle.
  */
-const [osNotificationsUnavailable, setOsNotificationsUnavailable] = createSignal(false);
-export { osNotificationsUnavailable };
+const [notificationBundleId, setNotificationBundleId] = createSignal("");
+export { notificationBundleId };
+
+/**
+ * True when running unbundled (`task dev`). On macOS this means notifications
+ * fire as Terminal; on Linux there is no equivalent caveat so this is always
+ * false.
+ */
+const [notificationDevMode, setNotificationDevMode] = createSignal(false);
+export { notificationDevMode };
+
+/**
+ * Optional human-readable note returned by the backend, used for surface-level
+ * caveats like the dev-mode "fires as Terminal" hint or the Linux missing-
+ * daemon message.
+ */
+const [notificationStateNote, setNotificationStateNote] = createSignal<string | null>(null);
+export { notificationStateNote };
+
+/**
+ * True when the OS notification path is definitively unusable — i.e. the user
+ * has explicitly denied permission. `"unknown"` means the bundle has not yet
+ * been registered with the OS notification center (first launch, no prior
+ * `sendNotification` call); on macOS that is the state _before_ the first
+ * permission prompt, not a rejection. We optimistically try the OS path in
+ * that case so the very first real notification triggers the system prompt
+ * and registers the bundle — otherwise we'd be stuck in the toast fallback
+ * forever, because the plist entry never gets written without a send.
+ */
+export const osNotificationsUnavailable = (): boolean => permissionState() === "denied";
 
 /** Whether to fire notifications when an agent needs input (`waiting`). */
 const [notifyOnWaiting, setNotifyOnWaiting] = createSignal(true);
@@ -195,19 +219,6 @@ function shouldDedupNotify(sessionId: string, now: number): boolean {
   return false;
 }
 
-// Deferred window handle; lazily resolved so tests that stub out the tauri
-// runtime don't crash on import.
-let windowHandle: TauriWindow | null = null;
-function getWindowHandle(): TauriWindow | null {
-  if (windowHandle) return windowHandle;
-  try {
-    windowHandle = getCurrentWindow();
-  } catch {
-    windowHandle = null;
-  }
-  return windowHandle;
-}
-
 /**
  * Register (or update) the human-readable context for a session. The title
  * and body of the OS notification are built from these strings. Callers are
@@ -227,45 +238,69 @@ export function clearNotificationContext(sessionId: string): void {
 // Permission handling (§11.4)
 // ---------------------------------------------------------------------------
 
+interface NotificationAuthorization {
+  status: "granted" | "denied" | "unknown";
+  bundle_id: string;
+  is_dev_mode: boolean;
+  note: string | null;
+}
+
 /**
- * Request OS notification permission on first launch. On denial, set the
- * one-time hint flag so the UI only surfaces the explainer banner once.
- * Safe to call more than once; subsequent calls are a no-op if the current
- * state has already been resolved to `granted` or `denied`.
+ * Probe the actual OS authorization state via the Rust backend. The Tauri
+ * notification plugin's `isPermissionGranted` is hard-coded to return true on
+ * desktop, so we go directly to `~/Library/Preferences/com.apple.ncprefs.plist`
+ * (macOS) or the session DBus (Linux) instead. Updates the reactive signals
+ * and returns the raw payload for callers that need the bundle/dev fields.
  */
-export async function ensureNotificationPermission(): Promise<"granted" | "denied"> {
+export async function refreshNotificationAuthorization(): Promise<NotificationAuthorization> {
   try {
-    if (await isPermissionGranted()) {
-      setPermissionState("granted");
-      return "granted";
-    }
-    const response = await requestPermission();
-    if (response === "granted") {
-      setPermissionState("granted");
-      return "granted";
-    }
-    setPermissionState("denied");
+    const auth = await invoke<NotificationAuthorization>("notifications_check_authorization");
+    setPermissionState(auth.status);
+    setNotificationBundleId(auth.bundle_id);
+    setNotificationDevMode(auth.is_dev_mode);
+    setNotificationStateNote(auth.note ?? null);
+    return auth;
+  } catch (e) {
+    console.warn("notifications_check_authorization failed", e);
+    setPermissionState("unknown");
+    setNotificationBundleId("");
+    setNotificationDevMode(false);
+    setNotificationStateNote(null);
+    return { status: "unknown", bundle_id: "", is_dev_mode: false, note: null };
+  }
+}
+
+/**
+ * Open the OS notification settings panel — the canonical place for the user
+ * to toggle authorization. On macOS this lands on the Notifications pane in
+ * System Settings; on Linux it tries the active desktop environment's control
+ * panel. After the user returns, callers should re-invoke
+ * [`refreshNotificationAuthorization`] to pick up the new state.
+ */
+export async function openNotificationSystemSettings(): Promise<void> {
+  try {
+    await invoke("notifications_open_system_settings");
+  } catch (e) {
+    console.warn("notifications_open_system_settings failed", e);
+  }
+}
+
+/**
+ * Best-effort first-launch initialiser. The plugin can no longer "request"
+ * permission (its desktop impl is a no-op), so this just resolves the current
+ * state. The actual macOS first-time prompt is triggered by the first real
+ * `sendNotification` call — typically the user's "Send test" click.
+ */
+export async function ensureNotificationPermission(): Promise<"granted" | "denied" | "unknown"> {
+  const auth = await refreshNotificationAuthorization();
+  if (auth.status !== "granted") {
     try {
       await invoke("notifications_mark_hint_shown");
     } catch (e) {
       console.warn("notifications_mark_hint_shown failed", e);
     }
-    return "denied";
-  } catch (e) {
-    // Plugin threw (macOS: unbundled dev build with no registered
-    // UNUserNotificationCenter). Fall back to in-app banners + sound
-    // and surface the distinct "unavailable" state so the UI can
-    // explain why the OS prompt never appeared.
-    console.warn("ensureNotificationPermission failed", e);
-    setPermissionState("denied");
-    setOsNotificationsUnavailable(true);
-    try {
-      await invoke("notifications_mark_hint_shown");
-    } catch (markErr) {
-      console.warn("notifications_mark_hint_shown failed", markErr);
-    }
-    return "denied";
   }
+  return auth.status;
 }
 
 // ---------------------------------------------------------------------------
@@ -273,15 +308,19 @@ export async function ensureNotificationPermission(): Promise<"granted" | "denie
 // ---------------------------------------------------------------------------
 
 function titleFor(ctx: NotificationContext | undefined, harness: AgentKind): string {
-  const project = ctx?.projectName ?? "raum";
-  return `${project}: ${harness} needs input`;
+  void ctx;
+  void harness;
+  return "Interactive Question";
 }
 
-function bodyFor(ctx: NotificationContext | undefined, sessionId: string): string {
-  if (ctx?.worktreeName) {
-    return `Worktree ${ctx.worktreeName} is awaiting your reply.`;
-  }
-  return `Session ${sessionId} is awaiting your reply.`;
+function bodyFor(
+  ctx: NotificationContext | undefined,
+  sessionId: string,
+  harness: AgentKind,
+): string {
+  void ctx;
+  void sessionId;
+  return `${kindDisplayLabel(harness)} is asking for feedback.`;
 }
 
 // ObjectURL cache keyed by the absolute on-disk path. The webview can't
@@ -370,36 +409,49 @@ function focusSession(sessionId: string): void {
 
 /**
  * Fire a test notification from the settings UI so the user can verify the
- * full notify path end-to-end. Always pushes an in-app toast; additionally
- * sends an OS toast when permission is granted. The configured sound also
- * plays so the user hears what they'll hear on a real agent event.
+ * full notify path end-to-end. Always pushes both an in-app toast and an OS
+ * notification — the OS attempt also doubles as the macOS first-time
+ * permission probe, since `tauri-plugin-notification` no longer drives that
+ * dialog separately. Re-reads the authorization state afterwards so the
+ * badge reflects the user's choice immediately.
  */
 export async function sendTestNotification(): Promise<void> {
   const title = "raum: test notification";
   const body = "If you see this, notifications are working.";
   void playWaitingSound();
 
-  toast.success(title, { description: body });
-
-  if (permissionState() === "granted") {
+  let osSent = false;
+  if (osNotificationsAvailable()) {
     try {
       sendNotification({ title, body });
+      osSent = true;
     } catch (e) {
       console.warn("sendTestNotification: sendNotification failed", e);
     }
   }
+
+  // Toast is the fallback — only surface it when the OS path is known to be
+  // unavailable (denied) or the send call threw.
+  if (!osSent) {
+    toast.success(title, { description: body });
+  }
+
+  // The first sendNotification on macOS may surface the OS authorization
+  // prompt; re-probe so the badge picks up the new state without forcing
+  // the user to reopen settings.
+  await refreshNotificationAuthorization();
 }
 
-async function isWindowUnfocused(): Promise<boolean> {
-  const win = getWindowHandle();
-  if (!win) return true;
-  try {
-    return !(await win.isFocused());
-  } catch {
-    // Treat focus check failure as "unfocused" — we'd rather fire a
-    // missed notification than swallow a real one.
-    return true;
-  }
+/**
+ * True when the OS notification path is worth attempting. We try on both
+ * `"granted"` and `"unknown"` — the latter is the pre-prompt state on macOS,
+ * where the first `sendNotification` call triggers the system permission
+ * dialog and registers the bundle in `com.apple.ncprefs.plist`. Treating
+ * `"unknown"` as "not available" would keep us locked in the toast fallback
+ * forever, because the plist entry only appears after a real send.
+ */
+function osNotificationsAvailable(): boolean {
+  return permissionState() !== "denied";
 }
 
 async function readSoundPath(): Promise<string | undefined> {
@@ -458,29 +510,30 @@ async function dispatchWaitingNotification(sessionId: string, harness: AgentKind
 
   const ctx = contextBySession.get(sessionId);
   const title = titleFor(ctx, harness);
-  const body = bodyFor(ctx, sessionId);
+  const body = bodyFor(ctx, sessionId, harness);
 
   void playWaitingSound();
 
-  // Always push an in-app toast. This is the only signal users get when
-  // the OS notification plugin is unavailable (e.g. `tauri dev` on macOS),
-  // and it doubles as a clickable reminder for users running a real
-  // bundle. The "Open" action fires the same `terminal-focus-requested`
-  // CustomEvent that the OS-notification click path uses.
-  toast(title, {
-    description: body,
-    action: { label: "Open", onClick: () => focusSession(sessionId) },
-  });
+  // Toast is the fallback — fires only when the OS path is definitively
+  // denied. On `"unknown"` we still attempt the OS path so the first send
+  // triggers macOS's authorization prompt and registers the bundle. The
+  // focus state of the window is intentionally NOT consulted: if the user
+  // has enabled notifications they should fire regardless of which window
+  // is foregrounded. The "Open" action fires the same
+  // `terminal-focus-requested` CustomEvent that the OS-notification click
+  // path uses.
+  if (!osNotificationsAvailable()) {
+    toast(title, {
+      description: body,
+      action: { label: "Open", onClick: () => focusSession(sessionId) },
+    });
+    return;
+  }
 
-  // In parallel, fire the OS toast when the user has raum in the
-  // background. Focused windows don't need two signals; skip the OS
-  // toast so we don't stack a macOS notification on top of the in-app one.
-  if (permissionState() === "granted" && (await isWindowUnfocused())) {
-    try {
-      sendNotification({ title, body, extra: { sessionId } });
-    } catch (e) {
-      console.warn("sendNotification failed", e);
-    }
+  try {
+    sendNotification({ title, body, extra: { sessionId } });
+  } catch (e) {
+    console.warn("sendNotification failed", e);
   }
 }
 
@@ -492,31 +545,34 @@ async function dispatchDoneNotification(
   if (!notifyOnDone()) return;
 
   const ctx = contextBySession.get(sessionId);
-  const project = ctx?.projectName ?? "raum";
-  const wt = ctx?.worktreeName ? ` (${ctx.worktreeName})` : "";
-  const finished = doneState === "completed" ? "finished" : "errored";
-  const title = `${project}: ${harness} ${finished}${wt}`;
+  void ctx;
+  const harnessName = kindDisplayLabel(harness);
+  const title = doneState === "completed" ? "Finished" : "Error";
   const body =
-    doneState === "completed" ? "Agent completed successfully." : "Agent encountered an error.";
+    doneState === "completed"
+      ? `${harnessName} finished successfully.`
+      : `${harnessName} hit an error.`;
 
   const soundPath = await readSoundPath();
   if (soundPath) void playSound(soundPath);
 
-  // Always push an in-app toast (click → focuses the pane). The OS toast
-  // is additive and only fires when raum is in the background so users
-  // don't get two notifications for the same event when the window is up.
-  const toastKind = doneState === "completed" ? toast.success : toast.error;
-  toastKind(title, {
-    description: body,
-    action: { label: "Open", onClick: () => focusSession(sessionId) },
-  });
+  // Toast is the fallback when the OS path is denied; click → focuses the
+  // pane. When the OS path is viable (granted or pre-prompt), fire the
+  // system notification regardless of window focus — the user opted in
+  // via the notification settings and we don't second-guess them.
+  if (!osNotificationsAvailable()) {
+    const toastKind = doneState === "completed" ? toast.success : toast.error;
+    toastKind(title, {
+      description: body,
+      action: { label: "Open", onClick: () => focusSession(sessionId) },
+    });
+    return;
+  }
 
-  if (permissionState() === "granted" && (await isWindowUnfocused())) {
-    try {
-      sendNotification({ title, body, extra: { sessionId } });
-    } catch (e) {
-      console.warn("sendNotification failed", e);
-    }
+  try {
+    sendNotification({ title, body, extra: { sessionId } });
+  } catch (e) {
+    console.warn("sendNotification failed", e);
   }
 }
 
@@ -638,7 +694,8 @@ async function dispatchPermissionNotification(payload: NotificationEventPayload)
   if (sessionId && shouldDedupNotify(sessionId, Date.now())) return;
 
   const ctx = payload.session_id ? contextBySession.get(payload.session_id) : undefined;
-  const title = `${ctx?.projectName ?? "raum"}: ${payload.harness} needs permission`;
+  void ctx;
+  const title = "Permission requested";
   const summary = permissionSummaryFor(payload);
 
   void playWaitingSound();
@@ -661,7 +718,7 @@ async function dispatchPermissionNotification(payload: NotificationEventPayload)
     },
   });
 
-  if (permissionState() === "granted") {
+  if (osNotificationsAvailable()) {
     try {
       sendNotification({
         title,
@@ -675,12 +732,13 @@ async function dispatchPermissionNotification(payload: NotificationEventPayload)
 }
 
 function permissionSummaryFor(payload: NotificationEventPayload): string {
+  const harnessName = kindDisplayLabel(payload.harness);
   const p = payload.payload as Record<string, unknown> | null | undefined;
   if (p && typeof p === "object") {
     const tool = typeof p.tool_name === "string" ? p.tool_name : null;
-    if (tool) return `${tool} requires permission — open the terminal to answer.`;
+    if (tool) return `${harnessName} needs permission for ${tool}.`;
   }
-  return "Permission requested — open the terminal to answer.";
+  return `${harnessName} needs permission.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -713,8 +771,10 @@ export function __resetNotificationCenterForTests(): void {
   lastNotifyAt.clear();
   contextBySession.clear();
   setPermissionState("unknown");
+  setNotificationBundleId("");
+  setNotificationDevMode(false);
+  setNotificationStateNote(null);
   lastBadgeCount = -1;
-  windowHandle = null;
   for (const url of audioObjectUrlCache.values()) URL.revokeObjectURL(url);
   audioObjectUrlCache.clear();
   audioInflight.clear();

@@ -43,10 +43,13 @@ import {
 } from "~/lib/theme/themeController";
 import {
   type BadgeMode,
-  ensureNotificationPermission,
-  osNotificationsUnavailable,
+  notificationBundleId,
+  notificationDevMode,
+  notificationStateNote,
+  openNotificationSystemSettings,
   permissionState,
   previewSound,
+  refreshNotificationAuthorization,
   refreshNotificationConfig,
   sendTestNotification,
 } from "../lib/notificationCenter";
@@ -217,14 +220,32 @@ const PermissionBadge: Component = () => {
   const color = () => {
     const s = permissionState();
     return s === "granted"
-      ? "bg-success/15 text-success"
+      ? "bg-success/15 text-success hover:bg-success/25"
       : s === "denied"
-        ? "bg-destructive/15 text-destructive"
-        : "bg-muted text-muted-foreground";
+        ? "bg-destructive/15 text-destructive hover:bg-destructive/25"
+        : "bg-muted text-muted-foreground hover:bg-muted/70";
+  };
+
+  const onClick = async () => {
+    await openNotificationSystemSettings();
+    // Best-effort re-probe a moment after the user returns. The OS pane
+    // opens asynchronously and the user may toggle in either direction;
+    // a delayed refresh covers both cases without polling.
+    window.setTimeout(() => void refreshNotificationAuthorization(), 1500);
   };
 
   return (
-    <span class={cx("rounded px-1.5 py-0.5 text-[10px] font-medium", color())}>{label()}</span>
+    <button
+      type="button"
+      class={cx(
+        "rounded px-1.5 py-0.5 text-[10px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+        color(),
+      )}
+      onClick={onClick}
+      title="Open System Settings → Notifications"
+    >
+      {label()}
+    </button>
   );
 };
 
@@ -713,9 +734,15 @@ const NotificationsSection: Component = () => {
     await previewSound(localSound());
   };
 
-  const handleRequestPermission = async () => {
-    await ensureNotificationPermission();
+  const handleOpenOsSettings = async () => {
+    await openNotificationSystemSettings();
+    window.setTimeout(() => void refreshNotificationAuthorization(), 1500);
   };
+
+  // The Tauri notification plugin's `permission_state` lies (always
+  // "Granted"); re-probe via the backend each time the user opens the
+  // Notifications section so the badge isn't stuck on a stale value.
+  void refreshNotificationAuthorization();
 
   // Label shown in the dropdown trigger. Resolves the current value against
   // the system-sound list so users see "Glass" rather than the absolute path.
@@ -741,16 +768,15 @@ const NotificationsSection: Component = () => {
           </div>
           <div class="flex items-center gap-2">
             <PermissionBadge />
-            <Show when={permissionState() !== "granted" && !osNotificationsUnavailable()}>
-              <button
-                type="button"
-                class="rounded border border-border bg-background px-2 py-0.5 text-[10px] text-foreground transition-colors hover:bg-accent disabled:pointer-events-none disabled:opacity-50"
-                onClick={handleRequestPermission}
-                disabled={saving()}
-              >
-                Request
-              </button>
-            </Show>
+            <button
+              type="button"
+              class="rounded border border-border bg-background px-2 py-0.5 text-[10px] text-foreground transition-colors hover:bg-accent disabled:pointer-events-none disabled:opacity-50"
+              onClick={handleOpenOsSettings}
+              disabled={saving()}
+              title="Open macOS / Linux notification settings"
+            >
+              Open Settings
+            </button>
             <button
               type="button"
               class="rounded border border-border bg-background px-2 py-0.5 text-[10px] text-foreground transition-colors hover:bg-accent disabled:pointer-events-none disabled:opacity-50"
@@ -761,12 +787,14 @@ const NotificationsSection: Component = () => {
             </button>
           </div>
         </div>
-        <Show when={osNotificationsUnavailable()}>
+        <Show when={notificationStateNote()}>
           <p class="rounded border border-warning/30 bg-warning/10 px-2 py-1 text-[10px] text-warning">
-            System notifications unavailable. On macOS this means raum is running unbundled (
-            <code>task dev</code>); the OS only registers signed <code>.app</code> bundles. In-app
-            banners and sound still fire — run <code>task build</code> and launch{" "}
-            <code>target/release/bundle/macos/raum.app</code> to enable real notifications.
+            {notificationStateNote()}
+          </p>
+        </Show>
+        <Show when={notificationBundleId() && !notificationDevMode()}>
+          <p class="text-[10px] text-muted-foreground">
+            Authorization checked for <code>{notificationBundleId()}</code>.
           </p>
         </Show>
       </div>

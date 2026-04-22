@@ -4,6 +4,7 @@ mod cli;
 mod commands;
 mod keymap;
 mod notifications;
+mod path_env;
 mod state;
 
 use raum_core::logging;
@@ -33,6 +34,12 @@ pub fn run() {
 
     let _log_guard = logging::init_tracing(&paths::logs_dir());
     info!("raum starting");
+
+    // Bundled apps launched from Finder inherit a minimal PATH that doesn't
+    // see Homebrew, nvm, or other dev tool locations — so harness binaries
+    // (`claude`, `codex`, `opencode`) fail to resolve. Probe the user's
+    // login shell once here, before any `which::which()` call runs.
+    path_env::augment_process_path();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_decorum::init())
@@ -137,6 +144,8 @@ pub fn run() {
             commands::notifications::config_set_notifications,
             commands::notifications::notifications_list_system_sounds,
             commands::notifications::notifications_read_sound_bytes,
+            commands::notifications::notifications_check_authorization,
+            commands::notifications::notifications_open_system_settings,
             commands::config_set_harness_flags,
             commands::config_set_worktree_path_pattern,
             commands::config_set_appearance_theme,

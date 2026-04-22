@@ -1,8 +1,9 @@
 /**
- * §4.7 — Terminal registry used by `<GlobalSearchPanel>` to iterate every
- * mounted xterm.js buffer. `<TerminalPane>` registers on mount and unregisters
- * on unmount. Kept deliberately framework-free: no Solid signals here because
- * the search panel materializes the set lazily when invoked, not reactively.
+ * §4.7 — Terminal registry used by the spotlight dock's scrollback search
+ * to iterate every mounted xterm.js buffer. `<TerminalPane>` registers on
+ * mount and unregisters on unmount. Kept deliberately framework-free: no
+ * Solid signals here because the search materialises the set lazily when
+ * invoked, not reactively.
  */
 
 import type { IBuffer, Terminal } from "@xterm/xterm";

@@ -361,12 +361,45 @@ mod tests {
         m.on_hook_event(&ev("UserPromptSubmit"));
         let change = m
             .on_hook_event(&HookEvent {
-                payload: serde_json::json!({ "notification_type": "idle_prompt" }),
+                payload: serde_json::json!({ "notification_type": "elicitation_dialog" }),
                 ..ev("Notification")
             })
             .unwrap();
         assert_eq!(change.to, AgentState::Waiting);
         assert_eq!(change.reliability, Reliability::Deterministic);
+    }
+
+    #[test]
+    fn claude_idle_prompt_after_stop_keeps_completed() {
+        // Regression: Claude fires `Notification { notification_type: idle_prompt }`
+        // after the prompt has been idle for a while, which used to flip a
+        // Completed pane back to Waiting and emit a second "attention"
+        // notification on top of the "Finished" one.
+        let mut m = sm();
+        m.on_hook_event(&ev("UserPromptSubmit"));
+        m.on_hook_event(&ev("Stop"));
+        assert_eq!(m.state(), AgentState::Completed);
+        let change = m.on_hook_event(&HookEvent {
+            payload: serde_json::json!({ "notification_type": "idle_prompt" }),
+            ..ev("Notification")
+        });
+        assert!(change.is_none(), "idle_prompt must not change state");
+        assert_eq!(m.state(), AgentState::Completed);
+    }
+
+    #[test]
+    fn claude_permission_prompt_notification_is_ignored() {
+        // The synchronous `PermissionRequest` hook is what promotes to
+        // Waiting; the non-blocking `Notification { notification_type:
+        // permission_prompt }` echo must not drive a transition on its own.
+        let mut m = sm();
+        m.on_hook_event(&ev("UserPromptSubmit"));
+        let change = m.on_hook_event(&HookEvent {
+            payload: serde_json::json!({ "notification_type": "permission_prompt" }),
+            ..ev("Notification")
+        });
+        assert!(change.is_none());
+        assert_eq!(m.state(), AgentState::Working);
     }
 
     #[test]
@@ -529,7 +562,7 @@ mod tests {
         let mut m = sm().with_silence_threshold(Duration::from_millis(500));
         m.on_hook_event(&ev("UserPromptSubmit"));
         m.on_hook_event(&HookEvent {
-            payload: serde_json::json!({ "notification_type": "idle_prompt" }),
+            payload: serde_json::json!({ "notification_type": "elicitation_dialog" }),
             ..ev("Notification")
         });
         assert_eq!(m.state(), AgentState::Waiting);
@@ -561,7 +594,7 @@ mod tests {
         m.on_hook_event(&ev("UserPromptSubmit"));
         assert!(m.activity_armed());
         m.on_hook_event(&HookEvent {
-            payload: serde_json::json!({ "notification_type": "idle_prompt" }),
+            payload: serde_json::json!({ "notification_type": "elicitation_dialog" }),
             ..ev("Notification")
         });
         assert!(!m.activity_armed());
@@ -574,7 +607,7 @@ mod tests {
         let mut m = sm().with_silence_threshold(Duration::from_millis(100));
         m.on_hook_event(&ev("UserPromptSubmit"));
         m.on_hook_event(&HookEvent {
-            payload: serde_json::json!({ "notification_type": "idle_prompt" }),
+            payload: serde_json::json!({ "notification_type": "elicitation_dialog" }),
             ..ev("Notification")
         });
         // Harness is quiet and deterministically waiting — silence tick must

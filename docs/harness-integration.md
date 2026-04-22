@@ -145,9 +145,12 @@ Every session moves through `idle → working → waiting → completed` (or
 The waiting-state classifier is payload-aware:
 
 - Claude Code `Notification` only counts as waiting when
-  `notification_type` is one of `permission_prompt`, `idle_prompt`, or
-  `elicitation_dialog`; non-interactive notifications like
-  `auth_success` are ignored.
+  `notification_type` is `elicitation_dialog` (MCP elicitation prompt,
+  no synchronous counterpart). `permission_prompt` is a non-blocking
+  echo of the synchronous `PermissionRequest` hook that already drives
+  waiting, and `idle_prompt` (the prompt has been idle waiting for
+  input) is observational — it must not flip a finished pane back to
+  waiting. `auth_success` and anything else is ignored.
 - Codex `notify` payloads are not treated as generic waiting-state.
 - Unknown notifications are ignored rather than being collapsed into
   `waiting`.

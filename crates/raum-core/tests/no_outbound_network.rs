@@ -153,7 +153,7 @@ fn waiting_burst_uses_no_network() {
         event: "Notification".into(),
         source: None,
         reliability: None,
-        payload: serde_json::json!({ "notification_type": "idle_prompt" }),
+        payload: serde_json::json!({ "notification_type": "elicitation_dialog" }),
     };
 
     let mut waiting_count = 0usize;

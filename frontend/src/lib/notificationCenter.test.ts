@@ -135,8 +135,8 @@ describe("notification center badge modes", () => {
     expect(pendingPermissionCount()).toBe(1);
     expect(mockSendNotification).toHaveBeenCalledTimes(1);
     expect(mockSendNotification.mock.calls[0]?.[0]).toMatchObject({
-      title: "raum: codex needs permission",
-      body: "shell requires permission — open the terminal to answer.",
+      title: "Permission requested",
+      body: "Codex needs permission for shell.",
       extra: { sessionId: "codex-1" },
     });
     expect(mockSendNotification.mock.calls[0]?.[0]).not.toHaveProperty("actions");
@@ -146,7 +146,8 @@ describe("notification center badge modes", () => {
       string,
       { description: string; duration: number; onDismiss: () => void } | undefined,
     ];
-    expect(title).toBe("raum: codex needs permission");
+    expect(title).toBe("Permission requested");
+    expect(opts?.description).toBe("Codex needs permission for shell.");
     expect(opts?.duration).toBe(Number.POSITIVE_INFINITY);
   });
 

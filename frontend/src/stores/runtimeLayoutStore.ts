@@ -72,6 +72,8 @@ export interface ActiveLayoutCell {
   h: number;
   kind: CellKind;
   title?: string;
+  project_slug?: string;
+  worktree_id?: string;
   active_tab_id: string;
   tabs: ActiveLayoutTab[];
 }
@@ -282,6 +284,8 @@ function scheduleActiveSave(): void {
         h: c.h,
         kind: c.kind,
         title: c.title,
+        project_slug: c.projectSlug,
+        worktree_id: c.worktreeId,
         active_tab_id: c.activeTabId,
         tabs: c.tabs.map((t) => ({
           id: t.id,

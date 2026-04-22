@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import { invoke } from "@tauri-apps/api/core";
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn().mockResolvedValue(undefined),
@@ -62,6 +63,8 @@ function pane(id: string, overrides: Partial<PaneContent> = {}): PaneContent {
 
 describe("runtimeLayoutStore (BSP)", () => {
   beforeEach(() => {
+    vi.useRealTimers();
+    vi.clearAllMocks();
     __resetRuntimeLayoutForTests();
   });
 
@@ -153,6 +156,36 @@ describe("runtimeLayoutStore (BSP)", () => {
     const tabId = runtimeLayoutStore.cells[0].tabs[0].id;
     setTabSessionId("a", tabId, "my-session");
     expect(runtimeLayoutStore.cells[0].tabs[0].sessionId).toBe("my-session");
+  });
+
+  it("setRuntimeLayout persists pane-scoped project context in active layout saves", async () => {
+    vi.useFakeTimers();
+    setRuntimeLayout([
+      cell("a", {
+        kind: "claude-code",
+        projectSlug: "acme",
+        worktreeId: "/tmp/acme-main",
+        tabs: [{ id: "tab-a", sessionId: "raum-a" }],
+        activeTabId: "tab-a",
+      }),
+    ]);
+
+    await vi.advanceTimersByTimeAsync(500);
+
+    expect(invoke).toHaveBeenCalledWith(
+      "active_layout_save",
+      expect.objectContaining({
+        layout: expect.objectContaining({
+          cells: [
+            expect.objectContaining({
+              project_slug: "acme",
+              worktree_id: "/tmp/acme-main",
+              tabs: [expect.objectContaining({ session_id: "raum-a" })],
+            }),
+          ],
+        }),
+      }),
+    );
   });
 
   it("addCellTab appends a new tab and makes it active", () => {
