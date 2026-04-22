@@ -97,7 +97,7 @@ jobs:
       - name: install frontend
         working-directory: frontend
         run: bun install --frozen-lockfile
-      - uses: tauri-apps/tauri-action@v0
+      - uses: tauri-apps/tauri-action@v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # macOS signing/notarization (see docs/release.md):
