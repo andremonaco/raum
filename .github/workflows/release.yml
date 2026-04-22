@@ -100,13 +100,14 @@ jobs:
       - uses: tauri-apps/tauri-action@v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # macOS signing/notarization (see docs/release.md):
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # Apple signing/notarization env vars are intentionally omitted
+          # until the APPLE_CERTIFICATE / APPLE_ID / etc. secrets are
+          # configured. tauri-action with an empty APPLE_CERTIFICATE
+          # tries `security import` against an empty cert and the whole
+          # macOS build aborts; omitting the env vars makes tauri-action
+          # honour bundle.macOS.signingIdentity = "-" (ad-hoc sign) from
+          # src-tauri/tauri.conf.json. Restore these envs alongside
+          # secret setup when we move to full Developer ID notarization.
           # Tauri updater key for signing the update artifacts:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
