@@ -58,6 +58,7 @@ import {
   movePaneToRootEdge,
   nextCellId,
   nextTabId,
+  pruneTreeByProject,
   removeCellTab,
   removePane,
   runtimeLayoutStore,
@@ -81,8 +82,15 @@ import type { AgentState } from "../stores/agentStore";
 import { terminalStore } from "../stores/terminalStore";
 import { worktreesByProject } from "../stores/worktreeStore";
 import { kindDisplayLabel, type AgentKind } from "../lib/agentKind";
-import { AlertCircleIcon, CheckIcon, HARNESS_ICONS, LoaderIcon } from "./icons";
-import { activeProjectSlug } from "../stores/projectStore";
+import { AlertCircleIcon, CheckIcon, ClockIcon, HARNESS_ICONS, LoaderIcon } from "./icons";
+import {
+  activeProjectSlug,
+  projectColor,
+  projectStore,
+  setActiveProjectSlug,
+} from "../stores/projectStore";
+import { crossProjectViewMode, setCrossProjectViewMode } from "./top-row";
+import type { CrossProjectViewMode } from "./top-row";
 import { extractSnippet } from "../lib/terminalSnippet";
 import { Dock } from "./dock";
 import { beginDrag, dragState, ROOT_TARGET, type DropZone } from "../lib/paneDnD";
@@ -111,9 +119,32 @@ const KIND_LABELS: Record<string, string> = {
 export const TerminalGrid: Component = () => {
   const [rootEl, setRootEl] = createSignal<HTMLDivElement | null>(null);
 
+  // Pruned tree for the active project tab — drops every leaf whose pane
+  // belongs to a different project. Shell panes (no projectSlug) survive.
+  // The full tree in the store is untouched, so per-project layouts persist
+  // across tab switches.
+  const activeTree = createMemo<LayoutNode | null>(() =>
+    pruneTreeByProject(runtimeLayoutStore.tree, activeProjectSlug(), runtimeLayoutStore.panes),
+  );
+
+  // Projection of `activeTree` to rects, keyed by leaf id. Each LeafFrame
+  // reads its own rect from this map so geometry reflects the pruned view.
+  const activeRectMap = createMemo<Map<string, Rect>>(() => {
+    const tree = activeTree();
+    if (!tree) return new Map();
+    return new Map(projectToRects(tree, LAYOUT_UNIT).map((r) => [r.id, r]));
+  });
+
+  // Cells that belong to the active tree, preserving store identity so xterm
+  // instances stay mounted across `activeTree` recomputes.
+  const activeCells = createMemo(() => {
+    const map = activeRectMap();
+    return runtimeLayoutStore.cells.filter((c) => map.has(c.id));
+  });
+
   const visibleCells = createMemo(() => {
     const minimized = minimizedPaneIds();
-    return runtimeLayoutStore.cells.filter((c) => !minimized.has(c.id));
+    return activeCells().filter((c) => !minimized.has(c.id));
   });
 
   type SpawnKind = "shell" | "claude-code" | "codex" | "opencode";
@@ -217,7 +248,7 @@ export const TerminalGrid: Component = () => {
   // Mutation replay mirrors onDrop exactly (swap vs. split, root vs. pane).
   const previewTree = createMemo<LayoutNode | null>(() => {
     const s = dragState();
-    const base = runtimeLayoutStore.tree;
+    const base = activeTree();
     if (!s || !s.targetId || !s.zone || !base) return null;
     if (s.sourceId === s.targetId) return null;
 
@@ -248,11 +279,20 @@ export const TerminalGrid: Component = () => {
   // Tree passed to DividerLayer — preview while hovering a zone so dividers
   // reflow with the panes (otherwise they'd be stuck at pre-drag positions
   // while panes animate to projected ones). Falls back to the real tree.
-  const renderTree = createMemo<LayoutNode | null>(() => previewTree() ?? runtimeLayoutStore.tree);
+  const renderTree = createMemo<LayoutNode | null>(() => previewTree() ?? activeTree());
 
   return (
     <div class="flex h-full w-full flex-col">
-      {/* The grid canvas fills the entire main region with zero outer
+      {/* Views are filters over the global terminal store. `crossProjectViewMode`
+          non-null => render a flat cross-project grid (awaiting/recent/working)
+          instead of the per-project BSP layout. Each session has a single live
+          TerminalPane mounted in exactly one view at a time, so there's never
+          a double attach to the same tmux session. */}
+      <Show
+        when={crossProjectViewMode() === null}
+        fallback={<CrossProjectView mode={crossProjectViewMode()!} />}
+      >
+        {/* The grid canvas fills the entire main region with zero outer
           padding — the chrome (top-row, sidebar, dock) is `bg-background`
           and the canvas is `var(--selected)`, so the colour contrast IS the
           visual separation, no padding moat required. This keeps the gap
@@ -260,89 +300,101 @@ export const TerminalGrid: Component = () => {
           own internal slack (≈6 px above buttons, 6 px below = canvas top),
           and matches the canvas's left/right/bottom against sidebar/right
           edge/dock with the same hairline contrast on every side. */}
-      <div class="flex-1 min-h-0 overflow-hidden bg-background">
-        <div
-          class="relative h-full w-full overflow-hidden rounded-xl"
-          ref={setRootEl}
-          data-dnd-root="true"
-        >
-          {/* Empty-state spawn button grid. */}
-          <Show when={visibleCells().length === 0}>
-            <div
-              class="absolute inset-0 z-10 grid h-full w-full gap-px bg-border-subtle"
-              style={{
-                "grid-template-columns": `repeat(${Math.min(availableKinds()?.length ?? 1, 2)}, 1fr)`,
-              }}
-            >
-              <For each={availableKinds() ?? []}>
-                {(kind) => {
-                  const Icon = HARNESS_ICONS[kind];
-                  const disabled = () => !canSpawnKind(kind);
-                  return (
-                    <button
-                      type="button"
-                      class="group flex flex-col items-center justify-center gap-3 bg-surface-sunken text-foreground-dim transition-colors duration-[var(--motion-base)] ease-[var(--motion-ease)] hover:bg-hover hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-surface-sunken disabled:hover:text-foreground-dim"
-                      disabled={disabled()}
-                      title={disabled() ? "Add a project before spawning a harness" : undefined}
-                      onClick={() => {
-                        if (disabled()) return;
-                        window.dispatchEvent(
-                          new CustomEvent("raum:spawn-requested", {
-                            detail: { kind, projectSlug: activeProjectSlug() },
-                          }),
-                        );
-                      }}
-                    >
-                      <Icon class="size-7 transition-transform group-hover:scale-110" />
-                      <span class="text-[11px] uppercase tracking-widest">{KIND_LABELS[kind]}</span>
-                    </button>
-                  );
+        <div class="flex-1 min-h-0 overflow-hidden bg-background">
+          <div
+            class="relative h-full w-full overflow-hidden rounded-xl"
+            ref={setRootEl}
+            data-dnd-root="true"
+          >
+            {/* Empty-state spawn button grid. */}
+            <Show when={visibleCells().length === 0}>
+              <div
+                class="absolute inset-0 z-10 grid h-full w-full gap-px bg-border-subtle"
+                style={{
+                  "grid-template-columns": `repeat(${Math.min(availableKinds()?.length ?? 1, 2)}, 1fr)`,
                 }}
-              </For>
-            </div>
-          </Show>
+              >
+                <For each={availableKinds() ?? []}>
+                  {(kind) => {
+                    const Icon = HARNESS_ICONS[kind];
+                    const disabled = () => !canSpawnKind(kind);
+                    return (
+                      <button
+                        type="button"
+                        class="group flex flex-col items-center justify-center gap-3 bg-surface-sunken text-foreground-dim transition-colors duration-[var(--motion-base)] ease-[var(--motion-ease)] hover:bg-hover hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-surface-sunken disabled:hover:text-foreground-dim"
+                        disabled={disabled()}
+                        title={disabled() ? "Add a project before spawning a harness" : undefined}
+                        onClick={() => {
+                          if (disabled()) return;
+                          window.dispatchEvent(
+                            new CustomEvent("raum:spawn-requested", {
+                              detail: { kind, projectSlug: activeProjectSlug() },
+                            }),
+                          );
+                        }}
+                      >
+                        <Icon class="size-7 transition-transform group-hover:scale-110" />
+                        <span class="text-[11px] uppercase tracking-widest">
+                          {KIND_LABELS[kind]}
+                        </span>
+                      </button>
+                    );
+                  }}
+                </For>
+              </div>
+            </Show>
 
-          {/* PANE LAYER: flat absolute-positioned leaves keyed by id. Only
+            {/* PANE LAYER: flat absolute-positioned leaves keyed by id. Only
             position/size changes on layout mutations; the xterm inside each
             stays mounted. While a drag is hovering a valid drop zone, every
             non-dragging pane renders at its PREVIEW position; the dragging
             pane stays anchored at its original slot so the cursor-follow
             transform (translate by pointer-delta) stays coherent. */}
-          <Show when={runtimeLayoutStore.cells.length > 0}>
-            <For each={runtimeLayoutStore.cells}>
-              {(cell) => {
-                const effective = createMemo<RuntimeCell>(() => {
-                  const map = previewCellMap();
-                  if (!map) return cell;
-                  // The dragging pane floats at the cursor — keep its CSS
-                  // base at its original slot so translate(pointer-delta)
-                  // positions it correctly. Other panes follow the preview.
-                  if (dragState()?.sourceId === cell.id) return cell;
-                  const projected = map.get(cell.id);
-                  if (!projected) return cell;
-                  return {
-                    ...cell,
-                    x: projected.x,
-                    y: projected.y,
-                    w: projected.w,
-                    h: projected.h,
-                  };
-                });
-                return <LeafFrame cell={effective()} />;
-              }}
-            </For>
-          </Show>
+            <Show when={activeCells().length > 0}>
+              <For each={activeCells()}>
+                {(cell) => {
+                  const effective = createMemo<RuntimeCell>(() => {
+                    // The dragging pane floats at the cursor — keep its CSS
+                    // base at its original slot so translate(pointer-delta)
+                    // positions it correctly. Other panes follow the preview
+                    // during drag, or the active-tree projection otherwise.
+                    if (dragState()?.sourceId === cell.id) return cell;
+                    const preview = previewCellMap()?.get(cell.id);
+                    if (preview) {
+                      return {
+                        ...cell,
+                        x: preview.x,
+                        y: preview.y,
+                        w: preview.w,
+                        h: preview.h,
+                      };
+                    }
+                    const active = activeRectMap().get(cell.id);
+                    if (!active) return cell;
+                    return {
+                      ...cell,
+                      x: active.x,
+                      y: active.y,
+                      w: active.w,
+                      h: active.h,
+                    };
+                  });
+                  return <LeafFrame cell={effective()} />;
+                }}
+              </For>
+            </Show>
 
-          {/* DIVIDER LAYER: overlay that reads the tree separately. During
+            {/* DIVIDER LAYER: overlay that reads the tree separately. During
             drag we feed it the preview tree so dividers reflow with the
             panes instead of being left behind at pre-drag positions. */}
-          <DividerLayer tree={renderTree()} />
+            <DividerLayer tree={renderTree()} />
 
-          {/* No drop-zone or landing overlays. The live reflow of the grid
+            {/* No drop-zone or landing overlays. The live reflow of the grid
             under the cursor *is* the feedback; extra overlay layers caused
             continuous repaints on the xterm canvases beneath them. */}
+          </div>
         </div>
-      </div>
+      </Show>
       <Dock onRestore={onRestoreFromDock} />
     </div>
   );
@@ -650,14 +702,21 @@ const PaneHeader: Component<PaneHeaderProps> = (props) => {
       // Snapshot the cells so hit-testing uses the stable REAL layout
       // throughout the drag, not the live (animating) DOM bounds. See
       // BeginDragOptions.cells for the rationale — mixing animating rects
-      // with the cursor created a target/preview feedback loop.
-      const cellsSnapshot = runtimeLayoutStore.cells.map((c) => ({
-        id: c.id,
-        x: c.x,
-        y: c.y,
-        w: c.w,
-        h: c.h,
-      }));
+      // with the cursor created a target/preview feedback loop. Scope the
+      // snapshot to the active project's pruned tree so DnD can't target
+      // panes from other tabs that aren't in the DOM.
+      const prunedTree = pruneTreeByProject(
+        runtimeLayoutStore.tree,
+        activeProjectSlug(),
+        runtimeLayoutStore.panes,
+      );
+      const prunedRects = prunedTree
+        ? new Map(projectToRects(prunedTree, LAYOUT_UNIT).map((r) => [r.id, r]))
+        : new Map<string, Rect>();
+      const cellsSnapshot = runtimeLayoutStore.cells.flatMap((c) => {
+        const r = prunedRects.get(c.id);
+        return r ? [{ id: c.id, x: r.x, y: r.y, w: r.w, h: r.h }] : [];
+      });
       beginDrag({
         sourceId: props.cellId,
         sourceKind: props.kind,
@@ -1021,3 +1080,227 @@ function CloseGlyph() {
     </svg>
   );
 }
+
+// ---- CrossProjectView: flat filter over the global terminal store ----------
+//
+// When `crossProjectViewMode()` is non-null, the grid renders this view in
+// place of the BSP per-project layout. It's a pure filter+sort over
+// `terminalStore.byId`: "awaiting" shows all sessions whose agent state is
+// `waiting`, "working" shows all `working`, and "recent" shows the 9 most
+// recent sessions regardless of state, sorted by `lastOutputMs` desc.
+//
+// Each tile hosts a full live `TerminalPane` — the tile IS the terminal.
+// Project color frames the tile and accents the slim header strip. Clicking
+// the header switches `activeProjectSlug` and clears the mode so the BSP view
+// reopens on the corresponding pane; Escape clears the mode without switching
+// projects.
+
+const RECENT_CAP = 9;
+
+interface MatchedSession {
+  sessionId: string;
+  kind: AgentKind;
+  projectSlug: string;
+  worktreeId: string | null;
+  projectName: string;
+  projectColor: string;
+  state: AgentState | null;
+  lastActivity: number;
+}
+
+function filterMatches(mode: CrossProjectViewMode, state: AgentState | null | undefined): boolean {
+  if (mode === "awaiting") return state === "waiting";
+  if (mode === "working") return state === "working";
+  return true; // recent — any state
+}
+
+function projectNameFor(slug: string | null | undefined): string {
+  if (!slug) return "unknown";
+  return projectStore.items.find((p) => p.slug === slug)?.name ?? slug;
+}
+
+function stateChip(state: AgentState | null): { label: string; tone: string } {
+  if (state === "working") return { label: "Working", tone: "bg-success/15 text-success" };
+  if (state === "waiting") return { label: "Waiting", tone: "bg-warning/15 text-warning" };
+  if (state === "errored") return { label: "Errored", tone: "bg-danger/15 text-danger" };
+  if (state === "completed")
+    return { label: "Completed", tone: "bg-muted/30 text-foreground-subtle" };
+  return { label: "Idle", tone: "bg-muted/30 text-foreground-subtle" };
+}
+
+function relativeAgo(ms: number): string {
+  if (!ms) return "";
+  const s = (Date.now() - ms) / 1000;
+  if (s < 60) return `${Math.floor(s)}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  if (s < 86_400) return `${Math.floor(s / 3600)}h`;
+  return `${Math.floor(s / 86_400)}d`;
+}
+
+function headerLabel(mode: CrossProjectViewMode): string {
+  if (mode === "awaiting") return "Awaiting across projects";
+  if (mode === "working") return "Working across projects";
+  return "Recent across projects";
+}
+
+function headerIcon(mode: CrossProjectViewMode): typeof AlertCircleIcon {
+  if (mode === "awaiting") return AlertCircleIcon;
+  if (mode === "working") return LoaderIcon;
+  return ClockIcon;
+}
+
+interface CrossProjectViewProps {
+  mode: CrossProjectViewMode;
+}
+
+const CrossProjectView: Component<CrossProjectViewProps> = (props) => {
+  const matched = createMemo<MatchedSession[]>(() => {
+    const out: MatchedSession[] = [];
+    for (const terminal of Object.values(terminalStore.byId)) {
+      if (!terminal.project_slug) continue;
+      const state = agentStore.sessions[terminal.session_id]?.state ?? null;
+      if (!filterMatches(props.mode, state)) continue;
+      out.push({
+        sessionId: terminal.session_id,
+        kind: terminal.kind,
+        projectSlug: terminal.project_slug,
+        worktreeId: terminal.worktree_id,
+        projectName: projectNameFor(terminal.project_slug),
+        projectColor: projectColor(terminal.project_slug) ?? "#6b7280",
+        state,
+        lastActivity: terminal.lastOutputMs || terminal.created_unix * 1000,
+      });
+    }
+    out.sort((a, b) => b.lastActivity - a.lastActivity);
+    if (props.mode === "recent") return out.slice(0, RECENT_CAP);
+    return out;
+  });
+
+  onMount(() => {
+    function onKey(ev: KeyboardEvent): void {
+      if (ev.key === "Escape" && crossProjectViewMode() !== null) {
+        ev.preventDefault();
+        setCrossProjectViewMode(null);
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    onCleanup(() => window.removeEventListener("keydown", onKey));
+  });
+
+  const Icon = () => {
+    const I = headerIcon(props.mode);
+    return <I class="size-3.5 text-foreground" />;
+  };
+
+  return (
+    <div class="flex flex-1 min-h-0 flex-col bg-background">
+      <div class="flex items-center justify-between border-b border-border-subtle px-4 py-1.5">
+        <div class="flex items-center gap-2">
+          <Icon />
+          <h2 class="text-xs font-medium text-foreground">{headerLabel(props.mode)}</h2>
+          <span class="text-[11px] text-foreground-subtle">
+            {matched().length} {matched().length === 1 ? "session" : "sessions"}
+          </span>
+        </div>
+        <button
+          type="button"
+          class="rounded px-2 py-0.5 text-[11px] text-foreground-subtle hover:bg-hover hover:text-foreground"
+          onClick={() => setCrossProjectViewMode(null)}
+        >
+          Close (Esc)
+        </button>
+      </div>
+
+      <Show
+        when={matched().length > 0}
+        fallback={
+          <div class="flex flex-1 items-center justify-center text-sm text-foreground-subtle">
+            No matching sessions across your projects.
+          </div>
+        }
+      >
+        <div class="flex-1 overflow-auto p-3">
+          <div class="grid grid-cols-[repeat(auto-fill,minmax(360px,1fr))] gap-3">
+            <For each={matched()}>{(entry) => <CrossProjectTile entry={entry} />}</For>
+          </div>
+        </div>
+      </Show>
+    </div>
+  );
+};
+
+const CrossProjectTile: Component<{ entry: MatchedSession }> = (props) => {
+  const HarnessIcon = () => {
+    const I = HARNESS_ICONS[props.entry.kind as keyof typeof HARNESS_ICONS];
+    return I ? <I class="size-3.5 shrink-0" /> : null;
+  };
+  const chip = () => stateChip(props.entry.state);
+
+  // Soft project-colored wash over the header strip. Border uses the saturated
+  // color so the frame reads as "this terminal belongs to <project>".
+  const headerStyle = () => {
+    const c = props.entry.projectColor;
+    return {
+      "background-image": `linear-gradient(180deg, ${c}40 0%, ${c}14 60%, transparent 100%)`,
+      "box-shadow": `inset 0 1px 0 ${c}66, inset 0 -1px 0 ${c}1f`,
+    } as Record<string, string>;
+  };
+
+  function jumpToProject(): void {
+    const slug = props.entry.projectSlug;
+    const sessionId = props.entry.sessionId;
+    if (activeProjectSlug() !== slug) setActiveProjectSlug(slug);
+    setCrossProjectViewMode(null);
+    queueMicrotask(() => {
+      try {
+        window.dispatchEvent(
+          new CustomEvent("terminal-focus-requested", {
+            detail: { sessionId },
+          }),
+        );
+      } catch {
+        /* non-DOM env (tests) */
+      }
+    });
+  }
+
+  return (
+    <div
+      class="flex flex-col overflow-hidden rounded-md border-2 bg-background"
+      style={{ "border-color": props.entry.projectColor }}
+    >
+      <button
+        type="button"
+        class="flex items-center gap-2 px-3 py-1.5 text-left hover:bg-hover/50"
+        style={headerStyle()}
+        onClick={jumpToProject}
+        title="Jump to this terminal in its project"
+      >
+        <span
+          class="inline-block size-2 shrink-0 rounded-full"
+          style={{ "background-color": props.entry.projectColor }}
+        />
+        <span class="truncate text-xs font-medium text-foreground">{props.entry.projectName}</span>
+        <HarnessIcon />
+        <span class="truncate text-[11px] text-foreground-subtle">
+          {kindDisplayLabel(props.entry.kind)}
+        </span>
+        <span class={`ml-auto rounded px-1.5 py-0.5 text-[10px] font-medium ${chip().tone}`}>
+          {chip().label}
+        </span>
+        <span class="shrink-0 text-[10px] text-foreground-subtle">
+          {relativeAgo(props.entry.lastActivity)}
+        </span>
+      </button>
+      <div class="relative aspect-[16/10] min-h-0 flex-1">
+        <TerminalPane
+          kind={props.entry.kind}
+          sessionId={props.entry.sessionId}
+          projectSlug={props.entry.projectSlug}
+          worktreeId={props.entry.worktreeId ?? undefined}
+          borderColor="transparent"
+        />
+      </div>
+    </div>
+  );
+};

@@ -95,7 +95,11 @@ send_fire_and_forget() {{
   JSON=$(printf '{{"harness":"%s","event":"%s","session_id":%s,"payload":%s}}\n' \
     "{harness}" "$EVENT_NAME" "$SESSION_JSON" "$QUOTED_PAYLOAD")
   if command -v socat >/dev/null 2>&1; then
-    printf '%s' "$JSON" | socat - UNIX-CONNECT:"$SOCK" || true
+    # `-u` = unidirectional (stdin → socket). socat exits on stdin EOF
+    # instead of waiting for the peer to fully close, which on some
+    # Linux builds it never detects promptly even when the peer has
+    # dropped the connection.
+    printf '%s' "$JSON" | socat -u - UNIX-CONNECT:"$SOCK" || true
   elif command -v nc >/dev/null 2>&1; then
     printf '%s' "$JSON" | nc -U "$SOCK" || true
   elif command -v python3 >/dev/null 2>&1; then

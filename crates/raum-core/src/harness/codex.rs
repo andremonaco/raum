@@ -715,7 +715,10 @@ ENVELOPE=$(printf '{"harness":"codex","event":"Notification","source":"notify","
   "$SESSION_JSON" "$PAYLOAD")
 
 if command -v socat >/dev/null 2>&1; then
-  printf '%s' "$ENVELOPE" | socat - UNIX-CONNECT:"$SOCK" || true
+  # `-u` = unidirectional (stdin → socket); exits on stdin EOF rather
+  # than waiting on the peer, which some Linux socat builds are slow
+  # to notice even after the server closes the socket.
+  printf '%s' "$ENVELOPE" | socat -u - UNIX-CONNECT:"$SOCK" || true
 elif command -v nc >/dev/null 2>&1; then
   printf '%s' "$ENVELOPE" | nc -U "$SOCK" || true
 elif command -v python3 >/dev/null 2>&1; then

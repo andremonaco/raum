@@ -87,6 +87,27 @@ export const HYDRATION_CHOICE_META: Record<
   none: { label: "Skip", icon: HydrationSkipIcon },
 };
 
+const HYDRATION_CHOICE_COLOR: Record<
+  HydrationChoice,
+  { icon: string; text: string; button: string }
+> = {
+  copy: {
+    icon: "text-emerald-400",
+    text: "text-emerald-200",
+    button: "bg-emerald-500/20 text-emerald-200",
+  },
+  symlink: {
+    icon: "text-sky-400",
+    text: "text-sky-200",
+    button: "bg-sky-500/20 text-sky-200",
+  },
+  none: {
+    icon: "text-muted-foreground",
+    text: "",
+    button: "",
+  },
+};
+
 // ---- row component ----------------------------------------------------------
 
 interface FileTreeRowProps {
@@ -195,7 +216,11 @@ const FileTreeRow: Component<FileTreeRowProps> = (props) => {
           </span>
 
           {/* Icon */}
-          <span class="shrink-0 text-muted-foreground" aria-hidden="true">
+          <span
+            class="shrink-0 transition-colors"
+            classList={{ [HYDRATION_CHOICE_COLOR[currentChoice()].icon]: true }}
+            aria-hidden="true"
+          >
             <Show
               when={props.node.isDir}
               fallback={
@@ -229,7 +254,12 @@ const FileTreeRow: Component<FileTreeRowProps> = (props) => {
           </span>
 
           {/* Name */}
-          <span class="min-w-0 flex-1 truncate font-mono text-[11px]">
+          <span
+            class="min-w-0 flex-1 truncate font-mono text-[11px] transition-colors"
+            classList={{
+              [HYDRATION_CHOICE_COLOR[currentChoice()].text]: currentChoice() !== "none",
+            }}
+          >
             {props.node.name}
             <Show when={props.node.isDir}>
               <span class="text-muted-foreground">/</span>
@@ -247,7 +277,7 @@ const FileTreeRow: Component<FileTreeRowProps> = (props) => {
                   type="button"
                   class="flex h-5 w-5 items-center justify-center rounded transition-colors"
                   classList={{
-                    "bg-accent text-accent-foreground": currentChoice() === choice,
+                    [HYDRATION_CHOICE_COLOR[choice].button]: currentChoice() === choice,
                     "text-muted-foreground hover:text-foreground": currentChoice() !== choice,
                   }}
                   onClick={() => handleToggle(choice)}

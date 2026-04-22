@@ -5,7 +5,6 @@ import { isPermissionGranted, sendNotification } from "@tauri-apps/plugin-notifi
 import { TopRow } from "./components/top-row";
 import { Sidebar } from "./components/sidebar";
 import { TerminalGrid } from "./components/terminal-grid";
-import { CrossProjectOverlay } from "./components/cross-project-overlay";
 import { OnboardingWizard } from "./components/onboarding-wizard";
 import { SpotlightDock } from "./components/spotlight-dock";
 import { Toaster } from "./components/ui/sonner";
@@ -176,7 +175,6 @@ const App: Component = () => {
           <Sidebar />
           <main class="relative flex-1 min-w-0 overflow-hidden">
             <TerminalGrid />
-            <CrossProjectOverlay />
           </main>
         </div>
         <Show when={showWizard()}>

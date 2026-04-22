@@ -60,11 +60,7 @@ import {
   type ProjectListItem,
 } from "../stores/projectStore";
 import { agentStore, type AgentListItem } from "../stores/agentStore";
-import {
-  harnessCountsForProject,
-  harnessCountsForWorktree,
-  terminalStore,
-} from "../stores/terminalStore";
+import { harnessCountsForWorktree, terminalStore } from "../stores/terminalStore";
 import { ActivityIcon, AlertCircleIcon, CheckIcon, LoaderIcon, PlusIcon } from "./icons";
 import { CreateWorktreeModal } from "./create-worktree-modal";
 import { Button } from "./ui/button";
@@ -1236,15 +1232,6 @@ const ProjectSection: Component<ProjectSectionProps> = (sectionProps) => {
     filteredItems().filter((wt) => wt.path !== sectionProps.project.rootPath),
   );
 
-  // Project-scoped harness totals from the shared terminal store. This
-  // includes sessions attached to the project root even when no specific
-  // worktree id is set.
-  const projectCounts = createMemo(() => harnessCountsForProject(sectionProps.project.slug));
-  const projectTotal = createMemo(() => {
-    const c = projectCounts();
-    return c.active + c.waiting + c.idle;
-  });
-
   return (
     <section class="mb-2">
       <Show
@@ -1255,26 +1242,10 @@ const ProjectSection: Component<ProjectSectionProps> = (sectionProps) => {
           </p>
         }
       >
-        {/* Card container — groups main + worktrees visually */}
+        {/* Card container — groups main + worktrees visually. The project
+            identity (color, sigil, name) lives in the top-bar tab, so this
+            section shows only the active project's root + worktrees. */}
         <div class="overflow-hidden rounded-md">
-          {/* Project header — name + aggregated harness counter */}
-          <div class="flex items-center justify-between gap-2 bg-panel px-2 py-1">
-            <span class="flex min-w-0 items-center gap-1.5">
-              <span
-                class="inline-flex w-3 shrink-0 select-none items-center justify-center font-mono text-[11px] leading-none tabular-nums"
-                style={{ color: sectionProps.project.color }}
-                aria-hidden="true"
-              >
-                {sectionProps.project.sigil}
-              </span>
-              <span class="truncate font-mono text-[11px] font-medium text-foreground">
-                {sectionProps.project.name}
-              </span>
-            </span>
-            <Show when={projectTotal() > 0}>
-              <HarnessCounter counts={projectCounts()} />
-            </Show>
-          </div>
           {/* Main worktree — slightly elevated background */}
           <Show when={mainWorktree()}>
             {(main) => (
@@ -1488,14 +1459,19 @@ export const Sidebar: Component = () => {
     });
   };
 
-  // Fetch worktrees for all projects when collapsed so the mini-view has data.
-  // When expanded, each ProjectSection mounts and fetches its own worktrees.
-  // When collapsed, ProjectSection is not mounted, so we do it here.
+  // Active project resolved from the top-bar tab. Both expanded and
+  // collapsed views scope to this — the project-card chrome is gone from
+  // the sidebar, so the tab at the top is the sole project identifier.
+  const activeProject = createMemo(() =>
+    projectStore.items.find((p) => p.slug === activeProjectSlug()),
+  );
+
+  // Fetch worktrees for the active project when collapsed so the mini-view
+  // has data. When expanded, ProjectSection mounts its own resource.
   createEffect(() => {
     if (!collapsed()) return;
-    for (const p of projectStore.items) {
-      void fetchWorktrees(p.slug);
-    }
+    const p = activeProject();
+    if (p) void fetchWorktrees(p.slug);
   });
 
   const renderedWidth = createMemo(() => (collapsed() ? SIDEBAR_COLLAPSED_PX : width()));
@@ -1515,81 +1491,71 @@ export const Sidebar: Component = () => {
         {/* so users build one visual vocabulary across the whole UI.             */}
         <Show when={collapsed()}>
           <Scrollable class="flex flex-col py-1">
-            <For each={projectStore.items}>
-              {(project, projectIdx) => {
-                const wts = createMemo(() => worktreesByProject()[project.slug] ?? []);
+            <Show when={activeProject()}>
+              {(project) => {
+                const wts = createMemo(() => worktreesByProject()[project().slug] ?? []);
                 return (
-                  <>
-                    <Show when={projectIdx() > 0 && wts().length > 0}>
-                      {/* Thin project separator line in the project's colour */}
-                      <div
-                        class="mx-auto my-1 h-px w-6 rounded-full opacity-30"
-                        style={{ background: project.color }}
-                        aria-hidden="true"
-                      />
-                    </Show>
-                    <For each={wts()}>
-                      {(wt) => {
-                        const counts = createMemo(() => harnessCountsForWorktree(wt.path));
+                  <For each={wts()}>
+                    {(wt) => {
+                      const counts = createMemo(() => harnessCountsForWorktree(wt.path));
 
-                        const isActiveWt = createMemo(
-                          () => activeWorktreeStore.byProject[project.slug] === wt.path,
-                        );
+                      const isActiveWt = createMemo(
+                        () => activeWorktreeStore.byProject[project().slug] === wt.path,
+                      );
 
-                        const wtName = createMemo(() => {
-                          const parts = wt.path.split("/");
-                          return parts[parts.length - 1] ?? wt.path;
-                        });
+                      const wtName = createMemo(() => {
+                        const parts = wt.path.split("/");
+                        return parts[parts.length - 1] ?? wt.path;
+                      });
 
-                        return (
-                          <button
-                            type="button"
-                            class="flex w-full items-center justify-center gap-0.5 rounded px-0.5 py-1.5 hover:bg-hover"
-                            classList={{ "bg-selected": isActiveWt() }}
-                            title={`${wtName()} — ${counts().active} active · ${counts().waiting} waiting · ${counts().idle} idle`}
-                            onClick={() => setActiveWorktree(project.slug, wt.path)}
+                      return (
+                        <button
+                          type="button"
+                          class="flex w-full items-center justify-center gap-0.5 rounded px-0.5 py-1.5 hover:bg-hover"
+                          classList={{ "bg-selected": isActiveWt() }}
+                          title={`${wtName()} — ${counts().active} active · ${counts().waiting} waiting · ${counts().idle} idle`}
+                          onClick={() => setActiveWorktree(project().slug, wt.path)}
+                        >
+                          {/* Active — spinning loader, emerald when > 0 */}
+                          <span
+                            class="flex items-center"
+                            classList={{
+                              "text-success": counts().active > 0,
+                              "text-foreground-dim": counts().active === 0,
+                            }}
                           >
-                            {/* Active — spinning loader, emerald when > 0 */}
-                            <span
-                              class="flex items-center"
-                              classList={{
-                                "text-success": counts().active > 0,
-                                "text-foreground-dim": counts().active === 0,
-                              }}
-                            >
-                              <LoaderIcon
-                                class="size-2.5"
-                                classList={{ "animate-spin": counts().active > 0 }}
-                              />
-                            </span>
-                            {/* Waiting — alert circle, amber when > 0 */}
-                            <span
-                              class="flex items-center"
-                              classList={{
-                                "text-warning": counts().waiting > 0,
-                                "text-foreground-dim": counts().waiting === 0,
-                              }}
-                            >
-                              <AlertCircleIcon class="size-2.5" />
-                            </span>
-                            {/* Idle — check, zinc when > 0 */}
-                            <span
-                              class="flex items-center"
-                              classList={{
-                                "text-muted-foreground": counts().idle > 0,
-                                "text-foreground-dim": counts().idle === 0,
-                              }}
-                            >
-                              <CheckIcon class="size-2.5" />
-                            </span>
-                          </button>
-                        );
-                      }}
-                    </For>
-                  </>
+                            <LoaderIcon
+                              class="size-2.5"
+                              classList={{ "animate-spin": counts().active > 0 }}
+                            />
+                          </span>
+                          {/* Waiting — alert circle, amber when > 0 */}
+                          <span
+                            class="flex items-center"
+                            classList={{
+                              "text-warning": counts().waiting > 0,
+                              "text-foreground-dim": counts().waiting === 0,
+                            }}
+                          >
+                            <AlertCircleIcon class="size-2.5" />
+                          </span>
+                          {/* Idle — check, zinc when > 0 */}
+                          <span
+                            class="flex items-center"
+                            classList={{
+                              "text-muted-foreground": counts().idle > 0,
+                              "text-foreground-dim": counts().idle === 0,
+                            }}
+                          >
+                            <CheckIcon class="size-2.5" />
+                          </span>
+                        </button>
+                      );
+                    }}
+                  </For>
                 );
               }}
-            </For>
+            </Show>
           </Scrollable>
         </Show>
 
@@ -1616,19 +1582,17 @@ export const Sidebar: Component = () => {
           </div>
           <Scrollable class="min-h-0 flex-1 p-2">
             <Show
-              when={projectStore.items.length > 0}
+              when={activeProject()}
               fallback={<p class="px-2 text-foreground-dim">No projects registered yet.</p>}
             >
-              <For each={projectStore.items}>
-                {(project) => (
-                  <ProjectSection
-                    project={project}
-                    worktreeFilter={worktreeFilter()}
-                    createOpen={createModalSlug() === project.slug}
-                    onCreateClose={() => setCreateModalSlug(null)}
-                  />
-                )}
-              </For>
+              {(project) => (
+                <ProjectSection
+                  project={project()}
+                  worktreeFilter={worktreeFilter()}
+                  createOpen={createModalSlug() === project().slug}
+                  onCreateClose={() => setCreateModalSlug(null)}
+                />
+              )}
             </Show>
           </Scrollable>
           <ResizeHandle

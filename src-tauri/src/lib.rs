@@ -143,7 +143,7 @@ pub fn run() {
             commands::notifications::notifications_mark_hint_shown,
             commands::notifications::config_set_notifications,
             commands::notifications::notifications_list_system_sounds,
-            commands::notifications::notifications_read_sound_bytes,
+            commands::notifications::notifications_play_sound,
             commands::notifications::notifications_check_authorization,
             commands::notifications::notifications_open_system_settings,
             commands::config_set_harness_flags,

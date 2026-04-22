@@ -18,8 +18,11 @@
  *      focuses the owning pane. Permission is requested on first launch;
  *      on denial we set a one-time flag in
  *      `Config.notifications.notifications_hint_shown` (§11.4).
- *   3. An optional sound played via the `Audio` element, reading the
- *      file path from `Config.notifications.sound` (§11.5).
+ *   3. An optional sound played via the backend `notifications_play_sound`
+ *      command, which delegates to the OS event-sound player (afplay /
+ *      canberra-gtk-play). Path from `Config.notifications.sound` (§11.5).
+ *      We don't use the webview's `<audio>` element because WKWebView
+ *      registers it with macOS's Now Playing session and pauses Spotify.
  *   4. A dock/taskbar badge counter reflecting the cross-project count
  *      of agents currently in `waiting` (§11.3). The counter is driven
  *      from the store; callers only need to invoke
@@ -323,59 +326,12 @@ function bodyFor(
   return `${kindDisplayLabel(harness)} is asking for feedback.`;
 }
 
-// ObjectURL cache keyed by the absolute on-disk path. The webview can't
-// fetch arbitrary `file://` URLs, so we round-trip the bytes through a
-// Tauri command once per session and reuse the resulting Blob URL on every
-// subsequent notification.
-const audioObjectUrlCache = new Map<string, string>();
-const audioInflight = new Map<string, Promise<string | null>>();
-
-function mimeForSoundPath(path: string): string {
-  const lower = path.toLowerCase();
-  if (lower.endsWith(".aiff") || lower.endsWith(".aif")) return "audio/aiff";
-  if (lower.endsWith(".oga") || lower.endsWith(".ogg")) return "audio/ogg";
-  if (lower.endsWith(".wav")) return "audio/wav";
-  if (lower.endsWith(".mp3")) return "audio/mpeg";
-  if (lower.endsWith(".flac")) return "audio/flac";
-  if (lower.endsWith(".m4a")) return "audio/mp4";
-  return "application/octet-stream";
-}
-
-async function objectUrlForSound(path: string): Promise<string | null> {
-  const cached = audioObjectUrlCache.get(path);
-  if (cached) return cached;
-  const inflight = audioInflight.get(path);
-  if (inflight) return inflight;
-
-  const job = (async () => {
-    try {
-      const bytes = await invoke<number[]>("notifications_read_sound_bytes", { path });
-      const blob = new Blob([Uint8Array.from(bytes)], { type: mimeForSoundPath(path) });
-      const url = URL.createObjectURL(blob);
-      audioObjectUrlCache.set(path, url);
-      return url;
-    } catch (e) {
-      console.warn("notifications_read_sound_bytes failed", path, e);
-      return null;
-    } finally {
-      audioInflight.delete(path);
-    }
-  })();
-  audioInflight.set(path, job);
-  return job;
-}
-
 async function playSound(path: string): Promise<void> {
-  const url = await objectUrlForSound(path);
-  if (!url) return;
+  if (!path) return;
   try {
-    const audio = new Audio(url);
-    audio.volume = 1.0;
-    await audio.play().catch(() => {
-      // Swallow: autoplay may be blocked; the notification fires regardless.
-    });
-  } catch {
-    // `new Audio` can throw under locked-down CSP; best-effort only.
+    await invoke("notifications_play_sound", { path });
+  } catch (e) {
+    console.warn("notifications_play_sound failed", path, e);
   }
 }
 
@@ -775,9 +731,6 @@ export function __resetNotificationCenterForTests(): void {
   setNotificationDevMode(false);
   setNotificationStateNote(null);
   lastBadgeCount = -1;
-  for (const url of audioObjectUrlCache.values()) URL.revokeObjectURL(url);
-  audioObjectUrlCache.clear();
-  audioInflight.clear();
   pendingPermissionKeys.clear();
   pendingPermissionSessions.clear();
   setPendingPermissionCount(0);

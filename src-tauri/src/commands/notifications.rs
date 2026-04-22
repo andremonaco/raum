@@ -14,9 +14,11 @@
 //! * `notifications_list_system_sounds` — enumerate the OS-bundled alert
 //!   sounds (macOS `/System/Library/Sounds`, Linux freedesktop) so the
 //!   settings dropdown can populate without bundling any audio.
-//! * `notifications_read_sound_bytes` — return the raw bytes of a sound
-//!   file. The webview can't fetch arbitrary `file://` URLs, so the
-//!   notification center wraps the bytes in a `Blob` + ObjectURL.
+//! * `notifications_play_sound` — fire-and-forget playback of a sound
+//!   file using the OS-standard event-sound player (`afplay` on macOS,
+//!   `canberra-gtk-play` / `paplay` on Linux). These APIs are designed
+//!   to mix with other audio, so they don't pause Spotify / Music the
+//!   way an in-webview `<audio>` element does.
 
 use std::process::Command as ProcessCommand;
 
@@ -147,16 +149,59 @@ pub fn notifications_list_system_sounds() -> Vec<SystemSound> {
     out
 }
 
-/// §11.5 — return the raw bytes of `path` so the frontend can wrap them in a
-/// `Blob` and play via `<audio>`. The webview origin (`tauri://localhost`)
-/// can't fetch arbitrary `file://` URLs, and configuring the asset protocol
-/// scope dynamically for each user-supplied custom path adds more surface
-/// than it saves over a one-shot IPC. The frontend caches the resulting
-/// ObjectURL keyed by path, so this fires at most once per sound choice per
-/// session.
+/// §11.5 — play `path` as an OS event sound. Fire-and-forget: spawns the
+/// standard per-OS player and returns immediately.
+///
+/// We delegate to the OS event-sound player instead of the webview's
+/// `<audio>` element because `HTMLAudioElement` in WKWebView (and to a
+/// lesser extent WebKitGTK) registers with the system's "Now Playing"
+/// media session, which pauses Spotify / Apple Music / Music for Linux and
+/// never resumes them. `afplay` (macOS) and `canberra-gtk-play` / `paplay`
+/// (Linux) are designed as short event-sound players and mix with other
+/// audio by default.
+///
+/// Errors are swallowed into `Ok(())` and logged — notification delivery
+/// must not fail just because the user's sound file is missing or the
+/// player binary isn't installed.
 #[tauri::command]
-pub fn notifications_read_sound_bytes(path: String) -> Result<Vec<u8>, String> {
-    std::fs::read(&path).map_err(|e| e.to_string())
+pub fn notifications_play_sound(path: String) -> Result<(), String> {
+    spawn_event_sound(&path);
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_event_sound(path: &str) {
+    match ProcessCommand::new("afplay").arg(path).spawn() {
+        Ok(child) => reap_detached(child),
+        Err(e) => eprintln!("afplay spawn failed ({path}): {e}"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_event_sound(path: &str) {
+    // libcanberra is the freedesktop event-sound standard; fall back to
+    // paplay (PulseAudio / PipeWire compat shim) when it isn't installed.
+    let attempt = ProcessCommand::new("canberra-gtk-play")
+        .args(["-f", path])
+        .spawn()
+        .or_else(|_| ProcessCommand::new("paplay").arg(path).spawn());
+    match attempt {
+        Ok(child) => reap_detached(child),
+        Err(e) => eprintln!("event-sound spawn failed ({path}): {e}"),
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn spawn_event_sound(_path: &str) {}
+
+/// Dropping a `Child` on Unix does not reap it, leaving a zombie until the
+/// parent exits. A tiny detached thread waits on the process so the kernel
+/// can clean it up promptly.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn reap_detached(mut child: std::process::Child) {
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
 }
 
 // ---------------------------------------------------------------------------

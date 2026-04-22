@@ -250,6 +250,36 @@ export async function subscribePaneActivity(): Promise<UnlistenFn> {
   };
 }
 
+// ---- per-project pruning --------------------------------------------------
+
+/**
+ * Return a pruned copy of `tree` that contains only leaves whose owning pane
+ * either has no `projectSlug` (shell panes — unowned, visible across every
+ * project tab) or whose `projectSlug === activeSlug`. Returns `null` when
+ * every leaf ends up pruned.
+ *
+ * Used by the grid render layer to scope the visible BSP tree to the active
+ * project tab. Pure — does not touch the store; `runtimeLayoutStore.tree`
+ * still holds every project's layout so switching tabs restores geometry.
+ */
+export function pruneTreeByProject(
+  tree: LayoutNode | null,
+  activeSlug: string | undefined,
+  panes: Record<string, PaneContent>,
+): LayoutNode | null {
+  if (!tree) return null;
+  let result: LayoutNode | null = tree;
+  for (const id of treeLeafIds(tree)) {
+    const pane = panes[id];
+    if (!pane) continue;
+    if (pane.projectSlug === undefined) continue;
+    if (pane.projectSlug === activeSlug) continue;
+    result = removeLeaf(result, id);
+    if (!result) return null;
+  }
+  return result;
+}
+
 // ---- id counters ----------------------------------------------------------
 
 let idCounter = 0;
