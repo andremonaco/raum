@@ -31,6 +31,7 @@
 //! `SetupAction::EnsureFeatureFlag` that the executor will skip until
 //! the flag is supported).
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -332,11 +333,24 @@ impl NotificationSetup for CodexAdapter {
             mode: 0o700,
         });
 
-        // config.toml — features + notify. When hooks are unsupported
-        // the managed block still flips the feature flag (harmless on
-        // older builds that ignore unknown feature flags) so upgrading
-        // the Codex binary does not require a re-install.
-        let notify_body = render_codex_toml_managed_body(&notify_script_path, supports_hooks);
+        // config.toml — features + notify + trusted-project tables.
+        // When hooks are unsupported the managed block still flips the
+        // feature flag (harmless on older builds that ignore unknown
+        // feature flags) so upgrading the Codex binary does not require
+        // a re-install. Trust tables cover the project root and every
+        // worktree raum knows about so Codex never re-prompts for a
+        // registered path on launch.
+        let mut trusted: Vec<PathBuf> = Vec::new();
+        if !ctx.project_dir.as_os_str().is_empty() {
+            trusted.push(ctx.project_dir.clone());
+        }
+        for wt in &ctx.worktree_paths {
+            if !wt.as_os_str().is_empty() {
+                trusted.push(wt.clone());
+            }
+        }
+        let notify_body =
+            render_codex_toml_managed_body(&notify_script_path, supports_hooks, &trusted);
         plan.push(SetupAction::WriteToml {
             path: self.config_toml_path_for_ctx(ctx),
             content: notify_body,
@@ -595,7 +609,11 @@ impl HarnessRuntime for CodexAdapter {
 
 // -- planner helpers --------------------------------------------------------
 
-fn render_codex_toml_managed_body(notify_script: &Path, enable_hooks: bool) -> String {
+fn render_codex_toml_managed_body(
+    notify_script: &Path,
+    enable_hooks: bool,
+    trusted_paths: &[PathBuf],
+) -> String {
     // TOML arrays are top-level; the `[features]` and `[tui]` tables are
     // siblings. We emit them in a single managed block so the whole raum
     // configuration sits between the sentinels.
@@ -611,12 +629,29 @@ fn render_codex_toml_managed_body(notify_script: &Path, enable_hooks: bool) -> S
     // Only `[features] codex_hooks` stays gated — it's the one setting
     // that triggers real behaviour change on versions that don't know
     // the feature flag yet.
+    //
+    // `[projects."<abs-path>"]` tables pre-declare every raum-registered
+    // project + worktree as trusted. Codex keys its trust prompt on the
+    // spawn cwd; without this raum users would re-accept per project and
+    // per worktree.
     let path_json = serde_json::to_string(&notify_script.display().to_string())
         .unwrap_or_else(|_| "\"\"".into());
     let mut body = format!("notify = [{path_json}]\n");
     body.push_str("\n[tui]\nnotifications = true\nnotification_method = \"osc9\"\n");
     if enable_hooks {
         body.push_str("\n[features]\ncodex_hooks = true\n");
+    }
+    // De-duplicate while preserving insertion order (project root first,
+    // worktrees in caller order) so the rendered body is stable across
+    // runs — otherwise a HashSet would make the managed block churn.
+    let mut seen: std::collections::HashSet<&Path> = std::collections::HashSet::new();
+    for path in trusted_paths {
+        if path.as_os_str().is_empty() || !seen.insert(path.as_path()) {
+            continue;
+        }
+        let key =
+            serde_json::to_string(&path.display().to_string()).unwrap_or_else(|_| "\"\"".into());
+        let _ = write!(body, "\n[projects.{key}]\ntrust_level = \"trusted\"\n");
     }
     let rendered = crate::config_io::managed_toml::render(None, body.trim_end());
     // Strip the begin/end sentinel frames — the `SetupAction::WriteToml`
@@ -711,18 +746,21 @@ else
 fi
 
 # The payload Codex hands us is already JSON; embed it verbatim.
-ENVELOPE=$(printf '{"harness":"codex","event":"Notification","source":"notify","reliability":"event-driven","session_id":%s,"payload":%s}\n' \
+# Build without the trailing `\n` — `$(...)` strips it off — and
+# re-append at the sending `printf` below. The server framing is
+# newline-delimited; forgetting the newline blocks the reader forever.
+ENVELOPE=$(printf '{"harness":"codex","event":"Notification","source":"notify","reliability":"event-driven","session_id":%s,"payload":%s}' \
   "$SESSION_JSON" "$PAYLOAD")
 
 if command -v socat >/dev/null 2>&1; then
   # `-u` = unidirectional (stdin → socket); exits on stdin EOF rather
   # than waiting on the peer, which some Linux socat builds are slow
   # to notice even after the server closes the socket.
-  printf '%s' "$ENVELOPE" | socat -u - UNIX-CONNECT:"$SOCK" || true
+  printf '%s\n' "$ENVELOPE" | socat -u - UNIX-CONNECT:"$SOCK" || true
 elif command -v nc >/dev/null 2>&1; then
-  printf '%s' "$ENVELOPE" | nc -U "$SOCK" || true
+  printf '%s\n' "$ENVELOPE" | nc -U "$SOCK" || true
 elif command -v python3 >/dev/null 2>&1; then
-  printf '%s' "$ENVELOPE" | python3 -c '
+  printf '%s\n' "$ENVELOPE" | python3 -c '
 import os, sys, socket
 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 sock.connect(os.environ["RAUM_EVENT_SOCK"])
@@ -1200,6 +1238,89 @@ mod tests {
         }
         assert!(parsed["hooks"]["PreToolUse"].is_null());
         assert!(parsed["hooks"]["PostToolUse"].is_null());
+    }
+
+    #[tokio::test]
+    async fn plan_emits_trusted_project_tables_for_root_and_worktrees() {
+        // With project_dir + worktree_paths set, the managed config.toml
+        // body must declare every path as Codex-trusted so the harness
+        // never re-prompts on spawn.
+        let dir = tempdir().unwrap();
+        let config_toml = dir.path().join("config.toml");
+        let adapter = CodexAdapter::with_paths(
+            config_toml.clone(),
+            dir.path().join("hooks.json"),
+            Some(semver_lite::Version {
+                major: 0,
+                minor: 120,
+                patch: 0,
+            }),
+        );
+        let project_root = dir.path().join("proj");
+        let wt_one = dir.path().join("proj-worktrees").join("feature-a");
+        let wt_two = dir.path().join("proj-worktrees").join("feature-b");
+        let ctx = SetupContext::new(
+            dir.path().join("hooks"),
+            dir.path().join("events.sock"),
+            "demo",
+        )
+        .with_project_dir(project_root.clone())
+        .with_worktree_paths(vec![wt_one.clone(), wt_two.clone(), project_root.clone()]);
+        let plan = <CodexAdapter as NotificationSetup>::plan(&adapter, &ctx)
+            .await
+            .unwrap();
+        let SetupAction::WriteToml { ref content, .. } = plan.actions[2] else {
+            panic!("expected WriteToml at index 2");
+        };
+        let root_key = serde_json::to_string(&project_root.display().to_string()).unwrap();
+        let wt_one_key = serde_json::to_string(&wt_one.display().to_string()).unwrap();
+        let wt_two_key = serde_json::to_string(&wt_two.display().to_string()).unwrap();
+        assert!(
+            content.contains(&format!("[projects.{root_key}]")),
+            "project root trust table missing: {content}",
+        );
+        assert!(
+            content.contains(&format!("[projects.{wt_one_key}]")),
+            "worktree #1 trust table missing: {content}",
+        );
+        assert!(
+            content.contains(&format!("[projects.{wt_two_key}]")),
+            "worktree #2 trust table missing: {content}",
+        );
+        // Duplicate (project_root appears in both project_dir and
+        // worktree_paths) must be emitted once, not twice.
+        let root_table_count = content.matches(&format!("[projects.{root_key}]")).count();
+        assert_eq!(root_table_count, 1, "duplicate trust tables: {content}");
+        assert!(content.contains("trust_level = \"trusted\""));
+    }
+
+    #[tokio::test]
+    async fn plan_with_empty_project_dir_emits_no_trust_tables() {
+        // Plan-body tests run with project_dir = "" (the default). No
+        // trust tables should be written — raum does not declare the
+        // user-global process as trusted.
+        let dir = tempdir().unwrap();
+        let adapter = CodexAdapter::with_paths(
+            dir.path().join("config.toml"),
+            dir.path().join("hooks.json"),
+            Some(semver_lite::Version {
+                major: 0,
+                minor: 120,
+                patch: 0,
+            }),
+        );
+        let ctx = test_ctx(dir.path(), "demo");
+        let plan = <CodexAdapter as NotificationSetup>::plan(&adapter, &ctx)
+            .await
+            .unwrap();
+        let SetupAction::WriteToml { ref content, .. } = plan.actions[2] else {
+            panic!("expected WriteToml at index 2");
+        };
+        assert!(
+            !content.contains("[projects."),
+            "unexpected trust table in empty-project body: {content}",
+        );
+        assert!(!content.contains("trust_level"));
     }
 
     #[tokio::test]

@@ -21,12 +21,13 @@
 //! is therefore idempotent — worst case the rename lands twice with the
 //! same bytes. No per-harness mutex is required.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use raum_core::agent::AgentKind;
 use raum_core::harness::ScanReport;
 use raum_core::harness::setup::{SetupContext, SetupReport};
 use raum_core::paths;
+use raum_hydration::worktree_list as git_worktree_list;
 use tauri::{AppHandle, Emitter, Runtime};
 use tracing::warn;
 
@@ -40,6 +41,32 @@ const HOME_UNSET_ERROR: &str = "could not resolve home directory ($HOME unset)";
 
 fn resolve_home_dir() -> Result<PathBuf, String> {
     dirs::home_dir().ok_or_else(|| HOME_UNSET_ERROR.to_string())
+}
+
+/// List the absolute paths of every git worktree rooted at `project_dir`.
+///
+/// Used to pre-declare each worktree as trusted inside the Codex managed
+/// block. Includes the main worktree (Codex keys trust by absolute path
+/// so the root path itself still needs an entry); duplicates are
+/// collapsed downstream in `render_codex_toml_managed_body`.
+///
+/// Returns `Vec::new()` when `project_dir` is empty or not a git repo —
+/// the caller falls back to a root-only trust entry.
+fn collect_worktree_paths(project_dir: &Path) -> Vec<PathBuf> {
+    if project_dir.as_os_str().is_empty() {
+        return Vec::new();
+    }
+    match git_worktree_list(project_dir) {
+        Ok(entries) => entries.into_iter().map(|e| e.path).collect(),
+        Err(e) => {
+            warn!(
+                project_dir = %project_dir.display(),
+                error = %e,
+                "git worktree list failed; skipping worktree trust entries",
+            );
+            Vec::new()
+        }
+    }
 }
 
 fn build_context(
@@ -97,9 +124,11 @@ pub async fn harness_install<R: Runtime>(
     let project_dir = resolve_project_dir(&state, project_slug.as_deref(), worktree_id.as_deref());
     let home_dir = resolve_home_dir()?;
     let slug = project_slug.clone().unwrap_or_default();
+    let worktree_paths = collect_worktree_paths(&project_dir);
     let ctx = SetupContext::new(paths::hooks_dir(), paths::event_socket_path(), slug)
         .with_project_dir(project_dir)
-        .with_home_dir(home_dir);
+        .with_home_dir(home_dir)
+        .with_worktree_paths(worktree_paths);
 
     let report = state
         .harness_runtimes

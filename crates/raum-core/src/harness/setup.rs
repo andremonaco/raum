@@ -69,6 +69,13 @@ pub struct SetupContext {
     /// adapter's default discovery chain
     /// (`$OPENCODE_PORT` → lockfile → 4096).
     pub opencode_port_override: Option<u16>,
+    /// Phase 6: Absolute filesystem paths of every worktree registered
+    /// under `project_slug`. Codex trust is keyed by absolute path, so
+    /// raum declares each known worktree trusted inside its managed
+    /// block — otherwise Codex re-prompts once per worktree on launch.
+    /// Empty when the caller does not have project context (plan-body
+    /// tests, shell sessions).
+    pub worktree_paths: Vec<PathBuf>,
 }
 
 impl SetupContext {
@@ -95,6 +102,7 @@ impl SetupContext {
             project_dir: PathBuf::new(),
             home_dir: home,
             opencode_port_override: None,
+            worktree_paths: Vec::new(),
         }
     }
 
@@ -118,6 +126,13 @@ impl SetupContext {
     #[must_use]
     pub fn with_opencode_port(mut self, port: Option<u16>) -> Self {
         self.opencode_port_override = port;
+        self
+    }
+
+    /// Set the list of worktree root directories for this context.
+    #[must_use]
+    pub fn with_worktree_paths(mut self, worktree_paths: Vec<PathBuf>) -> Self {
+        self.worktree_paths = worktree_paths;
         self
     }
 }

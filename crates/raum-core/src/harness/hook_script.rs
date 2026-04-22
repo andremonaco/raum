@@ -92,19 +92,23 @@ else
 fi
 
 send_fire_and_forget() {{
-  JSON=$(printf '{{"harness":"%s","event":"%s","session_id":%s,"payload":%s}}\n' \
+  # `$(...)` strips trailing newlines, so we build the body without one
+  # and re-append it via `printf '%s\n'` below. The server framing is
+  # newline-delimited, so we MUST terminate the line or the blocking
+  # reader on the other side waits forever.
+  JSON=$(printf '{{"harness":"%s","event":"%s","session_id":%s,"payload":%s}}' \
     "{harness}" "$EVENT_NAME" "$SESSION_JSON" "$QUOTED_PAYLOAD")
   if command -v socat >/dev/null 2>&1; then
     # `-u` = unidirectional (stdin → socket). socat exits on stdin EOF
     # instead of waiting for the peer to fully close, which on some
     # Linux builds it never detects promptly even when the peer has
     # dropped the connection.
-    printf '%s' "$JSON" | socat -u - UNIX-CONNECT:"$SOCK" || true
+    printf '%s\n' "$JSON" | socat -u - UNIX-CONNECT:"$SOCK" || true
   elif command -v nc >/dev/null 2>&1; then
-    printf '%s' "$JSON" | nc -U "$SOCK" || true
+    printf '%s\n' "$JSON" | nc -U "$SOCK" || true
   elif command -v python3 >/dev/null 2>&1; then
     # python3 fallback — hosts without socat/nc still get delivery.
-    printf '%s' "$JSON" | python3 -c '
+    printf '%s\n' "$JSON" | python3 -c '
 import os, sys, socket
 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 sock.connect(os.environ["RAUM_EVENT_SOCK"])
@@ -123,19 +127,23 @@ handle_permission_request() {{
   # Generate a short request id. `od -N8 -An -tx1` is POSIX-portable
   # (works on BusyBox); we collapse the spaces into a single hex string.
   REQ_ID=$(od -N8 -An -tx1 /dev/urandom 2>/dev/null | tr -d ' \n' || date +%s%N)
-  JSON=$(printf '{{"harness":"%s","event":"%s","session_id":%s,"request_id":"%s","payload":%s}}\n' \
+  # Build the JSON body *without* its trailing newline — `$(...)` strips
+  # trailing newlines from its capture, so we always append the `\n` at
+  # the sending `printf` instead. The server framing is newline-delimited
+  # and blocks until a complete line arrives.
+  JSON=$(printf '{{"harness":"%s","event":"%s","session_id":%s,"request_id":"%s","payload":%s}}' \
     "{harness}" "$EVENT_NAME" "$SESSION_JSON" "$REQ_ID" "$QUOTED_PAYLOAD")
   DECISION=""
   if command -v socat >/dev/null 2>&1; then
-    DECISION=$(printf '%s' "$JSON" | socat -T"$TIMEOUT_SECS" - UNIX-CONNECT:"$SOCK" 2>/dev/null | head -n1 || true)
+    DECISION=$(printf '%s\n' "$JSON" | socat -T"$TIMEOUT_SECS" - UNIX-CONNECT:"$SOCK" 2>/dev/null | head -n1 || true)
   elif command -v nc >/dev/null 2>&1; then
     # OpenBSD `nc` has -w for read-timeout after EOF; we write then
     # read one line. The exact flag is platform-dependent; plain nc
     # without -N may hang here indefinitely, so a python3 fallback
     # is preferred when available.
-    DECISION=$(printf '%s' "$JSON" | nc -U -w "$TIMEOUT_SECS" "$SOCK" 2>/dev/null | head -n1 || true)
+    DECISION=$(printf '%s\n' "$JSON" | nc -U -w "$TIMEOUT_SECS" "$SOCK" 2>/dev/null | head -n1 || true)
   elif command -v python3 >/dev/null 2>&1; then
-    DECISION=$(printf '%s' "$JSON" | python3 -c '
+    DECISION=$(printf '%s\n' "$JSON" | python3 -c '
 import os, socket, sys
 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 sock.settimeout(float(os.environ.get("RAUM_HOOK_TIMEOUT_SECS", "{timeout_secs}")))

@@ -35,6 +35,7 @@ use raum_core::harness::traits::SessionSpec;
 use raum_core::harness::{Reliability, decode_payload, default_registry};
 use raum_core::paths;
 use raum_hooks::HookEvent;
+use raum_hydration::worktree_list as git_worktree_list;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tokio::sync::{broadcast, mpsc};
@@ -960,13 +961,33 @@ pub async fn prepare_harness_launch<R: Runtime>(
     let hooks_dir = paths::hooks_dir();
     let event_sock = paths::event_socket_path();
     let home_dir = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from);
+    // Pre-declare every worktree + the project root as Codex-trusted so
+    // the spawn-time managed-TOML regenerate does not wipe Codex's
+    // per-path trust acceptance on each launch. `git worktree list`
+    // errors (e.g. not a git repo) degrade to root-only trust.
+    let worktree_paths: Vec<PathBuf> = if project_dir.as_os_str().is_empty() {
+        Vec::new()
+    } else {
+        match git_worktree_list(&project_dir) {
+            Ok(entries) => entries.into_iter().map(|e| e.path).collect(),
+            Err(e) => {
+                warn!(
+                    project_dir = %project_dir.display(),
+                    error = %e,
+                    "git worktree list failed; skipping worktree trust entries",
+                );
+                Vec::new()
+            }
+        }
+    };
     let ctx = SetupContext::new(
         hooks_dir.clone(),
         event_sock.clone(),
         project_slug.unwrap_or_default().to_string(),
     )
     .with_project_dir(project_dir)
-    .with_home_dir(home_dir);
+    .with_home_dir(home_dir)
+    .with_worktree_paths(worktree_paths);
 
     if adapter.supports_native_events() {
         match state.harness_runtimes.plan(harness, &ctx).await {

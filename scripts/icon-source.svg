@@ -12,14 +12,10 @@
     Grid corners: TL=(302,302)  TR=(722,302)  BR=(722,722)  BL=(302,722)
     2x2 grid midpoints: center=(512,512)
   -->
-  <g stroke="white" stroke-width="17" fill="none" stroke-linecap="round" stroke-linejoin="round">
+  <g stroke="white" stroke-width="24" fill="none" stroke-linecap="round" stroke-linejoin="round">
 
     <!-- Outer border -->
     <rect x="302" y="302" width="420" height="420"/>
-
-    <!-- Interior grid lines — 1 vertical, 1 horizontal (2x2 grid) -->
-    <line x1="512" y1="302" x2="512" y2="722"/>
-    <line x1="302" y1="512" x2="722" y2="512"/>
 
     <!-- 3 rays from top-right corner (722, 302) -->
     <line x1="722" y1="302" x2="302" y2="512"/>
