@@ -12,7 +12,7 @@ pub const DEFAULT_PATH_PATTERN: &str = "{parent-dir}/{base-folder}-worktrees/{br
 /// Pattern for the `Nested` strategy — worktrees live inside the project at
 /// `<root>/.raum/<branch>`. The backend auto-`.gitignore`s `.raum/` when this
 /// shape is detected (see `target_is_inside_raum_dir`).
-pub const NESTED_PATH_PATTERN: &str = "{root}/.raum/{branch-slug}";
+pub const NESTED_PATH_PATTERN: &str = "{repo-root}/.raum/{branch-slug}";
 /// Pattern for the `SiblingGroup` strategy — alias of `DEFAULT_PATH_PATTERN`,
 /// kept as a separate name so call sites that mean "the sibling preset"
 /// don't read as "whatever the default happens to be".
