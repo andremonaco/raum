@@ -252,8 +252,15 @@ export const KeymapProvider: Component<KeymapProviderProps> = (props) => {
     // trigger keymap actions (Cmd+A → select-all, not spawn-agent). We
     // still allow a small allow-list of globally-scoped actions so users
     // can open the cheat-sheet or global search from an input.
+    //
+    // xterm.js captures keystrokes through a hidden `.xterm-helper-textarea`.
+    // That technically makes `e.target` a TEXTAREA, but the user perceives
+    // the terminal as focused — app hotkeys must fire normally. We detect
+    // xterm's helper and skip the input-bailout for it.
     const target = e.target as HTMLElement | null;
-    if (target) {
+    const isXtermHelper =
+      target?.tagName === "TEXTAREA" && target.classList.contains("xterm-helper-textarea");
+    if (target && !isXtermHelper) {
       const tag = target.tagName;
       const editable = target.isContentEditable;
       if (editable || tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") {

@@ -172,10 +172,23 @@ pub fn run() {
             // that sits over the header and swallows all pointer events.
             #[cfg(target_os = "macos")]
             {
+                use objc2::msg_send;
+                use objc2::runtime::AnyObject;
+
                 main_window
                     .set_title_bar_style(tauri::TitleBarStyle::Overlay)
                     .unwrap();
                 main_window.set_traffic_lights_inset(12.0, 16.0).unwrap();
+
+                // `hiddenTitle: true` from tauri.conf.json is not re-applied
+                // after the runtime Overlay switch above, so the dev product
+                // name ("raum [dev]") bleeds over the custom header. Force
+                // NSWindowTitleVisibility::Hidden (= 1) directly.
+                let ns_window = main_window.ns_window().unwrap().cast::<AnyObject>();
+                #[allow(unsafe_code)]
+                unsafe {
+                    let _: () = msg_send![ns_window, setTitleVisibility: 1_isize];
+                }
             }
 
             // Linux / Windows: remove native decorations so our custom

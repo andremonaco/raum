@@ -228,7 +228,7 @@ export const ProjectSettingsDialog: Component<ProjectSettingsDialogProps> = (pro
          * Kobalte's base `grid` + `gap-4`; !p-0 lets the header / body /
          * footer manage their own padding.
          */}
-        <DialogContent class="!flex !flex-col !gap-0 !p-0 h-[640px] sm:max-w-[920px]">
+        <DialogContent class="!flex !flex-col !gap-0 !p-0 h-[min(780px,calc(100vh-2rem))] max-h-[780px] w-[min(1000px,calc(100vw-2rem))] max-w-[1000px] sm:max-w-[1000px]">
           {/* ── Header ──────────────────────────────────────────────── */}
           <DialogHeader class="shrink-0 border-b border-white/5 px-6 py-4">
             <DialogTitle class="flex items-center gap-2">

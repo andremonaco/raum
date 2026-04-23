@@ -1,20 +1,24 @@
 /**
- * §13.1–13.2 — 4-step onboarding wizard.
+ * §13.1–13.2 — 4-step onboarding wizard (intro + 3 workflow steps).
  *
- * Step 1: Prerequisites check — calls the `prereqs_check` Tauri command and
- *         renders the tmux/git status. "Next" is disabled until both report
- *         `found && meets_minimum`. A "Re-check" button re-runs the probe.
+ * Step 0: Welcome — introduces raum with an animated app-shell mock and a
+ *         short bulleted pitch. No backend calls; Next advances to step 1,
+ *         Skip marks onboarding complete. Body lives in
+ *         `./onboarding-intro-step.tsx` so this file doesn't bloat.
+ * Step 1: Prerequisites — combined `prereqs_check` (tmux, git) and
+ *         `harnesses_check` (claude-code, codex, opencode) probe. tmux and
+ *         git must both report `found && meets_minimum` before "Next" is
+ *         enabled; harnesses are informational (users can still advance
+ *         without any installed). A single "Re-check" button re-runs both
+ *         probes.
  * Step 2: First project — directory picker via `tauri-plugin-dialog::open`
  *         plus a name input; on "Next" invokes `project_register` and
  *         upserts the returned `ProjectListItem` into `projectStore`.
- * Step 3: Harness availability — calls `harnesses_check` and shows which
- *         harness binaries are on PATH (with their reported versions).
- *         Missing harnesses get install instructions. Purely informational —
- *         users add harnesses from the top bar after onboarding.
- * Step 4: First pane — "Spawn" button invokes `terminal_spawn` with a
- *         no-op `Channel` (the wizard discards the byte stream; real
- *         streaming resumes once the `<TerminalPane>` remounts against the
- *         same session id) and shows a success state.
+ * Step 3: First pane — "Spawn" dispatches a `raum:spawn-requested` window
+ *         event (the same one the top bar uses), which `TerminalGrid`
+ *         turns into a pane; the pane's own `TerminalPane` then calls
+ *         `terminal_spawn`. The wizard closes itself right after so the
+ *         user lands on the main UI with the new pane visible.
  *
  * Skip: every step has a "Skip" button that immediately marks onboarding
  *       complete (via `config_mark_onboarded`) and unmounts the wizard.
@@ -24,7 +28,7 @@
  */
 
 import { Component, For, Match, Show, Switch, createResource, createSignal } from "solid-js";
-import { Channel, invoke } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { upsertProject, type ProjectListItem } from "../stores/projectStore";
 import { tildify } from "../lib/pathDisplay";
@@ -33,7 +37,9 @@ import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
 import { Dialog, DialogContent, DialogPortal } from "./ui/dialog";
 import { TextField, TextFieldInput, TextFieldLabel } from "./ui/text-field";
-import { HARNESS_ICONS } from "./icons";
+import { FolderIcon, HARNESS_ICONS } from "./icons";
+import { RaumLogo } from "./icons/raum-logo";
+import { OnboardingIntroStep } from "./onboarding-intro-step";
 
 export interface OnboardingWizardProps {
   onDone: () => void;
@@ -269,6 +275,12 @@ function ToolRow(props: { tool: ToolStatus; os: OsInfo | undefined }) {
               <>Install {props.tool.name} with one of:</>
             </Show>
           </p>
+          <Show when={props.os?.family === "macos"}>
+            <p class="mb-2 text-[11px] text-muted-foreground/80">
+              Homebrew is the quickest way — the same package manager you likely used to install
+              raum.
+            </p>
+          </Show>
           <Show
             when={hints().length > 0}
             fallback={
@@ -333,7 +345,6 @@ function HarnessRow(props: { status: HarnessStatus }) {
 function HarnessCard(props: {
   status: HarnessStatus;
   spawning: boolean;
-  sessionId: string | undefined;
   error: string | undefined;
   onSpawn: () => void;
 }) {
@@ -357,24 +368,15 @@ function HarnessCard(props: {
           </div>
         </div>
       </div>
-      <Show
-        when={props.sessionId}
-        fallback={
-          <Button
-            type="button"
-            size="sm"
-            class="h-7 text-[11px]"
-            onClick={() => props.onSpawn()}
-            disabled={props.spawning}
-          >
-            {props.spawning ? "Spawning…" : "Spawn"}
-          </Button>
-        }
+      <Button
+        type="button"
+        size="sm"
+        class="h-7 text-[11px]"
+        onClick={() => props.onSpawn()}
+        disabled={props.spawning}
       >
-        <Badge variant="secondary" class="justify-center bg-success/15 text-[11px] text-success">
-          Live
-        </Badge>
-      </Show>
+        {props.spawning ? "Spawning…" : "Spawn"}
+      </Button>
       <Show when={props.error}>
         <Alert variant="destructive" class="px-2 py-1 text-[10px]">
           <AlertDescription>{props.error}</AlertDescription>
@@ -417,10 +419,10 @@ function InstallCommand(props: { hint: InstallHint }) {
 }
 
 export const OnboardingWizard: Component<OnboardingWizardProps> = (props) => {
-  const [step, setStep] = createSignal<1 | 2 | 3 | 4>(1);
+  const [step, setStep] = createSignal<0 | 1 | 2 | 3>(0);
   const [finishing, setFinishing] = createSignal(false);
 
-  const [prereq, { refetch: recheckPrereqs }] = createResource<PrereqReport>(() =>
+  const [prereq, { refetch: refetchPrereqs }] = createResource<PrereqReport>(() =>
     invoke<PrereqReport>("prereqs_check").catch(() => ({
       tmux: {
         name: "tmux",
@@ -506,7 +508,7 @@ export const OnboardingWizard: Component<OnboardingWizardProps> = (props) => {
     }
   }
 
-  const [harnessReport, { refetch: recheckHarnesses }] = createResource<HarnessReport>(() =>
+  const [harnessReport, { refetch: refetchHarnesses }] = createResource<HarnessReport>(() =>
     invoke<HarnessReport>("harnesses_check").catch(() => ({
       harnesses: (Object.keys(HARNESS_META) as Harness[]).map((kind) => ({
         kind,
@@ -517,58 +519,48 @@ export const OnboardingWizard: Component<OnboardingWizardProps> = (props) => {
       })),
     })),
   );
+  const prereqsLoading = (): boolean => prereq.loading || harnessReport.loading;
 
-  const [spawnedSessions, setSpawnedSessions] = createSignal<Partial<Record<Harness, string>>>({});
+  const [prereqsJustChecked, setPrereqsJustChecked] = createSignal(false);
+  let prereqsCheckedTimer: ReturnType<typeof setTimeout> | undefined;
+  async function recheckAll() {
+    setPrereqsJustChecked(false);
+    await Promise.all([refetchPrereqs(), refetchHarnesses()]);
+    setPrereqsJustChecked(true);
+    if (prereqsCheckedTimer) clearTimeout(prereqsCheckedTimer);
+    prereqsCheckedTimer = setTimeout(() => setPrereqsJustChecked(false), 2000);
+  }
+
   const [spawningKinds, setSpawningKinds] = createSignal<Set<Harness>>(new Set());
   const [spawnErrors, setSpawnErrors] = createSignal<Partial<Record<Harness, string>>>({});
   const availableHarnesses = (): HarnessStatus[] =>
     (harnessReport()?.harnesses ?? []).filter((h) => h.found && h.kind !== ("shell" as Harness));
 
   async function spawnHarness(kind: Harness) {
-    setSpawningKinds((prev) => new Set(prev).add(kind));
-    setSpawnErrors((prev) => {
-      const next = { ...prev };
-      delete next[kind];
-      return next;
-    });
     const rp = registered();
     if (!rp) {
       setSpawnErrors((prev) => ({
         ...prev,
         [kind]: "Add a project first, then launch a harness.",
       }));
-      setSpawningKinds((prev) => {
-        const next = new Set(prev);
-        next.delete(kind);
-        return next;
-      });
       return;
     }
-    try {
-      const channel = new Channel<ArrayBuffer>();
-      channel.onmessage = () => {
-        /* discarded until <TerminalPane> attaches */
-      };
-      const id = await invoke<string>("terminal_spawn", {
-        args: {
-          project_slug: rp.slug,
-          worktree_id: null,
-          kind,
-          cwd: rp.rootPath,
-        },
-        onData: channel,
-      });
-      setSpawnedSessions((prev) => ({ ...prev, [kind]: id }));
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      setSpawnErrors((prev) => ({ ...prev, [kind]: msg }));
-    } finally {
-      setSpawningKinds((prev) => {
-        const next = new Set(prev);
-        next.delete(kind);
-        return next;
-      });
-    }
+    setSpawningKinds((prev) => new Set(prev).add(kind));
+    setSpawnErrors((prev) => {
+      const next = { ...prev };
+      delete next[kind];
+      return next;
+    });
+    // Delegate pane creation + terminal_spawn to TerminalGrid — same event
+    // the top bar dispatches. TerminalPane mounts against the new pane and
+    // calls terminal_spawn itself; the resulting session id is tracked by
+    // the layout store, not the wizard.
+    window.dispatchEvent(
+      new CustomEvent("raum:spawn-requested", {
+        detail: { kind, projectSlug: rp.slug, worktreeId: undefined },
+      }),
+    );
+    await markOnboarded();
   }
 
   async function markOnboarded() {
@@ -589,23 +581,23 @@ export const OnboardingWizard: Component<OnboardingWizardProps> = (props) => {
       await registerProject();
       if (registered() === undefined) return;
     }
-    if (s < 4) setStep((s + 1) as 1 | 2 | 3 | 4);
+    if (s < 3) setStep((s + 1) as 0 | 1 | 2 | 3);
     else await markOnboarded();
   }
   function back() {
     const s = step();
-    if (s > 1) setStep((s - 1) as 1 | 2 | 3 | 4);
+    if (s > 0) setStep((s - 1) as 0 | 1 | 2 | 3);
   }
 
   const canAdvance = (): boolean => {
     switch (step()) {
+      case 0:
+        return true;
       case 1:
         return prereqsOk();
       case 2:
         return !projectBusy() && projectPath().length > 0;
       case 3:
-        return harnessReport() !== undefined;
-      case 4:
         return true;
       default:
         return false;
@@ -617,40 +609,53 @@ export const OnboardingWizard: Component<OnboardingWizardProps> = (props) => {
       <DialogPortal>
         <DialogContent
           showCloseButton={false}
-          class="flex w-[560px] max-w-[560px] flex-col gap-0 p-0 sm:max-w-[560px]"
+          class="flex h-[min(840px,calc(100vh-2rem))] max-h-[840px] w-[min(1000px,calc(100vw-2rem))] max-w-[1000px] flex-col gap-0 p-0 sm:max-w-[1000px]"
           data-testid="onboarding-wizard"
         >
-          <header class="flex items-center justify-between border-b border-border px-5 py-3">
-            <h2 class="text-xs font-medium" style={{ color: "var(--project-accent)" }}>
-              Welcome to raum
-            </h2>
-            <div
-              class="flex items-center gap-1 text-[10px] text-muted-foreground"
-              aria-label="Progress"
-            >
-              <For each={[1, 2, 3, 4] as const}>
-                {(n) => (
-                  <span
-                    class="h-1.5 w-8 rounded"
-                    classList={{
-                      "bg-foreground": step() >= n,
-                      "bg-muted": step() < n,
-                    }}
-                  />
-                )}
-              </For>
+          <header class="flex items-center justify-between border-b border-border px-8 py-5">
+            <div class="flex items-center gap-2">
+              <RaumLogo class="size-5 shrink-0" />
+              <h2 class="text-xs font-medium" style={{ color: "var(--project-accent)" }}>
+                Welcome to raum
+              </h2>
             </div>
+            <Show when={step() > 0}>
+              <div
+                class="flex items-center gap-1 text-[10px] text-muted-foreground"
+                aria-label="Progress"
+              >
+                <For each={[1, 2, 3] as const}>
+                  {(n) => (
+                    <span
+                      class="h-1.5 w-8 rounded"
+                      classList={{
+                        "bg-foreground": step() >= n,
+                        "bg-muted": step() < n,
+                      }}
+                    />
+                  )}
+                </For>
+              </div>
+            </Show>
           </header>
 
-          <div class="px-5 py-4">
+          <div class="flex-1 overflow-y-auto px-8 py-7">
             <Switch>
+              <Match when={step() === 0}>
+                <OnboardingIntroStep />
+              </Match>
               <Match when={step() === 1}>
                 <div>
-                  <h3 class="mb-1 text-xs font-medium">1. Prerequisites check</h3>
+                  <h3 class="mb-1 text-xs font-medium">1. Prerequisites</h3>
                   <p class="mb-3 text-xs text-muted-foreground">
-                    raum needs <code>tmux</code> ≥ 3.2 and <code>git</code> ≥ 2.30 on your{" "}
-                    <code>PATH</code>. Install the missing tools and press <em>Re-check</em>.
+                    raum runs each terminal inside a tmux session so your agents keep running even
+                    if the app restarts. You'll need tmux and git to continue — any harnesses we
+                    find will be ready to spawn from the top bar.
                   </p>
+
+                  <div class="mb-2 text-[11px] uppercase tracking-wide text-muted-foreground">
+                    Required
+                  </div>
                   <Show
                     when={prereq()}
                     fallback={<div class="text-xs text-muted-foreground">Probing…</div>}
@@ -662,15 +667,59 @@ export const OnboardingWizard: Component<OnboardingWizardProps> = (props) => {
                       </ul>
                     )}
                   </Show>
-                  <div class="mt-3">
+
+                  <div class="mt-4 mb-2 text-[11px] uppercase tracking-wide text-muted-foreground">
+                    Harnesses (optional)
+                  </div>
+                  <Show
+                    when={harnessReport()}
+                    fallback={
+                      <div
+                        class="flex items-center gap-2 rounded-md border border-border bg-card/40 px-3 py-2 text-xs text-muted-foreground"
+                        data-testid="onboarding-harness-checking"
+                      >
+                        <span
+                          class="inline-block h-3 w-3 animate-spin rounded-full border-2 border-border border-t-foreground"
+                          aria-hidden="true"
+                        />
+                        Probing harnesses…
+                      </div>
+                    }
+                  >
+                    {(report) => (
+                      <ul
+                        class="space-y-1"
+                        aria-label="Harness availability"
+                        data-testid="onboarding-harness"
+                      >
+                        <For
+                          each={report().harnesses.filter((h) => h.kind !== ("shell" as Harness))}
+                        >
+                          {(status) => <HarnessRow status={status} />}
+                        </For>
+                      </ul>
+                    )}
+                  </Show>
+
+                  <div class="mt-3 flex items-center gap-2">
                     <Button
                       type="button"
                       variant="outline"
                       size="sm"
-                      onClick={() => void recheckPrereqs()}
+                      onClick={() => void recheckAll()}
+                      disabled={prereqsLoading()}
                     >
-                      Re-check
+                      <Show when={prereqsLoading()} fallback={<>Re-check</>}>
+                        <span
+                          class="mr-1.5 inline-block h-3 w-3 animate-spin rounded-full border-2 border-border border-t-foreground"
+                          aria-hidden="true"
+                        />
+                        Checking…
+                      </Show>
                     </Button>
+                    <Show when={prereqsJustChecked() && !prereqsLoading()}>
+                      <span class="text-[11px] text-muted-foreground">Checked just now</span>
+                    </Show>
                   </div>
                 </div>
               </Match>
@@ -679,22 +728,23 @@ export const OnboardingWizard: Component<OnboardingWizardProps> = (props) => {
                 <div>
                   <h3 class="mb-1 text-xs font-medium">2. First project</h3>
                   <p class="mb-3 text-xs text-muted-foreground">
-                    Pick a directory. raum stores the project under{" "}
-                    <code>~/.config/raum/projects/&lt;slug&gt;/</code> and never writes to the repo
-                    unless <code>.raum.toml</code> is already present.
+                    Link your first project to raum to get started.
                   </p>
 
                   <div class="mb-2 grid gap-1">
                     <span class="text-xs text-muted-foreground">Root directory</span>
-                    <div class="flex gap-2">
-                      <input
-                        type="text"
-                        class="flex-1 rounded-md border border-input bg-background px-2 py-1 font-mono text-foreground focus:border-ring focus:outline-none"
-                        placeholder="/path/to/repo"
-                        value={projectPath()}
-                        readOnly
-                        data-testid="onboarding-project-path"
-                      />
+                    <div class="flex items-center gap-2">
+                      <div class="flex flex-1 items-center gap-1.5 h-7 rounded-md bg-selected px-2">
+                        <FolderIcon class="size-3 shrink-0 text-muted-foreground/60" />
+                        <input
+                          type="text"
+                          class="flex-1 min-w-0 bg-transparent font-mono text-xs text-foreground placeholder:text-muted-foreground/40 focus:outline-none"
+                          placeholder="~/path/to/repo"
+                          value={tildify(projectPath())}
+                          readOnly
+                          data-testid="onboarding-project-path"
+                        />
+                      </div>
                       <Button
                         type="button"
                         variant="outline"
@@ -733,57 +783,7 @@ export const OnboardingWizard: Component<OnboardingWizardProps> = (props) => {
 
               <Match when={step() === 3}>
                 <div>
-                  <h3 class="mb-1 text-xs font-medium">3. Harness availability</h3>
-                  <p class="mb-3 text-xs text-muted-foreground">
-                    raum looks for these CLIs on your <code>PATH</code>. Anything found here will be
-                    available from the top bar — you can spawn whichever harness you want, when you
-                    want.
-                  </p>
-                  <Show
-                    when={harnessReport()}
-                    fallback={
-                      <div
-                        class="flex items-center gap-2 rounded-md border border-border bg-card/40 px-3 py-2 text-xs text-muted-foreground"
-                        data-testid="onboarding-harness-checking"
-                      >
-                        <span
-                          class="inline-block h-3 w-3 animate-spin rounded-full border-2 border-border border-t-foreground"
-                          aria-hidden="true"
-                        />
-                        Probing harnesses…
-                      </div>
-                    }
-                  >
-                    {(report) => (
-                      <ul
-                        class="space-y-1"
-                        aria-label="Harness availability"
-                        data-testid="onboarding-harness"
-                      >
-                        <For
-                          each={report().harnesses.filter((h) => h.kind !== ("shell" as Harness))}
-                        >
-                          {(status) => <HarnessRow status={status} />}
-                        </For>
-                      </ul>
-                    )}
-                  </Show>
-                  <div class="mt-3">
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      onClick={() => void recheckHarnesses()}
-                    >
-                      Re-check
-                    </Button>
-                  </div>
-                </div>
-              </Match>
-
-              <Match when={step() === 4}>
-                <div>
-                  <h3 class="mb-1 text-xs font-medium">4. Try a harness</h3>
+                  <h3 class="mb-1 text-xs font-medium">3. Try a harness</h3>
                   <p class="mb-3 text-xs text-muted-foreground">
                     Launch one in your project to see it work. You can spawn more from the top bar
                     later.
@@ -793,8 +793,8 @@ export const OnboardingWizard: Component<OnboardingWizardProps> = (props) => {
                     when={availableHarnesses().length > 0}
                     fallback={
                       <div class="rounded-md border border-border bg-card/40 p-3 text-xs text-muted-foreground">
-                        No harnesses found on your <code>PATH</code>. Install one from the previous
-                        step, or skip — you can come back to this anytime.
+                        No harnesses found. Install one from the previous step, or skip — you can
+                        come back to this anytime.
                       </div>
                     }
                   >
@@ -804,7 +804,6 @@ export const OnboardingWizard: Component<OnboardingWizardProps> = (props) => {
                           <HarnessCard
                             status={h}
                             spawning={spawningKinds().has(h.kind)}
-                            sessionId={spawnedSessions()[h.kind]}
                             error={spawnErrors()[h.kind]}
                             onSpawn={() => void spawnHarness(h.kind)}
                           />
@@ -822,7 +821,7 @@ export const OnboardingWizard: Component<OnboardingWizardProps> = (props) => {
             </Switch>
           </div>
 
-          <footer class="flex items-center justify-between border-t border-border px-5 py-3">
+          <footer class="flex items-center justify-between border-t border-border px-8 py-4">
             <Button
               type="button"
               variant="ghost"
@@ -839,7 +838,7 @@ export const OnboardingWizard: Component<OnboardingWizardProps> = (props) => {
                 variant="outline"
                 size="sm"
                 onClick={back}
-                disabled={step() === 1}
+                disabled={step() === 0}
               >
                 Back
               </Button>
@@ -850,7 +849,7 @@ export const OnboardingWizard: Component<OnboardingWizardProps> = (props) => {
                 disabled={!canAdvance() || finishing()}
                 data-testid="onboarding-next"
               >
-                {step() === 2 && projectBusy() ? "Registering…" : step() === 4 ? "Finish" : "Next"}
+                {step() === 2 && projectBusy() ? "Registering…" : step() === 3 ? "Finish" : "Next"}
               </Button>
             </div>
           </footer>

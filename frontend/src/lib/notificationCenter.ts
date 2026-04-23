@@ -34,6 +34,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { onAction, sendNotification } from "@tauri-apps/plugin-notification";
 import { createEffect, createRoot, createSignal } from "solid-js";
 import { toast } from "solid-sonner";
@@ -152,6 +153,20 @@ const [notifyOnDone, setNotifyOnDone] = createSignal(true);
 export { notifyOnDone };
 
 /**
+ * Master delivery switch for OS notification banners. When `false`, every
+ * dispatch path short-circuits before calling `sendNotification` and also
+ * skips the in-app toast fallback — the user asked for a silent-with-badge
+ * experience and a toast is still a visual interruption. The dock badge
+ * is independent (driven by `badgeMode`) so counts keep updating.
+ *
+ * Explicit diagnostic sends (the Settings → "Send test" button) bypass
+ * this gate: it's a one-shot "does the OS path work?" probe and must fire
+ * regardless of the user's standing preference.
+ */
+const [notifyBannerEnabled, setNotifyBannerEnabled] = createSignal(true);
+export { notifyBannerEnabled };
+
+/**
  * §11.3 — dock/taskbar badge verbosity. Mirrors `raum_core::config::BadgeMode`
  * (serialised snake_case). Default matches the Rust default so a fresh
  * install gets "all unread" behavior before `config_get` completes.
@@ -250,10 +265,11 @@ interface NotificationAuthorization {
 
 /**
  * Probe the actual OS authorization state via the Rust backend. The Tauri
- * notification plugin's `isPermissionGranted` is hard-coded to return true on
- * desktop, so we go directly to `~/Library/Preferences/com.apple.ncprefs.plist`
- * (macOS) or the session DBus (Linux) instead. Updates the reactive signals
- * and returns the raw payload for callers that need the bundle/dev fields.
+ * notification plugin's desktop permission APIs are hard-coded to return
+ * granted, so the backend checks the native UserNotifications API on macOS and
+ * the session notification service on Linux instead. Updates the reactive
+ * signals and returns the raw payload for callers that need the bundle/dev
+ * fields.
  */
 export async function refreshNotificationAuthorization(): Promise<NotificationAuthorization> {
   try {
@@ -393,21 +409,42 @@ export async function sendTestNotification(): Promise<void> {
   }
 
   // The first sendNotification on macOS may surface the OS authorization
-  // prompt; re-probe so the badge picks up the new state without forcing
-  // the user to reopen settings.
+  // prompt; re-probe so the badge picks up the new state without forcing the
+  // user to reopen settings.
   await refreshNotificationAuthorization();
 }
 
 /**
  * True when the OS notification path is worth attempting. We try on both
  * `"granted"` and `"unknown"` — the latter is the pre-prompt state on macOS,
- * where the first `sendNotification` call triggers the system permission
- * dialog and registers the bundle in `com.apple.ncprefs.plist`. Treating
- * `"unknown"` as "not available" would keep us locked in the toast fallback
- * forever, because the plist entry only appears after a real send.
+ * where the first `sendNotification` call can trigger the system permission
+ * dialog. Treating `"unknown"` as "not available" would keep us locked in the
+ * toast fallback forever, because the first real send is what lets macOS
+ * resolve the app's notification authorization path.
  */
 function osNotificationsAvailable(): boolean {
   return permissionState() !== "denied";
+}
+
+// Tracks whether the raum window is currently focused. Conservative default
+// (true) avoids a spurious unfocused-toast race before the first isFocused()
+// probe resolves in startNotificationCenter.
+let _windowFocused = true;
+
+async function startWindowFocusTracking(): Promise<() => void> {
+  const win = getCurrentWindow();
+  _windowFocused = await win.isFocused();
+  const unBlur = await win.listen("blur", () => {
+    _windowFocused = false;
+  });
+  const unFocus = await win.listen("focus", () => {
+    _windowFocused = true;
+    void refreshNotificationAuthorization();
+  });
+  return () => {
+    unBlur();
+    unFocus();
+  };
 }
 
 async function readSoundPath(): Promise<string | undefined> {
@@ -427,11 +464,13 @@ async function loadNotificationConfig(): Promise<void> {
       notifications?: {
         notify_on_waiting?: boolean;
         notify_on_done?: boolean;
+        notify_banner_enabled?: boolean;
         badge_mode?: BadgeMode;
       };
     }>("config_get");
     setNotifyOnWaiting(cfg.notifications?.notify_on_waiting ?? true);
     setNotifyOnDone(cfg.notifications?.notify_on_done ?? true);
+    setNotifyBannerEnabled(cfg.notifications?.notify_banner_enabled ?? true);
     const mode = cfg.notifications?.badge_mode;
     if (mode === "off" || mode === "critical" || mode === "all_unread") {
       setBadgeMode(mode);
@@ -470,6 +509,11 @@ async function dispatchWaitingNotification(sessionId: string, harness: AgentKind
 
   void playWaitingSound();
 
+  // Banner master switch off → user opted into silent-with-badge. Skip both
+  // the OS notification AND the toast fallback; the dock badge still ticks
+  // via `handleAgentStateChanged`'s unread/pending counters.
+  if (!notifyBannerEnabled()) return;
+
   // Toast is the fallback — fires only when the OS path is definitively
   // denied. On `"unknown"` we still attempt the OS path so the first send
   // triggers macOS's authorization prompt and registers the bundle. The
@@ -479,10 +523,12 @@ async function dispatchWaitingNotification(sessionId: string, harness: AgentKind
   // `terminal-focus-requested` CustomEvent that the OS-notification click
   // path uses.
   if (!osNotificationsAvailable()) {
-    toast(title, {
-      description: body,
-      action: { label: "Open", onClick: () => focusSession(sessionId) },
-    });
+    if (!_windowFocused) {
+      toast(title, {
+        description: body,
+        action: { label: "Open", onClick: () => focusSession(sessionId) },
+      });
+    }
     return;
   }
 
@@ -511,6 +557,10 @@ async function dispatchDoneNotification(
 
   const soundPath = await readSoundPath();
   if (soundPath) void playSound(soundPath);
+
+  // Banner master switch off → silent-with-badge. Skip both the OS banner
+  // and the toast fallback.
+  if (!notifyBannerEnabled()) return;
 
   // Toast is the fallback when the OS path is denied; click → focuses the
   // pane. When the OS path is viable (granted or pre-prompt), fire the
@@ -579,6 +629,7 @@ function handleAgentStateChanged(payload: AgentStateChangedPayload): void {
 export async function startNotificationCenter(): Promise<UnlistenFn> {
   await ensureNotificationPermission();
   await loadNotificationConfig();
+  const disposeWindowFocus = await startWindowFocusTracking();
 
   const unlistenState = await listen<AgentStateChangedPayload>("agent-state-changed", (ev) => {
     handleAgentStateChanged(ev.payload);
@@ -629,6 +680,7 @@ export async function startNotificationCenter(): Promise<UnlistenFn> {
     unlistenPermission();
     actionListener.unregister();
     disposeBadge();
+    disposeWindowFocus();
     lastNotifyAt.clear();
   };
 }
@@ -656,22 +708,32 @@ async function dispatchPermissionNotification(payload: NotificationEventPayload)
 
   void playWaitingSound();
 
+  // Banner master switch off → silent-with-badge. The pending-permission
+  // counter already incremented above (drives the dock badge in Critical
+  // mode), so the user still notices; we just don't interrupt with a
+  // banner or toast.
+  if (!notifyBannerEnabled()) return;
+
   // Auto-close uses the Toaster's default duration; the dock badge and OS
   // notification keep the request visible after the toast fades. A manual
   // dismiss (close button or swipe) is treated as "ignore this request"
   // and aborts the session — sonner routes that through `onDismiss`,
   // while the timer path fires `onAutoClose`, so auto-hiding the toast
   // does not abort.
-  toast.warning(title, {
-    description: summary,
-    action: { label: "Open", onClick: () => focusSession(sessionId) },
-    onDismiss: () => {
-      if (!sessionId) return;
-      void invoke("abort_session", { sessionId }).catch((e) => {
-        console.warn("abort_session from toast dismiss failed", e);
-      });
-    },
-  });
+  // When raum is focused the pane bump handles the "look here" signal;
+  // the toast is reserved for the unfocused / background case.
+  if (!_windowFocused) {
+    toast.warning(title, {
+      description: summary,
+      action: { label: "Open", onClick: () => focusSession(sessionId) },
+      onDismiss: () => {
+        if (!sessionId) return;
+        void invoke("abort_session", { sessionId }).catch((e) => {
+          console.warn("abort_session from toast dismiss failed", e);
+        });
+      },
+    });
+  }
 
   if (osNotificationsAvailable()) {
     try {
@@ -725,6 +787,7 @@ export function syncDockBadge(count: number): void {
 export function __resetNotificationCenterForTests(): void {
   lastNotifyAt.clear();
   contextBySession.clear();
+  _windowFocused = false;
   setPermissionState("unknown");
   setNotificationBundleId("");
   setNotificationDevMode(false);
@@ -736,6 +799,7 @@ export function __resetNotificationCenterForTests(): void {
   setBadgeMode("all_unread");
   setNotifyOnWaiting(true);
   setNotifyOnDone(true);
+  setNotifyBannerEnabled(true);
 }
 
 /** @internal — hand the event handler directly so tests don't need Tauri IPC. */

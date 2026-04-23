@@ -24,9 +24,13 @@ export interface TerminalAppearanceConfig {
  *   that blur/refocus on every drag).
  * - `fontLigatures: false` — disables the (opt-in) ligatures addon path. The
  *   addon isn't loaded today; this is explicit intent for future maintainers.
- * - `macOptionIsMeta` / `macOptionClickForcesSelection` — makes Option key
- *   behave as Meta (for word-wise navigation in agent CLIs) and Option+click
- *   force-select text inside selections (xterm default swallows it).
+ * - `macOptionIsMeta: false` — let macOS compose Option-based characters
+ *   (Option+L → `@`, Option+E → `€`, etc.) so non-US layouts can type
+ *   normally. Word-wise navigation inside harness CLIs belongs in the
+ *   shell/readline config, not in a flag that clobbers every composed
+ *   Option character.
+ * - `macOptionClickForcesSelection` — Option+click force-selects text
+ *   inside selections (xterm default swallows it).
  * - `scrollOnUserInput: false` — don't jump to the bottom when the user
  *   types while scrolled back; they're usually reading.
  * - `scrollSensitivity` / `fastScrollSensitivity` — tuned for trackpad
@@ -42,7 +46,7 @@ export const BASE_TERMINAL_OPTIONS = {
   fontWeight: "normal" as const,
   fontWeightBold: "700" as const,
   allowProposedApi: true,
-  macOptionIsMeta: true,
+  macOptionIsMeta: false,
   macOptionClickForcesSelection: true,
   scrollOnUserInput: false,
   fastScrollSensitivity: 5,

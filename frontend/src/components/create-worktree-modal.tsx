@@ -43,6 +43,7 @@ import {
   DropdownMenuPortal,
   DropdownMenuTrigger,
 } from "./ui/dropdown-menu";
+import { Tooltip, TooltipContent, TooltipPortal, TooltipTrigger } from "./ui/tooltip";
 
 /**
  * Conventional-Commits-style branch prefixes offered by the "+ prefix"
@@ -132,6 +133,7 @@ interface PreviewArgs {
   slug: string;
   branch: string;
   strategy: PathStrategy | null;
+  patternOverride: string | null;
 }
 
 async function previewPath(args: PreviewArgs): Promise<WorktreePathPreview | null> {
@@ -140,7 +142,7 @@ async function previewPath(args: PreviewArgs): Promise<WorktreePathPreview | nul
     projectSlug: args.slug,
     branch: args.branch,
     pathStrategy: args.strategy,
-    pathPatternOverride: null,
+    pathPatternOverride: args.patternOverride,
   });
 }
 
@@ -163,6 +165,7 @@ interface CreateArgs {
   branch: string;
   baseBranch: string | null;
   strategyOverride: PathStrategy | null;
+  patternOverride: string | null;
 }
 
 /**
@@ -193,7 +196,7 @@ export function useWorktreeCreate(projectSlug: () => string): {
           baseBranch: args.baseBranch ?? null,
           skipHydration: false,
           pathStrategy: args.strategyOverride,
-          pathPatternOverride: null,
+          pathPatternOverride: args.patternOverride,
         },
       });
       setLastCreated(out);
@@ -225,6 +228,11 @@ export const CreateWorktreeModal: Component<CreateWorktreeModalProps> = (props) 
   // pathStrategy resolves to). Picking a different value here only affects
   // this one creation.
   const [strategyOverride, setStrategyOverride] = createSignal<PathStrategy | null>(null);
+  // Freeform pattern edited by the user when strategy === "custom". Seeded
+  // from the project's current configured pattern the first time the user
+  // switches to Custom, so they get a real starting point to tweak.
+  const [customPattern, setCustomPattern] = createSignal("");
+  const [customPatternSeeded, setCustomPatternSeeded] = createSignal(false);
   const [baseBranch, setBaseBranch] = createSignal<string | null>(null);
   const projectSlug = createMemo(() => props.projectSlug);
 
@@ -262,7 +270,12 @@ export const CreateWorktreeModal: Component<CreateWorktreeModalProps> = (props) 
     async (slug) => {
       if (!slug) return null;
       try {
-        return await previewPath({ slug, branch: EXAMPLE_BRANCH, strategy: null });
+        return await previewPath({
+          slug,
+          branch: EXAMPLE_BRANCH,
+          strategy: null,
+          patternOverride: null,
+        });
       } catch {
         return null;
       }
@@ -273,15 +286,44 @@ export const CreateWorktreeModal: Component<CreateWorktreeModalProps> = (props) 
     () => strategyOverride() ?? defaultPreview()?.pathStrategy ?? "sibling-group",
   );
 
+  // Seed the custom-pattern input the first time the user switches to Custom
+  // — they get the project's current pattern as a starting point to edit,
+  // instead of an empty field that silently does nothing.
+  createEffect(() => {
+    if (effectiveStrategy() !== "custom") return;
+    if (customPatternSeeded()) return;
+    const seed = defaultPreview()?.pattern;
+    if (seed) {
+      setCustomPattern(seed);
+      setCustomPatternSeeded(true);
+    }
+  });
+
+  // Override fed to backend previews/creates. Only send it when Custom is
+  // active and the user has typed a non-empty pattern — otherwise the preset
+  // (sibling/nested) path wins.
+  const patternOverride = createMemo<string | null>(() => {
+    if (effectiveStrategy() !== "custom") return null;
+    const p = customPattern().trim();
+    return p.length > 0 ? p : null;
+  });
+
   // Live preview that follows the typed branch (or the example placeholder)
   // and the chosen strategy override. We always pass the override so the
   // preview matches what `worktree_create` will actually do.
   const [pathPreview] = createResource(
-    () => [props.open, projectSlug(), branch() || EXAMPLE_BRANCH, strategyOverride()] as const,
-    async ([open, slug, br, strategy]) => {
+    () =>
+      [
+        props.open,
+        projectSlug(),
+        branch() || EXAMPLE_BRANCH,
+        strategyOverride(),
+        patternOverride(),
+      ] as const,
+    async ([open, slug, br, strategy, override]) => {
       if (!open) return null;
       try {
-        return await previewPath({ slug, branch: br, strategy });
+        return await previewPath({ slug, branch: br, strategy, patternOverride: override });
       } catch {
         return null;
       }
@@ -314,10 +356,13 @@ export const CreateWorktreeModal: Component<CreateWorktreeModalProps> = (props) 
         branch: branch(),
         baseBranch: baseBranch(),
         strategyOverride: strategyOverride(),
+        patternOverride: patternOverride(),
       });
       props.onCreated?.(out);
       setBranch("");
       setStrategyOverride(null);
+      setCustomPattern("");
+      setCustomPatternSeeded(false);
       props.onClose();
     } catch {
       // error() signal already captured the message.
@@ -331,6 +376,8 @@ export const CreateWorktreeModal: Component<CreateWorktreeModalProps> = (props) 
         if (!isOpen) {
           setBranch("");
           setStrategyOverride(null);
+          setCustomPattern("");
+          setCustomPatternSeeded(false);
           setBaseBranch(null);
           props.onClose();
         }
@@ -469,6 +516,22 @@ export const CreateWorktreeModal: Component<CreateWorktreeModalProps> = (props) 
                   )}
                 </For>
               </div>
+              <Show when={effectiveStrategy() === "custom"}>
+                <TextField value={customPattern()} onChange={setCustomPattern}>
+                  <TextFieldInput
+                    type="text"
+                    placeholder="{parent-dir}/{base-folder}-worktrees/{branch-slug}"
+                    class="font-mono text-xs"
+                    data-testid="custom-pattern-input"
+                  />
+                </TextField>
+                <p class="text-[10px] text-muted-foreground">
+                  Tokens: <code class="rounded bg-muted px-1 py-px font-mono">{"{repo-root}"}</code>
+                  , <code class="rounded bg-muted px-1 py-px font-mono">{"{parent-dir}"}</code>,{" "}
+                  <code class="rounded bg-muted px-1 py-px font-mono">{"{base-folder}"}</code>,{" "}
+                  <code class="rounded bg-muted px-1 py-px font-mono">{"{branch-slug}"}</code>.
+                </p>
+              </Show>
             </div>
 
             {/* Prefixed branch — fixed height, single line */}
@@ -491,12 +554,41 @@ export const CreateWorktreeModal: Component<CreateWorktreeModalProps> = (props) 
               <div class="mb-1 flex items-center gap-1 text-muted-foreground">
                 <span>Target path</span>
                 <Show when={pathPreview()?.pattern}>
-                  <span
-                    class="inline-flex h-3 w-3 cursor-help items-center justify-center rounded-full border border-muted-foreground/40 text-[8px] leading-none text-muted-foreground"
-                    title={`Pattern: ${pathPreview()?.pattern}\n\n{parent-dir} = folder containing the project\n{base-folder} = project folder name\n{branch-slug} = your branch name\n\nChange the pattern in Project Settings → Worktree path.`}
-                  >
-                    ?
-                  </span>
+                  <Tooltip>
+                    <TooltipTrigger
+                      as="button"
+                      type="button"
+                      aria-label="Target path help"
+                      class="inline-flex h-3 w-3 cursor-help items-center justify-center rounded-full border border-muted-foreground/40 text-[8px] leading-none text-muted-foreground hover:border-muted-foreground hover:text-foreground"
+                    >
+                      ?
+                    </TooltipTrigger>
+                    <TooltipPortal>
+                      <TooltipContent class="max-w-[280px] whitespace-normal text-left leading-relaxed">
+                        <div class="mb-1 font-mono text-[10px] text-muted-foreground">
+                          {pathPreview()?.pattern}
+                        </div>
+                        <div class="space-y-0.5">
+                          <div>
+                            <code class="font-mono">{"{repo-root}"}</code> — project root
+                          </div>
+                          <div>
+                            <code class="font-mono">{"{parent-dir}"}</code> — folder containing the
+                            project
+                          </div>
+                          <div>
+                            <code class="font-mono">{"{base-folder}"}</code> — project folder name
+                          </div>
+                          <div>
+                            <code class="font-mono">{"{branch-slug}"}</code> — slugified branch
+                          </div>
+                        </div>
+                        <div class="mt-1 text-muted-foreground">
+                          Change the default in Project Settings → Worktree path.
+                        </div>
+                      </TooltipContent>
+                    </TooltipPortal>
+                  </Tooltip>
                 </Show>
               </div>
               <div

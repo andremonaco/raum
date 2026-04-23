@@ -31,8 +31,9 @@ use raum_core::config::{BranchPrefixMode, PathStrategy, QUICKFIRE_HISTORY_LIMIT,
 use raum_hydration::{
     CreateOptions, HookContext, HookError, HookPhase, PatternInputs, PrefixContext,
     apply_branch_prefix, apply_hydration, preview_path_pattern, resolve_hook_path,
-    resolve_worktree_pattern, run_hook, worktree_create as git_worktree_create,
-    worktree_list as git_worktree_list, worktree_remove as git_worktree_remove,
+    resolve_worktree_pattern, run_hook, validate_path_pattern,
+    worktree_create as git_worktree_create, worktree_list as git_worktree_list,
+    worktree_remove as git_worktree_remove,
 };
 use serde::{Deserialize, Serialize};
 
@@ -235,6 +236,10 @@ pub fn worktree_create(
         opts.path_strategy,
         opts.path_pattern_override.as_deref(),
     );
+    // Reject typos (e.g. `{root}` instead of `{repo-root}`) before we mkdir a
+    // literal-token folder on disk. Preset patterns are valid by construction;
+    // this really guards Custom.
+    validate_path_pattern(&effective.worktree.path_pattern).map_err(|e| e.to_string())?;
     let prefix_ctx = PrefixContext {
         username: &os_username(),
     };

@@ -130,6 +130,9 @@ const RESIZE_DEBOUNCE_MS = 100;
 /** Spawn gate: below these dims the host isn't laid out yet and fit returns junk. */
 const MIN_SPAWN_COLS = 20;
 const MIN_SPAWN_ROWS = 5;
+/** Reattach can tolerate much smaller panes because the harness already exists. */
+const MIN_REATTACH_COLS = 8;
+const MIN_REATTACH_ROWS = 2;
 
 /** Upper bound before we give up waiting for `document.fonts.ready`. */
 const FONTS_READY_TIMEOUT_MS = 500;
@@ -454,7 +457,7 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       }
       const cols = term.cols;
       const rows = term.rows;
-      if (cols < MIN_SPAWN_COLS || rows < MIN_SPAWN_ROWS) return;
+      if (cols < MIN_REATTACH_COLS || rows < MIN_REATTACH_ROWS) return;
       // Mark as spawned synchronously so the resize observer doesn't race
       // into trySpawn while we're still negotiating with the backend.
       hasSpawned = true;

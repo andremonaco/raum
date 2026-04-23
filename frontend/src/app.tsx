@@ -20,6 +20,7 @@ import { installDevtoolsShortcut } from "./lib/devtoolsShortcut";
 import { loadThemeFromConfig } from "./lib/theme/themeController";
 import { initHomeDir } from "./lib/pathDisplay";
 import { installFileDrop } from "./lib/fileDrop";
+import { previewOnboarding, setPreviewOnboarding } from "./lib/devOnboardingPreview";
 import "overlayscrollbars/overlayscrollbars.css";
 
 interface RaumConfigSnapshot {
@@ -162,6 +163,7 @@ const App: Component = () => {
     }
   });
   const showWizard = (): boolean => {
+    if (previewOnboarding()) return true;
     if (dismissed()) return false;
     const c = cfg();
     if (!c) return false;
@@ -180,7 +182,12 @@ const App: Component = () => {
           </main>
         </div>
         <Show when={showWizard()}>
-          <OnboardingWizard onDone={() => setDismissed(true)} />
+          <OnboardingWizard
+            onDone={() => {
+              setDismissed(true);
+              setPreviewOnboarding(false);
+            }}
+          />
         </Show>
         <SpotlightDock />
         <Toaster />

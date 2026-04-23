@@ -101,9 +101,9 @@ export const UnlinkProjectModal: Component<UnlinkProjectModalProps> = (props) =>
       }}
     >
       <DialogPortal>
-        <DialogContent class="sm:max-w-[500px]">
+        <DialogContent class="!gap-6 !p-8 sm:max-w-[720px]">
           <DialogHeader>
-            <DialogTitle class="flex flex-wrap items-baseline gap-1 text-sm">
+            <DialogTitle class="flex flex-wrap items-baseline gap-1.5 text-sm">
               <span>Unlink project</span>
               <span class="min-w-0 font-mono text-foreground [word-break:break-all]">
                 {props.project.name}
@@ -112,54 +112,54 @@ export const UnlinkProjectModal: Component<UnlinkProjectModalProps> = (props) =>
             </DialogTitle>
           </DialogHeader>
 
-          <div class="min-w-0 space-y-3 text-xs">
+          <div class="min-w-0 space-y-5 text-xs">
             <p class="text-foreground">
               <span class="font-semibold">Unlinking never deletes files from your disk.</span> raum
               only stops tracking this project and clears its own settings.
             </p>
 
-            <div class="min-w-0 truncate rounded-md border border-border bg-muted/40 px-2 py-2 font-mono text-[11px] text-muted-foreground">
+            <div class="min-w-0 truncate rounded-md border border-border bg-muted/40 px-2.5 py-2 font-mono text-xs text-muted-foreground">
               {props.project.rootPath}
             </div>
 
             <section>
-              <div class="mb-1.5 text-[10px] uppercase tracking-wide text-foreground-subtle">
+              <div class="mb-2 text-[11px] uppercase tracking-wide text-foreground-subtle">
                 What raum will remove
               </div>
-              <ul class="space-y-1 text-muted-foreground">
-                <li class="flex items-start gap-2">
-                  <FolderIcon class="mt-[1px] size-3.5 shrink-0 text-warning/80" />
+              <ul class="space-y-1.5 text-muted-foreground">
+                <li class="flex items-start gap-2.5">
+                  <FolderIcon class="mt-[2px] size-4 shrink-0 text-warning/80" />
                   <span class="min-w-0 flex-1 text-foreground">
                     Per-project settings folder{" "}
-                    <span class="rounded bg-muted px-1 py-px font-mono text-[11px] [word-break:break-all]">
+                    <span class="rounded bg-muted px-1 py-px font-mono text-xs [word-break:break-all]">
                       ~/.config/raum/projects/{props.project.slug}/
                     </span>
                   </span>
                 </li>
-                <li class="flex items-start gap-2">
-                  <span class="mt-[5px] inline-block size-1 shrink-0 rounded-full bg-warning/70" />
+                <li class="flex items-start gap-2.5">
+                  <span class="mt-[7px] inline-block size-1 shrink-0 rounded-full bg-warning/70" />
                   <span class="min-w-0 flex-1">
                     Custom harness settings, layouts and keymaps for this project
                   </span>
                 </li>
-                <li class="flex items-start gap-2">
-                  <span class="mt-[5px] inline-block size-1 shrink-0 rounded-full bg-warning/70" />
+                <li class="flex items-start gap-2.5">
+                  <span class="mt-[7px] inline-block size-1 shrink-0 rounded-full bg-warning/70" />
                   <span class="min-w-0 flex-1">This project's entry in raum's project list</span>
                 </li>
                 <Show when={runningCount() > 0}>
-                  <li class="flex items-start gap-2">
-                    <ShellIcon class="mt-[1px] size-3.5 shrink-0 text-warning/80" />
+                  <li class="flex items-start gap-2.5">
+                    <ShellIcon class="mt-[2px] size-4 shrink-0 text-warning/80" />
                     <span class="min-w-0 flex-1">
                       <div class="text-foreground">
                         {runningCount()} running terminal{runningCount() === 1 ? "" : "s"} attached
                         to this project will be closed
                       </div>
-                      <ul class="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1">
+                      <ul class="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1">
                         <For each={runningByKind()}>
                           {(group) => {
                             const Icon = HARNESS_ICONS[group.kind];
                             return (
-                              <li class="inline-flex items-center gap-1 font-mono text-[11px]">
+                              <li class="inline-flex items-center gap-1 font-mono text-xs">
                                 <Icon class="size-3.5" />
                                 <span>{HARNESS_LABEL[group.kind]}</span>
                                 <span class="text-foreground">×{group.count}</span>
@@ -175,27 +175,27 @@ export const UnlinkProjectModal: Component<UnlinkProjectModalProps> = (props) =>
             </section>
 
             <section>
-              <div class="mb-1.5 text-[10px] uppercase tracking-wide text-foreground-subtle">
+              <div class="mb-2 text-[11px] uppercase tracking-wide text-foreground-subtle">
                 What stays on disk
               </div>
-              <ul class="space-y-1 text-muted-foreground">
-                <li class="flex items-start gap-2">
-                  <FolderIcon class="mt-[1px] size-3.5 shrink-0 text-success/70" />
+              <ul class="space-y-1.5 text-muted-foreground">
+                <li class="flex items-start gap-2.5">
+                  <FolderIcon class="mt-[2px] size-4 shrink-0 text-success/70" />
                   <span>Your project files and folders</span>
                 </li>
-                <li class="flex items-start gap-2">
-                  <FolderIcon class="mt-[1px] size-3.5 shrink-0 text-success/70" />
+                <li class="flex items-start gap-2.5">
+                  <FolderIcon class="mt-[2px] size-4 shrink-0 text-success/70" />
                   <span>All worktree folders and their contents</span>
                 </li>
-                <li class="flex items-start gap-2">
-                  <GitBranchIcon class="mt-[1px] size-3.5 shrink-0 text-success/70" />
+                <li class="flex items-start gap-2.5">
+                  <GitBranchIcon class="mt-[2px] size-4 shrink-0 text-success/70" />
                   <span>All git branches, commits and remotes</span>
                 </li>
-                <li class="flex items-start gap-2">
-                  <span class="mt-[5px] inline-block size-1 shrink-0 rounded-full bg-success/70" />
+                <li class="flex items-start gap-2.5">
+                  <span class="mt-[7px] inline-block size-1 shrink-0 rounded-full bg-success/70" />
                   <span>
                     The project's own{" "}
-                    <span class="rounded bg-muted px-1 py-px font-mono text-[11px] text-foreground">
+                    <span class="rounded bg-muted px-1 py-px font-mono text-xs text-foreground">
                       .raum.toml
                     </span>{" "}
                     file (if any)
@@ -212,12 +212,11 @@ export const UnlinkProjectModal: Component<UnlinkProjectModalProps> = (props) =>
           </div>
 
           <DialogFooter>
-            <Button type="button" variant="ghost" size="sm" onClick={() => props.onClose()}>
+            <Button type="button" variant="ghost" onClick={() => props.onClose()}>
               Cancel
             </Button>
             <Button
               type="button"
-              size="sm"
               disabled={submitting()}
               onClick={() => {
                 void submit();

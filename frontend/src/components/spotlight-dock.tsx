@@ -4,7 +4,10 @@
  * Triggered by `⌘F` (or `⌘.` for backwards compatibility). Shows recent
  * searches and all project harnesses when the input is empty; as the user
  * types, shows:
- *   - matching harness sessions (click → focus pane),
+ *   - matching harness sessions (click → focus pane) — each row renders
+ *     `<harness icon> <tab label> <project sigil> <project name> <state>`,
+ *     reusing the tab-strip label so users never see the raw tmux session
+ *     id,
  *   - scrollback matches across every live harness on every project — each
  *     row shows `<harness icon> <tab-label> <line-with-highlighted-match>`
  *     and activating one jumps to the owning project, focuses the pane,
@@ -42,7 +45,8 @@ import {
 } from "../lib/spotlightState";
 import { addRecentSearch, clearRecentSearch, recentSearches } from "../lib/recentSearchStore";
 import { listHarnessSessions } from "../stores/terminalStore";
-import { activeProjectSlug, setActiveProjectSlug } from "../stores/projectStore";
+import { activeProjectSlug, projectBySlug, setActiveProjectSlug } from "../stores/projectStore";
+import { resolveSessionTabLabel } from "../lib/harnessTabLabel";
 import { useKeymapAction } from "../lib/keymapContext";
 import {
   buildPreviewParts,
@@ -81,9 +85,11 @@ type HarnessItem = {
   sessionId: string;
   kind: HarnessIconKind;
   workingState: string;
-  worktreeId: string | null;
-  /** Human-readable label derived from worktreeId (last path segment). */
-  worktreeLabel: string | null;
+  /** Same label the grid's tab strip shows for this session. */
+  tabLabel: string;
+  projectSlug: string | null;
+  projectName: string | null;
+  projectSigil: string | null;
 };
 type FileItem = { type: "file"; hit: WorktreeFileHit };
 type ScrollbackItem = { type: "scrollback"; match: ScrollbackMatch };
@@ -103,13 +109,6 @@ function stateLabel(state: string): string {
   if (state === "working") return "active";
   if (state === "waiting") return "waiting";
   return "idle";
-}
-
-/** Return the last meaningful segment of a worktree path as a display label. */
-function worktreeLabel(worktreeId: string | null): string | null {
-  if (!worktreeId) return null;
-  const parts = worktreeId.replace(/\\/g, "/").split("/").filter(Boolean);
-  return parts.at(-1) ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -277,25 +276,29 @@ export const SpotlightDock: Component = () => {
   const harnessMatches = createMemo<HarnessItem[]>(() => {
     const q = query().toLowerCase().trim();
     const slug = activeProjectSlug();
+    const projects = projectBySlug();
     return listHarnessSessions(slug)
-      .filter(
-        (t) =>
-          !q ||
-          t.kind.toLowerCase().includes(q) ||
-          t.session_id.toLowerCase().includes(q) ||
-          (t.worktree_id?.toLowerCase().includes(q) ?? false),
-      )
-      .slice(0, 8)
-      .map(
-        (t): HarnessItem => ({
+      .map((t): HarnessItem => {
+        const project = t.project_slug ? (projects.get(t.project_slug) ?? null) : null;
+        return {
           type: "harness" as const,
           sessionId: t.session_id,
           kind: t.kind as HarnessIconKind,
           workingState: t.workingState,
-          worktreeId: t.worktree_id,
-          worktreeLabel: worktreeLabel(t.worktree_id),
-        }),
-      );
+          tabLabel: resolveSessionTabLabel(t.session_id),
+          projectSlug: t.project_slug,
+          projectName: project?.name ?? null,
+          projectSigil: project?.sigil ?? null,
+        };
+      })
+      .filter(
+        (item) =>
+          !q ||
+          item.tabLabel.toLowerCase().includes(q) ||
+          item.kind.toLowerCase().includes(q) ||
+          (item.projectName?.toLowerCase().includes(q) ?? false),
+      )
+      .slice(0, 8);
   });
 
   // ---------------------------------------------------------------------------
@@ -630,13 +633,14 @@ const ItemContent: Component<{
         return (
           <>
             <Icon class="size-3.5 shrink-0 text-muted-foreground" />
-            <span class="flex-1 truncate font-mono text-xs text-foreground/90">
-              {harness().sessionId}
-            </span>
-            <Show when={harness().worktreeLabel}>
-              <Badge class="shrink-0 bg-white/5 px-1.5 py-0.5 text-[9px] font-medium text-muted-foreground/70">
-                {harness().worktreeLabel}
-              </Badge>
+            <span class="flex-1 truncate text-foreground/90">{harness().tabLabel}</span>
+            <Show when={harness().projectName}>
+              <span class="flex shrink-0 items-center gap-1 text-[10px] text-muted-foreground/70">
+                <Show when={harness().projectSigil}>
+                  <span class="font-mono text-muted-foreground/60">{harness().projectSigil}</span>
+                </Show>
+                <span class="truncate">{harness().projectName}</span>
+              </span>
             </Show>
             <Badge
               class={`ml-1 shrink-0 px-1.5 py-0.5 text-[9px] font-medium ${stateColor(harness().workingState)}`}

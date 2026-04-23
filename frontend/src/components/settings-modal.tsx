@@ -67,7 +67,14 @@ import {
 import { activeProjectSlug, projectStore } from "../stores/projectStore";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 
-import { CheckIcon, HARNESS_ICONS, LoaderIcon, PlayIcon, type HarnessIconKind } from "./icons";
+import {
+  CheckIcon,
+  HARNESS_ICONS,
+  LoaderIcon,
+  PlayIcon,
+  RaumLogo,
+  type HarnessIconKind,
+} from "./icons";
 import { Scrollable } from "./ui/scrollable";
 import {
   DropdownMenu,
@@ -214,10 +221,18 @@ const SECTIONS: Section[] = [
 
 const PermissionBadge: Component = () => {
   const label = () => {
+    if (notificationDevMode()) return "Dev build";
+    if (linuxNotificationServiceUnavailable()) return "Unavailable";
     const s = permissionState();
     return s === "granted" ? "Granted" : s === "denied" ? "Denied" : "Not set";
   };
   const color = () => {
+    if (notificationDevMode()) {
+      return "bg-muted text-muted-foreground hover:bg-muted/70";
+    }
+    if (linuxNotificationServiceUnavailable()) {
+      return "bg-warning/15 text-warning hover:bg-warning/25";
+    }
     const s = permissionState();
     return s === "granted"
       ? "bg-success/15 text-success hover:bg-success/25"
@@ -248,6 +263,21 @@ const PermissionBadge: Component = () => {
     </button>
   );
 };
+
+function linuxNotificationServiceUnavailable(): boolean {
+  return (
+    notificationBundleId() === "org.freedesktop.Notifications" && permissionState() === "denied"
+  );
+}
+
+function notificationReadinessLabel(): string {
+  if (notificationDevMode()) return "Use bundled app";
+  if (linuxNotificationServiceUnavailable()) return "Service unavailable";
+  const state = permissionState();
+  if (state === "granted") return "Working";
+  if (state === "denied") return "OS permission denied";
+  return "Permission not set";
+}
 
 // ---------------------------------------------------------------------------
 // Toggle row
@@ -530,8 +560,13 @@ const AppearanceSection: Component = () => {
 interface NotifConfig {
   notify_on_waiting: boolean;
   notify_on_done: boolean;
+  notify_banner_enabled: boolean;
   sound: string | null;
   badge_mode: BadgeMode;
+}
+
+interface NotifOsInfo {
+  family: "macos" | "linux" | "other";
 }
 
 function isBadgeMode(value: unknown): value is BadgeMode {
@@ -572,13 +607,11 @@ const HarnessNotificationsSummary: Component = () => {
 
   void scanHarnessInstallState(activeProjectRoot());
 
-  const osGranted = () => permissionState() === "granted";
-
   const rowTone = (kind: HarnessIconKind): "ok" | "warn" | "error" | "muted" => {
     const scan = harnessHealth()[kind]?.scan ?? null;
     if (!scan) return "muted";
     if (!pathsReady(scan)) return "error";
-    if (!osGranted()) return "warn";
+    if (permissionState() !== "granted") return "warn";
     return "ok";
   };
 
@@ -586,8 +619,7 @@ const HarnessNotificationsSummary: Component = () => {
     const scan = harnessHealth()[kind]?.scan ?? null;
     if (!scan) return "Scanning…";
     if (!pathsReady(scan)) return "Not configured";
-    if (!osGranted()) return "OS permission needed";
-    return "Working";
+    return notificationReadinessLabel();
   };
 
   return (
@@ -616,12 +648,90 @@ const HarnessNotificationsSummary: Component = () => {
   );
 };
 
-const NotificationsSection: Component = () => {
+/**
+ * Mock dock icon with a Slack-style count badge. Used in Settings →
+ * Notifications → Delivery so macOS users can see what the "Dock badge"
+ * selector actually does to their dock icon. Purely presentational — no
+ * state, no IPC. The count + accent colour track `mode`:
+ *   • off         → no badge bubble at all (dimmed icon tile)
+ *   • critical    → amber bubble, single "1" (represents a pending perm)
+ *   • all_unread  → red bubble, "3" (represents several unread agents)
+ */
+const DockBadgePreview: Component<{ mode: BadgeMode }> = (props) => {
+  const showBadge = () => props.mode !== "off";
+  const badgeCount = () => (props.mode === "critical" ? "1" : "3");
+  const badgeTone = () =>
+    props.mode === "critical" ? "bg-amber-500 text-amber-950" : "bg-red-500 text-white";
+
+  return (
+    <div
+      class={cx(
+        "relative flex size-[64px] shrink-0 items-center justify-center rounded-[14px] border border-border bg-gradient-to-br from-card to-background shadow-sm transition-opacity",
+        props.mode === "off" && "opacity-60",
+      )}
+      aria-hidden="true"
+    >
+      <RaumLogo class="size-9 text-foreground" />
+      <Show when={showBadge()}>
+        <span
+          class={cx(
+            "absolute -right-1.5 -top-1.5 flex size-5 items-center justify-center rounded-full text-[10px] font-semibold shadow ring-2 ring-background",
+            badgeTone(),
+          )}
+        >
+          {badgeCount()}
+        </span>
+      </Show>
+    </div>
+  );
+};
+
+/**
+ * Mock macOS-style notification banner. Used alongside the "Show
+ * notification banners" toggle so users can see the exact thing they are
+ * enabling or disabling. Dims + grayscales when `enabled` is false, with
+ * a muted "Banners are off" overlay label. Purely presentational.
+ */
+const NotificationBannerPreview: Component<{ enabled: boolean }> = (props) => {
+  return (
+    <div
+      class={cx(
+        "relative flex w-full max-w-[280px] items-start gap-2.5 rounded-xl border border-border bg-card/70 p-2.5 shadow-sm backdrop-blur transition-all",
+        !props.enabled && "opacity-40 grayscale",
+      )}
+      aria-hidden="true"
+    >
+      <div class="flex size-8 shrink-0 items-center justify-center rounded-md border border-border bg-background">
+        <RaumLogo class="size-5 text-foreground" />
+      </div>
+      <div class="min-w-0 flex-1">
+        <div class="flex items-baseline gap-1.5">
+          <span class="text-[10px] font-medium text-foreground">raum</span>
+          <span class="truncate text-[9px] text-muted-foreground">now</span>
+        </div>
+        <p class="mt-0.5 truncate text-[11px] font-semibold text-foreground">
+          Interactive Question
+        </p>
+        <p class="mt-0.5 line-clamp-2 text-[10px] text-muted-foreground">
+          Claude Code is asking for feedback.
+        </p>
+      </div>
+      <Show when={!props.enabled}>
+        <span class="pointer-events-none absolute inset-x-0 bottom-1 text-center text-[9px] font-medium uppercase tracking-wider text-muted-foreground">
+          Banners are off
+        </span>
+      </Show>
+    </div>
+  );
+};
+
+const NotificationsSection: Component<{ active: boolean; open: boolean }> = (props) => {
   const [config] = createResource<NotifConfig>(async () => {
     const cfg = await invoke<{
       notifications?: {
         notify_on_waiting?: boolean;
         notify_on_done?: boolean;
+        notify_banner_enabled?: boolean;
         sound?: string | null;
         badge_mode?: string;
       };
@@ -630,10 +740,21 @@ const NotificationsSection: Component = () => {
     return {
       notify_on_waiting: cfg.notifications?.notify_on_waiting ?? true,
       notify_on_done: cfg.notifications?.notify_on_done ?? true,
+      notify_banner_enabled: cfg.notifications?.notify_banner_enabled ?? true,
       sound: cfg.notifications?.sound ?? null,
       badge_mode: isBadgeMode(rawBadgeMode) ? rawBadgeMode : "all_unread",
     };
   });
+
+  // Platform detection controls whether the Dock badge subsection is
+  // rendered. Tauri's `set_badge_count` only reliably hits the macOS dock;
+  // on Linux it targets the Unity launcher protocol, which GNOME Shell —
+  // the dominant DE — does not implement. Rather than surface a toggle
+  // that silently no-ops, we hide the subsection entirely off-macOS.
+  const [osInfo] = createResource<NotifOsInfo>(() =>
+    invoke<NotifOsInfo>("os_info").catch(() => ({ family: "other" as const })),
+  );
+  const isMacos = () => osInfo()?.family === "macos";
 
   // OS-bundled sounds for the dropdown. Empty on platforms with no known
   // sound directory; the UI degrades to "None" + "Custom path…".
@@ -649,6 +770,7 @@ const NotificationsSection: Component = () => {
   // Local editable copies of the config values
   const [localWaiting, setLocalWaiting] = createSignal(true);
   const [localDone, setLocalDone] = createSignal(true);
+  const [localBannerEnabled, setLocalBannerEnabled] = createSignal(true);
   // The on-disk sound path stored in config. "" means no sound.
   const [localSound, setLocalSound] = createSignal("");
   const [localBadgeMode, setLocalBadgeMode] = createSignal<BadgeMode>("all_unread");
@@ -666,6 +788,7 @@ const NotificationsSection: Component = () => {
     if (c && sounds && !seeded()) {
       setLocalWaiting(c.notify_on_waiting);
       setLocalDone(c.notify_on_done);
+      setLocalBannerEnabled(c.notify_banner_enabled);
       setLocalBadgeMode(c.badge_mode);
       const path = c.sound ?? "";
       setLocalSound(path);
@@ -680,6 +803,7 @@ const NotificationsSection: Component = () => {
   const saveConfig = async (patch: {
     waiting?: boolean;
     done?: boolean;
+    bannerEnabled?: boolean;
     sound?: string;
     badgeMode?: BadgeMode;
   }) => {
@@ -688,6 +812,7 @@ const NotificationsSection: Component = () => {
       await invoke("config_set_notifications", {
         notifyOnWaiting: patch.waiting ?? localWaiting(),
         notifyOnDone: patch.done ?? localDone(),
+        notifyBannerEnabled: patch.bannerEnabled ?? localBannerEnabled(),
         sound: (patch.sound ?? localSound()) || null,
         badgeMode: patch.badgeMode ?? localBadgeMode(),
       });
@@ -707,6 +832,11 @@ const NotificationsSection: Component = () => {
   const handleDoneToggle = async (v: boolean) => {
     setLocalDone(v);
     await saveConfig({ done: v });
+  };
+
+  const handleBannerToggle = async (v: boolean) => {
+    setLocalBannerEnabled(v);
+    await saveConfig({ bannerEnabled: v });
   };
 
   const handleBadgeModeSelect = async (value: BadgeMode) => {
@@ -739,10 +869,15 @@ const NotificationsSection: Component = () => {
     window.setTimeout(() => void refreshNotificationAuthorization(), 1500);
   };
 
-  // The Tauri notification plugin's `permission_state` lies (always
-  // "Granted"); re-probe via the backend each time the user opens the
-  // Notifications section so the badge isn't stuck on a stale value.
-  void refreshNotificationAuthorization();
+  createEffect(
+    on(
+      () => props.active && props.open,
+      (visible) => {
+        if (!visible) return;
+        void refreshNotificationAuthorization();
+      },
+    ),
+  );
 
   // Label shown in the dropdown trigger. Resolves the current value against
   // the system-sound list so users see "Glass" rather than the absolute path.
@@ -802,84 +937,118 @@ const NotificationsSection: Component = () => {
       {/* Per-harness notification readiness (read-only). */}
       <HarnessNotificationsSummary />
 
-      {/* When to notify */}
+      {/* Delivery — two delivery channels (OS banner + dock badge) with
+          live preview mocks so users can see exactly what each toggle
+          controls. The dock-badge subsection is hidden entirely on
+          non-macOS because Tauri's set_badge_count does not reliably
+          target GNOME Shell. */}
+      <div class="flex flex-col gap-1.5">
+        <h4 class="text-[10px] uppercase tracking-wider text-muted-foreground">Delivery</h4>
+
+        {/* Banner master toggle + live preview. */}
+        <div class="flex flex-col gap-2 rounded border border-border bg-card/30 p-3">
+          <ToggleRow
+            label="Show notification banners"
+            description="Pop an OS notification banner when an agent waits, finishes, or needs permission. Turn off for badge-only, silent delivery."
+            checked={seeded() ? localBannerEnabled() : (config()?.notify_banner_enabled ?? true)}
+            onChange={handleBannerToggle}
+            disabled={saving()}
+          />
+          <div class="flex justify-center py-1">
+            <NotificationBannerPreview
+              enabled={seeded() ? localBannerEnabled() : (config()?.notify_banner_enabled ?? true)}
+            />
+          </div>
+        </div>
+
+        {/* Dock badge — macOS only. */}
+        <Show when={isMacos()}>
+          <div class="mt-1.5 flex flex-col gap-2 rounded border border-border bg-card/30 p-3">
+            <div class="flex items-start justify-between gap-3">
+              <div class="min-w-0 flex-1">
+                <p class="text-xs text-foreground">Dock badge</p>
+                <p class="text-[10px] text-muted-foreground">
+                  Show a count on the raum dock icon. Independent of banners — leave this on for a
+                  silent "glance" signal.
+                </p>
+              </div>
+              <DockBadgePreview
+                mode={seeded() ? localBadgeMode() : (config()?.badge_mode ?? "all_unread")}
+              />
+            </div>
+            <DropdownMenu>
+              <DropdownMenuTrigger
+                as="button"
+                type="button"
+                disabled={saving()}
+                class="flex flex-1 items-center justify-between gap-2 rounded border border-border bg-background px-2 py-1 text-xs text-foreground transition-colors hover:bg-accent focus:border-ring focus:outline-none disabled:pointer-events-none disabled:opacity-50"
+              >
+                <span class="truncate">
+                  {BADGE_MODE_OPTIONS.find((o) => o.value === localBadgeMode())?.label ??
+                    "All unread"}
+                </span>
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  class="size-3 shrink-0 text-muted-foreground"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  aria-hidden="true"
+                >
+                  <polyline points="6 9 12 15 18 9" />
+                </svg>
+              </DropdownMenuTrigger>
+              <DropdownMenuPortal>
+                <DropdownMenuContent class="min-w-[var(--kb-popper-anchor-width)]">
+                  <For each={BADGE_MODE_OPTIONS}>
+                    {(opt) => (
+                      <DropdownMenuItem
+                        class="text-xs"
+                        onSelect={() => void handleBadgeModeSelect(opt.value)}
+                      >
+                        <CheckIcon
+                          class={cx(
+                            "size-3",
+                            localBadgeMode() === opt.value ? "opacity-100" : "opacity-0",
+                          )}
+                        />
+                        <span class="flex flex-col">
+                          <span>{opt.label}</span>
+                          <span class="text-[10px] text-muted-foreground">{opt.description}</span>
+                        </span>
+                      </DropdownMenuItem>
+                    )}
+                  </For>
+                </DropdownMenuContent>
+              </DropdownMenuPortal>
+            </DropdownMenu>
+          </div>
+        </Show>
+      </div>
+
+      {/* When to notify — event filters. Only meaningful while banners
+          are on; we gray them out (via `disabled`) when the master
+          switch is off so the interaction hints at the dependency. */}
       <div class="flex flex-col gap-1.5">
         <h4 class="text-[10px] uppercase tracking-wider text-muted-foreground">When to notify</h4>
         <div class="flex flex-col gap-1">
           <ToggleRow
             label="Agent needs input"
-            description="Notify when an agent is waiting for your reply."
+            description="Banner when an agent is waiting for your reply."
             checked={seeded() ? localWaiting() : (config()?.notify_on_waiting ?? true)}
             onChange={handleWaitingToggle}
-            disabled={saving()}
+            disabled={saving() || !(seeded() ? localBannerEnabled() : true)}
           />
           <ToggleRow
             label="Agent finished"
-            description="Notify when an agent completes or encounters an error."
+            description="Banner when an agent completes or encounters an error."
             checked={seeded() ? localDone() : (config()?.notify_on_done ?? true)}
             onChange={handleDoneToggle}
-            disabled={saving()}
+            disabled={saving() || !(seeded() ? localBannerEnabled() : true)}
           />
-        </div>
-      </div>
-
-      {/* Dock badge */}
-      <div class="flex flex-col gap-1.5">
-        <h4 class="text-[10px] uppercase tracking-wider text-muted-foreground">Dock badge</h4>
-        <div class="flex flex-col gap-1.5 rounded border border-border bg-card/30 px-3 py-2">
-          <p class="text-[10px] text-muted-foreground">
-            How much detail to show on the dock / taskbar icon. The OS must also allow badges for
-            raum (macOS: System Settings → Notifications → raum).
-          </p>
-          <DropdownMenu>
-            <DropdownMenuTrigger
-              as="button"
-              type="button"
-              disabled={saving()}
-              class="flex flex-1 items-center justify-between gap-2 rounded border border-border bg-background px-2 py-1 text-xs text-foreground transition-colors hover:bg-accent focus:border-ring focus:outline-none disabled:pointer-events-none disabled:opacity-50"
-            >
-              <span class="truncate">
-                {BADGE_MODE_OPTIONS.find((o) => o.value === localBadgeMode())?.label ??
-                  "All unread"}
-              </span>
-              <svg
-                xmlns="http://www.w3.org/2000/svg"
-                class="size-3 shrink-0 text-muted-foreground"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="2"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-                aria-hidden="true"
-              >
-                <polyline points="6 9 12 15 18 9" />
-              </svg>
-            </DropdownMenuTrigger>
-            <DropdownMenuPortal>
-              <DropdownMenuContent class="min-w-[var(--kb-popper-anchor-width)]">
-                <For each={BADGE_MODE_OPTIONS}>
-                  {(opt) => (
-                    <DropdownMenuItem
-                      class="text-xs"
-                      onSelect={() => void handleBadgeModeSelect(opt.value)}
-                    >
-                      <CheckIcon
-                        class={cx(
-                          "size-3",
-                          localBadgeMode() === opt.value ? "opacity-100" : "opacity-0",
-                        )}
-                      />
-                      <span class="flex flex-col">
-                        <span>{opt.label}</span>
-                        <span class="text-[10px] text-muted-foreground">{opt.description}</span>
-                      </span>
-                    </DropdownMenuItem>
-                  )}
-                </For>
-              </DropdownMenuContent>
-            </DropdownMenuPortal>
-          </DropdownMenu>
         </div>
       </div>
 
@@ -2206,14 +2375,14 @@ const HarnessNotificationStatus: Component<{ kind: HarnessIconKind }> = (props) 
   );
 };
 
-const SectionContent: Component<{ section: SectionId }> = (props) => {
+const SectionContent: Component<{ section: SectionId; open: boolean }> = (props) => {
   return (
     <>
       <div class={cx(props.section === "appearance" ? "" : "hidden")}>
         <AppearanceSection />
       </div>
       <div class={cx(props.section === "notifications" ? "" : "hidden")}>
-        <NotificationsSection />
+        <NotificationsSection active={props.section === "notifications"} open={props.open} />
       </div>
       <div class={cx(props.section === "harnesses" ? "" : "hidden")}>
         <HarnessesSection active={props.section === "harnesses"} />
@@ -2247,10 +2416,7 @@ export const SettingsModal: Component<SettingsModalProps> = (props) => {
         <DialogPrimitive.Overlay class="data-[expanded]:animate-in data-[closed]:animate-out data-[closed]:fade-out-0 data-[expanded]:fade-in-0 fixed inset-0 z-50 bg-scrim-strong" />
 
         {/* Modal shell */}
-        <DialogPrimitive.Content
-          class="floating-surface data-[expanded]:animate-in data-[closed]:animate-out data-[closed]:fade-out-0 data-[expanded]:fade-in-0 data-[closed]:zoom-out-95 data-[expanded]:zoom-in-95 fixed top-[50%] left-[50%] z-50 flex w-full max-w-2xl translate-x-[-50%] translate-y-[-50%] flex-col overflow-hidden rounded-xl border border-border-subtle bg-popover duration-200 focus:outline-none"
-          style={{ height: "520px" }}
-        >
+        <DialogPrimitive.Content class="floating-surface data-[expanded]:animate-in data-[closed]:animate-out data-[closed]:fade-out-0 data-[expanded]:fade-in-0 data-[closed]:zoom-out-95 data-[expanded]:zoom-in-95 fixed top-[50%] left-[50%] z-50 flex h-[min(780px,calc(100vh-2rem))] max-h-[780px] w-[min(1000px,calc(100vw-2rem))] max-w-[1000px] translate-x-[-50%] translate-y-[-50%] flex-col overflow-hidden rounded-xl border border-border-subtle bg-popover duration-200 focus:outline-none">
           {/* Title row (visually hidden, for accessibility) */}
           <DialogPrimitive.Title class="sr-only">Settings</DialogPrimitive.Title>
 
@@ -2316,7 +2482,7 @@ export const SettingsModal: Component<SettingsModalProps> = (props) => {
 
               {/* Scrollable content area */}
               <Scrollable class="min-h-0 flex-1 px-4 py-4">
-                <SectionContent section={activeSection()} />
+                <SectionContent section={activeSection()} open={props.open} />
               </Scrollable>
             </div>
           </div>

@@ -242,13 +242,13 @@ export const DeleteWorktreeModal: Component<DeleteWorktreeModalProps> = (props) 
       }}
     >
       <DialogPortal>
-        <DialogContent class="sm:max-w-[540px]">
+        <DialogContent class="!gap-6 !p-8 sm:max-w-[760px]">
           <DialogHeader>
-            <DialogTitle class="flex flex-wrap items-center gap-1.5 text-sm">
+            <DialogTitle class="flex flex-wrap items-center gap-2 text-sm">
               <Show when={branch() !== null} fallback={<>Delete this worktree?</>}>
                 <span>Delete worktree</span>
-                <span class="inline-flex min-w-0 items-center gap-1 rounded bg-muted px-1.5 py-px font-mono text-xs text-foreground [word-break:break-all]">
-                  <GitBranchIcon class="size-3 shrink-0" />
+                <span class="inline-flex min-w-0 items-center gap-1.5 rounded bg-muted px-2 py-0.5 font-mono text-xs text-foreground [word-break:break-all]">
+                  <GitBranchIcon class="size-3.5 shrink-0" />
                   <span class="min-w-0 [word-break:break-all]">{worktreeLabel()}</span>
                 </span>
                 <span>?</span>
@@ -256,20 +256,20 @@ export const DeleteWorktreeModal: Component<DeleteWorktreeModalProps> = (props) 
             </DialogTitle>
           </DialogHeader>
 
-          <div class="min-w-0 space-y-3 text-xs">
+          <div class="min-w-0 space-y-5 text-xs">
             {/* Path chip */}
-            <div class="min-w-0 truncate rounded-md border border-border bg-muted/40 px-2 py-2 font-mono text-[11px] text-muted-foreground">
+            <div class="min-w-0 truncate rounded-md border border-border bg-muted/40 px-2.5 py-2 font-mono text-xs text-muted-foreground">
               {props.worktree.path}
             </div>
 
             {/* Primary state banner — one at most, most severe first */}
             <Show when={hasUncommitted()}>
-              <div class="rounded-md border border-destructive/40 bg-destructive/10 px-2.5 py-2 text-destructive">
-                <div class="flex items-center gap-1.5 font-medium">
-                  <AlertCircleIcon class="size-3.5" />
+              <div class="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2.5 text-destructive">
+                <div class="flex items-center gap-2 font-medium">
+                  <AlertCircleIcon class="size-4" />
                   {changedFileCount()} uncommitted file{changedFileCount() === 1 ? "" : "s"}
                   <Show when={insertions() > 0 || deletions() > 0}>
-                    <span class="font-mono text-[11px]">
+                    <span class="font-mono text-xs">
                       <Show when={insertions() > 0}>
                         <span>+{insertions()}</span>
                       </Show>
@@ -279,19 +279,19 @@ export const DeleteWorktreeModal: Component<DeleteWorktreeModalProps> = (props) 
                     </span>
                   </Show>
                 </div>
-                <div class="mt-0.5 text-[11px] text-destructive/90">
+                <div class="mt-1 text-xs text-destructive/90">
                   These will be lost and are not recoverable.
                 </div>
               </div>
             </Show>
 
             <Show when={!hasUncommitted() && hasUnpushed()}>
-              <div class="rounded-md border border-warning/40 bg-warning/10 px-2.5 py-2 text-warning">
+              <div class="rounded-md border border-warning/40 bg-warning/10 px-3 py-2.5 text-warning">
                 <div class="font-medium">
                   {ahead()} unpushed commit{ahead() === 1 ? "" : "s"} on{" "}
                   <span class="font-mono">{branch()}</span>
                 </div>
-                <div class="mt-0.5 text-[11px] text-warning/90">
+                <div class="mt-1 text-xs text-warning/90">
                   Not yet pushed to <span class="font-mono">{upstreamLabel()}</span>. They will be
                   lost unless the branch is reachable from another branch.
                   <Show when={behind() > 0}> (also {behind()} behind upstream)</Show>
@@ -300,9 +300,9 @@ export const DeleteWorktreeModal: Component<DeleteWorktreeModalProps> = (props) 
             </Show>
 
             <Show when={!hasUncommitted() && !hasUnpushed() && isClean() && runningCount() === 0}>
-              <div class="rounded-md border border-success/40 bg-success/10 px-2.5 py-2 text-success">
+              <div class="rounded-md border border-success/40 bg-success/10 px-3 py-2.5 text-success">
                 <div class="font-medium">Nothing will be lost.</div>
-                <div class="mt-0.5 text-[11px] text-success/90">
+                <div class="mt-1 text-xs text-success/90">
                   No uncommitted changes
                   <Show when={branch() !== null}>
                     <>
@@ -320,26 +320,26 @@ export const DeleteWorktreeModal: Component<DeleteWorktreeModalProps> = (props) 
 
             {/* ---- Will be removed --------------------------------------- */}
             <section>
-              <div class="mb-1.5 text-[10px] uppercase tracking-wide text-foreground-subtle">
+              <div class="mb-2 text-[11px] uppercase tracking-wide text-foreground-subtle">
                 Will be removed
               </div>
-              <ul class="space-y-1 text-muted-foreground">
-                <li class="flex items-start gap-2">
-                  <FolderIcon class="mt-[1px] size-3.5 shrink-0 text-destructive/80" />
+              <ul class="space-y-1.5 text-muted-foreground">
+                <li class="flex items-start gap-2.5">
+                  <FolderIcon class="mt-[2px] size-4 shrink-0 text-destructive/80" />
                   <span class="min-w-0 flex-1 text-foreground">
                     Worktree folder{" "}
-                    <span class="rounded bg-muted px-1 py-px font-mono text-[11px] [word-break:break-all]">
+                    <span class="rounded bg-muted px-1 py-px font-mono text-xs [word-break:break-all]">
                       {props.worktree.path}
                     </span>
                   </span>
                 </li>
 
                 <Show when={branch() !== null && deleteBranch()}>
-                  <li class="flex items-start gap-2">
-                    <GitBranchIcon class="mt-[1px] size-3.5 shrink-0 text-destructive/80" />
+                  <li class="flex items-start gap-2.5">
+                    <GitBranchIcon class="mt-[2px] size-4 shrink-0 text-destructive/80" />
                     <span class="min-w-0 flex-1 text-foreground">
                       Branch{" "}
-                      <span class="rounded bg-muted px-1 py-px font-mono text-[11px] [word-break:break-all]">
+                      <span class="rounded bg-muted px-1 py-px font-mono text-xs [word-break:break-all]">
                         {branch()}
                       </span>
                     </span>
@@ -347,13 +347,13 @@ export const DeleteWorktreeModal: Component<DeleteWorktreeModalProps> = (props) 
                 </Show>
 
                 <Show when={hasUncommitted()}>
-                  <li class="flex items-start gap-2">
-                    <AlertCircleIcon class="mt-[1px] size-3.5 shrink-0 text-destructive/80" />
+                  <li class="flex items-start gap-2.5">
+                    <AlertCircleIcon class="mt-[2px] size-4 shrink-0 text-destructive/80" />
                     <span class="min-w-0 flex-1 text-destructive">
                       {changedFileCount()} uncommitted file
                       {changedFileCount() === 1 ? "" : "s"}
                       <Show when={insertions() > 0 || deletions() > 0}>
-                        <span class="ml-1 font-mono text-[11px]">
+                        <span class="ml-1 font-mono text-xs">
                           <Show when={insertions() > 0}>+{insertions()}</Show>
                           <Show when={deletions() > 0}>
                             <span class="ml-1">−{deletions()}</span>
@@ -365,14 +365,14 @@ export const DeleteWorktreeModal: Component<DeleteWorktreeModalProps> = (props) 
                 </Show>
 
                 <Show when={hasStash()}>
-                  <li class="flex items-start gap-2">
-                    <GitBranchIcon class="mt-[1px] size-3.5 shrink-0 text-destructive/80" />
+                  <li class="flex items-start gap-2.5">
+                    <GitBranchIcon class="mt-[2px] size-4 shrink-0 text-destructive/80" />
                     <span class="min-w-0 flex-1">
                       {stashCount()} stash entr{stashCount() === 1 ? "y" : "ies"}
                       <Show when={branch() !== null}>
                         <>
                           {" on "}
-                          <span class="rounded bg-muted px-1 py-px font-mono text-[11px] text-foreground [word-break:break-all]">
+                          <span class="rounded bg-muted px-1 py-px font-mono text-xs text-foreground [word-break:break-all]">
                             {branch()}
                           </span>
                         </>
@@ -382,19 +382,19 @@ export const DeleteWorktreeModal: Component<DeleteWorktreeModalProps> = (props) 
                 </Show>
 
                 <Show when={runningCount() > 0}>
-                  <li class="flex items-start gap-2">
-                    <ShellIcon class="mt-[1px] size-3.5 shrink-0 text-destructive/80" />
+                  <li class="flex items-start gap-2.5">
+                    <ShellIcon class="mt-[2px] size-4 shrink-0 text-destructive/80" />
                     <span class="min-w-0 flex-1">
                       <div class="text-foreground">
                         {runningCount()} running terminal{runningCount() === 1 ? "" : "s"} will be
                         closed
                       </div>
-                      <ul class="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1">
+                      <ul class="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1">
                         <For each={runningTerminals()}>
                           {(group) => {
                             const Icon = HARNESS_ICONS[group.kind];
                             return (
-                              <li class="inline-flex items-center gap-1 font-mono text-[11px]">
+                              <li class="inline-flex items-center gap-1 font-mono text-xs">
                                 <Icon class="size-3.5" />
                                 <span>{HARNESS_LABEL[group.kind]}</span>
                                 <span class="text-foreground">×{group.sessions.length}</span>
@@ -411,21 +411,21 @@ export const DeleteWorktreeModal: Component<DeleteWorktreeModalProps> = (props) 
 
             {/* ---- Will stay untouched ----------------------------------- */}
             <section>
-              <div class="mb-1.5 text-[10px] uppercase tracking-wide text-foreground-subtle">
+              <div class="mb-2 text-[11px] uppercase tracking-wide text-foreground-subtle">
                 Will stay untouched
               </div>
-              <ul class="space-y-0.5 text-muted-foreground">
-                <li class="flex items-start gap-2">
-                  <span class="mt-[5px] inline-block size-1 shrink-0 rounded-full bg-success/70" />
+              <ul class="space-y-1 text-muted-foreground">
+                <li class="flex items-start gap-2.5">
+                  <span class="mt-[7px] inline-block size-1 shrink-0 rounded-full bg-success/70" />
                   <span>Other worktrees and the project root</span>
                 </li>
-                <li class="flex items-start gap-2">
-                  <span class="mt-[5px] inline-block size-1 shrink-0 rounded-full bg-success/70" />
+                <li class="flex items-start gap-2.5">
+                  <span class="mt-[7px] inline-block size-1 shrink-0 rounded-full bg-success/70" />
                   <span>Other git branches, remotes and reflogs</span>
                 </li>
                 <Show when={isMerged()}>
-                  <li class="flex items-start gap-2">
-                    <span class="mt-[5px] inline-block size-1 shrink-0 rounded-full bg-success/70" />
+                  <li class="flex items-start gap-2.5">
+                    <span class="mt-[7px] inline-block size-1 shrink-0 rounded-full bg-success/70" />
                     <span>
                       Commits are reachable from{" "}
                       <For each={mergedInto().slice(0, 3)}>
@@ -444,11 +444,11 @@ export const DeleteWorktreeModal: Component<DeleteWorktreeModalProps> = (props) 
                   </li>
                 </Show>
                 <Show when={branch() !== null && !deleteBranch()}>
-                  <li class="flex items-start gap-2">
-                    <GitBranchIcon class="mt-[1px] size-3.5 shrink-0 text-success/70" />
+                  <li class="flex items-start gap-2.5">
+                    <GitBranchIcon class="mt-[2px] size-4 shrink-0 text-success/70" />
                     <span class="min-w-0">
                       Branch{" "}
-                      <span class="rounded bg-muted px-1 py-px font-mono text-[11px] text-foreground [word-break:break-all]">
+                      <span class="rounded bg-muted px-1 py-px font-mono text-xs text-foreground [word-break:break-all]">
                         {branch()}
                       </span>{" "}
                       (kept; only the worktree is removed)
@@ -456,8 +456,8 @@ export const DeleteWorktreeModal: Component<DeleteWorktreeModalProps> = (props) 
                   </li>
                 </Show>
                 <Show when={upstream() !== null}>
-                  <li class="flex items-start gap-2">
-                    <span class="mt-[5px] inline-block size-1 shrink-0 rounded-full bg-success/70" />
+                  <li class="flex items-start gap-2.5">
+                    <span class="mt-[7px] inline-block size-1 shrink-0 rounded-full bg-success/70" />
                     <span>
                       Upstream <span class="font-mono text-foreground">{upstreamLabel()}</span> is
                       not modified
@@ -469,13 +469,13 @@ export const DeleteWorktreeModal: Component<DeleteWorktreeModalProps> = (props) 
 
             {/* ---- Branch disposition (only interactive control) --------- */}
             <Show when={branch() !== null}>
-              <div class="rounded-md border border-border bg-panel/40 px-3 py-2">
+              <div class="rounded-md border border-border bg-panel/40 px-3.5 py-2.5">
                 <div class="flex items-center justify-between gap-3">
-                  <div class="flex min-w-0 items-center gap-1.5 text-foreground">
-                    <GitBranchIcon class="size-3.5 shrink-0 text-muted-foreground" />
+                  <div class="flex min-w-0 items-center gap-2 text-foreground">
+                    <GitBranchIcon class="size-4 shrink-0 text-muted-foreground" />
                     <span class="min-w-0">
                       Branch{" "}
-                      <span class="rounded bg-muted px-1 py-px font-mono text-[11px] [word-break:break-all]">
+                      <span class="rounded bg-muted px-1 py-px font-mono text-xs [word-break:break-all]">
                         {branch()}
                       </span>
                     </span>
@@ -490,7 +490,7 @@ export const DeleteWorktreeModal: Component<DeleteWorktreeModalProps> = (props) 
                       role="radio"
                       aria-checked={deleteBranch()}
                       onClick={() => setDeleteBranch(true)}
-                      class={`h-6 rounded-sm px-2 text-[11px] font-medium transition-colors duration-[var(--motion-fast)] ease-[var(--motion-ease)] ${
+                      class={`h-7 rounded-sm px-2.5 text-xs font-medium transition-colors duration-[var(--motion-fast)] ease-[var(--motion-ease)] ${
                         deleteBranch()
                           ? "bg-destructive/15 text-destructive"
                           : "text-muted-foreground hover:text-foreground"
@@ -503,7 +503,7 @@ export const DeleteWorktreeModal: Component<DeleteWorktreeModalProps> = (props) 
                       role="radio"
                       aria-checked={!deleteBranch()}
                       onClick={() => setDeleteBranch(false)}
-                      class={`h-6 rounded-sm px-2 text-[11px] font-medium transition-colors duration-[var(--motion-fast)] ease-[var(--motion-ease)] ${
+                      class={`h-7 rounded-sm px-2.5 text-xs font-medium transition-colors duration-[var(--motion-fast)] ease-[var(--motion-ease)] ${
                         !deleteBranch()
                           ? "bg-muted text-foreground"
                           : "text-muted-foreground hover:text-foreground"
@@ -514,7 +514,7 @@ export const DeleteWorktreeModal: Component<DeleteWorktreeModalProps> = (props) 
                   </div>
                 </div>
                 <Show when={branchUnsafe() && (hasNoUpstream() || !isMerged())}>
-                  <div class="mt-1.5 text-[11px] text-warning">
+                  <div class="mt-2 text-xs text-warning">
                     <Show
                       when={hasNoUpstream()}
                       fallback={
@@ -537,13 +537,12 @@ export const DeleteWorktreeModal: Component<DeleteWorktreeModalProps> = (props) 
           </div>
 
           <DialogFooter>
-            <Button type="button" variant="ghost" size="sm" onClick={() => props.onClose()}>
+            <Button type="button" variant="ghost" onClick={() => props.onClose()}>
               Cancel
             </Button>
             <Button
               type="button"
               variant="destructive"
-              size="sm"
               disabled={submitting()}
               onClick={() => {
                 void submit();

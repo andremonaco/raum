@@ -11,7 +11,7 @@ tasks:
   dev:
     desc: Run the app in dev mode with hot reload
     dir: src-tauri
-    cmd: cargo tauri dev
+    cmd: cargo tauri dev --config tauri.dev.conf.json
 
   build:
     desc: Build a release package (.app / .deb / .AppImage)
@@ -174,3 +174,14 @@ tasks:
   clean:frontend:
     desc: Remove frontend/dist only
     cmd: rm -rf frontend/dist
+
+  target:sweep:
+    desc: Prune stale artifacts from target/{debug,test,release} without forcing a full rebuild (requires cargo-sweep)
+    cmds:
+      - echo "Sweeping target/debug (keeping last 14 days)..."
+      - CARGO_TARGET_DIR=target/debug cargo sweep --time 14
+      - echo "Sweeping target/test (dropping non-current toolchains)..."
+      - CARGO_TARGET_DIR=target/test cargo sweep --installed
+      - echo "Sweeping target/release (dropping non-current toolchains)..."
+      - CARGO_TARGET_DIR=target/release cargo sweep --installed
+      - echo "Done."
