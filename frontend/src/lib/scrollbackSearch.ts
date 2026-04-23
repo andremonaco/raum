@@ -21,7 +21,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
 import type { AgentKind } from "./agentKind";
-import { resolveHarnessAutoLabel } from "./terminalTabLabel";
+import { resolveSessionTabLabel } from "./harnessTabLabel";
 import { listTerminalBuffers, listTerminals } from "./terminalRegistry";
 import type { TerminalBufferKind } from "./terminalRegistry";
 import { harnessIds, terminalStore, type TerminalRecord } from "../stores/terminalStore";
@@ -127,12 +127,7 @@ export async function runScrollbackSearch(
     if (cancel.aborted) return [];
     if (out.length >= MAX_MATCHES_TOTAL) break;
 
-    const tabLabel = resolveHarnessAutoLabel({
-      kind: term.kind,
-      paneTitle: term.paneContext?.paneTitle,
-      windowName: term.paneContext?.windowName,
-      currentCommand: term.paneContext?.currentCommand,
-    });
+    const tabLabel = resolveSessionTabLabel(term.session_id);
 
     let perSession = 0;
     const push = (m: ScrollbackMatch): boolean => {

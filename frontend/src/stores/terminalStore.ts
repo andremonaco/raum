@@ -590,6 +590,27 @@ export const waitingCount = selectors.waitingCount;
 /** Count of harnesses at rest (state = `idle`). */
 export const idleCount = selectors.idleCount;
 
+export type CrossProjectHarnessMode = "awaiting" | "working" | "recent";
+
+export function listCrossProjectHarnessSessions(mode: CrossProjectHarnessMode): TerminalRecord[] {
+  if (mode === "awaiting") return waitingTerminals();
+  if (mode === "working") return activeTerminals();
+
+  const ids = [...harnessIds()];
+  const lo = lastOutputBySession();
+  const records: TerminalRecord[] = [];
+  for (const id of ids) {
+    const record = terminalStore.byId[id];
+    if (record) records.push(record);
+  }
+  records.sort(
+    (left, right) =>
+      (lo.get(right.session_id) ?? right.created_unix * 1000) -
+      (lo.get(left.session_id) ?? left.created_unix * 1000),
+  );
+  return records;
+}
+
 export function harnessCountsForProject(projectSlug: string | null | undefined): HarnessCounts {
   if (!projectSlug) return ZERO_COUNTS;
   return harnessCountsByProject()[projectSlug] ?? ZERO_COUNTS;

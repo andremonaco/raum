@@ -70,6 +70,8 @@ const CATEGORY_BY_ACTION: Record<string, Category> = {
   "cycle-focus-forward": "Panes",
   "cycle-focus-back": "Panes",
   "maximize-pane": "Panes",
+  "reset-harness": "Panes",
+  "new-tab-same-harness": "Panes",
   "toggle-sidebar": "Chrome",
   "toggle-quick-fire": "Chrome",
   "focus-quick-fire": "Chrome",

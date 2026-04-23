@@ -35,7 +35,6 @@ import {
   Component,
   For,
   Show,
-  createDeferred,
   createEffect,
   createMemo,
   createResource,
@@ -80,13 +79,7 @@ import {
 } from "../stores/runtimeLayoutStore";
 import { agentStore } from "../stores/agentStore";
 import type { AgentState } from "../stores/agentStore";
-import {
-  harnessIds,
-  lastOutputBySession,
-  terminalStore,
-  waitingIds,
-  workingIds,
-} from "../stores/terminalStore";
+import { listCrossProjectHarnessSessions, terminalStore } from "../stores/terminalStore";
 import {
   activeWorktreeStore,
   ALL_WORKTREES_SCOPE,
@@ -94,8 +87,8 @@ import {
 } from "../stores/worktreeStore";
 import { kindDisplayLabel, type AgentKind } from "../lib/agentKind";
 import { resolveSpawnWorktree } from "../lib/resolveSpawnWorktree";
-import { AlertCircleIcon, CheckIcon, ClockIcon, HARNESS_ICONS, LoaderIcon } from "./icons";
-import { activeProjectSlug, projectBySlug, setActiveProjectSlug } from "../stores/projectStore";
+import { AlertCircleIcon, CheckIcon, HARNESS_ICONS, LoaderIcon } from "./icons";
+import { activeProjectSlug, projectBySlug } from "../stores/projectStore";
 import { timeMemoSettle } from "../lib/perf";
 import { projectStore } from "../stores/projectStore";
 import {
@@ -103,6 +96,11 @@ import {
   setProjectionCacheMaxSize,
   type ScopedProjection,
 } from "../lib/scopedProjection";
+import {
+  getCrossProjectProjection,
+  setCrossProjectProjectionCacheMaxSize,
+} from "../lib/crossProjectProjection";
+import { crossProjectViewMode, setCrossProjectViewMode } from "./top-row";
 
 function getScopedProjection(
   rev: number,
@@ -122,8 +120,6 @@ function getScopedProjection(
     mainPath,
   });
 }
-import { crossProjectViewMode, setCrossProjectViewMode } from "./top-row";
-import type { CrossProjectViewMode } from "./top-row";
 import { extractSnippet } from "../lib/terminalSnippet";
 import { Dock } from "./dock";
 import { beginDrag, dragState, ROOT_TARGET, type DropZone } from "../lib/paneDnD";
@@ -138,6 +134,7 @@ import {
   type Rect,
 } from "../lib/layoutTree";
 import { resolveDisplayedTabLabel, resolveHarnessAutoLabel } from "../lib/terminalTabLabel";
+import { useKeymap } from "../lib/keymapContext";
 
 const KIND_LABELS: Record<string, string> = {
   shell: "Shell",
@@ -150,6 +147,7 @@ const KIND_LABELS: Record<string, string> = {
 // ---- TerminalGrid ---------------------------------------------------------
 
 export const TerminalGrid: Component = () => {
+  const keymap = useKeymap();
   const [rootEl, setRootEl] = createSignal<HTMLDivElement | null>(null);
 
   // Main-worktree path for the active project. Used by the scope prune as
@@ -194,6 +192,30 @@ export const TerminalGrid: Component = () => {
     if (!id) return null;
     return activeCells().some((c) => c.id === id) ? id : null;
   });
+  const crossProjectMode = createMemo(() => crossProjectViewMode());
+
+  const projectedSessionIds = createMemo<string[]>(() => {
+    const mode = crossProjectMode();
+    if (mode === null) return [];
+
+    return listCrossProjectHarnessSessions(mode)
+      .filter((terminal) => terminal.project_slug !== null)
+      .map((terminal) => terminal.session_id);
+  });
+  timeMemoSettle(() => {
+    const mode = crossProjectMode();
+    return mode ? `filter-click:${mode}` : "filter-click:inactive";
+  }, projectedSessionIds);
+
+  const projectedRectMap = createMemo<ReadonlyMap<string, Rect>>(() => {
+    const mode = crossProjectMode();
+    if (mode === null) return new Map();
+    setCrossProjectProjectionCacheMaxSize(Math.max(16, projectStore.items.length * 4));
+    return getCrossProjectProjection({
+      mode,
+      orderedIds: projectedSessionIds(),
+    }).rects;
+  });
 
   type SpawnKind = "shell" | "claude-code" | "codex" | "opencode";
   const [availableKinds] = createResource<SpawnKind[]>(async () => {
@@ -210,25 +232,71 @@ export const TerminalGrid: Component = () => {
 
   const canSpawnKind = (kind: SpawnKind): boolean => kind === "shell" || !!activeProjectSlug();
 
-  // Focus / cycle / maximize hotkeys dispatched by the keymap provider.
+  // Pane-scoped hotkeys registered via the keymap provider.
   onMount(() => {
-    function onAction(ev: Event) {
-      const action = (ev as CustomEvent<string>).detail;
-      if (typeof action !== "string") return;
-      if (action.startsWith("focus-pane-")) {
-        const n = Number.parseInt(action.slice("focus-pane-".length), 10);
-        if (Number.isFinite(n) && n >= 1 && n <= 9) focusPaneByIndex(n);
-      } else if (action === "cycle-focus-forward") {
-        cycleFocus("forward");
-      } else if (action === "cycle-focus-back") {
-        cycleFocus("back");
-      } else if (action === "maximize-pane") {
+    const unregs: Array<() => void> = [];
+
+    for (let i = 1; i <= 9; i++) {
+      const n = i;
+      unregs.push(keymap.register(`focus-pane-${n}`, () => focusPaneByIndex(n)));
+    }
+    unregs.push(keymap.register("cycle-focus-forward", () => cycleFocus("forward")));
+    unregs.push(keymap.register("cycle-focus-back", () => cycleFocus("back")));
+    unregs.push(
+      keymap.register("maximize-pane", () => {
         const id = focusedPaneId();
         if (id) toggleMaximize(id);
+      }),
+    );
+    unregs.push(
+      keymap.register("reset-harness", () => {
+        const paneId = focusedPaneId();
+        if (!paneId) return;
+        const pane = runtimeLayoutStore.panes[paneId];
+        if (!pane || pane.kind === "empty") return;
+        const activeTab = pane.tabs.find((t) => t.id === pane.activeTabId);
+        const oldTabId = activeTab?.id;
+        const oldSessionId = activeTab?.sessionId;
+        addCellTab(paneId, {
+          projectSlug: activeTab?.projectSlug ?? pane.projectSlug,
+          worktreeId: activeTab?.worktreeId ?? pane.worktreeId,
+        });
+        if (oldTabId) removeCellTab(paneId, oldTabId);
+        if (oldSessionId) {
+          invoke("terminal_kill", { sessionId: oldSessionId }).catch((e: unknown) => {
+            console.warn("[reset-harness] terminal_kill failed", e);
+          });
+        }
+      }),
+    );
+    unregs.push(
+      keymap.register("new-tab-same-harness", () => {
+        const paneId = focusedPaneId();
+        if (!paneId) return;
+        const pane = runtimeLayoutStore.panes[paneId];
+        if (!pane || pane.kind === "empty") return;
+        const activeTab = pane.tabs.find((t) => t.id === pane.activeTabId);
+        addCellTab(paneId, {
+          projectSlug: activeTab?.projectSlug ?? pane.projectSlug,
+          worktreeId: activeTab?.worktreeId ?? pane.worktreeId,
+        });
+      }),
+    );
+
+    onCleanup(() => {
+      for (const fn of unregs) fn();
+    });
+  });
+
+  onMount(() => {
+    function onKey(ev: KeyboardEvent): void {
+      if (ev.key === "Escape" && crossProjectViewMode() !== null) {
+        ev.preventDefault();
+        setCrossProjectViewMode(null);
       }
     }
-    window.addEventListener("raum-action", onAction);
-    onCleanup(() => window.removeEventListener("raum-action", onAction));
+    window.addEventListener("keydown", onKey);
+    onCleanup(() => window.removeEventListener("keydown", onKey));
   });
 
   // New-terminal spawn: split the focused pane along its longer axis, or
@@ -331,81 +399,66 @@ export const TerminalGrid: Component = () => {
 
   return (
     <div class="flex h-full w-full flex-col">
-      {/* Views are filters over the global terminal store. `crossProjectViewMode`
-          non-null => render a flat cross-project grid (awaiting/recent/working)
-          instead of the per-project BSP layout. Each session has a single live
-          TerminalPane mounted in exactly one view at a time, so there's never
-          a double attach to the same tmux session. */}
-      <Show
-        when={crossProjectViewMode() === null}
-        fallback={<CrossProjectView mode={crossProjectViewMode()!} />}
-      >
-        {/* The grid canvas fills the entire main region with zero outer
-          padding — the chrome (top-row, sidebar, dock) is `bg-background`
-          and the canvas is `var(--selected)`, so the colour contrast IS the
-          visual separation, no padding moat required. This keeps the gap
-          between the top-row buttons and the canvas equal to the top-row's
-          own internal slack (≈6 px above buttons, 6 px below = canvas top),
-          and matches the canvas's left/right/bottom against sidebar/right
-          edge/dock with the same hairline contrast on every side. */}
-        <div class="flex-1 min-h-0 overflow-hidden bg-background">
-          <div
-            class="relative h-full w-full overflow-hidden rounded-xl"
-            ref={setRootEl}
-            data-dnd-root="true"
-          >
-            {/* Empty-state spawn button grid. */}
-            <Show when={visibleCells().length === 0}>
-              <div
-                class="absolute inset-0 z-10 grid h-full w-full gap-px bg-border-subtle"
-                style={{
-                  "grid-template-columns": `repeat(${Math.min(availableKinds()?.length ?? 1, 2)}, 1fr)`,
+      {/* The grid canvas fills the entire main region with zero outer
+        padding — the chrome (top-row, sidebar, dock) is `bg-background`
+        and the canvas is `var(--selected)`, so the colour contrast IS the
+        visual separation, no padding moat required. This keeps the gap
+        between the top-row buttons and the canvas equal to the top-row's
+        own internal slack (≈6 px above buttons, 6 px below = canvas top),
+        and matches the canvas's left/right/bottom against sidebar/right
+        edge/dock with the same hairline contrast on every side. */}
+      <div class="flex-1 min-h-0 overflow-hidden bg-background">
+        <div
+          class="relative h-full w-full overflow-hidden rounded-xl"
+          ref={setRootEl}
+          data-dnd-root="true"
+        >
+          <Show when={crossProjectMode() === null && visibleCells().length === 0}>
+            <div
+              class="absolute inset-0 z-10 grid h-full w-full gap-px bg-border-subtle"
+              style={{
+                "grid-template-columns": `repeat(${Math.min(availableKinds()?.length ?? 1, 2)}, 1fr)`,
+              }}
+            >
+              <For each={availableKinds() ?? []}>
+                {(kind) => {
+                  const Icon = HARNESS_ICONS[kind];
+                  const disabled = () => !canSpawnKind(kind);
+                  return (
+                    <button
+                      type="button"
+                      class="group flex flex-col items-center justify-center gap-3 bg-surface-sunken text-foreground-dim transition-colors duration-[var(--motion-base)] ease-[var(--motion-ease)] hover:bg-hover hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-surface-sunken disabled:hover:text-foreground-dim"
+                      disabled={disabled()}
+                      title={disabled() ? "Add a project before spawning a harness" : undefined}
+                      onClick={() => {
+                        if (disabled()) return;
+                        window.dispatchEvent(
+                          new CustomEvent("raum:spawn-requested", {
+                            detail: { kind, projectSlug: activeProjectSlug() },
+                          }),
+                        );
+                      }}
+                    >
+                      <Icon class="size-7 transition-transform group-hover:scale-110" />
+                      <span class="text-[11px] uppercase tracking-widest">{KIND_LABELS[kind]}</span>
+                    </button>
+                  );
                 }}
-              >
-                <For each={availableKinds() ?? []}>
-                  {(kind) => {
-                    const Icon = HARNESS_ICONS[kind];
-                    const disabled = () => !canSpawnKind(kind);
-                    return (
-                      <button
-                        type="button"
-                        class="group flex flex-col items-center justify-center gap-3 bg-surface-sunken text-foreground-dim transition-colors duration-[var(--motion-base)] ease-[var(--motion-ease)] hover:bg-hover hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-surface-sunken disabled:hover:text-foreground-dim"
-                        disabled={disabled()}
-                        title={disabled() ? "Add a project before spawning a harness" : undefined}
-                        onClick={() => {
-                          if (disabled()) return;
-                          window.dispatchEvent(
-                            new CustomEvent("raum:spawn-requested", {
-                              detail: { kind, projectSlug: activeProjectSlug() },
-                            }),
-                          );
-                        }}
-                      >
-                        <Icon class="size-7 transition-transform group-hover:scale-110" />
-                        <span class="text-[11px] uppercase tracking-widest">
-                          {KIND_LABELS[kind]}
-                        </span>
-                      </button>
-                    );
-                  }}
-                </For>
-              </div>
-            </Show>
+              </For>
+            </div>
+          </Show>
 
-            {/* PANE LAYER: flat absolute-positioned leaves keyed by id. Only
-            position/size changes on layout mutations; the xterm inside each
-            stays mounted. While a drag is hovering a valid drop zone, every
-            non-dragging pane renders at its PREVIEW position; the dragging
-            pane stays anchored at its original slot so the cursor-follow
-            transform (translate by pointer-delta) stays coherent. */}
+          <Show when={crossProjectMode() !== null && projectedSessionIds().length === 0}>
+            <div class="absolute inset-0 grid place-items-center text-sm text-foreground-subtle">
+              No matching sessions across your projects.
+            </div>
+          </Show>
+
+          <Show when={crossProjectMode() === null}>
             <Show when={activeCells().length > 0}>
               <For each={activeCells()}>
                 {(cell) => {
                   const effective = createMemo<RuntimeCell>(() => {
-                    // The dragging pane floats at the cursor — keep its CSS
-                    // base at its original slot so translate(pointer-delta)
-                    // positions it correctly. Other panes follow the preview
-                    // during drag, or the active-tree projection otherwise.
                     if (dragState()?.sourceId === cell.id) return cell;
                     const preview = previewCellMap()?.get(cell.id);
                     if (preview) {
@@ -434,17 +487,23 @@ export const TerminalGrid: Component = () => {
               </For>
             </Show>
 
-            {/* DIVIDER LAYER: overlay that reads the tree separately. During
-            drag we feed it the preview tree so dividers reflow with the
-            panes instead of being left behind at pre-drag positions. */}
             <DividerLayer tree={renderTree()} />
+          </Show>
 
-            {/* No drop-zone or landing overlays. The live reflow of the grid
-            under the cursor *is* the feedback; extra overlay layers caused
-            continuous repaints on the xterm canvases beneath them. */}
-          </div>
+          <Show when={crossProjectMode() !== null && projectedSessionIds().length > 0}>
+            <For each={projectedSessionIds()}>
+              {(sessionId) => {
+                const rect = createMemo(() => projectedRectMap().get(sessionId) ?? null);
+                return <ProjectedSessionFrame sessionId={sessionId} rect={rect()} />;
+              }}
+            </For>
+          </Show>
+
+          {/* No drop-zone or landing overlays. The live reflow of the grid
+          under the cursor *is* the feedback; extra overlay layers caused
+          continuous repaints on the xterm canvases beneath them. */}
         </div>
-      </Show>
+      </div>
       <Dock onRestore={onRestoreFromDock} />
     </div>
   );
@@ -899,6 +958,17 @@ const TabItem: Component<{
   const tabState = (): AgentState | null =>
     agentStore.sessions[props.tab.sessionId ?? ""]?.state ?? null;
 
+  const [bumping, setBumping] = createSignal(false);
+  let prevTabState: AgentState | null = null;
+  createEffect(() => {
+    const s = tabState();
+    if (s === "waiting" && prevTabState !== "waiting") {
+      setBumping(true);
+      setTimeout(() => setBumping(false), 400);
+    }
+    prevTabState = s;
+  });
+
   const HarnessIcon = () => {
     const Icon = HARNESS_ICONS[props.kind as keyof typeof HARNESS_ICONS];
     if (!Icon) return null;
@@ -933,8 +1003,13 @@ const TabItem: Component<{
     <div
       class="pane-header-tab group relative flex h-[18px] shrink-0 cursor-pointer items-center gap-1 rounded-md px-2 text-[10px] uppercase tracking-wide transition-colors"
       classList={{
-        "bg-selected text-foreground": props.isActive,
-        "text-foreground-subtle hover:bg-hover hover:text-foreground": !props.isActive,
+        "bg-selected text-foreground": props.isActive && tabState() !== "waiting",
+        "bg-selected text-warning": props.isActive && tabState() === "waiting",
+        "text-foreground-subtle hover:bg-hover hover:text-foreground":
+          !props.isActive && tabState() !== "waiting",
+        "bg-warning/15 text-warning hover:bg-warning/25":
+          !props.isActive && tabState() === "waiting",
+        wiggle: bumping(),
       }}
       title={tabLabel()}
       onClick={(e) => {
@@ -1023,7 +1098,7 @@ function StateIndicator(props: { state: AgentState | null }) {
         <LoaderIcon class="h-3 w-3 animate-spin text-success" />
       </Show>
       <Show when={props.state === "waiting"}>
-        <AlertCircleIcon class="h-3 w-3 text-warning" />
+        <AlertCircleIcon class="h-3 w-3 animate-pulse text-warning" />
       </Show>
       <Show when={props.state === "idle" || props.state === null}>
         <CheckIcon class="h-3 w-3 text-foreground-subtle" />
@@ -1137,243 +1212,88 @@ function CloseGlyph() {
   );
 }
 
-// ---- CrossProjectView: flat filter over the global terminal store ----------
-//
-// When `crossProjectViewMode()` is non-null, the grid renders this view in
-// place of the BSP per-project layout. It's a pure filter+sort over
-// `terminalStore.byId`: "awaiting" shows all sessions whose agent state is
-// `waiting`, "working" shows all `working`, and "recent" shows the 9 most
-// recent sessions regardless of state, sorted by `lastOutputMs` desc.
-//
-// Each tile hosts a full live `TerminalPane` — the tile IS the terminal.
-// Project color frames the tile and accents the slim header strip. Clicking
-// the header switches `activeProjectSlug` and clears the mode so the BSP view
-// reopens on the corresponding pane; Escape clears the mode without switching
-// projects.
+// ---- Cross-project projected panes ----------------------------------------
 
-const RECENT_CAP = 9;
-
-interface MatchedSession {
-  sessionId: string;
-  kind: AgentKind;
-  projectSlug: string;
-  worktreeId: string | null;
-  projectName: string;
-  projectColor: string;
-  state: AgentState | null;
-  lastActivity: number;
-}
-
-function stateChip(state: AgentState | null): { label: string; tone: string } {
-  if (state === "working") return { label: "Working", tone: "bg-success/15 text-success" };
-  if (state === "waiting") return { label: "Waiting", tone: "bg-warning/15 text-warning" };
-  if (state === "errored") return { label: "Errored", tone: "bg-danger/15 text-danger" };
-  if (state === "completed")
-    return { label: "Completed", tone: "bg-muted/30 text-foreground-subtle" };
-  return { label: "Idle", tone: "bg-muted/30 text-foreground-subtle" };
-}
-
-function relativeAgo(ms: number): string {
-  if (!ms) return "";
-  const s = (Date.now() - ms) / 1000;
-  if (s < 60) return `${Math.floor(s)}s`;
-  if (s < 3600) return `${Math.floor(s / 60)}m`;
-  if (s < 86_400) return `${Math.floor(s / 3600)}h`;
-  return `${Math.floor(s / 86_400)}d`;
-}
-
-function headerLabel(mode: CrossProjectViewMode): string {
-  if (mode === "awaiting") return "Awaiting across projects";
-  if (mode === "working") return "Working across projects";
-  return "Recent across projects";
-}
-
-function headerIcon(mode: CrossProjectViewMode): typeof AlertCircleIcon {
-  if (mode === "awaiting") return AlertCircleIcon;
-  if (mode === "working") return LoaderIcon;
-  return ClockIcon;
-}
-
-interface CrossProjectViewProps {
-  mode: CrossProjectViewMode;
-}
-
-const CrossProjectView: Component<CrossProjectViewProps> = (props) => {
-  // Membership: the set of session ids that satisfy the filter mode.
-  // Depends on the index signals (membership) and agentStore.sessions,
-  // but NOT on `lastOutputBySession` — so a PTY-output storm doesn't
-  // invalidate this memo.
-  const matchedIds = createMemo<string[]>(() => {
-    const hs = harnessIds();
-    const pickBucket = (bucket: ReadonlySet<string>): string[] => {
-      const out: string[] = [];
-      for (const id of bucket) if (hs.has(id)) out.push(id);
-      return out;
-    };
-    if (props.mode === "awaiting") return pickBucket(waitingIds());
-    if (props.mode === "working") return pickBucket(workingIds());
-    // Recent: any project-scoped harness.
-    return [...hs];
-  });
-
-  // Projection: shape each id into a tile. `lastOutputBySession` enters
-  // here (for the sort key) and `projectBySlug` is an O(1) map lookup.
-  // Wrapped in `createDeferred` so rapid PTY updates let the browser
-  // paint between re-sorts — the membership is already stable by the
-  // time this settles.
-  const rawMatched = createMemo<MatchedSession[]>(() => {
-    const ids = matchedIds();
-    const lo = lastOutputBySession();
-    const pm = projectBySlug();
-    const sessions = agentStore.sessions;
-    const out: MatchedSession[] = [];
-    for (const id of ids) {
-      const terminal = terminalStore.byId[id];
-      if (!terminal || !terminal.project_slug) continue;
-      const proj = pm.get(terminal.project_slug);
-      out.push({
-        sessionId: id,
-        kind: terminal.kind,
-        projectSlug: terminal.project_slug,
-        worktreeId: terminal.worktree_id,
-        projectName: proj?.name ?? terminal.project_slug,
-        projectColor: proj?.color ?? "#6b7280",
-        state: sessions[id]?.state ?? null,
-        lastActivity: lo.get(id) ?? terminal.created_unix * 1000,
-      });
-    }
-    out.sort((a, b) => b.lastActivity - a.lastActivity);
-    if (props.mode === "recent") return out.slice(0, RECENT_CAP);
-    return out;
-  });
-  const matched = createDeferred(rawMatched, { timeoutMs: 200 });
-  timeMemoSettle(() => `filter-click:${props.mode}`, matched);
-
-  onMount(() => {
-    function onKey(ev: KeyboardEvent): void {
-      if (ev.key === "Escape" && crossProjectViewMode() !== null) {
-        ev.preventDefault();
-        setCrossProjectViewMode(null);
-      }
-    }
-    window.addEventListener("keydown", onKey);
-    onCleanup(() => window.removeEventListener("keydown", onKey));
-  });
-
-  const Icon = () => {
-    const I = headerIcon(props.mode);
-    return <I class="size-3.5 text-foreground" />;
+function rectStyle(rect: Rect): Record<string, string> {
+  const pct = 100 / LAYOUT_UNIT;
+  return {
+    "--x-pct": `${rect.x * pct}%`,
+    "--y-pct": `${rect.y * pct}%`,
+    "--w-pct": `${rect.w * pct}%`,
+    "--h-pct": `${rect.h * pct}%`,
   };
+}
 
-  return (
-    <div class="flex flex-1 min-h-0 flex-col bg-background">
-      <div class="flex items-center justify-between border-b border-border-subtle px-4 py-1.5">
-        <div class="flex items-center gap-2">
-          <Icon />
-          <h2 class="text-xs font-medium text-foreground">{headerLabel(props.mode)}</h2>
-          <span class="text-[11px] text-foreground-subtle">
-            {matched().length} {matched().length === 1 ? "session" : "sessions"}
-          </span>
-        </div>
-        <button
-          type="button"
-          class="rounded px-2 py-0.5 text-[11px] text-foreground-subtle hover:bg-hover hover:text-foreground"
-          onClick={() => setCrossProjectViewMode(null)}
-        >
-          Close (Esc)
-        </button>
-      </div>
-
-      <Show
-        when={matched().length > 0}
-        fallback={
-          <div class="flex flex-1 items-center justify-center text-sm text-foreground-subtle">
-            No matching sessions across your projects.
-          </div>
-        }
-      >
-        <div class="flex-1 overflow-auto p-3">
-          <div class="grid grid-cols-[repeat(auto-fill,minmax(360px,1fr))] gap-3">
-            <For each={matched()}>{(entry) => <CrossProjectTile entry={entry} />}</For>
-          </div>
-        </div>
-      </Show>
-    </div>
-  );
-};
-
-const CrossProjectTile: Component<{ entry: MatchedSession }> = (props) => {
+const ProjectedSessionFrame: Component<{ sessionId: string; rect: Rect | null }> = (props) => {
+  const terminal = createMemo(() => terminalStore.byId[props.sessionId]);
+  const project = createMemo(() => {
+    const slug = terminal()?.project_slug;
+    return slug ? projectBySlug().get(slug) : undefined;
+  });
   const HarnessIcon = () => {
-    const I = HARNESS_ICONS[props.entry.kind as keyof typeof HARNESS_ICONS];
+    const kind = terminal()?.kind;
+    if (!kind) return null;
+    const I = HARNESS_ICONS[kind as keyof typeof HARNESS_ICONS];
     return I ? <I class="size-3.5 shrink-0" /> : null;
   };
-  const chip = () => stateChip(props.entry.state);
-
-  // Soft project-colored wash over the header strip. Border uses the saturated
-  // color so the frame reads as "this terminal belongs to <project>".
-  const headerStyle = () => {
-    const c = props.entry.projectColor;
-    return {
-      "background-image": `linear-gradient(180deg, ${c}40 0%, ${c}14 60%, transparent 100%)`,
-      "box-shadow": `inset 0 1px 0 ${c}66, inset 0 -1px 0 ${c}1f`,
-    } as Record<string, string>;
-  };
-
-  function jumpToProject(): void {
-    const slug = props.entry.projectSlug;
-    const sessionId = props.entry.sessionId;
-    if (activeProjectSlug() !== slug) setActiveProjectSlug(slug);
-    setCrossProjectViewMode(null);
-    queueMicrotask(() => {
-      try {
-        window.dispatchEvent(
-          new CustomEvent("terminal-focus-requested", {
-            detail: { sessionId },
-          }),
-        );
-      } catch {
-        /* non-DOM env (tests) */
-      }
+  const state = () => agentStore.sessions[props.sessionId]?.state ?? null;
+  const label = createMemo(() => {
+    const current = terminal();
+    const ctx = current?.paneContext;
+    const kind = current?.kind;
+    if (!kind || kind === "shell") return kind ? kindDisplayLabel(kind) : "";
+    return resolveHarnessAutoLabel({
+      kind,
+      paneTitle: ctx?.paneTitle,
+      windowName: ctx?.windowName,
+      currentCommand: ctx?.currentCommand,
+      fallbackLabel: kindDisplayLabel(kind),
     });
-  }
+  });
+  const accent = () => `color-mix(in oklab, ${project()?.color ?? "#6b7280"} 18%, transparent)`;
+  const headerStyle = () =>
+    ({
+      "box-shadow": `inset 0 1px 0 color-mix(in oklab, ${project()?.color ?? "#6b7280"} 26%, transparent)`,
+      "background-image": `linear-gradient(180deg, color-mix(in oklab, ${project()?.color ?? "#6b7280"} 7%, transparent) 0%, transparent 100%)`,
+    }) as Record<string, string>;
 
   return (
-    <div
-      class="flex flex-col overflow-hidden rounded-md border-2 bg-background"
-      style={{ "border-color": props.entry.projectColor }}
-    >
-      <button
-        type="button"
-        class="flex items-center gap-2 px-3 py-1.5 text-left hover:bg-hover/50"
-        style={headerStyle()}
-        onClick={jumpToProject}
-        title="Jump to this terminal in its project"
-      >
-        <span
-          class="inline-block size-2 shrink-0 rounded-full"
-          style={{ "background-color": props.entry.projectColor }}
-        />
-        <span class="truncate text-xs font-medium text-foreground">{props.entry.projectName}</span>
-        <HarnessIcon />
-        <span class="truncate text-[11px] text-foreground-subtle">
-          {kindDisplayLabel(props.entry.kind)}
-        </span>
-        <span class={`ml-auto rounded px-1.5 py-0.5 text-[10px] font-medium ${chip().tone}`}>
-          {chip().label}
-        </span>
-        <span class="shrink-0 text-[10px] text-foreground-subtle">
-          {relativeAgo(props.entry.lastActivity)}
-        </span>
-      </button>
-      <div class="relative aspect-[16/10] min-h-0 flex-1">
-        <TerminalPane
-          kind={props.entry.kind}
-          sessionId={props.entry.sessionId}
-          projectSlug={props.entry.projectSlug}
-          worktreeId={props.entry.worktreeId ?? undefined}
-          borderColor="transparent"
-        />
-      </div>
-    </div>
+    <Show when={terminal()}>
+      {(currentTerminal) => (
+        <Show when={props.rect}>
+          {(rect) => (
+            <div
+              class="leaf-frame flex min-h-0 min-w-0 flex-col"
+              data-session-id={props.sessionId}
+              data-testid={`projected-session-${props.sessionId}`}
+              style={rectStyle(rect())}
+              title={currentTerminal().project_slug ?? ""}
+            >
+              <div
+                class="flex h-7 shrink-0 items-center border-b border-border-subtle"
+                style={headerStyle()}
+              >
+                <div class="no-scrollbar flex min-w-0 flex-1 items-center overflow-x-auto pl-1.5">
+                  <div class="pane-header-tab relative flex h-[18px] shrink-0 items-center gap-1 rounded-md px-2 text-[10px] uppercase tracking-wide text-foreground">
+                    <HarnessIcon />
+                    <StateIndicator state={state()} />
+                    <span class="max-w-[16ch] truncate normal-case">{label()}</span>
+                  </div>
+                </div>
+              </div>
+              <div class="relative min-h-0 min-w-0 flex-1 overflow-hidden">
+                <TerminalPane
+                  kind={currentTerminal().kind}
+                  sessionId={props.sessionId}
+                  projectSlug={currentTerminal().project_slug ?? undefined}
+                  worktreeId={currentTerminal().worktree_id ?? undefined}
+                  borderColor={accent()}
+                />
+              </div>
+            </div>
+          )}
+        </Show>
+      )}
+    </Show>
   );
 };

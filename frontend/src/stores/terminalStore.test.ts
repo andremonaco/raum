@@ -22,6 +22,7 @@ import {
   idsByProjectSlug,
   idsByWorktreeId,
   lastOutputBySession,
+  listCrossProjectHarnessSessions,
   markOutput,
   removeTerminal,
   setTerminals,
@@ -181,6 +182,60 @@ describe("terminalStore harness counts", () => {
     expect(waitingCount()).toBe(1);
     expect(activeCount()).toBe(1);
     expect(idleCount()).toBe(0);
+  });
+
+  it("lists working and awaiting cross-project sessions from the live state buckets", () => {
+    setTerminals([
+      terminal({ session_id: "waiting-alpha", created_unix: 1 }),
+      terminal({
+        session_id: "working-beta",
+        project_slug: "beta",
+        kind: "codex",
+        created_unix: 2,
+      }),
+      terminal({
+        session_id: "idle-gamma",
+        project_slug: "gamma",
+        kind: "opencode",
+        created_unix: 3,
+      }),
+    ]);
+
+    applyAgentStateToTerminal("waiting-alpha", "waiting");
+    applyAgentStateToTerminal("working-beta", "working");
+
+    expect(listCrossProjectHarnessSessions("awaiting").map((t) => t.session_id)).toEqual([
+      "waiting-alpha",
+    ]);
+    expect(listCrossProjectHarnessSessions("working").map((t) => t.session_id)).toEqual([
+      "working-beta",
+    ]);
+  });
+
+  it("lists recent cross-project sessions uncapped and sorted by last output", () => {
+    vi.useFakeTimers();
+    try {
+      setTerminals([
+        terminal({ session_id: "older", created_unix: 1 }),
+        terminal({ session_id: "middle", project_slug: "beta", kind: "codex", created_unix: 2 }),
+        terminal({ session_id: "newer", project_slug: "gamma", kind: "opencode", created_unix: 3 }),
+      ]);
+
+      vi.setSystemTime(new Date("2026-04-23T10:00:00Z"));
+      markOutput("older");
+      vi.setSystemTime(new Date("2026-04-23T10:00:01Z"));
+      markOutput("middle");
+      vi.setSystemTime(new Date("2026-04-23T10:00:02Z"));
+      markOutput("newer");
+
+      expect(listCrossProjectHarnessSessions("recent").map((t) => t.session_id)).toEqual([
+        "newer",
+        "middle",
+        "older",
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("clears buffered state when the terminal is removed before hydration", () => {

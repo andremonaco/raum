@@ -167,6 +167,18 @@ const DEFAULTS: &[(&str, &str, &str, bool)] = &[
         "Toggle maximize the focused pane",
         false,
     ),
+    (
+        "reset-harness",
+        "CmdOrCtrl+R",
+        "Reset focused pane (new session, same harness)",
+        false,
+    ),
+    (
+        "new-tab-same-harness",
+        "CmdOrCtrl+T",
+        "New tab in focused pane (same harness)",
+        false,
+    ),
     // ---- chrome -----------------------------------------------------------
     (
         "toggle-sidebar",
@@ -194,7 +206,7 @@ const DEFAULTS: &[(&str, &str, &str, bool)] = &[
         false,
     ),
     ("spotlight", "CmdOrCtrl+.", "Open spotlight dock", false),
-    ("reload", "CmdOrCtrl+R", "Reload the app", false),
+    ("reload", "CmdOrCtrl+Shift+R", "Reload the app UI", false),
     // ---- worktrees --------------------------------------------------------
     (
         "new-worktree",
