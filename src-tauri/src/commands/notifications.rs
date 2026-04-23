@@ -60,13 +60,15 @@ pub fn notifications_mark_hint_shown(
 }
 
 /// §11 — persist user notification preferences from the settings modal.
-/// Updates `notify_on_waiting`, `notify_on_done`, the optional sound path, and
-/// the dock/taskbar `badge_mode` atomically in a single config write.
+/// Updates `notify_on_waiting`, `notify_on_done`, the banner master switch,
+/// the optional sound path, and the dock/taskbar `badge_mode` atomically in a
+/// single config write.
 #[tauri::command]
 pub fn config_set_notifications(
     state: tauri::State<'_, AppHandleState>,
     notify_on_waiting: bool,
     notify_on_done: bool,
+    notify_banner_enabled: bool,
     sound: Option<String>,
     badge_mode: BadgeMode,
 ) -> Result<(), String> {
@@ -74,6 +76,7 @@ pub fn config_set_notifications(
     let mut cfg: Config = store.read_config().map_err(|e| e.to_string())?;
     cfg.notifications.notify_on_waiting = notify_on_waiting;
     cfg.notifications.notify_on_done = notify_on_done;
+    cfg.notifications.notify_banner_enabled = notify_banner_enabled;
     cfg.notifications.badge_mode = badge_mode;
     // Treat empty string as None (no sound file configured).
     cfg.notifications.sound = sound.filter(|s| !s.trim().is_empty());
@@ -235,22 +238,21 @@ pub fn notifications_check_authorization<R: Runtime>(
 ) -> Result<NotificationAuthorization, String> {
     #[cfg(target_os = "macos")]
     {
-        // notify_rust calls `set_application("com.apple.Terminal")` in dev so
-        // the system attributes our notifications to Terminal. Probing the
-        // raum bundle in that case would show "unknown" forever even when
-        // notifications are actually working.
         let is_dev = tauri::is_dev();
-        let bundle_id = if is_dev {
-            "com.apple.Terminal".to_string()
+        let bundle_id = app.config().identifier.clone();
+        let status = if is_dev {
+            "unknown"
         } else {
-            app.config().identifier.clone()
+            check_macos_authorization()
         };
-        let status = check_macos_authorization(&bundle_id);
         let note = if is_dev {
-            Some(format!(
-                "Dev build: notifications fire as Terminal ({bundle_id}). \
-                 Build a release bundle (`task build`) for raum-branded alerts."
-            ))
+            Some(
+                "Dev build: desktop notifications are attributed to Terminal \
+                 (`com.apple.Terminal`), so raum cannot read an authoritative \
+                 permission state here. Build and launch the bundled app \
+                 (`task build`) to verify raum's own macOS authorization."
+                    .to_string(),
+            )
         } else {
             None
         };
@@ -292,58 +294,47 @@ pub fn notifications_check_authorization<R: Runtime>(
 }
 
 #[cfg(target_os = "macos")]
-fn check_macos_authorization(bundle_id: &str) -> &'static str {
-    let Some(home) = std::env::var_os("HOME") else {
-        return "unknown";
-    };
-    let mut plist = std::path::PathBuf::from(home);
-    plist.push("Library/Preferences/com.apple.ncprefs.plist");
-    let Ok(out) = ProcessCommand::new("plutil")
-        .args(["-convert", "xml1", "-o", "-", "--"])
-        .arg(&plist)
-        .output()
-    else {
-        return "unknown";
-    };
-    if !out.status.success() {
-        return "unknown";
+fn check_macos_authorization() -> &'static str {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use block2::RcBlock;
+    use objc2_user_notifications::{UNNotificationSettings, UNUserNotificationCenter};
+
+    let (tx, rx) = mpsc::channel();
+    let completion = RcBlock::new(move |settings: std::ptr::NonNull<UNNotificationSettings>| {
+        #[allow(unsafe_code)]
+        let settings = unsafe { settings.as_ref() };
+        let _ = tx.send(map_macos_authorization_status(
+            settings.authorizationStatus(),
+        ));
+    });
+
+    let center = UNUserNotificationCenter::currentNotificationCenter();
+    center.getNotificationSettingsWithCompletionHandler(&completion);
+
+    match rx.recv_timeout(Duration::from_secs(2)) {
+        Ok(status) => status,
+        Err(_) => "unknown",
     }
-    let Ok(xml) = std::str::from_utf8(&out.stdout) else {
-        return "unknown";
-    };
-    parse_macos_flags(xml, bundle_id)
 }
 
-/// Single-pass scan for `<string>{bundle}</string>` followed by the next
-/// `<key>flags</key><integer>N</integer>` pair. The plist is a few kilobytes
-/// in practice, so a hand-rolled scan beats pulling in an XML crate.
-///
-/// `flags == 0` matches macOS's "Allow Notifications: off" toggle. Any
-/// nonzero value means the user has at least one notification surface
-/// enabled.
 #[cfg(target_os = "macos")]
-fn parse_macos_flags(xml: &str, bundle_id: &str) -> &'static str {
-    let target = format!("<string>{bundle_id}</string>");
-    let Some(start) = xml.find(&target) else {
+fn map_macos_authorization_status(
+    status: objc2_user_notifications::UNAuthorizationStatus,
+) -> &'static str {
+    use objc2_user_notifications::UNAuthorizationStatus;
+
+    if status == UNAuthorizationStatus::Authorized
+        || status == UNAuthorizationStatus::Provisional
+        || status == UNAuthorizationStatus::Ephemeral
+    {
+        "granted"
+    } else if status == UNAuthorizationStatus::Denied {
+        "denied"
+    } else {
         return "unknown";
-    };
-    let after = &xml[start + target.len()..];
-    let Some(flags_pos) = after.find("<key>flags</key>") else {
-        return "unknown";
-    };
-    let after_flags = &after[flags_pos + "<key>flags</key>".len()..];
-    let Some(open) = after_flags.find("<integer>") else {
-        return "unknown";
-    };
-    let int_start = open + "<integer>".len();
-    let Some(close_rel) = after_flags[int_start..].find("</integer>") else {
-        return "unknown";
-    };
-    let n: i64 = after_flags[int_start..int_start + close_rel]
-        .trim()
-        .parse()
-        .unwrap_or(0);
-    if n == 0 { "denied" } else { "granted" }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -416,37 +407,42 @@ pub fn notifications_open_system_settings() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     #[cfg(target_os = "macos")]
-    use super::parse_macos_flags;
-
+    use super::map_macos_authorization_status;
     #[cfg(target_os = "macos")]
-    const SAMPLE: &str = r"
-        <plist><dict><key>apps</key><array>
-            <dict>
-                <key>bundle-id</key><string>com.apple.mail</string>
-                <key>flags</key><integer>310378510</integer>
-            </dict>
-            <dict>
-                <key>bundle-id</key><string>com.example.muted</string>
-                <key>flags</key><integer>0</integer>
-            </dict>
-        </array></dict></plist>
-    ";
+    use objc2_user_notifications::UNAuthorizationStatus;
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn parses_granted_when_flags_nonzero() {
-        assert_eq!(parse_macos_flags(SAMPLE, "com.apple.mail"), "granted");
+    fn maps_authorized_statuses_to_granted() {
+        assert_eq!(
+            map_macos_authorization_status(UNAuthorizationStatus::Authorized),
+            "granted"
+        );
+        assert_eq!(
+            map_macos_authorization_status(UNAuthorizationStatus::Provisional),
+            "granted"
+        );
+        assert_eq!(
+            map_macos_authorization_status(UNAuthorizationStatus::Ephemeral),
+            "granted"
+        );
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn parses_denied_when_flags_zero() {
-        assert_eq!(parse_macos_flags(SAMPLE, "com.example.muted"), "denied");
+    fn maps_denied_status_to_denied() {
+        assert_eq!(
+            map_macos_authorization_status(UNAuthorizationStatus::Denied),
+            "denied"
+        );
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn unknown_when_bundle_absent() {
-        assert_eq!(parse_macos_flags(SAMPLE, "com.never.here"), "unknown");
+    fn maps_not_determined_to_unknown() {
+        assert_eq!(
+            map_macos_authorization_status(UNAuthorizationStatus::NotDetermined),
+            "unknown"
+        );
     }
 }

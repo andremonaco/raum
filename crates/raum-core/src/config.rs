@@ -339,6 +339,13 @@ pub struct NotificationsConfig {
     /// or `errored` (agent is done). Defaults to `true`.
     #[serde(default = "default_true")]
     pub notify_on_done: bool,
+    /// §11 — master switch for OS notification banners. When `false`, the
+    /// frontend skips `sendNotification` (and the toast fallback) for every
+    /// event regardless of `notify_on_waiting` / `notify_on_done`. The dock
+    /// badge keeps updating because `badge_mode` is an independent channel.
+    /// Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub notify_banner_enabled: bool,
     /// §11.3 — dock/taskbar badge verbosity. Defaults to [`BadgeMode::AllUnread`].
     #[serde(default)]
     pub badge_mode: BadgeMode,
@@ -355,6 +362,7 @@ impl Default for NotificationsConfig {
             notifications_hint_shown: false,
             notify_on_waiting: true,
             notify_on_done: true,
+            notify_banner_enabled: true,
             badge_mode: BadgeMode::default(),
         }
     }
@@ -629,6 +637,7 @@ mod tests {
                 notifications_hint_shown: true,
                 notify_on_waiting: true,
                 notify_on_done: false,
+                notify_banner_enabled: false,
                 badge_mode: BadgeMode::Critical,
             },
             keybindings: Keybindings { overrides },
@@ -674,6 +683,23 @@ mod tests {
         ";
         let cfg: NotificationsConfig = toml::from_str(raw).expect("deserialize");
         assert_eq!(cfg.badge_mode, BadgeMode::AllUnread);
+    }
+
+    #[test]
+    fn notifications_notify_banner_enabled_defaults_true() {
+        // Both a blank TOML block and a pre-banner-field config (missing
+        // `notify_banner_enabled`) should deserialize to the on-by-default
+        // banner state so existing user configs keep receiving banners
+        // after upgrade.
+        let cfg = NotificationsConfig::default();
+        assert!(cfg.notify_banner_enabled);
+
+        let raw = r"
+            notify_on_waiting = true
+            notify_on_done = true
+        ";
+        let cfg: NotificationsConfig = toml::from_str(raw).expect("deserialize");
+        assert!(cfg.notify_banner_enabled);
     }
 
     #[test]
