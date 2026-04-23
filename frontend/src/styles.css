@@ -60,6 +60,11 @@ textarea,
   cursor: default;
 }
 
+.no-drag-region {
+  app-region: no-drag;
+  -webkit-app-region: no-drag;
+}
+
 @theme inline {
   --font-mono: "JetBrains Mono", "Menlo", "DejaVu Sans Mono", monospace;
   --radius-sm: calc(var(--radius) - 4px);
@@ -806,4 +811,228 @@ body,
  */
 .floating-surface {
   box-shadow: var(--shadow-lg);
+}
+
+/*
+ * §13.0 — Onboarding intro mock.
+ *
+ * Miniature of the raum app shell used on the welcome step of the
+ * onboarding wizard. Top bar (real RaumLogo + harness spawn buttons) +
+ * left sidebar + BSP pane grid whose count oscillates 1 → 2 → 3 → 4 →
+ * 3 → 2 → 1 → … as a seamless palindrome. Each pane's position, size,
+ * and visibility are driven by inline style from Solid; the transition
+ * itself lives here so additions and removals share the same overshoot
+ * easing used on `.leaf-frame`. No hard reset — the loop never snaps.
+ *
+ * Bars inside each pane pulse subtly (1.6s, row-staggered) to evoke live
+ * terminal output. Pane position/size/opacity are driven by inline style
+ * from Solid (see onboarding-intro-step.tsx); keyframed CSS is reserved
+ * for the passive ambience (bar pulse, pill shimmer, bullet entrance).
+ *
+ * Every animation is gated on `prefers-reduced-motion: no-preference`;
+ * the `reduce` fallback at the end of this block renders a static,
+ * fully-visible 4-pane layout with no motion.
+ */
+.raum-mock {
+  display: flex;
+  flex-direction: column;
+  height: 340px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: color-mix(in oklab, var(--background) 85%, transparent);
+  overflow: hidden;
+  user-select: none;
+}
+.raum-mock__topbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 28px;
+  padding: 0 10px;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in oklab, var(--muted) 50%, transparent);
+  flex-shrink: 0;
+}
+.raum-mock__logo {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+}
+.raum-mock__spawn {
+  width: 19px;
+  height: 19px;
+  border-radius: 4px;
+  background: color-mix(in oklab, var(--foreground) 10%, transparent);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.raum-mock__spawn-icon {
+  width: 11px;
+  height: 11px;
+  color: var(--foreground);
+  opacity: 0.85;
+}
+.raum-mock__spacer {
+  flex: 1;
+}
+.raum-mock__pill {
+  width: 28px;
+  height: 11px;
+  border-radius: 6px;
+  background: color-mix(in oklab, var(--foreground) 18%, transparent);
+  opacity: 0.6;
+  flex-shrink: 0;
+}
+.raum-mock__body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+.raum-mock__sidebar {
+  width: 72px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 8px;
+  border-right: 1px solid var(--border);
+  background: color-mix(in oklab, var(--muted) 30%, transparent);
+  flex-shrink: 0;
+}
+.raum-mock__row {
+  height: 6px;
+  border-radius: 2px;
+  background: color-mix(in oklab, var(--foreground) 16%, transparent);
+}
+.raum-mock__row:nth-child(2) {
+  width: 72%;
+}
+.raum-mock__row:nth-child(3) {
+  width: 88%;
+}
+.raum-mock__row:nth-child(4) {
+  width: 60%;
+}
+.raum-mock__row:nth-child(5) {
+  width: 80%;
+}
+.raum-mock__grid {
+  position: relative;
+  flex: 1;
+  padding: 3px;
+  background: var(--selected, var(--background));
+  overflow: hidden;
+}
+.raum-mock__pane {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 7px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: color-mix(in oklab, var(--background) 92%, var(--foreground) 4%);
+  box-shadow: inset 0 1px 0 color-mix(in oklab, var(--foreground) 6%, transparent);
+  transform-origin: center;
+  overflow: hidden;
+  will-change: left, top, width, height, opacity, transform;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .raum-mock__pane {
+    transition:
+      left 560ms cubic-bezier(0.34, 1.56, 0.64, 1),
+      top 560ms cubic-bezier(0.34, 1.56, 0.64, 1),
+      width 560ms cubic-bezier(0.34, 1.56, 0.64, 1),
+      height 560ms cubic-bezier(0.34, 1.56, 0.64, 1),
+      opacity 320ms var(--motion-ease),
+      transform 320ms cubic-bezier(0.34, 1.56, 0.64, 1);
+  }
+}
+.raum-mock__pane-header {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 12px;
+  flex-shrink: 0;
+}
+.raum-mock__pane-icon {
+  width: 12px;
+  height: 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--foreground);
+  opacity: 0.9;
+}
+.raum-mock__pane-icon-svg {
+  width: 11px;
+  height: 11px;
+}
+.raum-mock__pane-dot {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: color-mix(in oklab, var(--foreground) 18%, transparent);
+}
+.raum-mock__pane-body {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  flex: 1;
+  justify-content: center;
+  overflow: hidden;
+}
+.raum-mock__bar {
+  display: block;
+  height: 3px;
+  border-radius: 2px;
+  background: color-mix(in oklab, var(--foreground) 30%, transparent);
+  opacity: 0.45;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .raum-mock__bar {
+    animation: raum-mock-bar-pulse 1.6s ease-in-out infinite;
+    animation-delay: calc(var(--bar-index, 0) * 200ms);
+  }
+  .raum-mock__pill {
+    animation: raum-mock-pill-shimmer 3.2s ease-in-out infinite;
+  }
+  .raum-mock__topbar > .raum-mock__pill:last-child {
+    animation-delay: -1.6s;
+  }
+  .raum-intro-bullet {
+    animation: raum-bullet-in 240ms var(--motion-ease) backwards;
+    animation-delay: calc(var(--i, 0) * 60ms);
+  }
+}
+
+@keyframes raum-mock-bar-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 0.65;
+  }
+}
+@keyframes raum-mock-pill-shimmer {
+  0%,
+  100% {
+    opacity: 0.5;
+  }
+  50% {
+    opacity: 0.8;
+  }
+}
+@keyframes raum-bullet-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
