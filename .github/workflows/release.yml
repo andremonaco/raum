@@ -25,6 +25,31 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
+      # Diagnostic dry-run. `release-plz/action@v0.5` swallows the CLI's
+      # stderr on success, so a silent `{"prs":[]}` decision (e.g. the
+      # regex didn't match, or no package was affected) leaves no trail
+      # in the job log. Run the same command beforehand with `--dry-run`
+      # and stderr merged to stdout so the reasoning is always visible.
+      # `continue-on-error: true` keeps this strictly diagnostic — any
+      # transient failure here must not block the real release-pr step.
+      - name: release-plz dry-run (diagnostic)
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: taiki-e/install-action@v2
+        with:
+          tool: release-plz@0.3.157
+      - name: release-plz release-pr --dry-run
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          release-plz release-pr \
+            --git-token "${GITHUB_TOKEN}" \
+            --repo-url "https://github.com/${GITHUB_REPOSITORY}" \
+            --dry-run \
+            --verbose \
+            2>&1 || true
       - uses: release-plz/action@v0.5
         with:
           command: release-pr
