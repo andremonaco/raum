@@ -278,6 +278,33 @@ mod tests {
         path
     }
 
+    /// Retry `run_hook` on Linux's `ETXTBSY` ("Text file busy"). When the
+    /// hydration test suite runs in parallel with the rest of the workspace
+    /// on Linux CI, one test's `fork()` can inherit another test's just-
+    /// written script fd before the parent closes it; the subsequent
+    /// `execve` of that script races the still-open write fd and fails
+    /// with ETXTBSY. The file is valid — retry a few times with a small
+    /// backoff gives the forked child a chance to finish its own exec and
+    /// release the inherited fd.
+    fn run_hook_retry(
+        phase: HookPhase,
+        script: &Path,
+        ctx: &HookContext<'_>,
+        timeout_secs: u32,
+    ) -> Result<HookReport, HookError> {
+        for attempt in 0..5 {
+            match run_hook(phase, script, ctx, timeout_secs) {
+                Err(HookError::Spawn { source, .. })
+                    if source.kind() == std::io::ErrorKind::ExecutableFileBusy =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(50 * (attempt + 1)));
+                }
+                other => return other,
+            }
+        }
+        run_hook(phase, script, ctx, timeout_secs)
+    }
+
     fn ctx<'a>(root: &'a Path, worktree: &'a Path) -> HookContext<'a> {
         HookContext {
             project_slug: "acme",
@@ -315,7 +342,7 @@ mod tests {
             "#!/bin/sh\ntouch \"$RAUM_WORKTREE_PATH/marker\"\necho ok\n",
         );
 
-        let report = run_hook(HookPhase::PostCreate, &script, &ctx(&root, &wt), 30).unwrap();
+        let report = run_hook_retry(HookPhase::PostCreate, &script, &ctx(&root, &wt), 30).unwrap();
         assert!(wt.join("marker").exists(), "post-create ran with wt cwd");
         assert!(report.stdout_tail.contains("ok"));
     }
@@ -325,7 +352,8 @@ mod tests {
         let tmp = tempdir().unwrap();
         let root = tmp.path().to_path_buf();
         let script = write_script(&root, "fail.sh", "#!/bin/sh\necho boom 1>&2\nexit 7\n");
-        let err = run_hook(HookPhase::PreCreate, &script, &ctx(&root, &root), 30).unwrap_err();
+        let err =
+            run_hook_retry(HookPhase::PreCreate, &script, &ctx(&root, &root), 30).unwrap_err();
         match err {
             HookError::Failed {
                 code, stderr_tail, ..
@@ -342,7 +370,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let root = tmp.path().to_path_buf();
         let script = write_script(&root, "sleep.sh", "#!/bin/sh\nsleep 10\n");
-        let err = run_hook(HookPhase::PreCreate, &script, &ctx(&root, &root), 1).unwrap_err();
+        let err = run_hook_retry(HookPhase::PreCreate, &script, &ctx(&root, &root), 1).unwrap_err();
         assert!(matches!(err, HookError::Timeout { .. }), "got {err:?}");
     }
 
@@ -359,7 +387,7 @@ mod tests {
                 out.display()
             ),
         );
-        run_hook(HookPhase::PreCreate, &script, &ctx(&root, &root), 30).unwrap();
+        run_hook_retry(HookPhase::PreCreate, &script, &ctx(&root, &root), 30).unwrap();
         let contents = fs::read_to_string(&out).unwrap();
         assert!(contents.contains("phase=pre-create"));
         assert!(contents.contains("slug=acme"));
