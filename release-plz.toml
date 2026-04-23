@@ -45,8 +45,12 @@ git_release_enable = true
 git_tag_enable = true
 # Create the GH release as a draft so the build matrix has time to
 # attach signed bundles before anything is visible publicly. The
-# maintainer publishes the draft manually after the post-release smoke
-# test (see docs/release.md).
+# `publish-release` job in release.yml flips the draft to published
+# automatically once every bundle has uploaded successfully — no
+# manual smoke-test gate. Leaving draft=true during the build window
+# avoids the ugly "Latest release, 0 downloads" state users would see
+# if `release-plz release` were to create a non-draft release before
+# the build matrix finishes (~15 min).
 git_release_draft = true
 
 [[package]]
