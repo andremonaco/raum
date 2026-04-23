@@ -22,12 +22,15 @@ Optional (only required if you want to spawn the matching harness):
 | Codex        | `codex`    | OpenAI Codex CLI                        |
 | OpenCode     | `opencode` | <https://github.com/opencode-ai/opencode> |
 
-Install raum itself via the notarized release for your platform:
+Install raum itself:
 
-- **macOS** — download the `.dmg` from the [latest release][releases] and drag
-  the app into `/Applications`.
+- **macOS** — `brew install --cask andremonaco/raum/raum`. The cask strips
+  Gatekeeper's quarantine flag so the ad-hoc-signed bundle launches directly;
+  direct `.dmg` downloads from the [latest release][releases] currently
+  require `xattr -dr com.apple.quarantine /Applications/raum.app` once after
+  installing, until Developer ID notarization lands.
 - **Linux** — install the `.deb` (Ubuntu/Debian) or run the `.AppImage`
-  (anything with FUSE).
+  (anything with FUSE) from the [latest release][releases].
 
 [releases]: https://github.com/andremonaco/raum/releases/latest
 

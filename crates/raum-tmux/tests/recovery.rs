@@ -304,9 +304,17 @@ async fn capture_pane_snapshot_separates_normal_history_from_live_alt_screen() {
     let mgr = TmuxManager::with_socket(socket.clone());
     mgr.new_session(&session_id, &PathBuf::from("/tmp"), None, Some((80, 24)))
         .expect("new-session");
+    // Re-pin after new_session: new_session_with_env sets `terminal-overrides`
+    // via `set-option -s`, which on some macOS tmux builds resets server-level
+    // defaults including exit-empty. Calling start_server_with_pinned_lifetime
+    // again is idempotent (start-server is a no-op on a running server).
+    start_server_with_pinned_lifetime(&socket);
     mgr.respawn_with(
         &session_id,
-        "sh -lc \"printf 'raum-main-marker\\n'; tput smcup; printf 'raum-alt-marker\\n'; sleep 5\"",
+        // Use printf '\033[?1049h' (direct ANSI sequence) instead of `tput smcup`
+        // to avoid login-shell profile side-effects and tput/terminfo failures on
+        // macOS CI that caused `sh` to exit before `sleep 5`, collapsing the pane.
+        "sh -c \"printf 'raum-main-marker\\n'; printf '\\033[?1049h'; printf 'raum-alt-marker\\n'; sleep 5\"",
     )
     .expect("respawn_with");
 
