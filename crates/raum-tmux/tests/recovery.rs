@@ -28,21 +28,40 @@ fn unique_socket() -> String {
     format!("raum-test-{}-{}", std::process::id(), nanos)
 }
 
-/// Pin server-level options that keep tmux alive across transient
-/// "no sessions" / "no clients" states. macOS CI runners have hit
-/// both `no server running` and `server exited unexpectedly` errors
-/// from `capture-pane` because `respawn-pane -k` briefly leaves the
-/// pane (and therefore the only session) without a process; with
-/// `exit-empty on` (the default since tmux 2.4) the server then
-/// shuts down before the next CLI command lands. Forcing both off
-/// lets the server outlive the test even if the inner pane dies.
-fn keep_server_alive(socket: &str) {
-    let _ = Command::new("tmux")
-        .args(["-L", socket, "set-option", "-s", "exit-empty", "off"])
-        .output();
-    let _ = Command::new("tmux")
-        .args(["-L", socket, "set-option", "-s", "exit-unattached", "off"])
-        .output();
+/// Bring up a tmux server on `socket` with the lifetime options
+/// already pinned so there's never a moment where the defaults could
+/// shut it down. Must be called *before* `new_session` — order
+/// matters: setting `exit-empty off` after the server is empty doesn't
+/// resurrect it, and setting it after a session exists in macOS-CI
+/// `respawn-pane -k` flows still races the kill-then-exec window.
+///
+/// `start-server \; set-option …` runs both in a single tmux command
+/// chain so the options are in effect before the first `new-session`
+/// returns.
+fn start_server_with_pinned_lifetime(socket: &str) {
+    let out = Command::new("tmux")
+        .args([
+            "-L",
+            socket,
+            "start-server",
+            ";",
+            "set-option",
+            "-s",
+            "exit-empty",
+            "off",
+            ";",
+            "set-option",
+            "-s",
+            "exit-unattached",
+            "off",
+        ])
+        .output()
+        .expect("spawn tmux start-server");
+    assert!(
+        out.status.success(),
+        "tmux start-server + set-option failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[tokio::test]
@@ -224,10 +243,10 @@ async fn capture_pane_snapshot_returns_normal_buffer_with_crlf() {
     let socket = unique_socket();
     let session_id = format!("cap-{}", std::process::id());
 
+    start_server_with_pinned_lifetime(&socket);
     let mgr = TmuxManager::with_socket(socket.clone());
     mgr.new_session(&session_id, &PathBuf::from("/tmp"), None, Some((80, 24)))
         .expect("new-session");
-    keep_server_alive(&socket);
     mgr.respawn_with(
         &session_id,
         "sh -lc \"printf 'raum-capture-marker-0xFEED\\n'; sleep 5\"",
@@ -281,10 +300,10 @@ async fn capture_pane_snapshot_separates_normal_history_from_live_alt_screen() {
     let socket = unique_socket();
     let session_id = format!("alt-{}", std::process::id());
 
+    start_server_with_pinned_lifetime(&socket);
     let mgr = TmuxManager::with_socket(socket.clone());
     mgr.new_session(&session_id, &PathBuf::from("/tmp"), None, Some((80, 24)))
         .expect("new-session");
-    keep_server_alive(&socket);
     mgr.respawn_with(
         &session_id,
         "sh -lc \"printf 'raum-main-marker\\n'; tput smcup; printf 'raum-alt-marker\\n'; sleep 5\"",
