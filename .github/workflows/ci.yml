@@ -19,7 +19,7 @@ jobs:
   # ---------------------------------------------------------------------------
   hooks:
     name: hooks (prek)
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -61,9 +61,9 @@ jobs:
       fail-fast: false
       matrix:
         target:
-          - { name: macos-arm64, os: macos-14, triple: aarch64-apple-darwin }
-          - { name: linux-x86_64, os: ubuntu-22.04, triple: x86_64-unknown-linux-gnu }
-          - { name: linux-arm64, os: ubuntu-22.04-arm, triple: aarch64-unknown-linux-gnu }
+          - { name: macos-arm64, os: macos-latest, triple: aarch64-apple-darwin }
+          - { name: linux-x86_64, os: ubuntu-latest, triple: x86_64-unknown-linux-gnu }
+          - { name: linux-arm64, os: ubuntu-24.04-arm, triple: aarch64-unknown-linux-gnu }
     steps:
       - uses: actions/checkout@v4
       - name: install rust
@@ -99,17 +99,17 @@ jobs:
   # ---------------------------------------------------------------------------
   notification-fallback:
     name: notification fallback (no socat / nc)
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with: { workspaces: ". -> target" }
       - name: remove socat + nc from the runner
-        # ubuntu-22.04 runners ship socat + netcat-openbsd preinstalled;
-        # strip them so the hook scripts are forced onto their python3
-        # fallback. `python3` is a core system package on every supported
-        # Ubuntu image and is not removed.
+        # ubuntu-latest (currently ubuntu-24.04) ships socat + netcat-openbsd
+        # preinstalled; strip them so the hook scripts are forced onto their
+        # python3 fallback. `python3` is a core system package on every
+        # supported Ubuntu image and is not removed.
         run: |
           sudo apt-get remove -y socat netcat-openbsd ncat || true
           ! command -v socat
@@ -123,7 +123,7 @@ jobs:
   # ---------------------------------------------------------------------------
   frontend:
     name: frontend
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
