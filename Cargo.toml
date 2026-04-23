@@ -59,3 +59,10 @@ lto = "thin"
 codegen-units = 1
 strip = "symbols"
 panic = "abort"
+
+# Drop debug symbols for third-party deps only. Workspace crates keep full
+# debuginfo so stepping through our own code still works. Typically cuts
+# target/debug by 30–50% and slashes link time — the symbols we almost never
+# step into (serde, tokio, wry, …) were the bulk of the bloat.
+[profile.dev.package."*"]
+debug = false
