@@ -165,6 +165,18 @@ jobs:
             echo "run=true" >> "$GITHUB_OUTPUT"
           fi
 
+      # Check out the raum source at the freshly-cut tag so the cask
+      # template under `packaging/homebrew/Casks/raum.rb` is available
+      # to the `update cask` step below. Without this the workspace is
+      # empty and `cp packaging/... tap/...` fails with "No such file
+      # or directory" (v0.1.1 was the first release to exercise this
+      # path with the tap token configured).
+      - name: checkout raum at release tag
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
       - name: checkout tap
         if: steps.gate.outputs.run == 'true'
         uses: actions/checkout@v4
