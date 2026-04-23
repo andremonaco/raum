@@ -20,9 +20,22 @@ cask "raum" do
 
   app "raum.app"
 
+  postflight do
+    system_command "/usr/bin/xattr",
+                   args:         ["-d", "-r", "com.apple.quarantine", "#{appdir}/raum.app"],
+                   must_succeed: false
+  end
+
   zap trash: [
     "~/Library/Application Support/de.raum.desktop",
-    "~/Library/Preferences/de.raum.desktop.plist",
     "~/Library/Caches/de.raum.desktop",
+    "~/Library/Preferences/de.raum.desktop.plist",
   ]
+
+  caveats <<~EOS
+    raum is ad-hoc signed, not notarized by Apple. This cask strips the
+    Gatekeeper quarantine flag on install so the app launches directly from
+    Finder. The bundle is built from source at
+    https://github.com/andremonaco/raum.
+  EOS
 end
