@@ -9,8 +9,6 @@
  *   §9.2 `Open` / `Staged` file groups, clickable via the Tauri
  *        opener plugin (`openPath` — delegates to `open` on macOS,
  *        `xdg-open` on Linux).
- *   §9.3 active-agents sub-section driven by `agentStore`; clicks emit a
- *        `terminal-focus-requested` event the TerminalGrid listens to.
  *   §9.5 resize handle persists width into `config.toml.sidebar.width_px`
  *        via `config_set_sidebar_width`; collapse via the `toggle-sidebar`
  *        action from the keymap (listened through a window custom event so
@@ -20,7 +18,6 @@
  * Stores imported (from Wave 3B / 3D):
  *   • `projectStore` — project list, active slug, colors.
  *   • `worktreeStore` — the existing active-worktree tracking + cache.
- *   • `agentStore` — live harness sessions per worktree.
  *
  * This file intentionally contains every moving part for §9 to keep the
  * Wave-3C diff surface minimal; any future split would live under
@@ -62,7 +59,6 @@ import {
   removeProject,
   type ProjectListItem,
 } from "../stores/projectStore";
-import { agentStore, type AgentListItem } from "../stores/agentStore";
 import {
   harnessCountsForProject,
   harnessCountsForWorktree,
@@ -105,6 +101,10 @@ interface WorktreeStatus {
   staged: string[];
   insertions: number;
   deletions: number;
+  upstream: string | null;
+  ahead: number;
+  behind: number;
+  stashCount: number;
 }
 
 async function fetchWorktrees(slug: string): Promise<Worktree[]> {
@@ -123,7 +123,18 @@ async function fetchStatus(path: string): Promise<WorktreeStatus> {
   try {
     return await invoke<WorktreeStatus>("worktree_status", { path });
   } catch {
-    return { dirty: false, untracked: [], modified: [], staged: [], insertions: 0, deletions: 0 };
+    return {
+      dirty: false,
+      untracked: [],
+      modified: [],
+      staged: [],
+      insertions: 0,
+      deletions: 0,
+      upstream: null,
+      ahead: 0,
+      behind: 0,
+      stashCount: 0,
+    };
   }
 }
 
@@ -338,7 +349,7 @@ function resolveBaseBranchLabel(wt: Worktree, fallback: string | null): string |
 
 /**
  * Expandable worktree row. Shows git state, LOC stats, terminal counts.
- * Expanded section: git staging view (stage/unstage per file + bulk) and agents.
+ * Expanded section: git staging view (stage/unstage per file + bulk).
  */
 const WorktreeRow: Component<WorktreeRowProps> = (rowProps) => {
   const [expanded, setExpanded] = createSignal(false);
@@ -350,6 +361,10 @@ const WorktreeRow: Component<WorktreeRowProps> = (rowProps) => {
     staged: [],
     insertions: 0,
     deletions: 0,
+    upstream: null,
+    ahead: 0,
+    behind: 0,
+    stashCount: 0,
   });
 
   // Right-click context menu on file rows. Coordinates are viewport-relative
@@ -406,36 +421,12 @@ const WorktreeRow: Component<WorktreeRowProps> = (rowProps) => {
     onCleanup(() => window.clearInterval(handle));
   });
 
-  const agentsForWorktree = createMemo<AgentListItem[]>(() => {
-    // The terminal store owns the authoritative worktree → session
-    // mapping via `idsByWorktreeId`; that index is O(1) per row and
-    // updates incrementally, so a PTY-output storm doesn't force the
-    // sidebar to re-scan every agent session.
-    const ids = idsByWorktreeId().get(rowProps.worktree.path);
-    if (!ids || ids.size === 0) return [];
-    const out: AgentListItem[] = [];
-    for (const id of ids) {
-      const agent = agentStore.sessions[id];
-      if (agent) out.push(agent);
-    }
-    return out;
-  });
-
   const dirty = createMemo(() => status().dirty);
 
   // §8.3 / §9.x — count harnesses attached to *this* worktree. The authoritative
   // wiring lives in terminalStore; `worktree_id` is the worktree's filesystem
   // path (matches `wt.path`).
   const harnessCounts = createMemo(() => countHarnessesForPaths(new Set([rowProps.worktree.path])));
-
-  const focusAgent = (sessionId: string | null) => {
-    if (!sessionId) return;
-    window.dispatchEvent(
-      new CustomEvent("terminal-focus-requested", {
-        detail: { sessionId },
-      }),
-    );
-  };
 
   const stageFile = async (file: string) => {
     try {
@@ -650,7 +641,7 @@ const WorktreeRow: Component<WorktreeRowProps> = (rowProps) => {
             </Show>
           </span>
 
-          {/* Line 2 — branch name + LOC stats */}
+          {/* Line 2 — branch name + ahead/behind + LOC stats */}
           <span class="flex w-full items-center justify-between gap-2">
             <span class="flex min-w-0 items-center gap-1 font-mono text-[10px] text-foreground-subtle">
               <span class="text-foreground-dim" aria-hidden="true">
@@ -668,16 +659,28 @@ const WorktreeRow: Component<WorktreeRowProps> = (rowProps) => {
               </Show>
               <span class="truncate">{rowProps.worktree.branch ?? "(detached)"}</span>
             </span>
-            <Show when={status().insertions > 0 || status().deletions > 0}>
-              <span class="flex shrink-0 items-center gap-0.5 font-mono text-[10px]">
-                <Show when={status().insertions > 0}>
-                  <span class="text-success">+{status().insertions}</span>
-                </Show>
-                <Show when={status().deletions > 0}>
-                  <span class="text-destructive">-{status().deletions}</span>
-                </Show>
-              </span>
-            </Show>
+            <span class="flex shrink-0 items-center gap-1.5 font-mono text-[10px]">
+              <Show when={status().ahead > 0 || status().behind > 0}>
+                <span class="flex items-center gap-0.5 text-foreground-subtle">
+                  <Show when={status().ahead > 0}>
+                    <span>↑{status().ahead}</span>
+                  </Show>
+                  <Show when={status().behind > 0}>
+                    <span>↓{status().behind}</span>
+                  </Show>
+                </span>
+              </Show>
+              <Show when={status().insertions > 0 || status().deletions > 0}>
+                <span class="flex items-center gap-0.5">
+                  <Show when={status().insertions > 0}>
+                    <span class="text-success">+{status().insertions}</span>
+                  </Show>
+                  <Show when={status().deletions > 0}>
+                    <span class="text-destructive">-{status().deletions}</span>
+                  </Show>
+                </span>
+              </Show>
+            </span>
           </span>
         </span>
       </button>
@@ -940,9 +943,6 @@ const WorktreeRow: Component<WorktreeRowProps> = (rowProps) => {
               </Show>
             </div>
           </Show>
-
-          {/* Agents */}
-          <AgentList items={agentsForWorktree()} onFocus={focusAgent} />
         </div>
       </Show>
 
@@ -1136,65 +1136,6 @@ const DiscardConfirmDialog: Component<DiscardConfirmDialogProps> = (props) => {
         </DialogContent>
       </DialogPortal>
     </Dialog>
-  );
-};
-
-interface AgentListProps {
-  items: AgentListItem[];
-  onFocus: (sessionId: string | null) => void;
-}
-
-const AgentList: Component<AgentListProps> = (listProps) => {
-  return (
-    <Show when={listProps.items.length > 0}>
-      <div>
-        <div class="text-[10px] uppercase tracking-wide text-foreground-subtle">Agents</div>
-        <ul>
-          <For each={listProps.items}>
-            {(agent) => (
-              <li>
-                <button
-                  type="button"
-                  class="flex w-full items-center justify-between rounded px-1 py-0.5 text-left text-[11px] hover:bg-hover"
-                  onClick={() => listProps.onFocus(agent.session_id)}
-                >
-                  <span class="truncate">{agent.harness}</span>
-                  {/* Same icons as the top-right harness counter */}
-                  <Show when={agent.state === "working"}>
-                    <span class="ml-2 flex shrink-0 items-center text-success" title="working">
-                      <LoaderIcon class="size-3 animate-spin" />
-                    </span>
-                  </Show>
-                  <Show when={agent.state === "waiting"}>
-                    <span class="ml-2 flex shrink-0 items-center text-warning" title="waiting">
-                      <AlertCircleIcon class="size-3" />
-                    </span>
-                  </Show>
-                  <Show when={agent.state === "idle"}>
-                    <span
-                      class="ml-2 flex shrink-0 items-center text-foreground-subtle"
-                      title="idle"
-                    >
-                      <CheckIcon class="size-3" />
-                    </span>
-                  </Show>
-                  <Show when={agent.state === "completed"}>
-                    <span class="ml-2 flex shrink-0 items-center text-info" title="completed">
-                      <CheckIcon class="size-3" />
-                    </span>
-                  </Show>
-                  <Show when={agent.state === "errored"}>
-                    <span class="ml-2 flex shrink-0 items-center text-destructive" title="errored">
-                      <AlertCircleIcon class="size-3" />
-                    </span>
-                  </Show>
-                </button>
-              </li>
-            )}
-          </For>
-        </ul>
-      </div>
-    </Show>
   );
 };
 
