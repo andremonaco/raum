@@ -155,12 +155,46 @@ jobs:
           projectPath: src-tauri
           updaterJsonPreferNsis: false
 
+  # Flip the GH Release from draft to published once every platform
+  # bundle has uploaded successfully. release-plz creates the release
+  # as a draft so the build matrix has a window to attach artefacts
+  # without a publicly-visible "Latest release, 0 downloads" state;
+  # this job is what removes the draft flag once the bundles exist.
+  # `fail-fast: false` on the build matrix means a single-target
+  # failure lets the other bundles through — the `needs: build` here
+  # enforces that ALL targets must succeed before we flip to public.
+  publish-release:
+    name: publish GH release
+    needs: [release, build]
+    if: ${{ needs.release.outputs.released == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: resolve raum release tag
+        id: tag
+        env:
+          RELEASES: ${{ needs.release.outputs.releases }}
+        run: |
+          set -euo pipefail
+          tag=$(echo "$RELEASES" | jq -r '.[] | select(.package_name == "raum") | .tag')
+          if [ -z "$tag" ] || [ "$tag" = "null" ]; then
+            echo "no release entry for package 'raum' in outputs" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: flip draft → published
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+
   # Bump the Homebrew Cask in `andremonaco/homebrew-raum` after the DMGs
-  # are attached. Runs only when the tap PAT is configured — absence of
-  # the secret is a clean no-op so forks don't fail CI.
+  # are attached and the release is public (so the
+  # releases/download/<tag>/<asset> URL template in the cask resolves).
+  # Runs only when the tap PAT is configured — absence of the secret
+  # is a clean no-op so forks don't fail CI.
   bump-homebrew:
     name: bump homebrew cask
-    needs: [release, build]
+    needs: [release, build, publish-release]
     if: ${{ needs.release.outputs.released == 'true' }}
     runs-on: ubuntu-latest
     steps:
@@ -219,11 +253,14 @@ jobs:
           TAG: ${{ steps.tag.outputs.tag }}
           # `gh release download` hits the REST API
           # `/repos/.../releases/assets/{id}` endpoint with this token,
-          # which is required for *draft* releases. The public
-          # `releases/download/<tag>/<asset>` URL 404s until the release
-          # is published, so the previous `curl`-based approach broke
-          # for every release here (we publish the draft only after a
-          # smoke test).
+          # which is required for *draft* releases. This job runs AFTER
+          # `publish-release` has flipped the draft to public, so in
+          # principle the direct `releases/download/<tag>/<asset>` URL
+          # would also work — we keep the API path because it handles
+          # the brief window (rare, but possible) where the publish
+          # call returns before GitHub's CDN has propagated the public
+          # URL, and because it's the authorization-token path for
+          # anything in a private/draft state.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
@@ -260,7 +297,7 @@ jobs:
           p.write_text(text)
           PY
 
-      - name: open tap PR
+      - name: open + merge tap PR
         if: steps.gate.outputs.run == 'true'
         working-directory: tap
         env:
@@ -275,9 +312,14 @@ jobs:
           git add Casks/raum.rb
           git commit -m "raum ${VERSION}"
           git push origin "$branch" --force
+          # Create the PR (idempotent — `|| gh pr edit` handles a re-run
+          # of the same release where the branch already has an open PR),
+          # then merge it immediately. The tap repo has no CI and no
+          # branch protection; the PR is purely an audit-trail convention.
           gh pr create \
             --title "raum ${VERSION}" \
             --body "Automated cask bump for raum ${VERSION}." \
             --base main \
-            --head "$branch" || \
-          gh pr edit "$branch" --title "raum ${VERSION}" || true
+            --head "$branch" \
+          || gh pr edit "$branch" --title "raum ${VERSION}"
+          gh pr merge "$branch" --merge --delete-branch
