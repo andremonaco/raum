@@ -31,6 +31,18 @@ export default defineConfig({
       ).pathname,
     },
   },
+  /* `resolve.alias` only rewrites imports on the main graph. Vite's
+     dep optimizer scans node_modules directly and, because
+     vite-plugin-solid adds the `solid` export condition, picked
+     `overlayscrollbars-solid`'s raw-JSX `source/` entry and pre-
+     bundled it — esbuild then couldn't reparse the resulting
+     `<Dynamic>{…}</Dynamic>` chunk and vite's dev server 500'd on
+     every page load. Excluding the package from the optimizer
+     forces every import to go through the alias above, which
+     already points at the pre-compiled `.mjs`. */
+  optimizeDeps: {
+    exclude: ["overlayscrollbars-solid"],
+  },
   build: {
     target: process.env.TAURI_PLATFORM === "windows" ? "chrome105" : "safari15",
     minify: !process.env.TAURI_DEBUG ? "esbuild" : false,
