@@ -18,13 +18,38 @@ jobs:
   # and merges it when ready.
   release-pr:
     name: release-plz PR
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
+      # Diagnostic dry-run. `release-plz/action@v0.5` swallows the CLI's
+      # stderr on success, so a silent `{"prs":[]}` decision (e.g. the
+      # regex didn't match, or no package was affected) leaves no trail
+      # in the job log. Run the same command beforehand with `--dry-run`
+      # and stderr merged to stdout so the reasoning is always visible.
+      # `continue-on-error: true` keeps this strictly diagnostic — any
+      # transient failure here must not block the real release-pr step.
+      - name: release-plz dry-run (diagnostic)
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: taiki-e/install-action@v2
+        with:
+          tool: release-plz@0.3.157
+      - name: release-plz release-pr --dry-run
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          release-plz release-pr \
+            --git-token "${GITHUB_TOKEN}" \
+            --repo-url "https://github.com/${GITHUB_REPOSITORY}" \
+            --dry-run \
+            --verbose \
+            2>&1 || true
       - uses: release-plz/action@v0.5
         with:
           command: release-pr
@@ -36,7 +61,7 @@ jobs:
   # tag + draft GitHub Release for the `raum` package.
   release:
     name: release-plz tag + GH release
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     outputs:
       released: ${{ steps.release-plz.outputs.releases_created }}
       releases: ${{ steps.release-plz.outputs.releases }}
@@ -63,13 +88,14 @@ jobs:
       matrix:
         target:
           # Both macOS targets cross-compile on the arm64 runner. The
-          # `macos-13` Intel pool is being wound down by GitHub and queue
-          # times routinely exceed two hours; `cargo build --target` plus
-          # the Rust x86_64-apple-darwin toolchain produces an Intel
-          # binary on an arm64 host without any Rosetta dance.
-          - { name: macos-arm64, os: macos-14, triple: aarch64-apple-darwin, args: "--target aarch64-apple-darwin" }
-          - { name: macos-x86_64, os: macos-14, triple: x86_64-apple-darwin, args: "--target x86_64-apple-darwin" }
-          - { name: linux-x86_64, os: ubuntu-22.04, triple: x86_64-unknown-linux-gnu, args: "" }
+          # x86_64 macOS `macos-*-intel` pool is sunsetting in Fall 2027
+          # (last Intel image is `macos-26-intel`); `cargo build --target`
+          # plus the Rust x86_64-apple-darwin toolchain produces an Intel
+          # binary on an arm64 host without any Rosetta dance, and keeps
+          # working past the Intel runner retirement.
+          - { name: macos-arm64, os: macos-latest, triple: aarch64-apple-darwin, args: "--target aarch64-apple-darwin" }
+          - { name: macos-x86_64, os: macos-latest, triple: x86_64-apple-darwin, args: "--target x86_64-apple-darwin" }
+          - { name: linux-x86_64, os: ubuntu-latest, triple: x86_64-unknown-linux-gnu, args: "" }
     steps:
       - name: resolve raum release tag
         id: tag
@@ -129,14 +155,48 @@ jobs:
           projectPath: src-tauri
           updaterJsonPreferNsis: false
 
-  # Bump the Homebrew Cask in `andremonaco/homebrew-raum` after the DMGs
-  # are attached. Runs only when the tap PAT is configured — absence of
-  # the secret is a clean no-op so forks don't fail CI.
-  bump-homebrew:
-    name: bump homebrew cask
+  # Flip the GH Release from draft to published once every platform
+  # bundle has uploaded successfully. release-plz creates the release
+  # as a draft so the build matrix has a window to attach artefacts
+  # without a publicly-visible "Latest release, 0 downloads" state;
+  # this job is what removes the draft flag once the bundles exist.
+  # `fail-fast: false` on the build matrix means a single-target
+  # failure lets the other bundles through — the `needs: build` here
+  # enforces that ALL targets must succeed before we flip to public.
+  publish-release:
+    name: publish GH release
     needs: [release, build]
     if: ${{ needs.release.outputs.released == 'true' }}
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
+    steps:
+      - name: resolve raum release tag
+        id: tag
+        env:
+          RELEASES: ${{ needs.release.outputs.releases }}
+        run: |
+          set -euo pipefail
+          tag=$(echo "$RELEASES" | jq -r '.[] | select(.package_name == "raum") | .tag')
+          if [ -z "$tag" ] || [ "$tag" = "null" ]; then
+            echo "no release entry for package 'raum' in outputs" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: flip draft → published
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+
+  # Bump the Homebrew Cask in `andremonaco/homebrew-raum` after the DMGs
+  # are attached and the release is public (so the
+  # releases/download/<tag>/<asset> URL template in the cask resolves).
+  # Runs only when the tap PAT is configured — absence of the secret
+  # is a clean no-op so forks don't fail CI.
+  bump-homebrew:
+    name: bump homebrew cask
+    needs: [release, build, publish-release]
+    if: ${{ needs.release.outputs.released == 'true' }}
+    runs-on: ubuntu-latest
     steps:
       - name: resolve raum release tag
         id: tag
@@ -165,6 +225,18 @@ jobs:
             echo "run=true" >> "$GITHUB_OUTPUT"
           fi
 
+      # Check out the raum source at the freshly-cut tag so the cask
+      # template under `packaging/homebrew/Casks/raum.rb` is available
+      # to the `update cask` step below. Without this the workspace is
+      # empty and `cp packaging/... tap/...` fails with "No such file
+      # or directory" (v0.1.1 was the first release to exercise this
+      # path with the tap token configured).
+      - name: checkout raum at release tag
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
       - name: checkout tap
         if: steps.gate.outputs.run == 'true'
         uses: actions/checkout@v4
@@ -181,11 +253,14 @@ jobs:
           TAG: ${{ steps.tag.outputs.tag }}
           # `gh release download` hits the REST API
           # `/repos/.../releases/assets/{id}` endpoint with this token,
-          # which is required for *draft* releases. The public
-          # `releases/download/<tag>/<asset>` URL 404s until the release
-          # is published, so the previous `curl`-based approach broke
-          # for every release here (we publish the draft only after a
-          # smoke test).
+          # which is required for *draft* releases. This job runs AFTER
+          # `publish-release` has flipped the draft to public, so in
+          # principle the direct `releases/download/<tag>/<asset>` URL
+          # would also work — we keep the API path because it handles
+          # the brief window (rare, but possible) where the publish
+          # call returns before GitHub's CDN has propagated the public
+          # URL, and because it's the authorization-token path for
+          # anything in a private/draft state.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
@@ -222,7 +297,7 @@ jobs:
           p.write_text(text)
           PY
 
-      - name: open tap PR
+      - name: open + merge tap PR
         if: steps.gate.outputs.run == 'true'
         working-directory: tap
         env:
@@ -237,9 +312,14 @@ jobs:
           git add Casks/raum.rb
           git commit -m "raum ${VERSION}"
           git push origin "$branch" --force
+          # Create the PR (idempotent — `|| gh pr edit` handles a re-run
+          # of the same release where the branch already has an open PR),
+          # then merge it immediately. The tap repo has no CI and no
+          # branch protection; the PR is purely an audit-trail convention.
           gh pr create \
             --title "raum ${VERSION}" \
             --body "Automated cask bump for raum ${VERSION}." \
             --base main \
-            --head "$branch" || \
-          gh pr edit "$branch" --title "raum ${VERSION}" || true
+            --head "$branch" \
+          || gh pr edit "$branch" --title "raum ${VERSION}"
+          gh pr merge "$branch" --merge --delete-branch
