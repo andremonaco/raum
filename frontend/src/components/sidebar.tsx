@@ -37,8 +37,9 @@ import {
   onCleanup,
   onMount,
 } from "solid-js";
+import { Portal } from "solid-js/web";
 import { invoke } from "@tauri-apps/api/core";
-import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { FileTypeIcon } from "../lib/fileTypeIcon";
 import {
   activeWorktreeStore,
@@ -379,6 +380,13 @@ const WorktreeRow: Component<WorktreeRowProps> = (rowProps) => {
   // FileEditorModal target — absolute path of the file to open. Null = closed.
   const [editorPath, setEditorPath] = createSignal<string | null>(null);
 
+  // Main-worktree branch picker state. `null` = closed. Open carries the
+  // anchor rect so the popover can align under the badge.
+  const [branchPickerAnchor, setBranchPickerAnchor] = createSignal<{
+    x: number;
+    y: number;
+  } | null>(null);
+
   // Pending discard confirmation. Either a single file or the bulk sweep.
   const [discardTarget, setDiscardTarget] = createSignal<
     { kind: "file"; file: string } | { kind: "all" } | null
@@ -472,6 +480,14 @@ const WorktreeRow: Component<WorktreeRowProps> = (rowProps) => {
 
   const openInEditor = (file: string) => {
     setEditorPath(absPath(file));
+  };
+
+  const openFileNative = async (file: string) => {
+    try {
+      await openPath(absPath(file));
+    } catch (e) {
+      console.warn("openPath failed", e);
+    }
   };
 
   const revealFile = async (file: string) => {
@@ -657,7 +673,29 @@ const WorktreeRow: Component<WorktreeRowProps> = (rowProps) => {
                   </>
                 )}
               </Show>
-              <span class="truncate">{rowProps.worktree.branch ?? "(detached)"}</span>
+              <Show
+                when={rowProps.isMain && rowProps.worktree.branch}
+                fallback={<span class="truncate">{rowProps.worktree.branch ?? "(detached)"}</span>}
+              >
+                <button
+                  type="button"
+                  class="group/branch focus-ring flex min-w-0 items-center gap-0.5 truncate rounded px-1 -mx-1 hover:bg-hover hover:text-foreground"
+                  title="Switch branch"
+                  onClick={(ev) => {
+                    ev.stopPropagation();
+                    const r = ev.currentTarget.getBoundingClientRect();
+                    setBranchPickerAnchor({ x: r.left, y: r.bottom + 4 });
+                  }}
+                >
+                  <span class="truncate">{rowProps.worktree.branch}</span>
+                  <span
+                    class="shrink-0 text-foreground-dim opacity-60 transition-opacity group-hover/branch:opacity-100"
+                    aria-hidden="true"
+                  >
+                    ▾
+                  </span>
+                </button>
+              </Show>
             </span>
             <span class="flex shrink-0 items-center gap-1.5 font-mono text-[10px]">
               <Show when={status().ahead > 0 || status().behind > 0}>
@@ -946,96 +984,110 @@ const WorktreeRow: Component<WorktreeRowProps> = (rowProps) => {
         </div>
       </Show>
 
-      {/* Right-click context menu on a file row. Fixed positioning escapes any
-          sidebar overflow clipping; closes on mouseleave or after an action. */}
+      {/* Right-click context menu on a file row. Portalled + fixed-positioned
+          so it escapes any sidebar stacking context / overflow clipping;
+          closes on mouseleave or after an action. */}
       <Show when={menuTarget()}>
         {(target) => (
-          <div
-            class="floating-surface fixed z-50 w-44 rounded-xl border border-border bg-popover p-1 text-xs"
-            role="menu"
-            style={{ left: `${target().x}px`, top: `${target().y}px` }}
-            onMouseLeave={() => setMenuTarget(null)}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <button
-              type="button"
-              class="block w-full rounded px-2 py-1 text-left hover:bg-accent hover:text-accent-foreground"
-              onClick={() => {
-                openDiff(target().file, target().staged);
-                setMenuTarget(null);
-              }}
-            >
-              Open diff
-            </button>
-            <button
-              type="button"
-              class="block w-full rounded px-2 py-1 text-left hover:bg-accent hover:text-accent-foreground"
-              onClick={() => {
-                openInEditor(target().file);
-                setMenuTarget(null);
-              }}
-            >
-              Open file
-            </button>
-            <Show
-              when={target().staged}
-              fallback={
-                <>
-                  <button
-                    type="button"
-                    class="block w-full rounded px-2 py-1 text-left hover:bg-accent hover:text-accent-foreground"
-                    onClick={() => {
-                      void stageFile(target().file);
-                      setMenuTarget(null);
-                    }}
-                  >
-                    Stage changes
-                  </button>
-                  <button
-                    type="button"
-                    class="block w-full rounded px-2 py-1 text-left text-destructive hover:bg-destructive/10"
-                    onClick={() => {
-                      setDiscardTarget({ kind: "file", file: target().file });
-                      setMenuTarget(null);
-                    }}
-                  >
-                    Discard changes
-                  </button>
-                </>
-              }
+          <Portal>
+            <div
+              class="floating-surface fixed z-[70] w-44 rounded-xl border border-border bg-popover p-1 text-xs"
+              role="menu"
+              style={{ left: `${target().x}px`, top: `${target().y}px` }}
+              onMouseLeave={() => setMenuTarget(null)}
+              onClick={(e) => e.stopPropagation()}
             >
               <button
                 type="button"
                 class="block w-full rounded px-2 py-1 text-left hover:bg-accent hover:text-accent-foreground"
                 onClick={() => {
-                  void unstageFile(target().file);
+                  void openFileNative(target().file);
                   setMenuTarget(null);
                 }}
               >
-                Unstage changes
+                Open file
               </button>
-            </Show>
-            <button
-              type="button"
-              class="block w-full rounded px-2 py-1 text-left hover:bg-accent hover:text-accent-foreground"
-              onClick={() => {
-                void revealFile(target().file);
-                setMenuTarget(null);
-              }}
-            >
-              Reveal in Finder
-            </button>
-            <button
-              type="button"
-              class="block w-full rounded px-2 py-1 text-left hover:bg-accent hover:text-accent-foreground"
-              onClick={() => {
-                void copyPath(target().file);
-                setMenuTarget(null);
-              }}
-            >
-              Copy path
-            </button>
-          </div>
+              <button
+                type="button"
+                class="flex w-full items-center gap-2 rounded px-2 py-1 text-left hover:bg-accent hover:text-accent-foreground"
+                onClick={() => {
+                  openInEditor(target().file);
+                  setMenuTarget(null);
+                }}
+              >
+                <RaumLogo class="size-3.5 shrink-0 text-foreground" />
+                <span>Open in raum</span>
+              </button>
+              <button
+                type="button"
+                class="block w-full rounded px-2 py-1 text-left hover:bg-accent hover:text-accent-foreground"
+                onClick={() => {
+                  openDiff(target().file, target().staged);
+                  setMenuTarget(null);
+                }}
+              >
+                Open diff
+              </button>
+              <Show
+                when={target().staged}
+                fallback={
+                  <>
+                    <button
+                      type="button"
+                      class="block w-full rounded px-2 py-1 text-left hover:bg-accent hover:text-accent-foreground"
+                      onClick={() => {
+                        void stageFile(target().file);
+                        setMenuTarget(null);
+                      }}
+                    >
+                      Stage changes
+                    </button>
+                    <button
+                      type="button"
+                      class="block w-full rounded px-2 py-1 text-left text-destructive hover:bg-destructive/10"
+                      onClick={() => {
+                        setDiscardTarget({ kind: "file", file: target().file });
+                        setMenuTarget(null);
+                      }}
+                    >
+                      Discard changes
+                    </button>
+                  </>
+                }
+              >
+                <button
+                  type="button"
+                  class="block w-full rounded px-2 py-1 text-left hover:bg-accent hover:text-accent-foreground"
+                  onClick={() => {
+                    void unstageFile(target().file);
+                    setMenuTarget(null);
+                  }}
+                >
+                  Unstage changes
+                </button>
+              </Show>
+              <button
+                type="button"
+                class="block w-full rounded px-2 py-1 text-left hover:bg-accent hover:text-accent-foreground"
+                onClick={() => {
+                  void revealFile(target().file);
+                  setMenuTarget(null);
+                }}
+              >
+                Reveal in Finder
+              </button>
+              <button
+                type="button"
+                class="block w-full rounded px-2 py-1 text-left hover:bg-accent hover:text-accent-foreground"
+                onClick={() => {
+                  void copyPath(target().file);
+                  setMenuTarget(null);
+                }}
+              >
+                Copy path
+              </button>
+            </div>
+          </Portal>
         )}
       </Show>
 
@@ -1044,6 +1096,17 @@ const WorktreeRow: Component<WorktreeRowProps> = (rowProps) => {
         <Suspense>
           <FileEditorModal open={true} path={editorPath()} onClose={() => setEditorPath(null)} />
         </Suspense>
+      </Show>
+
+      {/* Main-worktree branch picker — click the ⎇ badge on the main row. */}
+      <Show when={rowProps.isMain && branchPickerAnchor()}>
+        {(anchor) => (
+          <MainBranchPicker
+            projectSlug={rowProps.projectSlug}
+            anchor={anchor()}
+            onClose={() => setBranchPickerAnchor(null)}
+          />
+        )}
       </Show>
 
       {/* Discard confirmation — single file or worktree-wide. */}
@@ -1663,3 +1726,145 @@ export const Sidebar: Component = () => {
 };
 
 export default Sidebar;
+
+interface MainBranchPickerProps {
+  projectSlug: string;
+  anchor: { x: number; y: number };
+  onClose: () => void;
+}
+
+interface BranchListResult {
+  branches: string[];
+  current: string | null;
+}
+
+/**
+ * Click-to-switch popover for the main worktree's branch badge. Loads the
+ * local branch list via `worktree_branches`, refuses the switch on a dirty
+ * tree (surfaces the backend error inline), and closes on success — the
+ * `.git/HEAD` watcher will refresh the sidebar.
+ */
+const MainBranchPicker: Component<MainBranchPickerProps> = (props) => {
+  const [data, setData] = createSignal<BranchListResult | null>(null);
+  const [loadError, setLoadError] = createSignal<string | null>(null);
+  const [submitting, setSubmitting] = createSignal<string | null>(null);
+  const [switchError, setSwitchError] = createSignal<string | null>(null);
+
+  onMount(() => {
+    void (async () => {
+      try {
+        const r = await invoke<BranchListResult>("worktree_branches", {
+          projectSlug: props.projectSlug,
+        });
+        setData(r);
+      } catch (e) {
+        setLoadError(String(e));
+      }
+    })();
+  });
+
+  const switchTo = async (branch: string) => {
+    setSubmitting(branch);
+    setSwitchError(null);
+    try {
+      await invoke<void>("git_checkout_branch", {
+        projectSlug: props.projectSlug,
+        branch,
+      });
+      props.onClose();
+    } catch (e) {
+      setSwitchError(String(e));
+    } finally {
+      setSubmitting(null);
+    }
+  };
+
+  // Dismiss on outside click / Esc. The Portal means we can't rely on
+  // sidebar-level mouseleave.
+  onMount(() => {
+    const onDoc = (ev: MouseEvent) => {
+      const t = ev.target as Element | null;
+      if (t && !t.closest("[data-branch-picker]")) props.onClose();
+    };
+    const onKey = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape") props.onClose();
+    };
+    document.addEventListener("mousedown", onDoc);
+    document.addEventListener("keydown", onKey);
+    onCleanup(() => {
+      document.removeEventListener("mousedown", onDoc);
+      document.removeEventListener("keydown", onKey);
+    });
+  });
+
+  return (
+    <Portal>
+      <div
+        data-branch-picker
+        class="floating-surface fixed z-[70] w-56 overflow-hidden rounded-xl border border-border bg-popover p-1 text-xs"
+        style={{ left: `${props.anchor.x}px`, top: `${props.anchor.y}px` }}
+        role="menu"
+      >
+        <Show when={loadError()}>
+          <p class="px-2 py-1.5 text-destructive">{loadError()}</p>
+        </Show>
+        <Show when={!loadError() && !data()}>
+          <p class="px-2 py-1.5 text-foreground-dim">Loading branches…</p>
+        </Show>
+        <Show when={data()}>
+          {(d) => (
+            <>
+              <div class="max-h-64 overflow-auto">
+                <For each={d().branches}>
+                  {(b) => {
+                    const isCurrent = () => b === d().current;
+                    const isBusy = () => submitting() === b;
+                    return (
+                      <button
+                        type="button"
+                        class="flex w-full items-center gap-2 rounded px-2 py-1 text-left hover:bg-accent hover:text-accent-foreground disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:bg-transparent"
+                        disabled={isCurrent() || submitting() !== null}
+                        onClick={() => void switchTo(b)}
+                      >
+                        <span class="w-3 shrink-0 text-foreground-dim" aria-hidden="true">
+                          {isCurrent() ? "✓" : isBusy() ? "…" : ""}
+                        </span>
+                        <span class="truncate font-mono">{b}</span>
+                      </button>
+                    );
+                  }}
+                </For>
+              </div>
+              <Show when={switchError()}>
+                <p class="border-t border-border-subtle px-2 py-1.5 text-destructive">
+                  {switchError()}
+                </p>
+              </Show>
+            </>
+          )}
+        </Show>
+      </div>
+    </Portal>
+  );
+};
+
+function RaumLogo(props: { class?: string }) {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      viewBox="0 0 100 100"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="8"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      class={props.class}
+      aria-hidden="true"
+    >
+      <rect x="4" y="4" width="92" height="92" />
+      <line x1="96" y1="4" x2="4" y2="50" />
+      <line x1="96" y1="4" x2="4" y2="96" />
+      <line x1="96" y1="4" x2="50" y2="96" />
+    </svg>
+  );
+}

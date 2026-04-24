@@ -1,8 +1,13 @@
 //! Per-project `.git/HEAD` watcher. Emits `worktree-branches-changed` so the
 //! UI refreshes branch badges without polling.
 //!
-//! Watches `<root>/.git/HEAD` (main project) plus every
-//! `<root>/.git/worktrees/*/HEAD` (linked worktrees). FS events are coalesced
+//! Watches `<root>/.git/` (main project) plus every
+//! `<root>/.git/worktrees/*/` (linked worktrees) non-recursively, filtering
+//! notify events by filename to only pulse on HEAD touches. We watch the
+//! *directory* rather than the HEAD file itself because git rewrites HEAD
+//! with an atomic rename — on macOS FSEvents this invalidates per-file
+//! watches after the first checkout, so subsequent branch switches were
+//! silent. Dir inodes stay stable across the rename. FS events are coalesced
 //! inside a debounce window before a single event is emitted to the webview.
 
 use std::collections::HashSet;
@@ -40,7 +45,8 @@ impl GitHeadWatcher {
                     if matches!(
                         ev.kind,
                         EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
-                    ) {
+                    ) && event_touches_head(&ev)
+                    {
                         let _ = cb_tx.send(());
                     }
                 }
@@ -48,7 +54,7 @@ impl GitHeadWatcher {
             })?;
 
         let mut watched = HashSet::new();
-        for path in discover_head_paths(root) {
+        for path in discover_watch_dirs(root) {
             match watcher.watch(&path, RecursiveMode::NonRecursive) {
                 Ok(()) => {
                     debug!(path = %path.display(), "git_watcher: added watch");
@@ -91,7 +97,7 @@ impl GitHeadWatcher {
     /// `worktree_create` / `worktree_remove` so newly-added worktree HEADs are
     /// watched and stale ones are dropped.
     pub fn rescan(&mut self, root: &Path) {
-        let fresh = discover_head_paths(root);
+        let fresh = discover_watch_dirs(root);
         for path in &fresh {
             if !self.watched.contains(path) {
                 match self.watcher.watch(path, RecursiveMode::NonRecursive) {
@@ -118,22 +124,34 @@ impl GitHeadWatcher {
     }
 }
 
-fn discover_head_paths(root: &Path) -> HashSet<PathBuf> {
-    let mut paths = HashSet::new();
+/// Collect every directory whose `HEAD` file identifies a branch — the main
+/// `<root>/.git/` plus `<root>/.git/worktrees/<id>/` for each linked
+/// worktree. Only existing dirs with a HEAD inside are returned so a
+/// never-initialised worktree doesn't pollute the watch set.
+fn discover_watch_dirs(root: &Path) -> HashSet<PathBuf> {
+    let mut dirs = HashSet::new();
     let git_dir = resolve_git_dir(root);
-    let head = git_dir.join("HEAD");
-    if head.is_file() {
-        paths.insert(head);
+    if git_dir.join("HEAD").is_file() {
+        dirs.insert(git_dir.clone());
     }
     if let Ok(entries) = std::fs::read_dir(git_dir.join("worktrees")) {
         for entry in entries.flatten() {
-            let head = entry.path().join("HEAD");
-            if head.is_file() {
-                paths.insert(head);
+            let dir = entry.path();
+            if dir.join("HEAD").is_file() {
+                dirs.insert(dir);
             }
         }
     }
-    paths
+    dirs
+}
+
+/// True when any of the event's paths points at a file named `HEAD`. Dir
+/// watches fire for every file touched inside `.git/` (index, ORIG_HEAD,
+/// packed-refs, etc.); HEAD is the one that identifies the branch.
+fn event_touches_head(ev: &notify::Event) -> bool {
+    ev.paths
+        .iter()
+        .any(|p| p.file_name().is_some_and(|n| n == "HEAD"))
 }
 
 /// Resolve `<root>/.git` to its actual directory. A plain `.git` directory is
@@ -161,7 +179,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn discover_head_paths_finds_main_and_worktrees() {
+    fn discover_watch_dirs_finds_main_and_worktrees() {
         let dir = tempdir().unwrap();
         let root = dir.path();
         let git = root.join(".git");
@@ -179,17 +197,50 @@ mod tests {
         )
         .unwrap();
 
-        let paths = discover_head_paths(root);
-        assert_eq!(paths.len(), 3);
-        assert!(paths.contains(&git.join("HEAD")));
-        assert!(paths.contains(&git.join("worktrees/feat-a/HEAD")));
-        assert!(paths.contains(&git.join("worktrees/feat-b/HEAD")));
+        let dirs = discover_watch_dirs(root);
+        assert_eq!(dirs.len(), 3);
+        assert!(dirs.contains(&git));
+        assert!(dirs.contains(&git.join("worktrees/feat-a")));
+        assert!(dirs.contains(&git.join("worktrees/feat-b")));
     }
 
     #[test]
-    fn discover_head_paths_missing_repo_is_empty() {
+    fn discover_watch_dirs_skips_worktree_without_head() {
+        // `git worktree add` briefly creates the dir before writing HEAD; we
+        // should not return a dir that lacks a HEAD file yet.
         let dir = tempdir().unwrap();
-        assert!(discover_head_paths(dir.path()).is_empty());
+        let root = dir.path();
+        let git = root.join(".git");
+        std::fs::create_dir_all(git.join("worktrees/half-done")).unwrap();
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        let dirs = discover_watch_dirs(root);
+        assert_eq!(dirs.len(), 1);
+        assert!(dirs.contains(&git));
+    }
+
+    #[test]
+    fn discover_watch_dirs_missing_repo_is_empty() {
+        let dir = tempdir().unwrap();
+        assert!(discover_watch_dirs(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn event_touches_head_matches_head_paths() {
+        let ev = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Data(
+            notify::event::DataChange::Any,
+        )))
+        .add_path(PathBuf::from("/repo/.git/HEAD"));
+        assert!(event_touches_head(&ev));
+    }
+
+    #[test]
+    fn event_touches_head_ignores_index_writes() {
+        let ev = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Data(
+            notify::event::DataChange::Any,
+        )))
+        .add_path(PathBuf::from("/repo/.git/index"));
+        assert!(!event_touches_head(&ev));
     }
 
     #[test]

@@ -60,6 +60,7 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .menu(build_app_menu)
@@ -125,6 +126,7 @@ pub fn run() {
             commands::worktree_list,
             commands::worktree_branches,
             commands::worktree_branch_merged,
+            commands::git_checkout_branch,
             commands::worktree_remove,
             commands::worktree_config_write,
             // §9 — sidebar surface (Wave 3C).
@@ -159,6 +161,10 @@ pub fn run() {
             // Updater — persists the "check on launch" pref; actual
             // check/install happen via tauri-plugin-updater directly.
             commands::updater::config_set_updater_check_on_launch,
+            // Reports how this binary was installed so the UI can disable
+            // in-app install on distro-managed Linux `.deb` and fall back
+            // to a "download from GitHub" link.
+            commands::updater::updater_install_flavor,
             // Devtools — opened via keyboard shortcut since the native
             // right-click "Inspect" entry is globally suppressed.
             commands::devtools::open_devtools,

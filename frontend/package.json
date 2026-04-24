@@ -34,6 +34,7 @@
     "@tauri-apps/plugin-global-shortcut": "latest",
     "@tauri-apps/plugin-notification": "latest",
     "@tauri-apps/plugin-opener": "latest",
+    "@tauri-apps/plugin-process": "latest",
     "@tauri-apps/plugin-updater": "latest",
     "@uiw/codemirror-theme-dracula": "^4.25.9",
     "@uiw/codemirror-theme-github": "^4.25.9",
