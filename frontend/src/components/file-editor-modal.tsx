@@ -11,6 +11,7 @@
  */
 
 import { Component, Show, createEffect, createSignal, onCleanup } from "solid-js";
+import { Portal } from "solid-js/web";
 import { invoke } from "@tauri-apps/api/core";
 
 // CodeMirror 6 core
@@ -251,110 +252,112 @@ export const FileEditorModal: Component<FileEditorModalProps> = (props) => {
 
   return (
     <Show when={props.open && props.path}>
-      {/* Backdrop */}
-      <div
-        class="fixed inset-0 z-[60] bg-scrim-strong"
-        onClick={() => {
-          if (!dirty()) props.onClose();
-        }}
-      />
+      <Portal>
+        {/* Backdrop */}
+        <div
+          class="fixed inset-0 z-[60] bg-scrim-strong"
+          onClick={() => {
+            if (!dirty()) props.onClose();
+          }}
+        />
 
-      {/* Modal panel */}
-      <div
-        class="floating-surface animate-in fade-in zoom-in-95 duration-150 fixed inset-x-4 bottom-4 top-[6vh] z-[60] mx-auto flex max-w-5xl flex-col overflow-hidden rounded-2xl border border-border bg-card"
-        onKeyDown={onKeyDown}
-        // Prevent backdrop click from closing when clicking panel
-        onClick={(e) => e.stopPropagation()}
-        role="dialog"
-        aria-modal="true"
-        aria-label={`Edit ${fileName()}`}
-        // Ensure container is focusable for keydown
-        tabIndex={-1}
-      >
-        {/* Header */}
-        <header class="flex shrink-0 items-center gap-3 border-b border-border-subtle bg-surface-sunken/40 px-5 py-3">
-          <FileIcon class="size-4 shrink-0 text-muted-foreground/70" />
-          <div class="min-w-0 flex-1">
-            <div class="flex items-center gap-2">
-              <span class="truncate font-mono text-xs text-foreground">{fileName()}</span>
-              <Show when={dirty()}>
-                <span class="size-2 shrink-0 rounded-full bg-warning" title="Unsaved changes" />
-              </Show>
+        {/* Modal panel */}
+        <div
+          class="floating-surface animate-in fade-in zoom-in-95 duration-150 fixed inset-x-4 bottom-4 top-[6vh] z-[60] mx-auto flex max-w-5xl flex-col overflow-hidden rounded-2xl border border-border bg-card"
+          onKeyDown={onKeyDown}
+          // Prevent backdrop click from closing when clicking panel
+          onClick={(e) => e.stopPropagation()}
+          role="dialog"
+          aria-modal="true"
+          aria-label={`Edit ${fileName()}`}
+          // Ensure container is focusable for keydown
+          tabIndex={-1}
+        >
+          {/* Header */}
+          <header class="flex shrink-0 items-center gap-3 border-b border-border-subtle bg-surface-sunken/40 px-5 py-3">
+            <FileIcon class="size-4 shrink-0 text-muted-foreground/70" />
+            <div class="min-w-0 flex-1">
+              <div class="flex items-center gap-2">
+                <span class="truncate font-mono text-xs text-foreground">{fileName()}</span>
+                <Show when={dirty()}>
+                  <span class="size-2 shrink-0 rounded-full bg-warning" title="Unsaved changes" />
+                </Show>
+              </div>
+              <p class="truncate font-mono text-[10px] text-muted-foreground/50">
+                {tildify(dirPath())}
+              </p>
             </div>
-            <p class="truncate font-mono text-[10px] text-muted-foreground/50">
-              {tildify(dirPath())}
-            </p>
+            <button
+              type="button"
+              class="focus-ring rounded-md p-1.5 text-foreground-subtle transition-colors hover:bg-hover hover:text-foreground"
+              onClick={() => props.onClose()}
+              aria-label="Close editor"
+            >
+              <XIcon class="size-4" />
+            </button>
+          </header>
+
+          {/* Editor body */}
+          <div class="relative min-h-0 flex-1 overflow-hidden">
+            <Show when={loading()}>
+              <div class="absolute inset-0 flex items-center justify-center bg-card">
+                <span class="text-xs text-muted-foreground/60">Loading…</span>
+              </div>
+            </Show>
+            <Show when={error() && !loading()}>
+              <div class="absolute inset-0 flex items-center justify-center bg-card">
+                <span class="max-w-xs text-center text-xs text-destructive">{error()}</span>
+              </div>
+            </Show>
+            {/* CodeMirror container — always mounted so EditorView has a stable parent */}
+            <div
+              ref={(el) => (editorContainerRef = el)}
+              class="h-full w-full overflow-auto"
+              classList={{ "opacity-0": loading() || !!error() }}
+            />
           </div>
-          <button
-            type="button"
-            class="focus-ring rounded-md p-1.5 text-foreground-subtle transition-colors hover:bg-hover hover:text-foreground"
-            onClick={() => props.onClose()}
-            aria-label="Close editor"
-          >
-            <XIcon class="size-4" />
-          </button>
-        </header>
 
-        {/* Editor body */}
-        <div class="relative min-h-0 flex-1 overflow-hidden">
-          <Show when={loading()}>
-            <div class="absolute inset-0 flex items-center justify-center bg-card">
-              <span class="text-xs text-muted-foreground/60">Loading…</span>
-            </div>
-          </Show>
-          <Show when={error() && !loading()}>
-            <div class="absolute inset-0 flex items-center justify-center bg-card">
-              <span class="max-w-xs text-center text-xs text-destructive">{error()}</span>
-            </div>
-          </Show>
-          {/* CodeMirror container — always mounted so EditorView has a stable parent */}
-          <div
-            ref={(el) => (editorContainerRef = el)}
-            class="h-full w-full overflow-auto"
-            classList={{ "opacity-0": loading() || !!error() }}
-          />
-        </div>
-
-        {/* Footer */}
-        <footer class="flex shrink-0 items-center gap-3 border-t border-border-subtle bg-surface-sunken/40 px-5 py-3">
-          <Show when={savedFlash()}>
-            <span class="animate-in fade-in text-xs text-success duration-150">Saved</span>
-          </Show>
-          <Show when={error()}>
-            <span class="min-w-0 flex-1 truncate text-xs text-destructive">{error()}</span>
-          </Show>
-          <div class="ml-auto flex items-center gap-2">
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              onClick={props.onClose}
-              class="text-muted-foreground hover:text-foreground"
-            >
-              {dirty() ? "Discard" : "Close"}
-            </Button>
-            <Button
-              type="button"
-              variant="default"
-              size="sm"
-              onClick={() => void save()}
-              disabled={saving() || !dirty()}
-              class="gap-1.5"
-            >
-              <Show
-                when={saving()}
-                fallback={
-                  <>
-                    Save <Kbd>⌘S</Kbd>
-                  </>
-                }
+          {/* Footer */}
+          <footer class="flex shrink-0 items-center gap-3 border-t border-border-subtle bg-surface-sunken/40 px-5 py-3">
+            <Show when={savedFlash()}>
+              <span class="animate-in fade-in text-xs text-success duration-150">Saved</span>
+            </Show>
+            <Show when={error()}>
+              <span class="min-w-0 flex-1 truncate text-xs text-destructive">{error()}</span>
+            </Show>
+            <div class="ml-auto flex items-center gap-2">
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={props.onClose}
+                class="text-muted-foreground hover:text-foreground"
               >
-                Saving…
-              </Show>
-            </Button>
-          </div>
-        </footer>
-      </div>
+                {dirty() ? "Discard" : "Close"}
+              </Button>
+              <Button
+                type="button"
+                variant="default"
+                size="sm"
+                onClick={() => void save()}
+                disabled={saving() || !dirty()}
+                class="gap-1.5"
+              >
+                <Show
+                  when={saving()}
+                  fallback={
+                    <>
+                      Save <Kbd>⌘S</Kbd>
+                    </>
+                  }
+                >
+                  Saving…
+                </Show>
+              </Button>
+            </div>
+          </footer>
+        </div>
+      </Portal>
     </Show>
   );
 };

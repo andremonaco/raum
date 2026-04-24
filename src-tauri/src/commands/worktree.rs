@@ -455,6 +455,89 @@ pub fn worktree_branches(
     Ok(WorktreeBranchList { branches, current })
 }
 
+/// Switch the root worktree to `branch`. Refuses the switch if the tree has
+/// any staged/unstaged/untracked changes — surfaces the first few dirty
+/// paths so the UI can show them. A no-op if `branch` is already checked
+/// out. On success the `GitHeadWatcher` will fire and refresh the sidebar;
+/// we also rescan eagerly for parity with `worktree_create`.
+#[tauri::command]
+pub fn git_checkout_branch(
+    state: tauri::State<'_, AppHandleState>,
+    project_slug: String,
+    branch: String,
+) -> Result<(), String> {
+    let effective = load_effective(&state, &project_slug)?;
+    let root = effective.root_path.to_string_lossy().into_owned();
+
+    // No-op if already on this branch — don't surface a git error to the UI.
+    let current = Command::new("git")
+        .args(["-C", &root, "branch", "--show-current"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if s.is_empty() { None } else { Some(s) }
+            } else {
+                None
+            }
+        });
+    if current.as_deref() == Some(branch.as_str()) {
+        return Ok(());
+    }
+
+    // Refuse with a readable error if the working tree has any changes —
+    // avoids the "would be overwritten" git checkout surprise and means we
+    // never lose the user's in-flight edits.
+    let status_out = Command::new("git")
+        .args(["-C", &root, "status", "--porcelain"])
+        .output()
+        .map_err(|e| format!("git status: {e}"))?;
+    if !status_out.status.success() {
+        return Err(format!(
+            "git status: {}",
+            String::from_utf8_lossy(&status_out.stderr).trim()
+        ));
+    }
+    let dirty: Vec<String> = String::from_utf8_lossy(&status_out.stdout)
+        .lines()
+        .map(|l| l.get(3..).unwrap_or("").to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if !dirty.is_empty() {
+        let shown = dirty
+            .iter()
+            .take(3)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = if dirty.len() > 3 {
+            format!(" (+{} more)", dirty.len() - 3)
+        } else {
+            String::new()
+        };
+        return Err(format!(
+            "Working tree has uncommitted changes: {shown}{more}. Commit, stash, or discard before switching branch."
+        ));
+    }
+
+    let out = Command::new("git")
+        .args(["-C", &root, "checkout", &branch])
+        .output()
+        .map_err(|e| format!("git checkout: {e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!("git checkout {branch} failed")
+        } else {
+            stderr
+        });
+    }
+
+    rescan_git_watcher(&state, &project_slug, &effective.root_path);
+    Ok(())
+}
+
 /// Read the configured upstream/merge branch for `branch` in the worktree at
 /// `path`. Returns `None` if git is unavailable, the branch is untracked, or
 /// the worktree is in detached-HEAD state.
