@@ -1,0 +1,215 @@
+name: propose-release
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: propose-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Opens (or refreshes) a "chore(release): vX.Y.Z" PR that bumps
+  # `src-tauri/Cargo.toml` + `src-tauri/CHANGELOG.md` based on the
+  # conventional commits that have landed since the previous `v*` tag.
+  # Replaces `release-plz release-pr`, which can't detect bumps for a
+  # `publish = false` workspace because its baseline discovery goes
+  # through crates.io (see release.yml for details).
+  propose:
+    name: propose release PR
+    runs-on: ubuntu-latest
+    # Don't re-propose off the PR's own merge commit — that push lands
+    # on main with the bump already applied; the release.yml tag job
+    # picks it up from there.
+    if: ${{ !startsWith(github.event.head_commit.message, 'chore(release):') }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # Use a non-default token so the PR-opening push triggers CI
+          # on the PR branch. The default GITHUB_TOKEN can't open PRs
+          # that themselves trigger workflows, so ci.yml would never run.
+          # (Falls back to GITHUB_TOKEN if RELEASE_BOT_TOKEN is unset;
+          # the PR will still open, CI just won't run on it.)
+          token: ${{ secrets.RELEASE_BOT_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: compute bump
+        id: bump
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          last_tag=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || echo "")
+          if [ -z "$last_tag" ]; then
+            echo "no prior v* tag — bootstrap release" >&2
+            last_tag="$(git rev-list --max-parents=0 HEAD | tail -n1)"
+            baseline_version="0.0.0"
+          else
+            baseline_version="${last_tag#v}"
+          fi
+          current_version=$(awk -F'"' '/^version = / { print $2; exit }' src-tauri/Cargo.toml)
+          echo "current_version=${current_version}" >> "$GITHUB_OUTPUT"
+          echo "baseline_version=${baseline_version}" >> "$GITHUB_OUTPUT"
+          echo "last_tag=${last_tag}" >> "$GITHUB_OUTPUT"
+
+          # Classify commits since the last tag. The regex matches the
+          # conventional-commits subject prefix; `!:` or `BREAKING
+          # CHANGE:` in the body escalates to a major bump.
+          commits=$(git log "${last_tag}..HEAD" --pretty=format:'%H%x09%s%x09%b%x1e')
+          bump="none"
+          while IFS=$'\t' read -r -d $'\x1e' hash subject body; do
+            [ -z "$subject" ] && continue
+            if echo "$subject" | grep -Eq '^(feat|fix|perf|revert)(\([^)]+\))?!:'; then
+              bump="major"; break
+            fi
+            if echo "$body" | grep -Eq '^BREAKING CHANGE:'; then
+              bump="major"; break
+            fi
+            if echo "$subject" | grep -Eq '^feat(\([^)]+\))?:'; then
+              [ "$bump" = "none" ] || [ "$bump" = "patch" ] && bump="minor"
+            elif echo "$subject" | grep -Eq '^(fix|perf|revert)(\([^)]+\))?:'; then
+              [ "$bump" = "none" ] && bump="patch"
+            fi
+          done <<< "$commits"
+
+          echo "bump=${bump}" >> "$GITHUB_OUTPUT"
+
+          if [ "$bump" = "none" ]; then
+            echo "no user-visible commits since ${last_tag} — nothing to propose" >&2
+            exit 0
+          fi
+
+          # Bump from the last released tag, not from the current
+          # Cargo.toml version. A previous run may have already bumped
+          # Cargo.toml to the target version while the release tag is
+          # still one step behind; using Cargo.toml as the baseline would
+          # double-bump. Using the tag matches what `release-plz release`
+          # will eventually tag on merge.
+          IFS='.' read -r major minor patch <<< "${baseline_version}"
+          case "$bump" in
+            major) next="$((major+1)).0.0" ;;
+            minor) next="${major}.$((minor+1)).0" ;;
+            patch) next="${major}.${minor}.$((patch+1))" ;;
+          esac
+
+          # Pre-1.0 we treat `feat` as patch too, mirroring the "pre-1.0
+          # narrow-bump" policy documented in release-plz.toml: until
+          # we're at 1.0.0 a minor bump is reserved for deliberate
+          # milestones, edited by the maintainer in-PR if desired.
+          if [ "$major" = "0" ] && [ "$bump" = "minor" ]; then
+            next="${major}.${minor}.$((patch+1))"
+          fi
+
+          echo "next_version=${next}" >> "$GITHUB_OUTPUT"
+          echo "proposing bump ${baseline_version} -> ${next} (${bump}, current Cargo.toml ${current_version})" >&2
+
+      - name: generate changelog entry
+        id: changelog
+        if: steps.bump.outputs.bump != 'none'
+        env:
+          NEXT_VERSION: ${{ steps.bump.outputs.next_version }}
+          LAST_TAG: ${{ steps.bump.outputs.last_tag }}
+        run: |
+          set -euo pipefail
+          # Idempotency: if CHANGELOG already lists the target version
+          # (e.g., the release PR was opened in a prior run and only the
+          # Cargo.toml bump landed), skip the splice so we don't stack
+          # duplicate headings.
+          if grep -Fq "## [${NEXT_VERSION}]" src-tauri/CHANGELOG.md; then
+            echo "CHANGELOG already has entry for ${NEXT_VERSION} — skipping splice" >&2
+            exit 0
+          fi
+          today=$(date -u +%Y-%m-%d)
+          added=""
+          fixed=""
+          other=""
+          while IFS=$'\t' read -r hash subject; do
+            [ -z "$subject" ] && continue
+            line="- ${subject}"
+            if echo "$subject" | grep -Eq '^feat(\([^)]+\))?!?:'; then
+              added+="${line}"$'\n'
+            elif echo "$subject" | grep -Eq '^(fix|perf|revert)(\([^)]+\))?!?:'; then
+              fixed+="${line}"$'\n'
+            elif echo "$subject" | grep -Eq '^(docs|chore|ci|test|style|build|refactor)(\([^)]+\))?!?:'; then
+              other+="${line}"$'\n'
+            fi
+          done < <(git log "${LAST_TAG}..HEAD" --pretty=format:'%H%x09%s' -- src-tauri crates/)
+
+          {
+            printf '\n## [%s](https://github.com/andremonaco/raum/releases/tag/v%s) - %s\n\n' \
+              "${NEXT_VERSION}" "${NEXT_VERSION}" "${today}"
+            if [ -n "$added" ]; then
+              printf '### Added\n\n%s\n' "$added"
+            fi
+            if [ -n "$fixed" ]; then
+              printf '### Fixed\n\n%s\n' "$fixed"
+            fi
+            if [ -n "$other" ]; then
+              printf '### Other\n\n%s\n' "$other"
+            fi
+          } > /tmp/changelog-entry.md
+
+          # Splice the new entry after the "## [Unreleased]" marker.
+          awk -v entry_file=/tmp/changelog-entry.md '
+            /^## \[Unreleased\]/ { print; while ((getline l < entry_file) > 0) print l; next }
+            { print }
+          ' src-tauri/CHANGELOG.md > src-tauri/CHANGELOG.md.new
+          mv src-tauri/CHANGELOG.md.new src-tauri/CHANGELOG.md
+
+      - name: bump src-tauri/Cargo.toml
+        if: steps.bump.outputs.bump != 'none'
+        env:
+          NEXT_VERSION: ${{ steps.bump.outputs.next_version }}
+        run: |
+          set -euo pipefail
+          sed -i "0,/^version = \"[^\"]*\"/ s//version = \"${NEXT_VERSION}\"/" src-tauri/Cargo.toml
+
+      - name: open or update release PR
+        if: steps.bump.outputs.bump != 'none'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || secrets.GITHUB_TOKEN }}
+          NEXT_VERSION: ${{ steps.bump.outputs.next_version }}
+          BUMP: ${{ steps.bump.outputs.bump }}
+          LAST_TAG: ${{ steps.bump.outputs.last_tag }}
+        run: |
+          set -euo pipefail
+          branch="release/v${NEXT_VERSION}"
+          git config user.name "raum-release-bot"
+          git config user.email "release-bot@raum.local"
+
+          # Re-target the branch at the current main tip so successive
+          # runs stay idempotent: each push to main recomputes the bump
+          # from the latest history and force-pushes the release branch.
+          git checkout -B "${branch}"
+          git add src-tauri/Cargo.toml src-tauri/CHANGELOG.md
+          if git diff --cached --quiet; then
+            echo "nothing to commit — release branch already up to date" >&2
+            exit 0
+          fi
+          git commit -m "chore(release): v${NEXT_VERSION}"
+          git push origin "${branch}" --force
+
+          body=$(mktemp)
+          {
+            printf '## Release PR\n\nBumps \`raum\` from \`%s\` to \`v%s\` (%s bump).\n\n' \
+              "${LAST_TAG}" "${NEXT_VERSION}" "${BUMP}"
+            printf 'Merge to cut the release — this triggers `release.yml` which tags `v%s`, runs the build matrix, publishes the draft GH release, and bumps the Homebrew cask.\n\n' "${NEXT_VERSION}"
+            printf 'Auto-generated from conventional commits since `%s`. Edit the version in `src-tauri/Cargo.toml` before merging if a narrower bump is desired — the push will reset the branch on next main push.\n' "${LAST_TAG}"
+          } > "$body"
+
+          if gh pr view "${branch}" --json number --jq .number >/dev/null 2>&1; then
+            gh pr edit "${branch}" \
+              --title "chore(release): v${NEXT_VERSION}" \
+              --body-file "$body"
+          else
+            gh pr create \
+              --title "chore(release): v${NEXT_VERSION}" \
+              --body-file "$body" \
+              --base main \
+              --head "${branch}" \
+              --label "release"
+          fi

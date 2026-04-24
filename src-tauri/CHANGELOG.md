@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/andremonaco/raum/releases/tag/v0.1.2) - 2026-04-24
+
+### Added
+
+- *(sidebar)* native open-file via OS handler, in-app CodeMirror editor, click-to-switch branch badge with dirty-tree guard, dir-based GitHeadWatcher that survives macOS atomic HEAD rename ([#20](https://github.com/andremonaco/raum/pull/20))
+
+### Fixed
+
+- *(release)* re-enable automatic release pipeline — replace release-plz release-pr (which silently no-ops on publish=false workspaces because crates.io lookup 404s) with a repo-local `propose-release` workflow that opens the bump PR from conventional commits; marks internal crates as publish=false so the tag cargo-package path is consistent
+
 ## [0.1.1](https://github.com/andremonaco/raum/releases/tag/v0.1.1) - 2026-04-23
 
 ### Added
