@@ -33,6 +33,7 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": ["app", "dmg", "appimage", "deb"],
     "category": "DeveloperTool",
     "shortDescription": "Lightning-fast, recoverable terminals for AI agent harnesses.",

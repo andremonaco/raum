@@ -19,6 +19,7 @@
     "notification:default",
     "global-shortcut:default",
     "updater:default",
+    "process:default",
     "opener:default",
     "dialog:default"
   ]

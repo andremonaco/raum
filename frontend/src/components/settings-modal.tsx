@@ -24,6 +24,7 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { check as checkForUpdate, type Update } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 import { Dialog as DialogPrimitive } from "@kobalte/core/dialog";
 
 import { cx } from "~/lib/cva";
@@ -1860,6 +1861,17 @@ type UpdatePhase =
   | { kind: "installed"; version: string }
   | { kind: "error"; message: string };
 
+/** How this binary was installed — reported by the Rust `updater_install_flavor`
+ *  command. `deb` is the only flavor that must NOT try in-app install (apt
+ *  owns the file); for everything else `update.downloadAndInstall()` works. */
+type InstallFlavor = "macos" | "appimage" | "deb" | "unknown";
+
+/** GitHub release page for a given raum version, used as the fallback
+ *  "open in browser" target for `.deb` installs. Matches the repo owner +
+ *  tag convention baked into `release.yml`. */
+const releasePageUrl = (version: string) =>
+  `https://github.com/andremonaco/raum/releases/tag/v${version}`;
+
 const UpdatesSection: Component = () => {
   const [currentVersion] = createResource<string>(async () => {
     try {
@@ -1868,6 +1880,22 @@ const UpdatesSection: Component = () => {
       return "unknown";
     }
   });
+
+  const [installFlavor] = createResource<InstallFlavor>(async () => {
+    try {
+      return (await invoke<InstallFlavor>("updater_install_flavor")) ?? "unknown";
+    } catch {
+      // A stale capability or a failed IPC means we don't know the flavor;
+      // fall back to permissive behaviour (try the install) rather than
+      // locking users out.
+      return "unknown";
+    }
+  });
+
+  /** True when this install can accept `downloadAndInstall()` — i.e. it's
+   *  not a distro-managed `.deb`. For `deb` we surface a link to the
+   *  release page instead, since apt owns the binary. */
+  const canSelfUpdate = () => installFlavor() !== "deb";
 
   const [initialPref] = createResource<boolean>(async () => {
     try {
@@ -1944,6 +1972,37 @@ const UpdatesSection: Component = () => {
         kind: "error",
         message: e instanceof Error ? e.message : String(e),
       });
+    }
+  };
+
+  const [relaunching, setRelaunching] = createSignal(false);
+  const runRelaunch = async () => {
+    setRelaunching(true);
+    try {
+      await relaunch();
+    } catch (e) {
+      // Plugin failure is rare but possible (e.g. capability not granted on
+      // an older installed version). Surface it so the user isn't left
+      // staring at an unresponsive button — they can still quit manually.
+      console.warn("relaunch failed", e);
+      setPhase({
+        kind: "error",
+        message: `Automatic relaunch failed (${
+          e instanceof Error ? e.message : String(e)
+        }). Quit raum manually and reopen to finish the update.`,
+      });
+      setRelaunching(false);
+    }
+  };
+
+  /** `.deb` installs can't self-update — apt owns the binary. Open the
+   *  GitHub release page for the detected version so the user can grab
+   *  the new `.deb` manually (or update via their package manager). */
+  const openReleasePage = async (version: string) => {
+    try {
+      await openUrl(releasePageUrl(version));
+    } catch (e) {
+      console.warn("openUrl release page failed", e);
     }
   };
 
@@ -2028,8 +2087,11 @@ const UpdatesSection: Component = () => {
                         <span class="font-mono text-warning">{p.update.version}</span>
                       </p>
                       <p class="text-[10px] text-muted-foreground">
-                        Released {p.update.date ?? "recently"}. Click "Install" to download and
-                        apply; raum will ask you to relaunch.
+                        {canSelfUpdate()
+                          ? `Released ${
+                              p.update.date ?? "recently"
+                            }. Click "Install" to download and relaunch.`
+                          : "You installed raum as a .deb package — apt owns that file, so in-app install is disabled. Download the new .deb from the release page or update via your package manager."}
                       </p>
                     </>
                   );
@@ -2064,11 +2126,10 @@ const UpdatesSection: Component = () => {
                   if (p.kind !== "installed") return null;
                   return (
                     <>
-                      <p class="text-xs text-success">
-                        Installed {p.version}. Relaunch raum to finish.
-                      </p>
+                      <p class="text-xs text-success">Installed {p.version} — ready to relaunch.</p>
                       <p class="text-[10px] text-muted-foreground">
-                        Quit raum (⌘Q) and reopen; tmux sessions survive the restart.
+                        tmux sessions survive the restart, so your terminals and agents come back
+                        exactly where they were.
                       </p>
                     </>
                   );
@@ -2091,20 +2152,44 @@ const UpdatesSection: Component = () => {
             </div>
             <div class="flex shrink-0 items-center gap-1.5">
               <Show when={phase().kind === "available"}>
+                {(() => {
+                  const p = phase();
+                  if (p.kind !== "available") return null;
+                  return canSelfUpdate() ? (
+                    <button
+                      type="button"
+                      class="rounded-md border border-warning/40 bg-warning/10 px-2 py-0.5 text-[10px] text-warning transition-colors hover:bg-warning/20 disabled:pointer-events-none disabled:opacity-45"
+                      onClick={() => void runInstall()}
+                      disabled={isBusy()}
+                    >
+                      Install
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      class="rounded-md border border-warning/40 bg-warning/10 px-2 py-0.5 text-[10px] text-warning transition-colors hover:bg-warning/20"
+                      onClick={() => void openReleasePage(p.update.version)}
+                    >
+                      View release
+                    </button>
+                  );
+                })()}
+              </Show>
+              <Show when={phase().kind === "installed"}>
                 <button
                   type="button"
-                  class="rounded-md border border-warning/40 bg-warning/10 px-2 py-0.5 text-[10px] text-warning transition-colors hover:bg-warning/20 disabled:pointer-events-none disabled:opacity-45"
-                  onClick={() => void runInstall()}
-                  disabled={isBusy()}
+                  class="rounded-md border border-success/40 bg-success/10 px-2 py-0.5 text-[10px] text-success transition-colors hover:bg-success/20 disabled:pointer-events-none disabled:opacity-45"
+                  onClick={() => void runRelaunch()}
+                  disabled={relaunching()}
                 >
-                  Install
+                  {relaunching() ? "Relaunching…" : "Relaunch now"}
                 </button>
               </Show>
               <button
                 type="button"
                 class="rounded border border-border bg-background px-2 py-0.5 text-[10px] text-foreground transition-colors hover:bg-accent disabled:pointer-events-none disabled:opacity-50"
                 onClick={() => void runCheck()}
-                disabled={isBusy()}
+                disabled={isBusy() || relaunching()}
               >
                 {primaryLabel()}
               </button>
