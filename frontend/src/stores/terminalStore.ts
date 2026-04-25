@@ -416,7 +416,7 @@ function samePaneContext(
   );
 }
 
-function setTerminalPaneContext(sessionId: string, paneContext: TerminalPaneContext): void {
+export function setTerminalPaneContext(sessionId: string, paneContext: TerminalPaneContext): void {
   const existing = terminalStore.byId[sessionId];
   if (!existing) return;
   if (samePaneContext(existing.paneContext, paneContext)) return;
@@ -424,6 +424,14 @@ function setTerminalPaneContext(sessionId: string, paneContext: TerminalPaneCont
   // any index, so it's safe to write past the chokepoint. Keep the write
   // targeted to the specific sub-path.
   setTerminalStore("byId", sessionId, "paneContext", paneContext);
+}
+
+export function setTerminalPaneContexts(contexts: Record<string, TerminalPaneContext>): void {
+  batch(() => {
+    for (const [sessionId, paneContext] of Object.entries(contexts)) {
+      setTerminalPaneContext(sessionId, paneContext);
+    }
+  });
 }
 
 async function hydrateHarnessPaneContext(item: TerminalListItem): Promise<void> {

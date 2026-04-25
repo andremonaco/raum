@@ -31,11 +31,11 @@ import {
   Suspense,
   createEffect,
   createMemo,
-  createResource,
   createSignal,
   lazy,
   onCleanup,
   onMount,
+  untrack,
 } from "solid-js";
 import { Portal } from "solid-js/web";
 import { invoke } from "@tauri-apps/api/core";
@@ -44,11 +44,15 @@ import { FileTypeIcon } from "../lib/fileTypeIcon";
 import {
   activeWorktreeStore,
   ALL_WORKTREES_SCOPE,
-  cacheWorktreeList,
   clearWorktreeListCache,
+  EMPTY_WORKTREE_STATUS,
+  refreshWorktreeList,
+  refreshWorktreeStatus,
+  refreshWorktreeStatuses,
   setActiveWorktree,
   setActiveWorktreeAll,
-  useBranchesVersion,
+  worktreeStatusByPath,
+  worktreeStatusLoadingPaths,
   worktreesByProject,
   type Worktree,
   type WorktreeScope,
@@ -94,50 +98,6 @@ import { sidebarHidden } from "../lib/sidebarVisibility";
 import { Scrollable } from "./ui/scrollable";
 
 // ---- Tauri command wrappers -----------------------------------------------
-
-interface WorktreeStatus {
-  dirty: boolean;
-  untracked: string[];
-  modified: string[];
-  staged: string[];
-  insertions: number;
-  deletions: number;
-  upstream: string | null;
-  ahead: number;
-  behind: number;
-  stashCount: number;
-}
-
-async function fetchWorktrees(slug: string): Promise<Worktree[]> {
-  try {
-    const items = await invoke<Worktree[]>("worktree_list", {
-      projectSlug: slug,
-    });
-    cacheWorktreeList(slug, items);
-    return items;
-  } catch {
-    return [];
-  }
-}
-
-async function fetchStatus(path: string): Promise<WorktreeStatus> {
-  try {
-    return await invoke<WorktreeStatus>("worktree_status", { path });
-  } catch {
-    return {
-      dirty: false,
-      untracked: [],
-      modified: [],
-      staged: [],
-      insertions: 0,
-      deletions: 0,
-      upstream: null,
-      ahead: 0,
-      behind: 0,
-      stashCount: 0,
-    };
-  }
-}
 
 async function gitStage(worktreePath: string, files: string[]): Promise<void> {
   await invoke<void>("git_stage", { worktreePath, files });
@@ -355,18 +315,12 @@ function resolveBaseBranchLabel(wt: Worktree, fallback: string | null): string |
 const WorktreeRow: Component<WorktreeRowProps> = (rowProps) => {
   const [expanded, setExpanded] = createSignal(false);
   const [diffTarget, setDiffTarget] = createSignal<{ file: string; staged: boolean } | null>(null);
-  const [status, setStatus] = createSignal<WorktreeStatus>({
-    dirty: false,
-    untracked: [],
-    modified: [],
-    staged: [],
-    insertions: 0,
-    deletions: 0,
-    upstream: null,
-    ahead: 0,
-    behind: 0,
-    stashCount: 0,
-  });
+  const status = createMemo(
+    () => worktreeStatusByPath()[rowProps.worktree.path] ?? EMPTY_WORKTREE_STATUS,
+  );
+  const hasStatus = createMemo(() => worktreeStatusByPath()[rowProps.worktree.path] !== undefined);
+  const statusLoading = createMemo(() => worktreeStatusLoadingPaths().has(rowProps.worktree.path));
+  const initialStatusLoading = createMemo(() => statusLoading() && !hasStatus());
 
   // Right-click context menu on file rows. Coordinates are viewport-relative
   // (clientX/Y); the menu renders with `position: fixed`.
@@ -401,25 +355,24 @@ const WorktreeRow: Component<WorktreeRowProps> = (rowProps) => {
     since: number;
   } | null>(null);
 
-  let inFlight = false;
   const runPoll = async () => {
-    if (inFlight) return;
-    inFlight = true;
-    try {
-      const s = await fetchStatus(rowProps.worktree.path);
-      setStatus(s);
-    } finally {
-      inFlight = false;
-    }
+    await refreshWorktreeStatus(rowProps.worktree.path);
   };
 
   // Bypasses the `inFlight` gate so an explicit user action (stage, unstage,
   // discard) always sees its own result even when the 2 s poll happens to be
   // running at the same moment.
   const refreshStatus = async () => {
-    const s = await fetchStatus(rowProps.worktree.path);
-    setStatus(s);
+    await refreshWorktreeStatus(rowProps.worktree.path);
   };
+
+  createEffect(() => {
+    const path = rowProps.worktree.path;
+    setDiffTarget(null);
+    setMenuTarget(null);
+    setEditorPath(null);
+    void untrack(() => refreshWorktreeStatuses([path], { onlyMissing: true }));
+  });
 
   onMount(() => {
     void runPoll();
@@ -639,6 +592,12 @@ const WorktreeRow: Component<WorktreeRowProps> = (rowProps) => {
                   title="Dirty working tree"
                 />
               </Show>
+              <Show when={initialStatusLoading()}>
+                <LoaderIcon
+                  class="size-3 shrink-0 animate-spin text-foreground-dim"
+                  aria-label="Loading git status"
+                />
+              </Show>
               <span
                 class="truncate font-mono text-xs font-medium"
                 classList={{
@@ -651,9 +610,13 @@ const WorktreeRow: Component<WorktreeRowProps> = (rowProps) => {
             </span>
 
             {/* Trailing slot — terminal badges; delete button is rendered
-                absolutely over the row so it doesn't steal space when idle. */}
+                absolutely over the row so it doesn't steal space when idle.
+                On row hover, fade the badges out so the unlink/delete button
+                (same right-edge area) is clearly visible. */}
             <Show when={totalTerminals() > 0}>
-              <HarnessCounter counts={harnessCounts()} compact />
+              <span class="transition-opacity duration-150 group-hover/wt:opacity-0">
+                <HarnessCounter counts={harnessCounts()} compact />
+              </span>
             </Show>
           </span>
 
@@ -823,163 +786,177 @@ const WorktreeRow: Component<WorktreeRowProps> = (rowProps) => {
 
           {/* Git staging view */}
           <Show
-            when={unstaged().length > 0 || status().staged.length > 0}
+            when={!initialStatusLoading()}
             fallback={
-              <div class="px-1 py-1 font-mono text-[10px] italic text-foreground-dim">
-                No changes
+              <div class="flex items-center gap-1.5 px-1 py-1 font-mono text-[10px] text-foreground-dim">
+                <LoaderIcon class="size-3 animate-spin" />
+                <span>Loading changes...</span>
               </div>
             }
           >
-            <div class="space-y-1.5">
-              {/* Unstaged */}
-              <Show when={unstaged().length > 0}>
-                <div>
-                  <div class="mb-0.5 flex items-center justify-between">
-                    <span class="text-[10px] uppercase tracking-wide text-foreground-subtle">
-                      Unstaged
-                    </span>
-                    <div class="flex items-center gap-0.5">
+            <Show
+              when={unstaged().length > 0 || status().staged.length > 0}
+              fallback={
+                <div class="px-1 py-1 font-mono text-[10px] italic text-foreground-dim">
+                  No changes
+                </div>
+              }
+            >
+              <div class="space-y-1.5">
+                {/* Unstaged */}
+                <Show when={unstaged().length > 0}>
+                  <div>
+                    <div class="mb-0.5 flex items-center justify-between">
+                      <span class="text-[10px] uppercase tracking-wide text-foreground-subtle">
+                        Unstaged
+                      </span>
+                      <div class="flex items-center gap-0.5">
+                        <button
+                          type="button"
+                          class="flex size-6 cursor-pointer items-center justify-center rounded text-foreground-subtle hover:bg-hover hover:text-destructive"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setDiscardTarget({ kind: "all" });
+                          }}
+                          title="Discard all unstaged changes"
+                          aria-label="Discard all unstaged changes"
+                        >
+                          <TrashGlyph class="size-3.5" />
+                        </button>
+                        <button
+                          type="button"
+                          class="flex size-6 cursor-pointer items-center justify-center rounded text-foreground-subtle hover:bg-hover hover:text-success"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void stageAll();
+                          }}
+                          title="Stage all"
+                          aria-label="Stage all"
+                        >
+                          <PlusIcon class="size-3.5" />
+                        </button>
+                      </div>
+                    </div>
+                    <ul>
+                      <For each={unstaged()}>
+                        {(file) => {
+                          const lastSlash = file.lastIndexOf("/");
+                          const dir = lastSlash >= 0 ? file.slice(0, lastSlash) : "";
+                          const name = lastSlash >= 0 ? file.slice(lastSlash + 1) : file;
+                          return (
+                            <li class="flex items-center justify-between gap-1 rounded px-1 py-0.5 hover:bg-hover">
+                              <button
+                                type="button"
+                                class="flex min-w-0 flex-1 items-center gap-1.5 text-left font-mono text-[11px] text-muted-foreground hover:text-foreground"
+                                title={`View diff: ${file}`}
+                                onClick={() => openDiff(file, false)}
+                                onContextMenu={(e) => {
+                                  e.preventDefault();
+                                  setMenuTarget({
+                                    file,
+                                    staged: false,
+                                    x: e.clientX,
+                                    y: e.clientY,
+                                  });
+                                }}
+                              >
+                                <FileTypeIcon name={file} class="size-3.5 shrink-0 opacity-75" />
+                                <span class="min-w-0 flex-1 truncate">
+                                  <span>{name}</span>
+                                  <Show when={dir !== ""}>
+                                    <span class="ml-1.5 text-[10px] text-foreground-dim">
+                                      {dir}
+                                    </span>
+                                  </Show>
+                                </span>
+                              </button>
+                              <button
+                                type="button"
+                                class="flex size-5 shrink-0 items-center justify-center rounded text-success/80 hover:bg-hover hover:text-success"
+                                onClick={() => void stageFile(file)}
+                                title="Stage file"
+                                aria-label="Stage file"
+                              >
+                                <PlusIcon class="size-3" />
+                              </button>
+                            </li>
+                          );
+                        }}
+                      </For>
+                    </ul>
+                  </div>
+                </Show>
+                {/* Staged */}
+                <Show when={status().staged.length > 0}>
+                  <div>
+                    <div class="mb-0.5 flex items-center justify-between">
+                      <span class="text-[10px] uppercase tracking-wide text-foreground-subtle">
+                        Staged
+                      </span>
                       <button
                         type="button"
                         class="flex size-6 cursor-pointer items-center justify-center rounded text-foreground-subtle hover:bg-hover hover:text-destructive"
                         onClick={(e) => {
                           e.stopPropagation();
-                          setDiscardTarget({ kind: "all" });
+                          void unstageAll();
                         }}
-                        title="Discard all unstaged changes"
-                        aria-label="Discard all unstaged changes"
+                        title="Unstage all"
+                        aria-label="Unstage all"
                       >
-                        <TrashGlyph class="size-3.5" />
-                      </button>
-                      <button
-                        type="button"
-                        class="flex size-6 cursor-pointer items-center justify-center rounded text-foreground-subtle hover:bg-hover hover:text-success"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          void stageAll();
-                        }}
-                        title="Stage all"
-                        aria-label="Stage all"
-                      >
-                        <PlusIcon class="size-3.5" />
+                        <MinusGlyph class="size-3.5" />
                       </button>
                     </div>
+                    <ul>
+                      <For each={status().staged}>
+                        {(file) => {
+                          const lastSlash = file.lastIndexOf("/");
+                          const dir = lastSlash >= 0 ? file.slice(0, lastSlash) : "";
+                          const name = lastSlash >= 0 ? file.slice(lastSlash + 1) : file;
+                          return (
+                            <li class="flex items-center justify-between gap-1 rounded px-1 py-0.5 hover:bg-hover">
+                              <button
+                                type="button"
+                                class="flex min-w-0 flex-1 items-center gap-1.5 text-left font-mono text-[11px] text-foreground hover:text-foreground"
+                                title={`View diff: ${file}`}
+                                onClick={() => openDiff(file, true)}
+                                onContextMenu={(e) => {
+                                  e.preventDefault();
+                                  setMenuTarget({
+                                    file,
+                                    staged: true,
+                                    x: e.clientX,
+                                    y: e.clientY,
+                                  });
+                                }}
+                              >
+                                <FileTypeIcon name={file} class="size-3.5 shrink-0 opacity-75" />
+                                <span class="min-w-0 flex-1 truncate">
+                                  <span>{name}</span>
+                                  <Show when={dir !== ""}>
+                                    <span class="ml-1.5 text-[10px] text-foreground-dim">
+                                      {dir}
+                                    </span>
+                                  </Show>
+                                </span>
+                              </button>
+                              <button
+                                type="button"
+                                class="flex size-5 shrink-0 items-center justify-center rounded text-destructive/80 hover:bg-hover hover:text-destructive"
+                                onClick={() => void unstageFile(file)}
+                                title="Unstage file"
+                                aria-label="Unstage file"
+                              >
+                                <MinusGlyph class="size-3" />
+                              </button>
+                            </li>
+                          );
+                        }}
+                      </For>
+                    </ul>
                   </div>
-                  <ul>
-                    <For each={unstaged()}>
-                      {(file) => {
-                        const lastSlash = file.lastIndexOf("/");
-                        const dir = lastSlash >= 0 ? file.slice(0, lastSlash) : "";
-                        const name = lastSlash >= 0 ? file.slice(lastSlash + 1) : file;
-                        return (
-                          <li class="flex items-center justify-between gap-1 rounded px-1 py-0.5 hover:bg-hover">
-                            <button
-                              type="button"
-                              class="flex min-w-0 flex-1 items-center gap-1.5 text-left font-mono text-[11px] text-muted-foreground hover:text-foreground"
-                              title={`View diff: ${file}`}
-                              onClick={() => openDiff(file, false)}
-                              onContextMenu={(e) => {
-                                e.preventDefault();
-                                setMenuTarget({
-                                  file,
-                                  staged: false,
-                                  x: e.clientX,
-                                  y: e.clientY,
-                                });
-                              }}
-                            >
-                              <FileTypeIcon name={file} class="size-3.5 shrink-0 opacity-75" />
-                              <span class="min-w-0 flex-1 truncate">
-                                <span>{name}</span>
-                                <Show when={dir !== ""}>
-                                  <span class="ml-1.5 text-[10px] text-foreground-dim">{dir}</span>
-                                </Show>
-                              </span>
-                            </button>
-                            <button
-                              type="button"
-                              class="flex size-5 shrink-0 items-center justify-center rounded text-success/80 hover:bg-hover hover:text-success"
-                              onClick={() => void stageFile(file)}
-                              title="Stage file"
-                              aria-label="Stage file"
-                            >
-                              <PlusIcon class="size-3" />
-                            </button>
-                          </li>
-                        );
-                      }}
-                    </For>
-                  </ul>
-                </div>
-              </Show>
-              {/* Staged */}
-              <Show when={status().staged.length > 0}>
-                <div>
-                  <div class="mb-0.5 flex items-center justify-between">
-                    <span class="text-[10px] uppercase tracking-wide text-foreground-subtle">
-                      Staged
-                    </span>
-                    <button
-                      type="button"
-                      class="flex size-6 cursor-pointer items-center justify-center rounded text-foreground-subtle hover:bg-hover hover:text-destructive"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        void unstageAll();
-                      }}
-                      title="Unstage all"
-                      aria-label="Unstage all"
-                    >
-                      <MinusGlyph class="size-3.5" />
-                    </button>
-                  </div>
-                  <ul>
-                    <For each={status().staged}>
-                      {(file) => {
-                        const lastSlash = file.lastIndexOf("/");
-                        const dir = lastSlash >= 0 ? file.slice(0, lastSlash) : "";
-                        const name = lastSlash >= 0 ? file.slice(lastSlash + 1) : file;
-                        return (
-                          <li class="flex items-center justify-between gap-1 rounded px-1 py-0.5 hover:bg-hover">
-                            <button
-                              type="button"
-                              class="flex min-w-0 flex-1 items-center gap-1.5 text-left font-mono text-[11px] text-foreground hover:text-foreground"
-                              title={`View diff: ${file}`}
-                              onClick={() => openDiff(file, true)}
-                              onContextMenu={(e) => {
-                                e.preventDefault();
-                                setMenuTarget({
-                                  file,
-                                  staged: true,
-                                  x: e.clientX,
-                                  y: e.clientY,
-                                });
-                              }}
-                            >
-                              <FileTypeIcon name={file} class="size-3.5 shrink-0 opacity-75" />
-                              <span class="min-w-0 flex-1 truncate">
-                                <span>{name}</span>
-                                <Show when={dir !== ""}>
-                                  <span class="ml-1.5 text-[10px] text-foreground-dim">{dir}</span>
-                                </Show>
-                              </span>
-                            </button>
-                            <button
-                              type="button"
-                              class="flex size-5 shrink-0 items-center justify-center rounded text-destructive/80 hover:bg-hover hover:text-destructive"
-                              onClick={() => void unstageFile(file)}
-                              title="Unstage file"
-                              aria-label="Unstage file"
-                            >
-                              <MinusGlyph class="size-3" />
-                            </button>
-                          </li>
-                        );
-                      }}
-                    </For>
-                  </ul>
-                </div>
-              </Show>
-            </div>
+                </Show>
+              </div>
+            </Show>
           </Show>
         </div>
       </Show>
@@ -1263,10 +1240,12 @@ interface ProjectSectionProps {
 
 const ProjectSection: Component<ProjectSectionProps> = (sectionProps) => {
   const slug = createMemo(() => sectionProps.project.slug);
-  const [worktrees, { refetch }] = createResource(
-    () => ({ slug: slug(), v: useBranchesVersion(slug()) }),
-    ({ slug: s }) => fetchWorktrees(s),
-  );
+
+  createEffect(() => {
+    const s = slug();
+    if (worktreesByProject()[s]) return;
+    void refreshWorktreeList(s);
+  });
 
   // Delete/unlink target — `null` means closed. `{ kind: "wt", wt }` opens
   // the worktree-delete modal; `{ kind: "project" }` opens the unlink modal
@@ -1278,8 +1257,12 @@ const ProjectSection: Component<ProjectSectionProps> = (sectionProps) => {
 
   const items = createMemo(() => {
     const cached = worktreesByProject()[slug()];
-    if (cached) return cached;
-    return worktrees() ?? [];
+    return cached ?? [];
+  });
+
+  createEffect(() => {
+    const paths = items().map((wt) => wt.path);
+    if (paths.length > 0) void untrack(() => refreshWorktreeStatuses(paths, { onlyMissing: true }));
   });
 
   const filteredItems = createMemo<Worktree[]>(() => {
@@ -1383,7 +1366,7 @@ const ProjectSection: Component<ProjectSectionProps> = (sectionProps) => {
         onClose={sectionProps.onCreateClose}
         onCreated={() => {
           sectionProps.onCreateClose();
-          void refetch();
+          void refreshWorktreeList(slug());
         }}
       />
 
@@ -1400,7 +1383,7 @@ const ProjectSection: Component<ProjectSectionProps> = (sectionProps) => {
                 onClose={closeDeleteTarget}
                 onDeleted={() => {
                   clearWorktreeListCache(slug());
-                  void refetch();
+                  void refreshWorktreeList(slug());
                 }}
               />
             </Suspense>
@@ -1561,7 +1544,7 @@ export const Sidebar: Component = () => {
   createEffect(() => {
     if (!collapsed()) return;
     const p = activeProject();
-    if (p) void fetchWorktrees(p.slug);
+    if (p) void refreshWorktreeList(p.slug);
   });
 
   const renderedWidth = createMemo(() => (collapsed() ? SIDEBAR_COLLAPSED_PX : width()));
@@ -1700,14 +1683,15 @@ export const Sidebar: Component = () => {
           </div>
           <Scrollable class="min-h-0 flex-1 p-2">
             <Show
+              keyed
               when={activeProject()}
               fallback={<p class="px-2 text-foreground-dim">No projects registered yet.</p>}
             >
               {(project) => (
                 <ProjectSection
-                  project={project()}
+                  project={project}
                   worktreeFilter={worktreeFilter()}
-                  createOpen={createModalSlug() === project().slug}
+                  createOpen={createModalSlug() === project.slug}
                   onCreateClose={() => setCreateModalSlug(null)}
                 />
               )}

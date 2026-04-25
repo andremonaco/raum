@@ -30,7 +30,6 @@ import {
   Show,
   createEffect,
   createMemo,
-  createResource,
   createSignal,
   onCleanup,
   onMount,
@@ -105,11 +104,7 @@ import {
   SearchIcon,
 } from "./icons";
 import { resolveSessionTabLabel } from "../lib/harnessTabLabel";
-import {
-  subscribeWorktreeBranchEvents,
-  useBranchesVersion,
-  type Worktree,
-} from "../stores/worktreeStore";
+import { branchForProject, subscribeWorktreeBranchEvents } from "../stores/worktreeStore";
 import { resolveSpawnWorktree } from "../lib/resolveSpawnWorktree";
 import { ProjectSettingsDialog } from "./project-settings-dialog";
 
@@ -179,20 +174,7 @@ const ProjectTab: Component<ProjectTabProps> = (props) => {
   const [settingsOpen, setSettingsOpen] = createSignal(false);
   const [hexInput, setHexInput] = createSignal("");
 
-  const [branch] = createResource(
-    () => ({ slug: props.project.slug, v: useBranchesVersion(props.project.slug) }),
-    async ({ slug }): Promise<string | null> => {
-      try {
-        const items = await invoke<Worktree[]>("worktree_list", {
-          projectSlug: slug,
-        });
-        const match = items.find((w) => w.path === props.project.rootPath) ?? items[0];
-        return match?.branch ?? null;
-      } catch {
-        return null;
-      }
-    },
-  );
+  const branch = createMemo(() => branchForProject(props.project.slug, props.project.rootPath));
 
   // Persist a new color. The popover stays open so the user can keep
   // tweaking (mirrors the sigil picker behaviour below).

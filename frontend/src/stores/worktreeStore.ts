@@ -6,6 +6,7 @@
 
 import { createStore } from "solid-js/store";
 import { createSignal } from "solid-js";
+import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 /** Shape of a worktree as surfaced by `worktree_list`. */
@@ -24,6 +25,32 @@ export interface Worktree {
    */
   baseBranch: string | null;
 }
+
+export interface WorktreeStatus {
+  dirty: boolean;
+  untracked: string[];
+  modified: string[];
+  staged: string[];
+  insertions: number;
+  deletions: number;
+  upstream: string | null;
+  ahead: number;
+  behind: number;
+  stashCount: number;
+}
+
+export const EMPTY_WORKTREE_STATUS: WorktreeStatus = Object.freeze({
+  dirty: false,
+  untracked: [],
+  modified: [],
+  staged: [],
+  insertions: 0,
+  deletions: 0,
+  upstream: null,
+  ahead: 0,
+  behind: 0,
+  stashCount: 0,
+});
 
 /**
  * Per-project sidebar selection. `all` is the aggregate "show every terminal
@@ -101,8 +128,106 @@ const [worktreesByProject, setWorktreesByProject] = createSignal<
 
 export { worktreesByProject };
 
+const [worktreeStatusByPath, setWorktreeStatusByPath] = createSignal<
+  Record<string, WorktreeStatus | undefined>
+>({});
+const [worktreeStatusLoadingPaths, setWorktreeStatusLoadingPaths] = createSignal<
+  ReadonlySet<string>
+>(new Set());
+
+export { worktreeStatusByPath, worktreeStatusLoadingPaths };
+
+function uniquePaths(paths: readonly string[]): string[] {
+  return [...new Set(paths.filter((path) => path.length > 0))];
+}
+
+function setStatusLoading(paths: readonly string[], loading: boolean): void {
+  if (paths.length === 0) return;
+  setWorktreeStatusLoadingPaths((prev) => {
+    const next = new Set(prev);
+    for (const path of paths) {
+      if (loading) next.add(path);
+      else next.delete(path);
+    }
+    return next;
+  });
+}
+
 export function cacheWorktreeList(projectSlug: string, items: Worktree[]): void {
   setWorktreesByProject((prev) => ({ ...prev, [projectSlug]: items }));
+}
+
+export async function refreshWorktreeList(projectSlug: string): Promise<Worktree[]> {
+  try {
+    const items = await invoke<Worktree[]>("worktree_list", { projectSlug });
+    cacheWorktreeList(projectSlug, items);
+    return items;
+  } catch {
+    return [];
+  }
+}
+
+export async function prewarmAllWorktrees(): Promise<void> {
+  try {
+    const all = await invoke<Record<string, Worktree[]>>("worktree_list_all");
+    setWorktreesByProject((prev) => ({ ...prev, ...all }));
+    const paths = Object.values(all).flatMap((items) => items.map((item) => item.path));
+    globalThis.setTimeout(() => {
+      void refreshWorktreeStatuses(paths, { onlyMissing: true });
+    }, 250);
+  } catch {
+    /* Tauri context unavailable in tests, or backend too old. */
+  }
+}
+
+export function branchForProject(projectSlug: string, rootPath: string): string | null {
+  const items = worktreesByProject()[projectSlug];
+  if (!items) return null;
+  const match = items.find((w) => w.path === rootPath) ?? items[0];
+  return match?.branch ?? null;
+}
+
+export async function refreshWorktreeStatuses(
+  paths: readonly string[],
+  options: { onlyMissing?: boolean } = {},
+): Promise<Record<string, WorktreeStatus>> {
+  const current = worktreeStatusByPath();
+  const loading = worktreeStatusLoadingPaths();
+  const targets = uniquePaths(paths).filter((path) => {
+    if (options.onlyMissing && current[path]) return false;
+    return !loading.has(path);
+  });
+  if (targets.length === 0) return {};
+
+  const initialTargets = targets.filter((path) => current[path] === undefined);
+  setStatusLoading(initialTargets, true);
+  try {
+    let statuses: Record<string, WorktreeStatus>;
+    try {
+      statuses = await invoke<Record<string, WorktreeStatus>>("worktree_status_batch", {
+        paths: targets,
+      });
+    } catch {
+      const entries = await Promise.all(
+        targets.map(async (path) => {
+          const status = await invoke<WorktreeStatus>("worktree_status", { path });
+          return [path, status] as const;
+        }),
+      );
+      statuses = Object.fromEntries(entries);
+    }
+    setWorktreeStatusByPath((prev) => ({ ...prev, ...statuses }));
+    return statuses;
+  } catch {
+    return {};
+  } finally {
+    setStatusLoading(initialTargets, false);
+  }
+}
+
+export async function refreshWorktreeStatus(path: string): Promise<WorktreeStatus> {
+  const statuses = await refreshWorktreeStatuses([path]);
+  return statuses[path] ?? worktreeStatusByPath()[path] ?? EMPTY_WORKTREE_STATUS;
 }
 
 export function clearWorktreeListCache(projectSlug: string): void {
@@ -111,19 +236,6 @@ export function clearWorktreeListCache(projectSlug: string): void {
     delete next[projectSlug];
     return next;
   });
-}
-
-/**
- * Per-slug version counter bumped whenever the backend emits
- * `worktree-branches-changed` (fired by the `.git/HEAD` file watcher in
- * `src-tauri/src/commands/git_watcher.rs`). Components include this in their
- * `createResource` source so Solid refetches `worktree_list` on every branch
- * switch — no polling.
- */
-const [branchesVersion, setBranchesVersion] = createSignal<Record<string, number>>({});
-
-export function useBranchesVersion(projectSlug: string): number {
-  return branchesVersion()[projectSlug] ?? 0;
 }
 
 /**
@@ -136,6 +248,6 @@ export function useBranchesVersion(projectSlug: string): number {
 export async function subscribeWorktreeBranchEvents(): Promise<UnlistenFn> {
   return listen<{ slug: string }>("worktree-branches-changed", (ev) => {
     const { slug } = ev.payload;
-    setBranchesVersion((prev) => ({ ...prev, [slug]: (prev[slug] ?? 0) + 1 }));
+    void refreshWorktreeList(slug);
   });
 }
