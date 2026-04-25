@@ -1862,15 +1862,23 @@ type UpdatePhase =
   | { kind: "error"; message: string };
 
 /** How this binary was installed — reported by the Rust `updater_install_flavor`
- *  command. `deb` is the only flavor that must NOT try in-app install (apt
- *  owns the file); for everything else `update.downloadAndInstall()` works. */
-type InstallFlavor = "macos" | "appimage" | "deb" | "unknown";
+ *  command. `deb` and `homebrew` must NOT try in-app install: apt owns the
+ *  Linux `.deb` file, and Homebrew owns the macOS cask record (replacing the
+ *  bundle out of band leaves `brew list` stale and breaks later
+ *  `brew upgrade`/`uninstall`). For everything else
+ *  `update.downloadAndInstall()` works. */
+type InstallFlavor = "macos" | "homebrew" | "appimage" | "deb" | "unknown";
 
 /** GitHub release page for a given raum version, used as the fallback
  *  "open in browser" target for `.deb` installs. Matches the repo owner +
  *  tag convention baked into `release.yml`. */
 const releasePageUrl = (version: string) =>
   `https://github.com/andremonaco/raum/releases/tag/v${version}`;
+
+/** Command surfaced for Homebrew-cask installs; copied to the clipboard so
+ *  users can paste it into a terminal. The cask is published from the
+ *  release workflow's `bump-homebrew` job. */
+const BREW_UPGRADE_COMMAND = "brew upgrade --cask raum";
 
 const UpdatesSection: Component = () => {
   const [currentVersion] = createResource<string>(async () => {
@@ -1893,9 +1901,14 @@ const UpdatesSection: Component = () => {
   });
 
   /** True when this install can accept `downloadAndInstall()` — i.e. it's
-   *  not a distro-managed `.deb`. For `deb` we surface a link to the
-   *  release page instead, since apt owns the binary. */
-  const canSelfUpdate = () => installFlavor() !== "deb";
+   *  neither a distro-managed `.deb` nor a Homebrew cask install. For
+   *  `deb` we surface a link to the release page; for `homebrew` we
+   *  surface the `brew upgrade --cask raum` command so brew stays
+   *  authoritative. */
+  const canSelfUpdate = () => {
+    const f = installFlavor();
+    return f !== "deb" && f !== "homebrew";
+  };
 
   const [initialPref] = createResource<boolean>(async () => {
     try {
@@ -2006,6 +2019,16 @@ const UpdatesSection: Component = () => {
     }
   };
 
+  /** Transient "Copied" affordance for the Homebrew-flow button. Flips
+   *  back to the default label after 2 s so the row stays quiet. */
+  const [brewCopied, setBrewCopied] = createSignal(false);
+  const copyBrewCommand = async () => {
+    const ok = await copyToClipboard(BREW_UPGRADE_COMMAND);
+    if (!ok) return;
+    setBrewCopied(true);
+    setTimeout(() => setBrewCopied(false), 2000);
+  };
+
   const primaryLabel = () => {
     const p = phase();
     switch (p.kind) {
@@ -2080,6 +2103,12 @@ const UpdatesSection: Component = () => {
                 {(() => {
                   const p = phase();
                   if (p.kind !== "available") return null;
+                  const fallbackCopy = () => {
+                    if (installFlavor() === "homebrew") {
+                      return "You installed raum via Homebrew. Run brew upgrade --cask raum in your terminal — keeping brew authoritative means brew uninstall later removes the right bundle.";
+                    }
+                    return "You installed raum as a .deb package — apt owns that file, so in-app install is disabled. Download the new .deb from the release page or update via your package manager.";
+                  };
                   return (
                     <>
                       <p class="text-xs text-foreground">
@@ -2091,7 +2120,7 @@ const UpdatesSection: Component = () => {
                           ? `Released ${
                               p.update.date ?? "recently"
                             }. Click "Install" to download and relaunch.`
-                          : "You installed raum as a .deb package — apt owns that file, so in-app install is disabled. Download the new .deb from the release page or update via your package manager."}
+                          : fallbackCopy()}
                       </p>
                     </>
                   );
@@ -2155,16 +2184,40 @@ const UpdatesSection: Component = () => {
                 {(() => {
                   const p = phase();
                   if (p.kind !== "available") return null;
-                  return canSelfUpdate() ? (
-                    <button
-                      type="button"
-                      class="rounded-md border border-warning/40 bg-warning/10 px-2 py-0.5 text-[10px] text-warning transition-colors hover:bg-warning/20 disabled:pointer-events-none disabled:opacity-45"
-                      onClick={() => void runInstall()}
-                      disabled={isBusy()}
-                    >
-                      Install
-                    </button>
-                  ) : (
+                  if (canSelfUpdate()) {
+                    return (
+                      <button
+                        type="button"
+                        class="rounded-md border border-warning/40 bg-warning/10 px-2 py-0.5 text-[10px] text-warning transition-colors hover:bg-warning/20 disabled:pointer-events-none disabled:opacity-45"
+                        onClick={() => void runInstall()}
+                        disabled={isBusy()}
+                      >
+                        Install
+                      </button>
+                    );
+                  }
+                  if (installFlavor() === "homebrew") {
+                    return (
+                      <>
+                        <button
+                          type="button"
+                          class="rounded-md border border-warning/40 bg-warning/10 px-2 py-0.5 text-[10px] text-warning transition-colors hover:bg-warning/20"
+                          onClick={() => void copyBrewCommand()}
+                          title={BREW_UPGRADE_COMMAND}
+                        >
+                          {brewCopied() ? "Copied" : "Copy command"}
+                        </button>
+                        <button
+                          type="button"
+                          class="rounded border border-border bg-background px-2 py-0.5 text-[10px] text-foreground transition-colors hover:bg-accent"
+                          onClick={() => void openReleasePage(p.update.version)}
+                        >
+                          View release
+                        </button>
+                      </>
+                    );
+                  }
+                  return (
                     <button
                       type="button"
                       class="rounded-md border border-warning/40 bg-warning/10 px-2 py-0.5 text-[10px] text-warning transition-colors hover:bg-warning/20"
