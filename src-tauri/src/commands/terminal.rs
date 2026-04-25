@@ -33,8 +33,9 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::commands::agent::{
-    RegisterOptions, cleanup_harness_session, infer_reattach_hook_fallback, prepare_harness_launch,
-    register_harness_session_runtime, register_harness_session_runtime_opts, resolve_project_dir,
+    RegisterOptions, cleanup_harness_session, infer_reattach_hook_fallback,
+    prepare_harness_launch_fast, register_harness_session_runtime,
+    register_harness_session_runtime_opts, resolve_project_dir, spawn_harness_launch_refresh,
 };
 use crate::state::AppHandleState;
 
@@ -645,19 +646,26 @@ pub async fn terminal_spawn<R: Runtime>(
     let launch_report = if args.kind == AgentKind::Shell {
         None
     } else {
-        let report = prepare_harness_launch(
+        let report = prepare_harness_launch_fast(
             &app,
             &state,
             args.kind,
             args.project_slug.as_deref(),
             project_dir.clone(),
-        )
-        .await?;
+        )?;
         if report.binary_missing {
             return Err(format!("binary `{}` not found on PATH", report.binary));
         }
         Some(report)
     };
+    if launch_report.is_some() {
+        spawn_harness_launch_refresh(
+            app.clone(),
+            args.kind,
+            args.project_slug.clone(),
+            project_dir.clone(),
+        );
+    }
 
     // Pick the entrypoint for the session based on the requested kind. For a
     // harness we use the placeholder-then-respawn pattern so the PTY bridge
@@ -2025,6 +2033,25 @@ pub async fn terminal_pane_context(
         .await
         .map_err(|e| format!("spawn_blocking join: {e}"))?;
     Ok(res.unwrap_or_default().into())
+}
+
+#[tauri::command]
+pub async fn terminal_pane_context_batch(
+    state: tauri::State<'_, AppHandleState>,
+    session_ids: Vec<String>,
+) -> Result<HashMap<String, PaneContextPayload>, String> {
+    let tmux = state.tmux.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        let mut out = HashMap::with_capacity(session_ids.len());
+        for session_id in session_ids {
+            let ctx = tmux.pane_context(&session_id).unwrap_or_default();
+            out.insert(session_id, ctx.into());
+        }
+        out
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking join: {e}"))?;
+    Ok(res)
 }
 
 /// §3.7 — stale-session reaper, invoked from the in-app "Orphaned sessions"

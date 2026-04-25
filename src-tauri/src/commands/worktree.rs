@@ -24,6 +24,7 @@
 //! * `config_set_sidebar_width` — §9.7 persist the sidebar width drag handle
 //!   into `config.toml.sidebar.width_px` (debounced client-side).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -114,6 +115,34 @@ pub struct WorktreeCreateOptions {
 
 fn default_true() -> bool {
     true
+}
+
+fn list_worktree_items_for_root(root_path: &Path) -> Result<Vec<WorktreeListItem>, String> {
+    let entries = git_worktree_list(root_path).map_err(|e| format!("list: {e}"))?;
+    let root = root_path.to_string_lossy().into_owned();
+    Ok(entries
+        .into_iter()
+        .map(|e| {
+            let path_str = e.path.to_string_lossy().into_owned();
+            let upstream = e
+                .branch
+                .as_deref()
+                .and_then(|branch| fetch_upstream_branch(&path_str, branch));
+            let base_branch = e
+                .branch
+                .as_deref()
+                .and_then(|branch| get_raum_base_branch(&root, branch));
+            WorktreeListItem {
+                branch: e.branch,
+                path: path_str,
+                head: e.head,
+                locked: e.locked,
+                detached: e.detached,
+                upstream,
+                base_branch,
+            }
+        })
+        .collect())
 }
 
 #[derive(Debug, Serialize)]
@@ -379,31 +408,52 @@ pub fn worktree_list(
     project_slug: String,
 ) -> Result<Vec<WorktreeListItem>, String> {
     let effective = load_effective(&state, &project_slug)?;
-    let entries = git_worktree_list(&effective.root_path).map_err(|e| format!("list: {e}"))?;
-    let root = effective.root_path.to_string_lossy().into_owned();
-    Ok(entries
-        .into_iter()
-        .map(|e| {
-            let path_str = e.path.to_string_lossy().into_owned();
-            let upstream = e
-                .branch
-                .as_deref()
-                .and_then(|branch| fetch_upstream_branch(&path_str, branch));
-            let base_branch = e
-                .branch
-                .as_deref()
-                .and_then(|branch| get_raum_base_branch(&root, branch));
-            WorktreeListItem {
-                branch: e.branch,
-                path: path_str,
-                head: e.head,
-                locked: e.locked,
-                detached: e.detached,
-                upstream,
-                base_branch,
+    list_worktree_items_for_root(&effective.root_path)
+}
+
+#[tauri::command]
+pub fn worktree_list_all(
+    state: tauri::State<'_, AppHandleState>,
+) -> Result<HashMap<String, Vec<WorktreeListItem>>, String> {
+    let projects = {
+        let store = state
+            .config_store
+            .lock()
+            .map_err(|e| format!("config_store lock: {e}"))?;
+        let slugs = store
+            .list_project_slugs()
+            .map_err(|e| format!("list_project_slugs: {e}"))?;
+        let mut projects = Vec::with_capacity(slugs.len());
+        for slug in slugs {
+            match store.effective_project(&slug) {
+                Ok(Some(mut effective)) => {
+                    effective.worktree.normalize();
+                    projects.push(effective);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(slug = %slug, error = %e, "worktree_list_all: skipping malformed project");
+                }
             }
-        })
-        .collect())
+        }
+        projects
+    };
+
+    let mut out = HashMap::with_capacity(projects.len());
+    for project in projects {
+        let slug = project.slug;
+        let root_path = project.root_path;
+        match list_worktree_items_for_root(&root_path) {
+            Ok(items) => {
+                out.insert(slug, items);
+            }
+            Err(e) => {
+                tracing::warn!(slug = %slug, error = %e, "worktree_list_all: list failed");
+                out.insert(slug, Vec::new());
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Response from `worktree_branches`: all local branches plus the one currently
@@ -843,84 +893,114 @@ pub struct WorktreeStatus {
 /// A single path can appear in both `modified` and `staged` when it has both
 /// index and worktree changes; the sidebar surfaces both buckets so the user
 /// can see it in each.
+fn worktree_status_for_path(path: &str) -> Result<WorktreeStatus, String> {
+    let output = Command::new("git")
+        .args([
+            "-C",
+            path,
+            "status",
+            "--porcelain=v2",
+            "--branch",
+            "--untracked-files=normal",
+        ])
+        .output()
+        .map_err(|e| format!("git status: {e}"))?;
+    if !output.status.success() {
+        // Non-zero exit is usually "not a git repository" when a
+        // worktree path was deleted out from under us. Treat as empty /
+        // clean rather than poisoning the sidebar with an error row.
+        return Ok(WorktreeStatus::default());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let (mut status, branch) = parse_porcelain_v2_with_branch(stdout.as_ref());
+
+    // Also fetch line-level diff stats vs HEAD. `git diff --shortstat HEAD`
+    // covers both staged and unstaged changes in the working tree.
+    // On a brand-new repo with no commits, this will fail — treat as 0/0.
+    let diff_out = Command::new("git")
+        .args(["-C", path, "diff", "--shortstat", "HEAD"])
+        .output();
+    if let Ok(diff_out) = diff_out {
+        if diff_out.status.success() {
+            let diff_str = String::from_utf8_lossy(&diff_out.stdout);
+            let (ins, del) = parse_shortstat(diff_str.as_ref());
+            status.insertions = ins;
+            status.deletions = del;
+        }
+    }
+
+    if let Some(ref br) = branch {
+        status.stash_count = count_stash_for_branch(path, br);
+    }
+
+    Ok(status)
+}
+
 #[tauri::command]
 pub async fn worktree_status(path: String) -> Result<WorktreeStatus, String> {
     // `git status` shells out — offload to the blocking pool so a slow repo
     // (fsck-in-progress, cold cache) doesn't stall the tokio runtime the
     // webview IPC uses. The 2-second poll cadence means this is the hottest
     // blocking-pool customer in the sidebar.
-    tokio::task::spawn_blocking(move || {
-        let output = Command::new("git")
-            .args([
-                "-C",
-                path.as_str(),
-                "status",
-                "--porcelain=v2",
-                "--untracked-files=normal",
-            ])
-            .output()
-            .map_err(|e| format!("git status: {e}"))?;
-        if !output.status.success() {
-            // Non-zero exit is usually "not a git repository" when a
-            // worktree path was deleted out from under us. Treat as empty /
-            // clean rather than poisoning the sidebar with an error row.
-            return Ok(WorktreeStatus::default());
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut status = parse_porcelain_v2(stdout.as_ref());
+    tokio::task::spawn_blocking(move || worktree_status_for_path(&path))
+        .await
+        .map_err(|e| format!("spawn_blocking join: {e}"))?
+}
 
-        // Also fetch line-level diff stats vs HEAD. `git diff --shortstat HEAD`
-        // covers both staged and unstaged changes in the working tree.
-        // On a brand-new repo with no commits, this will fail — treat as 0/0.
-        let diff_out = Command::new("git")
-            .args(["-C", path.as_str(), "diff", "--shortstat", "HEAD"])
-            .output();
-        if let Ok(diff_out) = diff_out {
-            if diff_out.status.success() {
-                let diff_str = String::from_utf8_lossy(&diff_out.stdout);
-                let (ins, del) = parse_shortstat(diff_str.as_ref());
-                status.insertions = ins;
-                status.deletions = del;
-            }
-        }
+#[tauri::command]
+pub async fn worktree_status_batch(
+    paths: Vec<String>,
+) -> Result<HashMap<String, WorktreeStatus>, String> {
+    let mut tasks = tokio::task::JoinSet::new();
+    for path in paths {
+        tasks.spawn_blocking(move || {
+            let status = worktree_status_for_path(&path).unwrap_or_default();
+            (path, status)
+        });
+    }
 
-        // Current branch (short name). Detached HEAD yields "HEAD" — treat as
-        // no branch so we skip the upstream/stash queries below.
-        let branch = Command::new("git")
-            .args(["-C", path.as_str(), "symbolic-ref", "--short", "HEAD"])
-            .output()
-            .ok()
-            .and_then(|o| {
-                if o.status.success() {
-                    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                    if s.is_empty() { None } else { Some(s) }
-                } else {
-                    None
-                }
-            });
-
-        if let Some(ref br) = branch {
-            status.upstream = fetch_upstream_branch(path.as_str(), br);
-            if status.upstream.is_some() {
-                let (ahead, behind) = count_ahead_behind(path.as_str());
-                status.ahead = ahead;
-                status.behind = behind;
-            }
-            status.stash_count = count_stash_for_branch(path.as_str(), br);
-        }
-
-        Ok(status)
-    })
-    .await
-    .map_err(|e| format!("spawn_blocking join: {e}"))?
+    let mut out = HashMap::new();
+    while let Some(result) = tasks.join_next().await {
+        let (path, status) = result.map_err(|e| format!("spawn_blocking join: {e}"))?;
+        out.insert(path, status);
+    }
+    Ok(out)
 }
 
 /// Parse `git status --porcelain=v2` output into the three buckets the sidebar
 /// renders. Split out for unit testing without a live repo.
+#[cfg(test)]
 fn parse_porcelain_v2(stdout: &str) -> WorktreeStatus {
+    parse_porcelain_v2_with_branch(stdout).0
+}
+
+fn parse_porcelain_v2_with_branch(stdout: &str) -> (WorktreeStatus, Option<String>) {
     let mut status = WorktreeStatus::default();
+    let mut branch = None;
     for line in stdout.lines() {
         if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("# branch.head ") {
+            if rest != "(detached)" {
+                branch = Some(rest.to_string());
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("# branch.upstream ") {
+            if !rest.is_empty() {
+                status.upstream = Some(rest.to_string());
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("# branch.ab ") {
+            for part in rest.split_whitespace() {
+                if let Some(n) = part.strip_prefix('+').and_then(|n| n.parse().ok()) {
+                    status.ahead = n;
+                } else if let Some(n) = part.strip_prefix('-').and_then(|n| n.parse().ok()) {
+                    status.behind = n;
+                }
+            }
             continue;
         }
         let mut parts = line.splitn(2, ' ');
@@ -948,7 +1028,7 @@ fn parse_porcelain_v2(stdout: &str) -> WorktreeStatus {
     }
     status.dirty =
         !status.untracked.is_empty() || !status.modified.is_empty() || !status.staged.is_empty();
-    status
+    (status, branch)
 }
 
 fn push_changed_path(marker: &str, rest: &str, out: &mut WorktreeStatus) {
@@ -976,31 +1056,6 @@ fn push_changed_path(marker: &str, rest: &str, out: &mut WorktreeStatus) {
     if worktree_char != '.' {
         out.modified.push(path);
     }
-}
-
-/// Count commits local-only vs upstream-only for the branch at HEAD. Shells
-/// out to `git rev-list --left-right --count HEAD...@{u}`. Returns `(0, 0)`
-/// when git fails or there is no upstream.
-fn count_ahead_behind(path: &str) -> (u32, u32) {
-    let out = Command::new("git")
-        .args([
-            "-C",
-            path,
-            "rev-list",
-            "--left-right",
-            "--count",
-            "HEAD...@{u}",
-        ])
-        .output();
-    let Ok(out) = out else { return (0, 0) };
-    if !out.status.success() {
-        return (0, 0);
-    }
-    let s = String::from_utf8_lossy(&out.stdout);
-    let mut parts = s.split_whitespace();
-    let ahead = parts.next().and_then(|n| n.parse().ok()).unwrap_or(0);
-    let behind = parts.next().and_then(|n| n.parse().ok()).unwrap_or(0);
-    (ahead, behind)
 }
 
 /// Count the stash entries whose `WIP on <branch>` / `On <branch>` header

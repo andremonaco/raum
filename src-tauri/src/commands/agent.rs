@@ -1036,6 +1036,103 @@ pub async fn prepare_harness_launch<R: Runtime>(
     })
 }
 
+/// Fast spawn-time preflight for `terminal_spawn`.
+///
+/// This intentionally avoids version probing, `git worktree list`, setup-plan
+/// writes, and selftests. Those are useful health checks, but they should not
+/// sit between the user's click and the harness process starting. We still
+/// verify the binary exists and do a cheap on-disk scan so sessions with hooks
+/// missing can start in silence-fallback mode until the background refresh
+/// catches up.
+pub fn prepare_harness_launch_fast<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &AppHandleState,
+    harness: AgentKind,
+    project_slug: Option<&str>,
+    project_dir: PathBuf,
+) -> Result<AgentSpawnReport, String> {
+    ensure_bridge_running(app, &state.agent_events);
+
+    let adapter = {
+        let registry = state
+            .agents
+            .lock()
+            .map_err(|e| format!("agent registry lock: {e}"))?;
+        registry
+            .find_adapter(harness)
+            .ok_or_else(|| format!("no adapter registered for {:?}", harness))?
+    };
+
+    if which::which(adapter.binary_path()).is_err() {
+        info!(
+            binary = adapter.binary_path(),
+            harness = ?harness,
+            "prepare_harness_launch_fast: binary missing on PATH"
+        );
+        emit_missing_binary_notification(app, adapter.binary_path(), harness);
+        return Ok(AgentSpawnReport {
+            session_id: String::new(),
+            binary_missing: true,
+            binary: adapter.binary_path().to_string(),
+            version_ok: None,
+            version_raw: None,
+            hook_fallback: false,
+            supports_native_events: adapter.supports_native_events(),
+        });
+    }
+
+    let mut hook_fallback = state
+        .channel_event_tx
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .is_none();
+
+    if adapter.supports_native_events() && !hook_fallback {
+        let home_dir = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from);
+        let ctx = SetupContext::new(
+            paths::hooks_dir(),
+            paths::event_socket_path(),
+            project_slug.unwrap_or_default().to_string(),
+        )
+        .with_project_dir(project_dir)
+        .with_home_dir(home_dir);
+        let scan = state.harness_runtimes.scan(harness, &ctx);
+        hook_fallback = !scan.raum_hooks_installed;
+    }
+
+    Ok(AgentSpawnReport {
+        session_id: String::new(),
+        binary_missing: false,
+        binary: adapter.binary_path().to_string(),
+        version_ok: None,
+        version_raw: None,
+        hook_fallback,
+        supports_native_events: adapter.supports_native_events(),
+    })
+}
+
+pub fn spawn_harness_launch_refresh<R: Runtime + 'static>(
+    app: AppHandle<R>,
+    harness: AgentKind,
+    project_slug: Option<String>,
+    project_dir: PathBuf,
+) {
+    tauri::async_runtime::spawn(async move {
+        let state: tauri::State<'_, AppHandleState> = app.state();
+        if let Err(e) =
+            prepare_harness_launch(&app, &state, harness, project_slug.as_deref(), project_dir)
+                .await
+        {
+            warn!(
+                harness = ?harness,
+                error = %e,
+                "background harness launch refresh failed"
+            );
+        }
+    });
+}
+
 pub fn infer_reattach_hook_fallback(
     state: &AppHandleState,
     harness: AgentKind,

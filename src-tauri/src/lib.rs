@@ -92,6 +92,7 @@ pub fn run() {
             commands::terminal::terminal_send_keys,
             commands::terminal::terminal_paste_paths,
             commands::terminal::terminal_pane_context,
+            commands::terminal::terminal_pane_context_batch,
             commands::terminal::terminal_reap_stale,
             commands::agent::agent_list,
             commands::agent::agent_spawn,
@@ -124,6 +125,7 @@ pub fn run() {
             commands::worktree_preview_manifest,
             commands::worktree_create,
             commands::worktree_list,
+            commands::worktree_list_all,
             commands::worktree_branches,
             commands::worktree_branch_merged,
             commands::git_checkout_branch,
@@ -131,6 +133,7 @@ pub fn run() {
             commands::worktree_config_write,
             // §9 — sidebar surface (Wave 3C).
             commands::worktree_status,
+            commands::worktree_status_batch,
             commands::git_stage,
             commands::git_unstage,
             commands::git_diff,
