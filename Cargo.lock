@@ -3763,6 +3763,7 @@ dependencies = [
  "block2",
  "dirs",
  "ignore",
+ "libc",
  "notify",
  "objc2",
  "objc2-user-notifications",

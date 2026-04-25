@@ -26,6 +26,59 @@ use tracing::{info, warn};
 #[cfg(target_os = "macos")]
 const MENU_ID_OPEN_SETTINGS: &str = "open-settings";
 
+/// Bump `RLIMIT_NOFILE` to the hard cap on macOS.
+///
+/// GUI apps launched by Finder/Dock inherit launchd's soft limit (256 by
+/// default). raum holds ~10–20 fds per terminal between PTY masters, tmux
+/// client pipes, hook IPC sockets, and per-project file watchers, so 12
+/// terminals saturates the cap and `tmux new-session` returns
+/// `EMFILE` ("Too many open files"). The hard cap is `kern.maxfilesperproc`,
+/// usually 24 576, which gives plenty of headroom for any sane number of
+/// terminals.
+///
+/// Linux distros leave the soft limit at the per-user value (1024+) and the
+/// system bus does not need help here, so the bump is macOS-only.
+#[cfg(target_os = "macos")]
+fn raise_nofile_limit() {
+    use libc::{RLIMIT_NOFILE, getrlimit, rlimit, setrlimit};
+    let mut lim = rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `getrlimit`/`setrlimit` are documented to take a pointer to a
+    // valid `rlimit` and write/read it; we own `lim` for the call.
+    #[allow(unsafe_code)]
+    unsafe {
+        if getrlimit(RLIMIT_NOFILE, &raw mut lim) != 0 {
+            warn!("raise_nofile_limit: getrlimit failed");
+            return;
+        }
+        let prev_soft = lim.rlim_cur;
+        if lim.rlim_cur >= lim.rlim_max {
+            info!(
+                soft = prev_soft,
+                hard = lim.rlim_max,
+                "RLIMIT_NOFILE already at hard cap"
+            );
+            return;
+        }
+        lim.rlim_cur = lim.rlim_max;
+        if setrlimit(RLIMIT_NOFILE, &raw const lim) != 0 {
+            warn!(
+                requested = lim.rlim_max,
+                prev_soft = prev_soft,
+                "raise_nofile_limit: setrlimit failed"
+            );
+        } else {
+            info!(
+                prev_soft = prev_soft,
+                new_soft = lim.rlim_cur,
+                "raised RLIMIT_NOFILE"
+            );
+        }
+    }
+}
+
 pub fn run() {
     // §2.7 — no user CLI surface. Inspect args; print GUI-only --help and exit before window.
     if !cli::handle_args() {
@@ -34,6 +87,12 @@ pub fn run() {
 
     let _log_guard = logging::init_tracing(&paths::logs_dir());
     info!("raum starting");
+
+    // Lift the launchd-imposed 256-fd ceiling before anything opens
+    // descriptors (tmux, file watchers, hook sockets). Must happen after
+    // tracing init so the bump is visible in the log.
+    #[cfg(target_os = "macos")]
+    raise_nofile_limit();
 
     // Bundled apps launched from Finder inherit a minimal PATH that doesn't
     // see Homebrew, nvm, or other dev tool locations — so harness binaries
