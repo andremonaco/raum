@@ -151,13 +151,17 @@ const FONTS_READY_TIMEOUT_MS = 120;
 /** Duration the "Copied" flash stays visible after an auto-copy (ms). */
 const COPY_FLASH_MS = 900;
 
-type TerminalLifecycleEvent = "mount" | "cleanup" | "spawn" | "reattach";
+const MAX_BRIDGE_RECOVERY_ATTEMPTS = 3;
+const BRIDGE_RECOVERY_RETRY_MS = 500;
+
+type TerminalLifecycleEvent = "mount" | "cleanup" | "spawn" | "reattach" | "recover";
 
 const lifecycleCounts: Record<TerminalLifecycleEvent, number> = {
   mount: 0,
   cleanup: 0,
   spawn: 0,
   reattach: 0,
+  recover: 0,
 };
 
 function logLifecycle(
@@ -187,6 +191,7 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
   // Exit overlay state: set when the backend reports the process exited naturally.
   const [exitState, setExitState] = createSignal<{ code: number } | null>(null);
   let unlistenProcessExited: UnlistenFn | null = null;
+  let unlistenBridgeLost: UnlistenFn | null = null;
 
   // §4.6 — Solid signal for the border so prop changes don't re-init xterm.
   // The effect below keeps the signal in sync with `props.borderColor`; the
@@ -227,6 +232,9 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
   // class is removed.
   let resizePendingFromDrag = false;
   let requestVisibleResize: (() => void) | null = null;
+  let bridgeRecoveryInFlight = false;
+  let bridgeRecoveryAttempts = 0;
+  let bridgeRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
 
   const normalBuffer = () => term?.buffer.normal ?? null;
   const hasDetachedHistory = (): boolean => {
@@ -490,8 +498,11 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
     let hasSpawned = false;
     const persistedSessionId = props.sessionId;
 
-    const tryReattach = (): void => {
-      if (hasSpawned || !persistedSessionId) return;
+    const reattachSession = (
+      targetSessionId: string,
+      options: { fallbackToSpawn: boolean; reason: "reattach" | "recover" },
+    ): void => {
+      if (!targetSessionId) return;
       if (!term || !fit) return;
       // Measure xterm's current dims so the backend opens the PTY at the
       // right size — tmux's attached client uses the PTY size as the
@@ -510,11 +521,14 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       hasSpawned = true;
       lastCols = cols;
       lastRows = rows;
-      setSessionId(persistedSessionId);
-      logLifecycle("reattach", paneId, persistedSessionId);
+      setSessionId(targetSessionId);
+      if (options.reason === "recover") {
+        bridgeRecoveryInFlight = true;
+      }
+      logLifecycle(options.reason, paneId, targetSessionId);
       void invoke<string>("terminal_reattach", {
         args: {
-          session_id: persistedSessionId,
+          session_id: targetSessionId,
           kind: props.kind,
           project_slug: props.projectSlug,
           worktree_id: props.worktreeId,
@@ -526,6 +540,10 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         .then((id) => {
           // Success — the output channel is live. Resize will be pushed by
           // the observer's first post-attach tick below.
+          bridgeRecoveryInFlight = false;
+          bridgeRecoveryAttempts = 0;
+          setErrorMsg(null);
+          setExitState(null);
           props.onSpawned?.(id);
           // Pull the harness state the backend seeded from `sessions.toml`.
           // Runs once per reattach; the live `agent-state-changed` stream
@@ -537,6 +555,19 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
           }
         })
         .catch((e) => {
+          bridgeRecoveryInFlight = false;
+          if (!options.fallbackToSpawn) {
+            console.warn("[TerminalPane] bridge recovery reattach failed", e);
+            if (bridgeRecoveryAttempts < MAX_BRIDGE_RECOVERY_ATTEMPTS) {
+              bridgeRecoveryTimer = setTimeout(() => {
+                bridgeRecoveryTimer = null;
+                recoverBridge(targetSessionId);
+              }, BRIDGE_RECOVERY_RETRY_MS);
+              return;
+            }
+            setExitState({ code: -1 });
+            return;
+          }
           // Either the tmux session is gone (expected after `kill-server`
           // or a long absence past reap_stale) or something transient
           // failed. Either way: release the gate and let `trySpawn` create
@@ -551,6 +582,18 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
           trySpawn();
         });
     };
+
+    const tryReattach = (): void => {
+      if (hasSpawned || !persistedSessionId) return;
+      reattachSession(persistedSessionId, { fallbackToSpawn: true, reason: "reattach" });
+    };
+
+    function recoverBridge(targetSessionId: string): void {
+      if (bridgeRecoveryInFlight) return;
+      if (!term || !fit) return;
+      bridgeRecoveryAttempts += 1;
+      reattachSession(targetSessionId, { fallbackToSpawn: false, reason: "recover" });
+    }
 
     const trySpawn = (): void => {
       if (hasSpawned) return;
@@ -591,6 +634,19 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
           hasSpawned = false;
         });
     };
+
+    void (async () => {
+      unlistenBridgeLost = await listen<{ sessionId: string; exitCode: number }>(
+        "terminal:bridge-lost",
+        (ev) => {
+          const id = sessionId();
+          if (!id || ev.payload.sessionId !== id) return;
+          if (exitState()) return;
+          if (bridgeRecoveryAttempts >= MAX_BRIDGE_RECOVERY_ATTEMPTS) return;
+          recoverBridge(id);
+        },
+      );
+    })();
 
     // §4.4 — dual-mode observer: pre-spawn it triggers trySpawn; post-spawn
     // it decides whether to debounce-resize or defer-until-drag-end. Solid's
@@ -795,6 +851,7 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
     logLifecycle("cleanup", paneId, sessionId());
     requestVisibleResize = null;
     unlistenProcessExited?.();
+    unlistenBridgeLost?.();
     unsubscribeTheme?.();
     unsubscribeTheme = null;
     unregisterTerminal(paneId);
@@ -806,6 +863,10 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
     if (copyFlashTimer !== null) {
       clearTimeout(copyFlashTimer);
       copyFlashTimer = null;
+    }
+    if (bridgeRecoveryTimer !== null) {
+      clearTimeout(bridgeRecoveryTimer);
+      bridgeRecoveryTimer = null;
     }
     clearResizeRepin();
     try {

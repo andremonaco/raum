@@ -912,15 +912,13 @@ async fn open_bridge_and_monitor<R: Runtime>(
             }),
             Box::new(move |exit_code| {
                 // Attached client exited unexpectedly — the bridge wasn't
-                // silenced via `shutdown_silent`, so this is e.g. tmux
-                // crashing or someone killing the client process directly.
-                // Forward the event so the frontend can show its overlay.
-                // The pane-death monitor task is still the canonical path
-                // for "inner process exited" (with remain-on-exit holding
-                // the client alive), so we don't kill the session from here
-                // — that would race the monitor.
+                // silenced via `shutdown_silent`, so this is an outer PTY /
+                // tmux-client failure, not proof that the inner shell or
+                // harness exited. Keep this distinct from
+                // `terminal:process-exited`; the frontend can reattach this
+                // pane in place when the tmux session is still alive.
                 let _ = exit_app.emit(
-                    "terminal:process-exited",
+                    "terminal:bridge-lost",
                     serde_json::json!({ "sessionId": &exit_id, "exitCode": exit_code }),
                 );
             }),
