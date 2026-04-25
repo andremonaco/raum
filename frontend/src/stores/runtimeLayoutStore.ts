@@ -203,12 +203,8 @@ function rebuildCells(): void {
     })
     .filter((c): c is RuntimeCell => c !== null);
   // `reconcile` diffs the current cells array against `cells` by the `id`
-  // key, producing surgical updates so existing <For> children (the
-  // `<LeafFrame>` that hosts each TerminalPane + xterm instance) stay mounted
-  // across layout mutations. Without this, every tree change would replace
-  // the cells array wholesale, remount all LeafFrames, and destroy the
-  // underlying xterm sessions — which is exactly what was making terminals
-  // die on the first drag or spawn.
+  // key, producing surgical updates so chrome/projection consumers keep
+  // stable cell identity across layout mutations.
   setRuntimeLayoutStore("cells", reconcile(cells, { key: "id", merge: true }));
 }
 
@@ -238,9 +234,9 @@ export function setLastSnippet(cellId: string, snippet: string, activityMs: numb
 
 /** Bump `lastActivityMs` on whichever pane owns `sessionId`. No-op if no pane
  *  tab currently points at that session. Used to keep the dock's Recent sort
- *  accurate for minimized panes (which are unmounted — their TerminalPane
- *  channel isn't running — so we rely on harness state-change events
- *  propagated from the backend). */
+ *  accurate for minimized/hidden panes. Terminal surfaces now stay mounted,
+ *  but backend state-change events remain the lowest-churn signal for dock
+ *  ordering. */
 export function touchPaneBySession(sessionId: string): void {
   if (!sessionId) return;
   for (const pane of Object.values(runtimeLayoutStore.panes)) {

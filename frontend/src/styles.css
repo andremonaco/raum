@@ -496,6 +496,47 @@ body,
     0 20px 50px -10px rgba(0, 0, 0, 0.85);
 }
 
+.terminal-surface-layer {
+  z-index: 1;
+}
+
+.terminal-surface-frame {
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+}
+
+.terminal-surface-body {
+  position: absolute;
+  top: 28px;
+  right: 1px;
+  bottom: 1px;
+  left: 1px;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border-bottom-right-radius: var(--pane-radius);
+  border-bottom-left-radius: var(--pane-radius);
+}
+
+.terminal-chrome-layer {
+  z-index: 20;
+  pointer-events: none;
+}
+
+.terminal-chrome-frame {
+  background: transparent;
+  pointer-events: none;
+}
+
+.terminal-chrome-frame .pane-drag-handle {
+  pointer-events: auto;
+}
+
+.terminal-chrome-body {
+  pointer-events: none;
+}
+
 /* Header: matches the pane's rounded top corners and the subtle gradient.
    Background is a small top-down sheen on `--surface-raised` so the header
    reads as a shallow lift over the pane body on any theme — replaces the

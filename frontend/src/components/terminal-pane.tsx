@@ -38,7 +38,12 @@ import "@xterm/xterm/css/xterm.css";
 import type { AgentKind } from "../lib/agentKind";
 import { applyAgentStateToTerminal, isHarnessKind, markOutput } from "../stores/terminalStore";
 import { type AgentState, updateSessionState } from "../stores/agentStore";
-import { registerPane, requestWebgl, unregisterPane } from "../lib/rendererScheduler";
+import {
+  registerPane,
+  requestWebgl,
+  setPaneVisibility,
+  unregisterPane,
+} from "../lib/rendererScheduler";
 import {
   registerTerminal,
   unregisterTerminal,
@@ -53,6 +58,8 @@ import { FALLBACK_XTERM_THEME } from "../lib/theme/toXtermTheme";
 import { ChevronDownIcon, CopyIcon } from "./icons";
 
 export interface TerminalPaneProps {
+  /** Stable identity for a persistent surface. Defaults to a component-local id. */
+  surfaceKey?: string;
   /** Pre-existing tmux session to re-attach to; omit to spawn a fresh one. */
   sessionId?: string;
   kind: AgentKind;
@@ -61,6 +68,10 @@ export interface TerminalPaneProps {
   worktreeId?: string;
   /** Hex string like `#ff00aa` (§4.6). Prop changes only update the border. */
   borderColor?: string;
+  /** Hidden surfaces stay mounted and streaming, but skip renderer promotion and resizes. */
+  visible?: boolean;
+  /** Whether this surface is the active/focused view owner. */
+  active?: boolean;
   /** Called once after `terminal_spawn` resolves with the new session id. */
   onSpawned?: (sessionId: string) => void;
   /** Called when the user clicks the exit overlay to dismiss the pane. */
@@ -135,10 +146,32 @@ const MIN_REATTACH_COLS = 8;
 const MIN_REATTACH_ROWS = 2;
 
 /** Upper bound before we give up waiting for `document.fonts.ready`. */
-const FONTS_READY_TIMEOUT_MS = 500;
+const FONTS_READY_TIMEOUT_MS = 120;
 
 /** Duration the "Copied" flash stays visible after an auto-copy (ms). */
 const COPY_FLASH_MS = 900;
+
+type TerminalLifecycleEvent = "mount" | "cleanup" | "spawn" | "reattach";
+
+const lifecycleCounts: Record<TerminalLifecycleEvent, number> = {
+  mount: 0,
+  cleanup: 0,
+  spawn: 0,
+  reattach: 0,
+};
+
+function logLifecycle(
+  event: TerminalLifecycleEvent,
+  surfaceKey: string,
+  sessionId: string | null | undefined,
+): void {
+  if (!import.meta.env.DEV) return;
+  lifecycleCounts[event] += 1;
+  console.log(`%c[perf] terminal-surface:${event} #${lifecycleCounts[event]}`, "color:#888", {
+    surfaceKey,
+    sessionId: sessionId ?? null,
+  });
+}
 
 interface HistoryOverlayState {
   lines: string[];
@@ -146,7 +179,8 @@ interface HistoryOverlayState {
 }
 
 export const TerminalPane: Component<TerminalPaneProps> = (props) => {
-  const paneId = createUniqueId();
+  const fallbackPaneId = createUniqueId();
+  const paneId = props.surfaceKey ?? fallbackPaneId;
   let host: HTMLDivElement | undefined;
   let historyViewport: HTMLDivElement | undefined;
 
@@ -192,6 +226,7 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
   // skipped the tmux resize; the MutationObserver flushes it once the
   // class is removed.
   let resizePendingFromDrag = false;
+  let requestVisibleResize: (() => void) | null = null;
 
   const normalBuffer = () => term?.buffer.normal ?? null;
   const hasDetachedHistory = (): boolean => {
@@ -264,8 +299,17 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
     }
   };
 
+  createEffect(() => {
+    const visible = props.visible !== false;
+    setPaneVisibility(paneId, visible);
+    if (!visible) return;
+    requestVisibleResize?.();
+    if (props.active) void requestWebgl(paneId);
+  });
+
   onMount(() => {
     if (!host) return;
+    logLifecycle("mount", paneId, props.sessionId ?? null);
 
     try {
       term = new Terminal(
@@ -334,9 +378,9 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
     void (async () => {
       const forbid = await shouldForbidWebgl();
       if (!term) return;
-      registerPane(paneId, term, { forbidWebgl: forbid });
+      registerPane(paneId, term, { forbidWebgl: forbid, visible: props.visible !== false });
       // Focusing the pane promotes it to WebGL (§4.2).
-      if (!forbid) requestWebgl(paneId);
+      if (!forbid && props.visible !== false && props.active) requestWebgl(paneId);
     })();
 
     // Subscribe to process-exit events from the backend monitor task. When the
@@ -395,6 +439,7 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
     let lastCols = -1;
     let lastRows = -1;
     const pushResize = (): void => {
+      if (props.visible === false) return;
       if (!term || !fit) return;
       const shouldRepin = shouldAutoStickToBottomOnResize(props.kind) && isViewportAtBottom(term);
       try {
@@ -421,12 +466,14 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         });
     };
     const scheduleResize = (): void => {
+      if (props.visible === false) return;
       if (resizeTimer !== null) clearTimeout(resizeTimer);
       resizeTimer = setTimeout(() => {
         resizeTimer = null;
         pushResize();
       }, RESIZE_DEBOUNCE_MS);
     };
+    requestVisibleResize = scheduleResize;
 
     // §4.1 — gated spawn. Harnesses (Ink-based TUIs) paint their banner at
     // the moment of attach, so the very first PTY frame should land at the
@@ -464,6 +511,7 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       lastCols = cols;
       lastRows = rows;
       setSessionId(persistedSessionId);
+      logLifecycle("reattach", paneId, persistedSessionId);
       void invoke<string>("terminal_reattach", {
         args: {
           session_id: persistedSessionId,
@@ -527,6 +575,7 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         cols,
         rows,
       };
+      logLifecycle("spawn", paneId, sessionId());
       void invoke<string>("terminal_spawn", {
         args,
         onData: channel,
@@ -577,6 +626,7 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
     if (typeof ResizeObserver !== "undefined") {
       resizeObserver = new ResizeObserver(() => {
         if (hasSpawned) {
+          if (props.visible === false) return;
           if (isDragging()) {
             // Keep xterm's buffer sized to the container so the user sees
             // smooth visual feedback during the drag, but hold off on the
@@ -659,7 +709,7 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
 
     // §4.2 — focus promotes to WebGL.
     term.textarea?.addEventListener("focus", () => {
-      requestWebgl(paneId);
+      if (props.visible !== false) requestWebgl(paneId);
     });
 
     // Auto-copy on selection release (Zellij-style). Fires on mouseup so a
@@ -742,6 +792,8 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
   });
 
   onCleanup(() => {
+    logLifecycle("cleanup", paneId, sessionId());
+    requestVisibleResize = null;
     unlistenProcessExited?.();
     unsubscribeTheme?.();
     unsubscribeTheme = null;

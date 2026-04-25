@@ -88,11 +88,12 @@ import {
 import { kindDisplayLabel, type AgentKind } from "../lib/agentKind";
 import { resolveSpawnWorktree } from "../lib/resolveSpawnWorktree";
 import { AlertCircleIcon, CheckIcon, HARNESS_ICONS, LoaderIcon } from "./icons";
-import { activeProjectSlug, projectBySlug } from "../stores/projectStore";
+import { activeProjectSlug, projectBySlug, setActiveProjectSlug } from "../stores/projectStore";
 import { timeMemoSettle } from "../lib/perf";
 import { projectStore } from "../stores/projectStore";
 import {
   getScopedProjection as getScopedProjectionCached,
+  prewarmProjectionCache,
   setProjectionCacheMaxSize,
   type ScopedProjection,
 } from "../lib/scopedProjection";
@@ -100,6 +101,11 @@ import {
   getCrossProjectProjection,
   setCrossProjectProjectionCacheMaxSize,
 } from "../lib/crossProjectProjection";
+import {
+  projectTerminalSurfaces,
+  type TerminalSurfaceDescriptor,
+} from "../lib/terminalSurfaceProjection";
+import { listTerminals } from "../lib/terminalRegistry";
 import { crossProjectViewMode, setCrossProjectViewMode } from "./top-row";
 
 function getScopedProjection(
@@ -160,6 +166,19 @@ export const TerminalGrid: Component = () => {
     () => activeWorktreeStore.byProject[activeProjectSlug() ?? ""] ?? ALL_WORKTREES_SCOPE,
   );
 
+  createEffect(() => {
+    const projects = projectStore.items;
+    if (projects.length === 0) return;
+    setProjectionCacheMaxSize(Math.max(16, projects.length * 2));
+    prewarmProjectionCache({
+      layoutRev: layoutRev(),
+      tree: runtimeLayoutStore.tree,
+      panes: runtimeLayoutStore.panes,
+      projects,
+      scopesByProject: activeWorktreeStore.byProject,
+    });
+  });
+
   // Pruned tree + rect projection for the active project tab. Both drop
   // every leaf whose pane belongs to a different project or worktree.
   // Results are keyed on the layout revision + scope, so repeat tab
@@ -216,6 +235,20 @@ export const TerminalGrid: Component = () => {
       orderedIds: projectedSessionIds(),
     }).rects;
   });
+
+  const terminalSurfaces = createMemo<TerminalSurfaceDescriptor[]>(() =>
+    projectTerminalSurfaces({
+      cells: runtimeLayoutStore.cells,
+      activeRectMap: activeRectMap(),
+      minimizedPaneIds: minimizedPaneIds(),
+      crossProjectMode: crossProjectMode(),
+      projectedSessionIds: projectedSessionIds(),
+      projectedRectMap: projectedRectMap(),
+      terminalById: terminalStore.byId,
+      focusedPaneId: focusedPaneId(),
+      maximizedPaneId: effectiveMaximizedPaneId(),
+    }),
+  );
 
   type SpawnKind = "shell" | "claude-code" | "codex" | "opencode";
   const [availableKinds] = createResource<SpawnKind[]>(async () => {
@@ -328,6 +361,52 @@ export const TerminalGrid: Component = () => {
     }
     window.addEventListener("raum:spawn-requested", onSpawn);
     onCleanup(() => window.removeEventListener("raum:spawn-requested", onSpawn));
+  });
+
+  function focusRegisteredSession(sessionId: string): void {
+    requestAnimationFrame(() => {
+      const registered = listTerminals().find((terminal) => terminal.sessionId === sessionId);
+      registered?.focus();
+    });
+  }
+
+  function findLayoutOwner(
+    sessionId: string,
+  ): { cellId: string; tabId: string; projectSlug?: string } | null {
+    for (const cell of runtimeLayoutStore.cells) {
+      for (const tab of cell.tabs) {
+        if (tab.sessionId !== sessionId) continue;
+        return {
+          cellId: cell.id,
+          tabId: tab.id,
+          projectSlug: tab.projectSlug ?? cell.projectSlug,
+        };
+      }
+    }
+    return null;
+  }
+
+  onMount(() => {
+    function onTerminalFocusRequested(ev: Event): void {
+      const sessionId = (ev as CustomEvent<{ sessionId?: string }>).detail?.sessionId;
+      if (!sessionId) return;
+
+      const owner = findLayoutOwner(sessionId);
+      if (owner) {
+        if (owner.projectSlug) setActiveProjectSlug(owner.projectSlug);
+        setActiveTabId(owner.cellId, owner.tabId);
+        if (minimizedPaneIds().has(owner.cellId)) toggleMinimize(owner.cellId);
+        setFocusedPaneId(owner.cellId);
+        setCrossProjectViewMode(null);
+      }
+
+      focusRegisteredSession(sessionId);
+    }
+
+    window.addEventListener("terminal-focus-requested", onTerminalFocusRequested);
+    onCleanup(() =>
+      window.removeEventListener("terminal-focus-requested", onTerminalFocusRequested),
+    );
   });
 
   function onRestoreFromDock(cellId: string): void {
@@ -454,49 +533,55 @@ export const TerminalGrid: Component = () => {
             </div>
           </Show>
 
+          <TerminalSurfaceLayer surfaces={terminalSurfaces()} />
+
           <Show when={crossProjectMode() === null}>
             <Show when={activeCells().length > 0}>
-              <For each={activeCells()}>
-                {(cell) => {
-                  const effective = createMemo<RuntimeCell>(() => {
-                    if (dragState()?.sourceId === cell.id) return cell;
-                    const preview = previewCellMap()?.get(cell.id);
-                    if (preview) {
+              <div class="terminal-chrome-layer absolute inset-0">
+                <For each={activeCells()}>
+                  {(cell) => {
+                    const effective = createMemo<RuntimeCell>(() => {
+                      if (dragState()?.sourceId === cell.id) return cell;
+                      const preview = previewCellMap()?.get(cell.id);
+                      if (preview) {
+                        return {
+                          ...cell,
+                          x: preview.x,
+                          y: preview.y,
+                          w: preview.w,
+                          h: preview.h,
+                        };
+                      }
+                      const active = activeRectMap().get(cell.id);
+                      if (!active) return cell;
                       return {
                         ...cell,
-                        x: preview.x,
-                        y: preview.y,
-                        w: preview.w,
-                        h: preview.h,
+                        x: active.x,
+                        y: active.y,
+                        w: active.w,
+                        h: active.h,
                       };
-                    }
-                    const active = activeRectMap().get(cell.id);
-                    if (!active) return cell;
-                    return {
-                      ...cell,
-                      x: active.x,
-                      y: active.y,
-                      w: active.w,
-                      h: active.h,
-                    };
-                  });
-                  return (
-                    <LeafFrame cell={effective()} maximizedPaneId={effectiveMaximizedPaneId()} />
-                  );
-                }}
-              </For>
+                    });
+                    return (
+                      <LeafFrame cell={effective()} maximizedPaneId={effectiveMaximizedPaneId()} />
+                    );
+                  }}
+                </For>
+              </div>
             </Show>
 
             <DividerLayer tree={renderTree()} />
           </Show>
 
           <Show when={crossProjectMode() !== null && projectedSessionIds().length > 0}>
-            <For each={projectedSessionIds()}>
-              {(sessionId) => {
-                const rect = createMemo(() => projectedRectMap().get(sessionId) ?? null);
-                return <ProjectedSessionFrame sessionId={sessionId} rect={rect()} />;
-              }}
-            </For>
+            <div class="terminal-chrome-layer absolute inset-0">
+              <For each={projectedSessionIds()}>
+                {(sessionId) => {
+                  const rect = createMemo(() => projectedRectMap().get(sessionId) ?? null);
+                  return <ProjectedSessionFrame sessionId={sessionId} rect={rect()} />;
+                }}
+              </For>
+            </div>
           </Show>
 
           {/* No drop-zone or landing overlays. The live reflow of the grid
@@ -518,14 +603,12 @@ export default TerminalGrid;
 // exposes generic names (for example `node` or a bare version), fall back to
 // the existing `kind · project/branch` synthesis from raum-side state.
 //
-// Shell panes: the inner command/cwd IS the interesting signal, so this does
-// poll `terminal_pane_context` every 2 s and composes
-// `"Shell · <cwd-basename> · <command>"` (dropping the command when it equals
-// the login shell).
+// Shell panes: the inner command/cwd IS the interesting signal, so the global
+// shell context poller writes paneContext into terminalStore and this binder
+// composes `"Shell · <cwd-basename> · <command>"` from the cached value.
 //
 // Returns null — the effect is the side effect.
 
-const AUTO_LABEL_POLL_MS = 2000;
 const SHELL_IDLE_COMMANDS = new Set(["zsh", "bash", "fish", "sh", "-zsh", "-bash"]);
 
 interface AutoLabelBinderProps {
@@ -585,7 +668,7 @@ const AutoLabelBinder: Component<AutoLabelBinderProps> = (props) => {
     setTabAutoLabel(props.cellId, props.tabId, label);
   });
 
-  // Shell-pane branch: tmux-polled context.
+  // Shell-pane branch: globally-polled tmux context.
   createEffect(() => {
     if (props.kind !== "shell") return;
     const sid = props.sessionId;
@@ -594,35 +677,133 @@ const AutoLabelBinder: Component<AutoLabelBinderProps> = (props) => {
       return;
     }
 
-    let cancelled = false;
-    const tick = async () => {
-      try {
-        const ctx = await invoke<{ currentCommand: string; currentPath: string }>(
-          "terminal_pane_context",
-          { sessionId: sid },
-        );
-        if (cancelled) return;
-        const basename = ctx.currentPath ? ctx.currentPath.split("/").pop() || "" : "";
-        const cmd = ctx.currentCommand.trim();
-        const showCmd = cmd && !SHELL_IDLE_COMMANDS.has(cmd);
-        const parts = ["Shell"];
-        if (basename) parts.push(basename);
-        if (showCmd) parts.push(cmd);
-        setTabAutoLabel(props.cellId, props.tabId, parts.join(" · "));
-      } catch {
-        /* non-fatal: keep the previous label */
-      }
-    };
-
-    void tick();
-    const timer = setInterval(tick, AUTO_LABEL_POLL_MS);
-    onCleanup(() => {
-      cancelled = true;
-      clearInterval(timer);
-    });
+    const ctx = livePaneContext();
+    if (!ctx) return;
+    const basename = ctx.currentPath ? ctx.currentPath.split("/").pop() || "" : "";
+    const cmd = ctx.currentCommand.trim();
+    const showCmd = cmd && !SHELL_IDLE_COMMANDS.has(cmd);
+    const parts = ["Shell"];
+    if (basename) parts.push(basename);
+    if (showCmd) parts.push(cmd);
+    setTabAutoLabel(props.cellId, props.tabId, parts.join(" · "));
   });
 
   return null;
+};
+
+// ---- TerminalSurfaceLayer: one persistent terminal per tab/session ----------
+
+const TerminalSurfaceLayer: Component<{ surfaces: TerminalSurfaceDescriptor[] }> = (props) => {
+  const byKey = createMemo(() => new Map(props.surfaces.map((surface) => [surface.key, surface])));
+  const keys = createMemo(() => props.surfaces.map((surface) => surface.key));
+
+  return (
+    <div class="terminal-surface-layer absolute inset-0">
+      <For each={keys()}>
+        {(key) => {
+          const surface = createMemo(() => byKey().get(key) ?? null);
+          return (
+            <Show when={surface()}>{(current) => <TerminalSurfaceHost surface={current()} />}</Show>
+          );
+        }}
+      </For>
+    </div>
+  );
+};
+
+const TerminalSurfaceHost: Component<{ surface: TerminalSurfaceDescriptor }> = (props) => {
+  const [lastRect, setLastRect] = createSignal<Rect | null>(null);
+  createEffect(() => {
+    const rect = props.surface.rect;
+    if (rect && rect.w > 0 && rect.h > 0) setLastRect(rect);
+  });
+
+  const rect = createMemo(() => props.surface.rect ?? lastRect());
+  const visible = createMemo(() => props.surface.visible && rect() !== null);
+  const style = createMemo<Record<string, string>>(() => {
+    const r = rect() ?? { id: props.surface.key, x: 0, y: 0, w: LAYOUT_UNIT, h: LAYOUT_UNIT };
+    return {
+      ...rectStyle(r),
+      visibility: visible() ? "visible" : "hidden",
+      "pointer-events": visible() ? "auto" : "none",
+    };
+  });
+
+  function claimFocus(): void {
+    const { cellId, tabId } = props.surface;
+    if (!cellId) return;
+    if (tabId && runtimeLayoutStore.panes[cellId]?.activeTabId !== tabId) {
+      setActiveTabId(cellId, tabId);
+    }
+    setFocusedPaneId(cellId);
+  }
+
+  function onSurfaceDoubleClick(e: MouseEvent): void {
+    const { cellId } = props.surface;
+    if (!cellId) return;
+    const target = e.target as HTMLElement | null;
+    if (target?.closest("input")) return;
+    e.stopPropagation();
+    e.preventDefault();
+    toggleMaximize(cellId);
+  }
+
+  async function closeSurface(): Promise<void> {
+    const { sessionId, cellId, tabId } = props.surface;
+    try {
+      if (sessionId) await invoke("terminal_kill", { sessionId });
+    } catch (e) {
+      console.warn("[TerminalSurfaceHost] terminal_kill on exit failed", e);
+    }
+    if (cellId && tabId) removeCellTab(cellId, tabId);
+  }
+
+  return (
+    <div
+      class="leaf-frame terminal-surface-frame flex min-h-0 min-w-0 flex-col"
+      classList={{
+        "pane-maximized": props.surface.maximized,
+      }}
+      data-surface-key={props.surface.key}
+      data-cell-id={props.surface.cellId}
+      data-session-id={props.surface.sessionId ?? ""}
+      style={style()}
+      onFocusIn={claimFocus}
+      onClick={claimFocus}
+      onDblClick={onSurfaceDoubleClick}
+    >
+      <Show when={props.surface.cellId && props.surface.tabId}>
+        <AutoLabelBinder
+          cellId={props.surface.cellId!}
+          tabId={props.surface.tabId!}
+          kind={props.surface.kind}
+          projectSlug={props.surface.projectSlug}
+          worktreeId={props.surface.worktreeId}
+          sessionId={props.surface.sessionId}
+        />
+      </Show>
+      <div class="terminal-surface-body">
+        <TerminalPane
+          surfaceKey={props.surface.key}
+          kind={props.surface.kind}
+          sessionId={props.surface.sessionId}
+          projectSlug={props.surface.projectSlug}
+          worktreeId={props.surface.worktreeId}
+          borderColor="transparent"
+          visible={visible()}
+          active={props.surface.active}
+          onSpawned={(sessionId) => {
+            if (props.surface.cellId && props.surface.tabId) {
+              setTabSessionId(props.surface.cellId, props.surface.tabId, sessionId);
+            }
+          }}
+          onRequestClose={() => {
+            void closeSurface();
+          }}
+        />
+      </div>
+    </div>
+  );
 };
 
 // ---- LeafFrame: absolute-positioned pane ----------------------------------
@@ -677,10 +858,12 @@ const LeafFrame: Component<{ cell: RuntimeCell; maximizedPaneId: string | null }
 
   return (
     <div
-      ref={cellRef}
+      ref={(el) => {
+        cellRef = el;
+      }}
       data-dnd-target-pane-id={props.cell.id}
       data-cell-id={props.cell.id}
-      class="leaf-frame flex min-h-0 min-w-0 flex-col"
+      class="leaf-frame terminal-chrome-frame flex min-h-0 min-w-0 flex-col"
       classList={{
         "pane-selected": isFocused(),
         "pane-dragging": isDragSource(),
@@ -699,7 +882,7 @@ const LeafFrame: Component<{ cell: RuntimeCell; maximizedPaneId: string | null }
         activeTabId={props.cell.activeTabId}
         isMaximized={isMaximized()}
       />
-      <div class="relative min-h-0 min-w-0 flex-1 overflow-hidden">
+      <div class="terminal-chrome-body relative min-h-0 min-w-0 flex-1 overflow-hidden">
         <Show
           when={props.cell.kind !== "empty"}
           fallback={
@@ -708,43 +891,7 @@ const LeafFrame: Component<{ cell: RuntimeCell; maximizedPaneId: string | null }
             </div>
           }
         >
-          <For each={props.cell.tabs}>
-            {(tab) => (
-              <div
-                class="absolute inset-0"
-                style={{
-                  visibility: tab.id === props.cell.activeTabId ? "visible" : "hidden",
-                }}
-              >
-                <AutoLabelBinder
-                  cellId={props.cell.id}
-                  tabId={tab.id}
-                  kind={props.cell.kind}
-                  projectSlug={tab.projectSlug ?? props.cell.projectSlug}
-                  worktreeId={tab.worktreeId ?? props.cell.worktreeId}
-                  sessionId={tab.sessionId}
-                />
-                <TerminalPane
-                  kind={props.cell.kind as Parameters<typeof TerminalPane>[0]["kind"]}
-                  sessionId={tab.sessionId}
-                  projectSlug={tab.projectSlug ?? props.cell.projectSlug}
-                  worktreeId={tab.worktreeId ?? props.cell.worktreeId}
-                  borderColor="transparent"
-                  onSpawned={(sid) => setTabSessionId(props.cell.id, tab.id, sid)}
-                  onRequestClose={async () => {
-                    try {
-                      if (tab.sessionId) {
-                        await invoke("terminal_kill", { sessionId: tab.sessionId });
-                      }
-                    } catch (e) {
-                      console.warn("[LeafFrame] terminal_kill on exit failed", e);
-                    }
-                    removeCellTab(props.cell.id, tab.id);
-                  }}
-                />
-              </div>
-            )}
-          </For>
+          <div class="h-full w-full" />
         </Show>
       </div>
     </div>
@@ -1250,7 +1397,6 @@ const ProjectedSessionFrame: Component<{ sessionId: string; rect: Rect | null }>
       fallbackLabel: kindDisplayLabel(kind),
     });
   });
-  const accent = () => `color-mix(in oklab, ${project()?.color ?? "#6b7280"} 18%, transparent)`;
   const headerStyle = () =>
     ({
       "box-shadow": `inset 0 1px 0 color-mix(in oklab, ${project()?.color ?? "#6b7280"} 26%, transparent)`,
@@ -1263,11 +1409,18 @@ const ProjectedSessionFrame: Component<{ sessionId: string; rect: Rect | null }>
         <Show when={props.rect}>
           {(rect) => (
             <div
-              class="leaf-frame flex min-h-0 min-w-0 flex-col"
+              class="leaf-frame terminal-chrome-frame flex min-h-0 min-w-0 flex-col"
               data-session-id={props.sessionId}
               data-testid={`projected-session-${props.sessionId}`}
               style={rectStyle(rect())}
               title={currentTerminal().project_slug ?? ""}
+              onClick={() => {
+                window.dispatchEvent(
+                  new CustomEvent("terminal-focus-requested", {
+                    detail: { sessionId: props.sessionId },
+                  }),
+                );
+              }}
             >
               <div
                 class="flex h-7 shrink-0 items-center border-b border-border-subtle"
@@ -1281,15 +1434,7 @@ const ProjectedSessionFrame: Component<{ sessionId: string; rect: Rect | null }>
                   </div>
                 </div>
               </div>
-              <div class="relative min-h-0 min-w-0 flex-1 overflow-hidden">
-                <TerminalPane
-                  kind={currentTerminal().kind}
-                  sessionId={props.sessionId}
-                  projectSlug={currentTerminal().project_slug ?? undefined}
-                  worktreeId={currentTerminal().worktree_id ?? undefined}
-                  borderColor={accent()}
-                />
-              </div>
+              <div class="terminal-chrome-body relative min-h-0 min-w-0 flex-1 overflow-hidden" />
             </div>
           )}
         </Show>

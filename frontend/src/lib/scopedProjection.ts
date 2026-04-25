@@ -80,6 +80,37 @@ export function getScopedProjection(params: {
   return entry;
 }
 
+export function prewarmProjectionCache(params: {
+  layoutRev: number;
+  tree: LayoutNode | null;
+  panes: Record<string, PaneContent>;
+  projects: readonly { slug: string; rootPath: string }[];
+  scopesByProject?: Record<string, WorktreeScope | undefined>;
+}): void {
+  for (const project of params.projects) {
+    getScopedProjection({
+      layoutRev: params.layoutRev,
+      tree: params.tree,
+      panes: params.panes,
+      slug: project.slug,
+      scope: { mode: "all" },
+      mainPath: project.rootPath,
+    });
+
+    const scope = params.scopesByProject?.[project.slug];
+    if (scope && scope.mode !== "all") {
+      getScopedProjection({
+        layoutRev: params.layoutRev,
+        tree: params.tree,
+        panes: params.panes,
+        slug: project.slug,
+        scope,
+        mainPath: project.rootPath,
+      });
+    }
+  }
+}
+
 export function __resetProjectionCacheForTests(): void {
   cache.clear();
   configuredMaxSize = 16;
