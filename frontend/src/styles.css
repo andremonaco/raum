@@ -705,6 +705,20 @@ body,
   animation: wiggle 0.35s ease-in-out;
 }
 
+@keyframes harness-pulse {
+  0%,
+  100% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(1.25);
+  }
+}
+.harness-pulse {
+  animation: harness-pulse 1.1s ease-in-out infinite;
+  transform-origin: center;
+}
+
 .no-scrollbar {
   scrollbar-width: none;
 }

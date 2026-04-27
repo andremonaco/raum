@@ -87,7 +87,7 @@ import {
 } from "../stores/worktreeStore";
 import { kindDisplayLabel, type AgentKind } from "../lib/agentKind";
 import { resolveSpawnWorktree } from "../lib/resolveSpawnWorktree";
-import { AlertCircleIcon, CheckIcon, HARNESS_ICONS, LoaderIcon } from "./icons";
+import { HARNESS_ICONS } from "./icons";
 import { activeProjectSlug, projectBySlug, setActiveProjectSlug } from "../stores/projectStore";
 import { timeMemoSettle } from "../lib/perf";
 import { projectStore } from "../stores/projectStore";
@@ -1139,17 +1139,25 @@ const TabItem: Component<{
   let prevTabState: AgentState | null = null;
   createEffect(() => {
     const s = tabState();
-    if (s === "waiting" && prevTabState !== "waiting") {
+    const transitioned =
+      (s === "waiting" && prevTabState !== "waiting") ||
+      (s === "completed" && prevTabState === "working");
+    if (transitioned) {
       setBumping(true);
       setTimeout(() => setBumping(false), 400);
     }
     prevTabState = s;
   });
 
+  const harnessAnimating = () => {
+    const s = tabState();
+    return s === "working" || s === "waiting";
+  };
+
   const HarnessIcon = () => {
     const Icon = HARNESS_ICONS[props.kind as keyof typeof HARNESS_ICONS];
     if (!Icon) return null;
-    return <Icon class="h-3 w-3 shrink-0" />;
+    return <Icon class="h-3 w-3 shrink-0" classList={{ "harness-pulse": harnessAnimating() }} />;
   };
 
   const lastPromptText = (): string | undefined => {
@@ -1223,7 +1231,6 @@ const TabItem: Component<{
       >
         <div class="flex min-w-0 items-center gap-1">
           <HarnessIcon />
-          <StateIndicator state={tabState()} />
           <Show when={editing()}>
             <input
               type="text"
@@ -1266,7 +1273,7 @@ const TabItem: Component<{
           </Show>
         </div>
         <Show when={lastPromptSubtitle()}>
-          <div class="mt-px min-w-0 truncate pl-[18px] text-[9px] font-normal normal-case tracking-normal opacity-85">
+          <div class="mt-px min-w-0 truncate pl-4 text-[9px] font-normal normal-case tracking-normal opacity-85">
             {lastPromptSubtitle()}
           </div>
         </Show>
@@ -1308,30 +1315,7 @@ const TabItem: Component<{
   );
 };
 
-// ---- StateIndicator + ChromeButton + glyphs -------------------------------
-
-function StateIndicator(props: { state: AgentState | null }) {
-  const title = () => props.state ?? "unknown";
-  return (
-    <span class="flex items-center" title={title()}>
-      <Show when={props.state === "working"}>
-        <LoaderIcon class="h-3 w-3 animate-spin text-success" />
-      </Show>
-      <Show when={props.state === "waiting"}>
-        <AlertCircleIcon class="h-3 w-3 animate-pulse text-warning" />
-      </Show>
-      <Show when={props.state === "idle" || props.state === null}>
-        <CheckIcon class="h-3 w-3 text-foreground-subtle" />
-      </Show>
-      <Show when={props.state === "completed"}>
-        <CheckIcon class="h-3 w-3 text-info" />
-      </Show>
-      <Show when={props.state === "errored"}>
-        <AlertCircleIcon class="h-3 w-3 text-destructive" />
-      </Show>
-    </span>
-  );
-}
+// ---- ChromeButton + glyphs ------------------------------------------------
 
 function ChromeButton(props: {
   label: string;
@@ -1450,13 +1434,18 @@ const ProjectedSessionFrame: Component<{ sessionId: string; rect: Rect | null }>
     const slug = terminal()?.project_slug;
     return slug ? projectBySlug().get(slug) : undefined;
   });
+  const state = () => agentStore.sessions[props.sessionId]?.state ?? null;
   const HarnessIcon = () => {
     const kind = terminal()?.kind;
     if (!kind) return null;
     const I = HARNESS_ICONS[kind as keyof typeof HARNESS_ICONS];
-    return I ? <I class="size-3.5 shrink-0" /> : null;
+    if (!I) return null;
+    const animating = () => {
+      const s = state();
+      return s === "working" || s === "waiting";
+    };
+    return <I class="size-3.5 shrink-0" classList={{ "harness-pulse": animating() }} />;
   };
-  const state = () => agentStore.sessions[props.sessionId]?.state ?? null;
   const label = createMemo(() => {
     const current = terminal();
     const ctx = current?.paneContext;
@@ -1517,7 +1506,6 @@ const ProjectedSessionFrame: Component<{ sessionId: string; rect: Rect | null }>
                     >
                       <div class="flex min-w-0 items-center gap-1">
                         <HarnessIcon />
-                        <StateIndicator state={state()} />
                         <span class="min-w-0 flex-1 truncate normal-case">{label()}</span>
                       </div>
                       <Show when={projectedSubtitle()}>
