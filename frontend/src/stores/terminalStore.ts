@@ -23,6 +23,7 @@ import { createStore, reconcile } from "solid-js/store";
 import { agentStore, type AgentKind, type AgentState } from "./agentStore";
 
 const TERMINAL_PANE_CONTEXT_CHANGED_EVENT = "terminal-pane-context-changed";
+const PANE_PROMPT_UPDATED_EVENT = "pane:prompt-updated";
 
 export interface TerminalListItem {
   session_id: string;
@@ -41,9 +42,15 @@ export interface TerminalPaneContext {
   windowName: string;
 }
 
+export interface LastPrompt {
+  text: string;
+  submittedAtMs: number;
+}
+
 export interface TerminalRecord extends TerminalListItem {
   workingState: TerminalWorkingState;
   paneContext?: TerminalPaneContext;
+  lastPrompt?: LastPrompt;
 }
 
 export interface HarnessCounts {
@@ -434,6 +441,43 @@ export function setTerminalPaneContexts(contexts: Record<string, TerminalPaneCon
   });
 }
 
+export function setLastPrompt(sessionId: string, entry: LastPrompt): void {
+  const existing = terminalStore.byId[sessionId];
+  if (!existing) return;
+  if (
+    existing.lastPrompt?.text === entry.text &&
+    existing.lastPrompt?.submittedAtMs === entry.submittedAtMs
+  ) {
+    return;
+  }
+  // Like paneContext, lastPrompt is observational metadata that doesn't
+  // feed any membership index. Targeted write past the chokepoint.
+  setTerminalStore("byId", sessionId, "lastPrompt", entry);
+}
+
+/**
+ * Seed `lastPrompt` on every terminal record using the per-session
+ * `last_prompt` field returned by `agent_snapshot`. Called after the
+ * snapshot has populated `terminalStore.byId` so the lookup hits a real
+ * record. Missing or null prompts are no-ops.
+ */
+export function seedLastPromptsFromAgents(
+  agents: ReadonlyArray<{
+    session_id: string | null;
+    last_prompt?: { text: string; submitted_at_ms: number };
+  }>,
+): void {
+  batch(() => {
+    for (const a of agents) {
+      if (!a.session_id || !a.last_prompt) continue;
+      setLastPrompt(a.session_id, {
+        text: a.last_prompt.text,
+        submittedAtMs: a.last_prompt.submitted_at_ms,
+      });
+    }
+  });
+}
+
 async function hydrateHarnessPaneContext(item: TerminalListItem): Promise<void> {
   if (!isHarnessKind(item.kind)) return;
   try {
@@ -662,6 +706,13 @@ interface TerminalPaneContextChanged extends TerminalPaneContext {
   sessionId: string;
 }
 
+interface PanePromptUpdated {
+  session_id: AgentStateChanged["session_id"];
+  harness: AgentKind;
+  text: string;
+  submitted_at_ms: number;
+}
+
 function sessionIdFromPayload(id: AgentStateChanged["session_id"]): string {
   if (typeof id === "string") return id;
   if (id && typeof id === "object") {
@@ -697,11 +748,20 @@ export async function subscribeTerminalEvents(): Promise<UnlistenFn> {
     if (!id) return;
     applyAgentStateToTerminal(id, ev.payload.to);
   });
+  const unlistenPrompt = await listen<PanePromptUpdated>(PANE_PROMPT_UPDATED_EVENT, (ev) => {
+    const id = sessionIdFromPayload(ev.payload.session_id);
+    if (!id) return;
+    setLastPrompt(id, {
+      text: ev.payload.text,
+      submittedAtMs: ev.payload.submitted_at_ms,
+    });
+  });
   return () => {
     unlistenUpsert();
     unlistenRemoved();
     unlistenPaneContext();
     unlistenAgentState();
+    unlistenPrompt();
   };
 }
 

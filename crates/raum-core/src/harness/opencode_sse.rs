@@ -483,6 +483,44 @@ fn translate(
                 payload: env.properties,
             })
         }
+        // User message events. OpenCode's SSE bus has shifted the exact
+        // event name between minor releases (`message.updated` vs
+        // `message.part.updated` vs the legacy `message`), and the user-
+        // text payload has moved between `info.parts[*].text` and
+        // top-level `part.text`. Be permissive: accept any of the known
+        // names and probe both locations. Emit a synthetic `TurnStart`
+        // notification so the same drain path that handles Claude/Codex
+        // `UserPromptSubmit` records the prompt and advances the state
+        // machine.
+        "message.updated" | "message.part.updated" | "message" => {
+            let role = env
+                .properties
+                .get("info")
+                .or_else(|| env.properties.get("message"))
+                .and_then(|i| i.get("role"))
+                .and_then(Value::as_str);
+            if role != Some("user") {
+                return None;
+            }
+            let session = env
+                .properties
+                .get("info")
+                .or_else(|| env.properties.get("message"))
+                .and_then(|i| i.get("sessionID"))
+                .and_then(Value::as_str)
+                .or_else(|| env.properties.get("sessionID").and_then(Value::as_str))
+                .map_or_else(|| fallback.clone(), SessionId::new);
+            let text = extract_user_message_text(&env.properties)?;
+            Some(NotificationEvent {
+                session_id: session,
+                harness: AgentKind::OpenCode,
+                kind: NotificationKind::TurnStart,
+                source,
+                reliability: Reliability::Deterministic,
+                request_id: None,
+                payload: serde_json::json!({ "prompt": text }),
+            })
+        }
         "session.status" => {
             // Modern equivalent of `session.idle`. Only surface the
             // `idle` transition — `busy` / `retry` are not "turn-end"
@@ -513,6 +551,45 @@ fn translate(
         }
         _ => None,
     }
+}
+
+/// Pull the user's submitted prompt text out of an OpenCode message event
+/// envelope. OpenCode has moved the field around between releases, so
+/// accept both shapes:
+///
+/// * `properties.part.text` — emitted by `message.part.updated` for a
+///   text part.
+/// * `properties.info.parts[i].text` — embedded in `message.updated` /
+///   `message` events.
+/// * `properties.message.parts[i].text` — alternate older shape.
+///
+/// Returns the first non-empty text part found, or `None` if no text is
+/// present (e.g. the message has only tool parts).
+fn extract_user_message_text(properties: &Value) -> Option<String> {
+    if let Some(text) = properties
+        .get("part")
+        .and_then(|p| p.get("text"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(text.to_string());
+    }
+    let info = properties
+        .get("info")
+        .or_else(|| properties.get("message"))?;
+    let parts = info.get("parts").and_then(Value::as_array)?;
+    for p in parts {
+        if let Some(text) = p
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Some(text.to_string());
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -639,6 +716,49 @@ mod tests {
         let pending = new_pending_map();
         let fallback = SessionId::new("raum-default");
         let data = r#"{"type":"session.status","properties":{"sessionID":"sess-1","status":{"type":"busy"}}}"#;
+        assert!(translate(data, &pending, &fallback).is_none());
+    }
+
+    #[test]
+    fn translate_message_updated_user_role_emits_turnstart_with_prompt() {
+        let pending = new_pending_map();
+        let fallback = SessionId::new("raum-default");
+        let data = r#"{"type":"message.updated","properties":{"info":{"id":"m-1","role":"user","sessionID":"sess-1","parts":[{"type":"text","text":"refactor session.ts"}]}}}"#;
+        let ev = translate(data, &pending, &fallback).expect("event");
+        assert_eq!(ev.kind, NotificationKind::TurnStart);
+        assert_eq!(ev.session_id, SessionId::new("sess-1"));
+        assert_eq!(
+            ev.payload.get("prompt").and_then(Value::as_str),
+            Some("refactor session.ts")
+        );
+    }
+
+    #[test]
+    fn translate_message_part_updated_user_role_emits_turnstart() {
+        let pending = new_pending_map();
+        let fallback = SessionId::new("raum-default");
+        let data = r#"{"type":"message.part.updated","properties":{"info":{"id":"m-1","role":"user","sessionID":"sess-1"},"part":{"type":"text","text":"add rate limit"}}}"#;
+        let ev = translate(data, &pending, &fallback).expect("event");
+        assert_eq!(ev.kind, NotificationKind::TurnStart);
+        assert_eq!(
+            ev.payload.get("prompt").and_then(Value::as_str),
+            Some("add rate limit")
+        );
+    }
+
+    #[test]
+    fn translate_message_updated_assistant_role_dropped() {
+        let pending = new_pending_map();
+        let fallback = SessionId::new("raum-default");
+        let data = r#"{"type":"message.updated","properties":{"info":{"id":"m-1","role":"assistant","sessionID":"sess-1","parts":[{"type":"text","text":"sure thing"}]}}}"#;
+        assert!(translate(data, &pending, &fallback).is_none());
+    }
+
+    #[test]
+    fn translate_message_updated_no_text_dropped() {
+        let pending = new_pending_map();
+        let fallback = SessionId::new("raum-default");
+        let data = r#"{"type":"message.updated","properties":{"info":{"id":"m-1","role":"user","sessionID":"sess-1","parts":[{"type":"tool"}]}}}"#;
         assert!(translate(data, &pending, &fallback).is_none());
     }
 

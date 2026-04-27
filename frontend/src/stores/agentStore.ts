@@ -31,6 +31,12 @@ export interface AgentListItem {
   supports_native_events: boolean;
   /** Latest `reliability` seen for this session, or `null` until a transition arrives. */
   reliability?: Reliability | null;
+  /**
+   * Most recent user-submitted prompt for this session, surfaced on the
+   * snapshot so a freshly-launched raum can repopulate the per-tab
+   * subtitle without waiting for a fresh `pane:prompt-updated` emit.
+   */
+  last_prompt?: { text: string; submitted_at_ms: number };
 }
 
 interface AgentStoreState {

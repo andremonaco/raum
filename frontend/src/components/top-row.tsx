@@ -58,6 +58,7 @@ import {
   activeCount,
   idleCount,
   refreshTerminals,
+  seedLastPromptsFromAgents,
   setTerminals,
   subscribeTerminalEvents,
   waitingCount,
@@ -493,6 +494,7 @@ export const TopRow: Component = () => {
       .then((snap) => {
         setAdapters(snap.agents);
         setTerminals(snap.terminals);
+        seedLastPromptsFromAgents(snap.agents);
       })
       .catch((e) => {
         // Fallback for older backends / test harnesses without the

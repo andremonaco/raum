@@ -50,6 +50,83 @@ pub struct AgentStateChanged {
     pub reliability: Reliability,
 }
 
+/// The user's most recently submitted prompt for a session. Captured from
+/// `UserPromptSubmit` hook payloads (Claude Code, Codex) and from the
+/// equivalent SSE event (OpenCode). Truncated to [`MAX_PROMPT_BYTES`] at
+/// write time so a giant pasted brief doesn't bloat the IPC bus or the
+/// session TOML.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptEntry {
+    pub text: String,
+    pub submitted_at_ms: u64,
+}
+
+/// Sibling to [`AgentStateChanged`] — re-emitted onto the Tauri webview
+/// as `pane:prompt-updated` so the tab can render the latest user prompt
+/// as a subtitle row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PromptUpdated {
+    pub session_id: SessionId,
+    pub harness: AgentKind,
+    pub text: String,
+    pub submitted_at_ms: u64,
+}
+
+/// Hard cap on the bytes we store / forward for a single prompt. The UI
+/// truncates further for display; this cap exists so a 1 MB pasted brief
+/// can't repeatedly cross the IPC boundary or balloon the persisted TOML.
+pub const MAX_PROMPT_BYTES: usize = 4096;
+
+/// UTF-8 safe truncation. If `text` is longer than [`MAX_PROMPT_BYTES`]
+/// bytes, drops bytes from the end at the previous char boundary and
+/// appends an ellipsis.
+#[must_use]
+pub fn truncate_prompt(text: &str) -> String {
+    if text.len() <= MAX_PROMPT_BYTES {
+        return text.to_string();
+    }
+    let mut end = MAX_PROMPT_BYTES;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = String::with_capacity(end + 3);
+    out.push_str(&text[..end]);
+    out.push('…');
+    out
+}
+
+/// Pull the user's prompt text out of a harness-specific hook payload.
+/// Returns `None` for harnesses without a known field (e.g. `Shell`) or
+/// when the field is missing.
+///
+/// * Claude Code emits `{ "prompt": "...", ... }` to the
+///   `UserPromptSubmit` hook on stdin.
+/// * Codex emits the same field for its `UserPromptSubmit` hook;
+///   `user_message` and `message` are accepted as fallbacks because the
+///   Codex hook payload schema has shifted between minor versions.
+/// * OpenCode does not flow through this helper — its prompts come off
+///   the SSE bus and are recorded directly via `record_user_prompt`.
+#[must_use]
+pub fn extract_user_prompt(harness: AgentKind, payload: &serde_json::Value) -> Option<String> {
+    let candidate = match harness {
+        AgentKind::ClaudeCode => payload.get("prompt"),
+        AgentKind::Codex => payload
+            .get("prompt")
+            .or_else(|| payload.get("user_message"))
+            .or_else(|| payload.get("message")),
+        // OpenCode prompts arrive over SSE; the channel synthesises a
+        // `UserPromptSubmit` wire event with `payload.prompt` set, so the
+        // same drain path handles all three harnesses uniformly.
+        AgentKind::OpenCode => payload.get("prompt"),
+        AgentKind::Shell => None,
+    };
+    candidate
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentStateMachine {
     session_id: SessionId,
@@ -68,6 +145,10 @@ pub struct AgentStateMachine {
     /// turn-end / error signals so stale trailing output cannot immediately
     /// reclaim `Working`.
     activity_armed: bool,
+    /// Most recent user-submitted prompt for this session. Replaced
+    /// in-place on each new submit; surfaced to the UI as the tab
+    /// subtitle.
+    last_prompt: Option<PromptEntry>,
 }
 
 impl AgentStateMachine {
@@ -80,6 +161,7 @@ impl AgentStateMachine {
             silence_threshold: Duration::from_millis(DEFAULT_SILENCE_THRESHOLD_MS),
             silence_only: false,
             activity_armed: false,
+            last_prompt: None,
         }
     }
 
@@ -141,6 +223,35 @@ impl AgentStateMachine {
     #[must_use]
     pub fn silence_threshold(&self) -> Duration {
         self.silence_threshold
+    }
+
+    #[must_use]
+    pub fn last_prompt(&self) -> Option<&PromptEntry> {
+        self.last_prompt.as_ref()
+    }
+
+    /// Seed the machine with a previously-persisted prompt so a freshly
+    /// rehydrated session shows the same context the user left behind.
+    pub fn seed_last_prompt(&mut self, entry: PromptEntry) {
+        self.last_prompt = Some(entry);
+    }
+
+    /// Record a user submit. Replaces the stored prompt, returning a
+    /// [`PromptUpdated`] record the caller can broadcast on the bus. The
+    /// state machine itself is not transitioned by this call — callers
+    /// pair it with `on_hook_event(UserPromptSubmit)` for the state side.
+    pub fn record_user_prompt(&mut self, text: String, submitted_at_ms: u64) -> PromptUpdated {
+        let entry = PromptEntry {
+            text: truncate_prompt(&text),
+            submitted_at_ms,
+        };
+        self.last_prompt = Some(entry.clone());
+        PromptUpdated {
+            session_id: self.session_id.clone(),
+            harness: self.harness,
+            text: entry.text,
+            submitted_at_ms: entry.submitted_at_ms,
+        }
     }
 
     /// Apply a hook event. Returns `Some(change)` if the state advanced.
@@ -839,5 +950,108 @@ mod tests {
         m.insert("codex".into(), 2000u64);
         let d = resolve_silence_threshold(AgentKind::Codex, &m);
         assert_eq!(d, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn extract_user_prompt_claude() {
+        let payload = serde_json::json!({ "session_id": "s", "prompt": "refactor session.ts" });
+        assert_eq!(
+            extract_user_prompt(AgentKind::ClaudeCode, &payload).as_deref(),
+            Some("refactor session.ts")
+        );
+    }
+
+    #[test]
+    fn extract_user_prompt_codex_fallbacks() {
+        let prompt = serde_json::json!({ "prompt": "primary" });
+        assert_eq!(
+            extract_user_prompt(AgentKind::Codex, &prompt).as_deref(),
+            Some("primary")
+        );
+        let user_msg = serde_json::json!({ "user_message": "fallback" });
+        assert_eq!(
+            extract_user_prompt(AgentKind::Codex, &user_msg).as_deref(),
+            Some("fallback")
+        );
+    }
+
+    #[test]
+    fn extract_user_prompt_missing_field_returns_none() {
+        let payload = serde_json::json!({ "other": "stuff" });
+        assert!(extract_user_prompt(AgentKind::ClaudeCode, &payload).is_none());
+    }
+
+    #[test]
+    fn extract_user_prompt_empty_or_whitespace_returns_none() {
+        let blank = serde_json::json!({ "prompt": "   " });
+        assert!(extract_user_prompt(AgentKind::ClaudeCode, &blank).is_none());
+    }
+
+    #[test]
+    fn extract_user_prompt_shell_returns_none() {
+        let payload = serde_json::json!({ "prompt": "ls" });
+        assert!(extract_user_prompt(AgentKind::Shell, &payload).is_none());
+    }
+
+    #[test]
+    fn truncate_prompt_short_passthrough() {
+        assert_eq!(truncate_prompt("hello"), "hello");
+    }
+
+    #[test]
+    fn truncate_prompt_caps_long_input_with_ellipsis() {
+        let big = "a".repeat(MAX_PROMPT_BYTES + 100);
+        let out = truncate_prompt(&big);
+        assert!(out.ends_with('…'));
+        assert!(out.len() <= MAX_PROMPT_BYTES + '…'.len_utf8());
+    }
+
+    #[test]
+    fn truncate_prompt_respects_char_boundary() {
+        // build a string whose byte length straddles MAX_PROMPT_BYTES on
+        // a multi-byte char so a naive `&s[..MAX]` would panic.
+        let mut s = "a".repeat(MAX_PROMPT_BYTES - 1);
+        s.push('é'); // 2 bytes — boundary at MAX_PROMPT_BYTES + 1
+        s.push_str(&"a".repeat(50));
+        let out = truncate_prompt(&s);
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn record_user_prompt_stores_and_returns_record() {
+        let mut m = sm();
+        let updated = m.record_user_prompt("refactor session".into(), 1_700_000_000_000);
+        assert_eq!(updated.text, "refactor session");
+        assert_eq!(updated.submitted_at_ms, 1_700_000_000_000);
+        let stored = m.last_prompt().expect("last_prompt set");
+        assert_eq!(stored.text, "refactor session");
+    }
+
+    #[test]
+    fn extract_user_prompt_works_with_decode_payload_for_string_wrapper() {
+        // Regression: the hook script `json_escape`s harness stdin into a
+        // JSON-encoded *string*, so the wire payload arrives as
+        // `Value::String("{...}")`. `decode_payload` unwraps the wrapper;
+        // `extract_user_prompt` only sees fields after that decode runs.
+        let raw = r#"{"session_id":"s-1","prompt":"refactor session.ts"}"#;
+        let wire = serde_json::Value::String(raw.to_string());
+        // Without decode: extraction fails because the value is a string.
+        assert!(extract_user_prompt(AgentKind::ClaudeCode, &wire).is_none());
+        // With decode: extraction succeeds.
+        let decoded = crate::harness::decode_payload(&wire);
+        assert_eq!(
+            extract_user_prompt(AgentKind::ClaudeCode, decoded.as_ref()).as_deref(),
+            Some("refactor session.ts")
+        );
+    }
+
+    #[test]
+    fn record_user_prompt_replaces_previous() {
+        let mut m = sm();
+        m.record_user_prompt("first".into(), 100);
+        m.record_user_prompt("second".into(), 200);
+        let stored = m.last_prompt().unwrap();
+        assert_eq!(stored.text, "second");
+        assert_eq!(stored.submitted_at_ms, 200);
     }
 }

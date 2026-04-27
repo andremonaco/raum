@@ -189,9 +189,46 @@ impl ConfigStore {
                 created_at_unix_ms: at_unix_ms,
                 last_state: Some(state),
                 last_state_at_unix_ms: Some(at_unix_ms),
+                last_prompt_text: None,
+                last_prompt_at_unix_ms: None,
             });
         }
         self.write_sessions(&st)
+    }
+
+    /// Upsert the most recently submitted prompt for `session_id`. The
+    /// session row must already exist (created by either
+    /// `update_session_last_state` or `upsert_tracked_session`) for the
+    /// write to take effect. The agent-event bridge tolerates a missing
+    /// row — the prompt simply isn't persisted that turn — because the
+    /// state-change path will register the row on its own emit and the
+    /// next prompt persists then.
+    pub fn update_session_last_prompt(
+        &self,
+        session_id: &str,
+        text: &str,
+        at_unix_ms: u64,
+    ) -> Result<(), StoreError> {
+        let mut st = self.read_sessions().unwrap_or_default();
+        let Some(row) = st.sessions.iter_mut().find(|s| s.session_id == session_id) else {
+            return Ok(());
+        };
+        row.last_prompt_text = Some(text.to_string());
+        row.last_prompt_at_unix_ms = Some(at_unix_ms);
+        self.write_sessions(&st)
+    }
+
+    /// Fetch the last persisted prompt + timestamp for `session_id`. Used
+    /// by the reattach seed path so a freshly-launched raum repopulates
+    /// the tab subtitle without the user re-submitting.
+    #[must_use]
+    pub fn last_session_prompt(&self, session_id: &str) -> Option<(String, u64)> {
+        let st = self.read_sessions().ok()?;
+        let row = st
+            .sessions
+            .into_iter()
+            .find(|s| s.session_id == session_id)?;
+        Some((row.last_prompt_text?, row.last_prompt_at_unix_ms?))
     }
 
     /// Fetch the last persisted `AgentState` for `session_id`, if any.
@@ -249,6 +286,8 @@ impl ConfigStore {
                 created_at_unix_ms,
                 last_state: None,
                 last_state_at_unix_ms: None,
+                last_prompt_text: None,
+                last_prompt_at_unix_ms: None,
             });
         }
         self.write_sessions(&st)
@@ -683,6 +722,8 @@ mod tests {
                 created_at_unix_ms: 42,
                 last_state: None,
                 last_state_at_unix_ms: None,
+                last_prompt_text: None,
+                last_prompt_at_unix_ms: None,
             }],
         };
         store.write_sessions(&st).unwrap();

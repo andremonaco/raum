@@ -323,13 +323,16 @@ pub fn run() {
 /// handle.
 fn bootstrap_event_socket(app: &mut tauri::App) {
     let sock_path = paths::event_socket_path();
-    let bus_tx = {
+    let (bus_tx, prompt_bus_tx) = {
         let state: tauri::State<'_, state::AppHandleState> = app.state();
         // Make sure the bridge task is running _before_ we start draining
         // socket events — otherwise early transitions emitted before the
         // first `agent_spawn` call would be lost on the broadcast bus.
         commands::agent::ensure_bridge_running(app.handle(), &state.agent_events);
-        state.agent_events.tx.clone()
+        (
+            state.agent_events.tx.clone(),
+            state.agent_events.prompt_tx.clone(),
+        )
     };
     let app_handle = app.handle().clone();
 
@@ -388,7 +391,10 @@ fn bootstrap_event_socket(app: &mut tauri::App) {
             }
         });
 
-        let bus = commands::agent::AgentEventBus { tx: bus_tx };
+        let bus = commands::agent::AgentEventBus {
+            tx: bus_tx,
+            prompt_tx: prompt_bus_tx,
+        };
         commands::agent::drive_event_socket(merged_rx, bus, app_handle).await;
     });
 }

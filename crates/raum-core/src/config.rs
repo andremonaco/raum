@@ -534,6 +534,14 @@ pub struct TrackedSession {
     pub last_state: Option<AgentState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_state_at_unix_ms: Option<u64>,
+    /// Most recent user-submitted prompt for this session. Persisted so a
+    /// freshly relaunched raum can repopulate the tab subtitle without
+    /// waiting for the user to submit again. Truncated upstream by
+    /// `truncate_prompt` to keep the file small.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_prompt_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_prompt_at_unix_ms: Option<u64>,
 }
 
 /// `state/quickfire-history.toml` — bounded ring of recent quick-fire commands.
@@ -849,6 +857,8 @@ mod tests {
                 created_at_unix_ms: 1_714_000_000_000,
                 last_state: None,
                 last_state_at_unix_ms: None,
+                last_prompt_text: None,
+                last_prompt_at_unix_ms: None,
             }],
         };
         roundtrip(st);
