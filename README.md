@@ -103,6 +103,10 @@ cargo tauri build               # release bundle
 
 Contributor tooling (formatters, linters, pre-commit hooks) lives behind the `task` runner — see [`AGENTS.md`](AGENTS.md).
 
+## Acknowledgements
+
+raum is inspired by [daintree](https://github.com/daintreehq/daintree).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
