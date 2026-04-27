@@ -119,6 +119,35 @@ describe("terminalSurfaceProjection", () => {
     expect(surfaces[0].visible).toBe(true);
   });
 
+  it("hides layout surfaces behind another maximized pane", () => {
+    const alpha = cell("alpha", "alpha");
+    const beta = cell("beta", "alpha");
+
+    const surfaces = projectTerminalSurfaces({
+      cells: [alpha, beta],
+      activeRectMap: new Map([
+        ["alpha", rect("alpha")],
+        ["beta", rect("beta", 5000, 0)],
+      ]),
+      minimizedPaneIds: new Set(),
+      crossProjectMode: null,
+      projectedSessionIds: [],
+      projectedRectMap: new Map(),
+      terminalById: {},
+      focusedPaneId: "beta",
+      maximizedPaneId: "beta",
+    });
+
+    expect(surfaces.find((surface) => surface.cellId === "alpha")).toMatchObject({
+      visible: false,
+      maximized: false,
+    });
+    expect(surfaces.find((surface) => surface.cellId === "beta")).toMatchObject({
+      visible: true,
+      maximized: true,
+    });
+  });
+
   it("pre-owns orphan harness sessions and only shows projected ones", () => {
     const surfaces = projectTerminalSurfaces({
       cells: [],

@@ -75,8 +75,13 @@ export function projectTerminalSurfaces(
     if (!isAgentKind(cell.kind)) continue;
     const homeRect = cellHomeRect(cell);
     const activeRect = args.activeRectMap.get(cell.id) ?? null;
+    const blockedByOtherMaximized =
+      args.maximizedPaneId !== null && args.maximizedPaneId !== cell.id;
     const normalCellVisible =
-      !isCrossProject && activeRect !== null && !args.minimizedPaneIds.has(cell.id);
+      !isCrossProject &&
+      activeRect !== null &&
+      !args.minimizedPaneIds.has(cell.id) &&
+      !blockedByOtherMaximized;
 
     for (const tab of cell.tabs) {
       const activeTab = tab.id === cell.activeTabId;
