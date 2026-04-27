@@ -189,6 +189,49 @@ export const TerminalGrid: Component = () => {
   const activeTree = createMemo<LayoutNode | null>(() => projection().tree);
   const activeRectMap = createMemo<ReadonlyMap<string, Rect>>(() => projection().rects);
 
+  // LIVE-PREVIEW TREE.
+  //
+  // As the user hovers over a drop zone, replay the would-be mutation
+  // *locally* using the same pure tree ops that the commit path uses. Panes
+  // then render at their projected positions, so the grid reflows under
+  // the cursor and the user sees the final layout before releasing. Nothing
+  // touches the real store until pointerup — if the user drifts away from
+  // the zone, the preview clears and the real layout is untouched.
+  //
+  // Mutation replay mirrors onDrop exactly (swap vs. split, root vs. pane).
+  // Defined here (above `terminalSurfaces`) so the surface projection memo
+  // can route preview rects to non-source surfaces without a forward TDZ.
+  const previewTree = createMemo<LayoutNode | null>(() => {
+    const s = dragState();
+    const base = activeTree();
+    if (!s || !s.targetId || !s.zone || !base) return null;
+    if (s.sourceId === s.targetId) return null;
+
+    if (s.zone === "center") {
+      if (s.targetId === ROOT_TARGET) return null;
+      return swapLeaves(base, s.sourceId, s.targetId);
+    }
+
+    const direction = zoneToDirection(s.zone);
+    if (!direction) return null;
+    const removed = removeLeaf(base, s.sourceId);
+    if (!removed) return null;
+    const newLeaf: LayoutNode = { kind: "leaf", id: s.sourceId };
+    return s.targetId === ROOT_TARGET
+      ? splitAtRoot(removed, direction, newLeaf)
+      : splitAtLeaf(removed, s.targetId, direction, newLeaf);
+  });
+
+  // Projected cell geometry keyed by pane id. Both `LeafFrame` (chrome) and
+  // `terminalSurfaces` (live PTY) consume this so chrome and surfaces reflow
+  // in lockstep during a drag.
+  const previewCellMap = createMemo<Map<string, Rect> | null>(() => {
+    const pt = previewTree();
+    if (!pt) return null;
+    const rects = projectToRects(pt, LAYOUT_UNIT);
+    return new Map(rects.map((r) => [r.id, r]));
+  });
+
   // Cells that belong to the active tree, preserving store identity so xterm
   // instances stay mounted across `activeTree` recomputes.
   const activeCells = createMemo(() => {
@@ -247,6 +290,12 @@ export const TerminalGrid: Component = () => {
       terminalById: terminalStore.byId,
       focusedPaneId: focusedPaneId(),
       maximizedPaneId: effectiveMaximizedPaneId(),
+      // Live drag preview: route sibling cells to their projected rects so
+      // their terminals reflow in lockstep with the chrome layer's
+      // `previewCellMap`. Source cell stays at committed rect; the
+      // `surface-dragging-source` class translates it to follow the cursor.
+      previewRectMap: previewCellMap(),
+      dragSourceId: dragState()?.sourceId ?? null,
     }),
   );
 
@@ -431,49 +480,11 @@ export const TerminalGrid: Component = () => {
     }
   });
 
-  // LIVE-PREVIEW TREE.
-  //
-  // As the user hovers over a drop zone, replay the would-be mutation
-  // *locally* using the same pure tree ops that the commit path uses. Panes
-  // then render at their projected positions, so the grid reflows under
-  // the cursor and the user sees the final layout before releasing. Nothing
-  // touches the real store until pointerup — if the user drifts away from
-  // the zone, the preview clears and the real layout is untouched.
-  //
-  // Mutation replay mirrors onDrop exactly (swap vs. split, root vs. pane).
-  const previewTree = createMemo<LayoutNode | null>(() => {
-    const s = dragState();
-    const base = activeTree();
-    if (!s || !s.targetId || !s.zone || !base) return null;
-    if (s.sourceId === s.targetId) return null;
-
-    if (s.zone === "center") {
-      if (s.targetId === ROOT_TARGET) return null;
-      return swapLeaves(base, s.sourceId, s.targetId);
-    }
-
-    const direction = zoneToDirection(s.zone);
-    if (!direction) return null;
-    const removed = removeLeaf(base, s.sourceId);
-    if (!removed) return null;
-    const newLeaf: LayoutNode = { kind: "leaf", id: s.sourceId };
-    return s.targetId === ROOT_TARGET
-      ? splitAtRoot(removed, direction, newLeaf)
-      : splitAtLeaf(removed, s.targetId, direction, newLeaf);
-  });
-
-  // Projected cell geometry keyed by pane id. Each LeafFrame looks up its
-  // own id and renders at that position while preview is active.
-  const previewCellMap = createMemo<Map<string, Rect> | null>(() => {
-    const pt = previewTree();
-    if (!pt) return null;
-    const rects = projectToRects(pt, LAYOUT_UNIT);
-    return new Map(rects.map((r) => [r.id, r]));
-  });
-
   // Tree passed to DividerLayer — preview while hovering a zone so dividers
   // reflow with the panes (otherwise they'd be stuck at pre-drag positions
   // while panes animate to projected ones). Falls back to the real tree.
+  // (`previewTree` and `previewCellMap` are defined above so the surface
+  // projection memo can read them.)
   const renderTree = createMemo<LayoutNode | null>(() => previewTree() ?? activeTree());
 
   return (
@@ -570,7 +581,14 @@ export const TerminalGrid: Component = () => {
               </div>
             </Show>
 
-            <DividerLayer tree={renderTree()} />
+            {/* Hide dividers while a pane is maximized: there's nothing to
+                resize when one pane fills the canvas, and the chrome frame
+                renders transparent (only the 28 px header is opaque), so
+                the small grip pills would otherwise show through the
+                maximized terminal. */}
+            <Show when={effectiveMaximizedPaneId() === null}>
+              <DividerLayer tree={renderTree()} />
+            </Show>
           </Show>
 
           <Show when={crossProjectMode() !== null && projectedSessionIds().length > 0}>
@@ -720,12 +738,21 @@ const TerminalSurfaceHost: Component<{ surface: TerminalSurfaceDescriptor }> = (
 
   const rect = createMemo(() => props.surface.rect ?? lastRect());
   const visible = createMemo(() => props.surface.visible && rect() !== null);
+  // True when this surface owns the pane currently being dragged. The
+  // `.surface-dragging-source` CSS rule then translates it with the same
+  // `--drag-dx`/`--drag-dy` the chrome uses, so the live terminal rides
+  // alongside its chrome card while the rest of the grid reflows underneath.
+  const isDragSource = createMemo(
+    () => !!props.surface.cellId && props.surface.cellId === dragState()?.sourceId,
+  );
   const style = createMemo<Record<string, string>>(() => {
     const r = rect() ?? { id: props.surface.key, x: 0, y: 0, w: LAYOUT_UNIT, h: LAYOUT_UNIT };
     return {
       ...rectStyle(r),
       visibility: visible() ? "visible" : "hidden",
-      "pointer-events": visible() ? "auto" : "none",
+      // Ghost surface must pass pointer events through so destination panes
+      // remain hit-testable during the drag.
+      "pointer-events": visible() && !isDragSource() ? "auto" : "none",
     };
   });
 
@@ -763,10 +790,12 @@ const TerminalSurfaceHost: Component<{ surface: TerminalSurfaceDescriptor }> = (
       class="leaf-frame terminal-surface-frame flex min-h-0 min-w-0 flex-col"
       classList={{
         "pane-maximized": props.surface.maximized,
+        "surface-dragging-source": isDragSource(),
       }}
       data-surface-key={props.surface.key}
       data-cell-id={props.surface.cellId}
       data-session-id={props.surface.sessionId ?? ""}
+      data-dragging={isDragSource() ? "true" : "false"}
       style={style()}
       onFocusIn={claimFocus}
       onClick={claimFocus}

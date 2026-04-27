@@ -135,8 +135,13 @@ interface SpawnArgs {
   rows?: number;
 }
 
-/** §4.4 — debounce resize pushes so gridstack drag doesn't flood tmux. */
-const RESIZE_DEBOUNCE_MS = 100;
+/**
+ * §4.4 — throttle resize pushes. ResizeObserver can fire at display refresh
+ * rate while the user drags a divider or previews a pane drop; tmux cannot
+ * usefully consume every frame, but it must receive regular updates so TUIs
+ * repaint live instead of jumping after the interaction ends.
+ */
+const RESIZE_THROTTLE_MS = 32;
 
 /** Spawn gate: below these dims the host isn't laid out yet and fit returns junk. */
 const MIN_SPAWN_COLS = 20;
@@ -219,19 +224,18 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
   let resizeRepinDisposable: IDisposable | null = null;
   let unsubscribeTheme: (() => void) | null = null;
   let resizeRepinRaf: number | null = null;
-  // Observes the grid root's `.is-resizing` class so we can defer the real
-  // `terminal_resize` invoke until a divider drag ends instead of firing
-  // every debounced ResizeObserver tick. Tmux emits a full composite
-  // repaint on each resize; every repaint's trailing `\r\n` at the bottom
-  // row pushes a line into xterm's scrollback. Doing ONE resize per drag
-  // instead of ~20 cuts the per-drag pollution to a single line.
+  // Observes the grid root's `.is-resizing` class so we can force one final
+  // resize flush when an interactive divider/pane drag ends. During the drag
+  // itself the latest-wins resize pump below still sends throttled updates,
+  // keeping tmux, the PTY, and xterm's fitted geometry close enough that TUI
+  // redraws remain live and correctly wrapped.
   let gridMutationObserver: MutationObserver | null = null;
-  // Whether a drag ended with a fit/resize still pending. If the final
-  // ResizeObserver tick happened while `is-resizing` was still set, we
-  // skipped the tmux resize; the MutationObserver flushes it once the
-  // class is removed.
+  // Whether an interactive drag saw at least one ResizeObserver tick. The
+  // MutationObserver uses this as a cheap "final flush owed" flag because the
+  // last pointerup style mutation and the last ResizeObserver callback do not
+  // have a guaranteed ordering across WebKit/Chromium.
   let resizePendingFromDrag = false;
-  let requestVisibleResize: (() => void) | null = null;
+  let requestVisibleResize: ((force?: boolean) => void) | null = null;
   let bridgeRecoveryInFlight = false;
   let bridgeRecoveryAttempts = 0;
   let bridgeRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -311,7 +315,7 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
     const visible = props.visible !== false;
     setPaneVisibility(paneId, visible);
     if (!visible) return;
-    requestVisibleResize?.();
+    requestVisibleResize?.(true);
     if (props.active) void requestWebgl(paneId);
   });
 
@@ -438,17 +442,28 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       }
     };
 
-    // §4.4 — debounced resize plumbing. Every observer tick runs fit.fit() and
-    // pushes cols/rows to tmux, but we coalesce rapid-fire ticks (gridstack
-    // drag, window resize) so the harness sees at most one SIGWINCH per settle.
+    // §4.4 — throttled resize plumbing. ResizeObserver ticks can arrive at
+    // display refresh rate while pane geometry is changing; every dispatched
+    // resize still runs against the latest measured xterm dimensions, but
+    // in-flight tmux round-trips collapse to a single follow-up resize.
     //
     // Crucially: we DO NOT hook `term.onResize` — fit.fit() triggers it, which
     // would produce a duplicate `terminal_resize` invoke per host change.
     let lastCols = -1;
     let lastRows = -1;
+    let resizeInFlight = false;
+    let resizeQueued = false;
+    let forceNextResize = false;
+    let lastResizeDispatchMs = 0;
     const pushResize = (): void => {
       if (props.visible === false) return;
       if (!term || !fit) return;
+      if (resizeInFlight) {
+        resizeQueued = true;
+        return;
+      }
+      const force = forceNextResize;
+      forceNextResize = false;
       const shouldRepin = shouldAutoStickToBottomOnResize(props.kind) && isViewportAtBottom(term);
       try {
         fit.fit();
@@ -457,10 +472,12 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       }
       const id = sessionId();
       if (!id) return;
-      if (term.cols === lastCols && term.rows === lastRows) return;
+      if (!force && term.cols === lastCols && term.rows === lastRows) return;
       lastCols = term.cols;
       lastRows = term.rows;
       if (shouldRepin) scheduleResizeRepin(false);
+      resizeInFlight = true;
+      lastResizeDispatchMs = performance.now();
       void invoke("terminal_resize", {
         sessionId: id,
         cols: term.cols,
@@ -470,16 +487,33 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
           if (shouldRepin) scheduleResizeRepin(true);
         })
         .catch((e) => {
+          lastCols = -1;
+          lastRows = -1;
           console.error("[TerminalPane] terminal_resize failed", e);
+        })
+        .finally(() => {
+          resizeInFlight = false;
+          if (!resizeQueued) return;
+          resizeQueued = false;
+          scheduleResize(true);
         });
     };
-    const scheduleResize = (): void => {
+    const scheduleResize = (force = false): void => {
       if (props.visible === false) return;
-      if (resizeTimer !== null) clearTimeout(resizeTimer);
+      if (force) forceNextResize = true;
+      resizeQueued = true;
+      if (resizeTimer !== null) {
+        if (!force) return;
+        clearTimeout(resizeTimer);
+        resizeTimer = null;
+      }
+      const elapsed = performance.now() - lastResizeDispatchMs;
+      const delay = force ? 0 : Math.max(0, RESIZE_THROTTLE_MS - elapsed);
       resizeTimer = setTimeout(() => {
         resizeTimer = null;
+        resizeQueued = false;
         pushResize();
-      }, RESIZE_DEBOUNCE_MS);
+      }, delay);
     };
     requestVisibleResize = scheduleResize;
 
@@ -649,47 +683,25 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
     })();
 
     // §4.4 — dual-mode observer: pre-spawn it triggers trySpawn; post-spawn
-    // it decides whether to debounce-resize or defer-until-drag-end. Solid's
+    // it schedules a throttled latest-wins resize. Solid's
     // ref assignment has already run by the time onMount fires, so `host`
     // is guaranteed non-null here.
     //
     // When the user drags a grid divider, `<DividerLayer>` stamps
     // `.is-resizing` on the root `[data-dnd-root="true"]` element and clears
-    // it on pointerup. ResizeObserver fires ~60Hz during the drag; firing
-    // a tmux resize per tick triggers ~20 tmux composite repaints per drag,
-    // each of which ships a full-screen redraw to xterm.js. Each repaint's
-    // trailing `\r\n` at the bottom of the viewport pushes a line into
-    // scrollback — the "flipbook of ghost frames" users saw.
-    //
-    // Strategy: during a drag, update xterm's internal dims locally (so the
-    // viewport stays visually aligned with the container) but suppress the
-    // tmux + PTY resize. When the drag ends, fire ONE resize with the
-    // final dims. Net repaint count per drag: 1.
+    // it on pointerup. Pane DnD uses the same class while the preview tree is
+    // active. We still resize tmux during those interactions; the class only
+    // tells us to issue an immediate final flush on pointerup so the harness
+    // ends at the exact committed geometry.
     const gridRoot = (host as HTMLElement).closest<HTMLElement>('[data-dnd-root="true"]');
     const isDragging = (): boolean => gridRoot?.classList.contains("is-resizing") ?? false;
-
-    const fitLocalOnly = (): void => {
-      if (!term || !fit) return;
-      const shouldRepin = shouldAutoStickToBottomOnResize(props.kind) && isViewportAtBottom(term);
-      try {
-        fit.fit();
-      } catch {
-        /* xterm not laid out yet — harmless, retry next tick */
-      }
-      if (shouldRepin) scheduleResizeRepin(false);
-    };
 
     if (typeof ResizeObserver !== "undefined") {
       resizeObserver = new ResizeObserver(() => {
         if (hasSpawned) {
           if (props.visible === false) return;
           if (isDragging()) {
-            // Keep xterm's buffer sized to the container so the user sees
-            // smooth visual feedback during the drag, but hold off on the
-            // tmux resize. MutationObserver below flushes it on drag-end.
-            fitLocalOnly();
             resizePendingFromDrag = true;
-            return;
           }
           scheduleResize();
           return;
@@ -709,10 +721,10 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         if (gridRoot.classList.contains("is-resizing")) return;
         if (!resizePendingFromDrag) return;
         resizePendingFromDrag = false;
-        // Drag just ended and we owe tmux a resize. Use the debounced
-        // `scheduleResize` so a brief class-flip flurry (drag → snap →
-        // divider reset, etc.) still collapses to one tmux round-trip.
-        scheduleResize();
+        // Drag just ended and the last ResizeObserver tick may have raced
+        // with pointerup. Force the pump to measure now so tmux lands on the
+        // committed geometry without waiting for the next throttle window.
+        scheduleResize(true);
       });
       gridMutationObserver.observe(gridRoot, {
         attributes: true,

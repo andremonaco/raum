@@ -1472,10 +1472,6 @@ pub async fn terminal_resize(
         return Err("not-found".to_string());
     };
     let (c, r) = clamp_pty_dims(cols, rows);
-    if c == prev_cols && r == prev_rows {
-        // No-op resize; skip the tmux round-trip entirely.
-        return Ok(());
-    }
     let tmux = state.tmux.clone();
     let id = session_id.clone();
     // Resize ordering matters: tmux renders a hatched "|..." pattern when

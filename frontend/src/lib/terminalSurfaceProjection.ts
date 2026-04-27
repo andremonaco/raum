@@ -30,10 +30,21 @@ export interface ProjectTerminalSurfacesArgs {
   terminalById: Readonly<Record<string, TerminalRecord | undefined>>;
   focusedPaneId: string | null;
   maximizedPaneId: string | null;
-}
-
-function cellHomeRect(cell: RuntimeCell): Rect {
-  return { id: cell.id, x: cell.x, y: cell.y, w: cell.w, h: cell.h };
+  /**
+   * Speculative cell rects from the live drag preview tree. When present and
+   * the cell is not the drag source, takes precedence over `activeRectMap` so
+   * sibling terminals reflow in lockstep with their chrome during a drag.
+   * Cross-project mode still wins (`projectedRectMap` is consulted first).
+   */
+  previewRectMap?: ReadonlyMap<string, Rect> | null;
+  /**
+   * Cell id of the pane currently being dragged. Excluded from preview-rect
+   * routing so its surface stays anchored to the committed slot — the
+   * `.surface-dragging-source` CSS class then ghost-translates it to follow
+   * the cursor (matching the chrome's existing `--drag-dx`/`--drag-dy`
+   * transform).
+   */
+  dragSourceId?: string | null;
 }
 
 function isAgentKind(kind: RuntimeCell["kind"]): kind is AgentKind {
@@ -73,8 +84,14 @@ export function projectTerminalSurfaces(
 
   for (const cell of args.cells) {
     if (!isAgentKind(cell.kind)) continue;
-    const homeRect = cellHomeRect(cell);
-    const activeRect = args.activeRectMap.get(cell.id) ?? null;
+    const committedRect = args.activeRectMap.get(cell.id) ?? null;
+    // Sibling cells reflow to their preview rect; the drag source stays
+    // anchored to its committed rect (CSS ghost-translate moves it visually).
+    const previewRect =
+      args.previewRectMap && cell.id !== args.dragSourceId
+        ? (args.previewRectMap.get(cell.id) ?? null)
+        : null;
+    const activeRect = previewRect ?? committedRect;
     const blockedByOtherMaximized =
       args.maximizedPaneId !== null && args.maximizedPaneId !== cell.id;
     const normalCellVisible =
@@ -94,7 +111,7 @@ export function projectTerminalSurfaces(
         projectedIds.has(sessionId);
       const normalVisible = normalCellVisible && activeTab;
       const visible = normalVisible || crossVisible;
-      const rect = crossVisible ? projectedRect : normalVisible ? activeRect : homeRect;
+      const rect = crossVisible ? projectedRect : normalVisible ? activeRect : null;
       const projectSlug = tab.projectSlug ?? cell.projectSlug;
       const worktreeId = tab.worktreeId ?? cell.worktreeId;
       const maximized = visible && !isCrossProject && args.maximizedPaneId === cell.id;

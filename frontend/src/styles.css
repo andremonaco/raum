@@ -504,6 +504,20 @@ body,
   background: transparent;
   border-color: transparent;
   box-shadow: none;
+  transition: none;
+}
+
+/* Source surface during a drag: rides the same `--drag-dx`/`--drag-dy`
+   transform the chrome card uses, so the live terminal content tracks the
+   cursor in lockstep with its frame. The chrome's `.pane-dragging` rule
+   carries the visible card lift (border, glow, tilt); this rule just keeps
+   the terminal pixels glued to it. `transition: transform 0ms` is critical
+   — the inherited 220 ms transform easing from `.leaf-frame` would lag the
+   surface a fraction of a second behind the cursor, breaking the ghost. */
+.terminal-surface-frame.surface-dragging-source {
+  transform: translate(var(--drag-dx), var(--drag-dy)) rotate(-0.6deg) scale(1.02);
+  transition: transform 0ms;
+  will-change: transform;
 }
 
 .terminal-surface-body {
