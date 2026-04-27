@@ -335,7 +335,6 @@ function scheduleActiveSave(): void {
   _saveTimer = setTimeout(() => {
     _saveTimer = null;
     const cells = runtimeLayoutStore.cells;
-    if (cells.length === 0) return;
     const payload: ActiveLayoutState = {
       saved_at: Math.floor(Date.now() / 1000),
       cells: cells.map((c) => ({

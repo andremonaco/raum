@@ -269,6 +269,20 @@ describe("runtimeLayoutStore (BSP)", () => {
     expect(runtimeLayoutStore.cells.map((c) => c.id)).toEqual(["b"]);
   });
 
+  it("persists an empty active layout when the last pane is removed", async () => {
+    vi.useFakeTimers();
+    splitPane(pane("a"), null, "right");
+    vi.mocked(invoke).mockClear();
+
+    removePane("a");
+    await vi.advanceTimersByTimeAsync(500);
+
+    expect(runtimeLayoutStore.cells).toEqual([]);
+    expect(invoke).toHaveBeenCalledWith("active_layout_save", {
+      layout: expect.objectContaining({ cells: [] }),
+    });
+  });
+
   it("setActiveTabId switches the visible tab", () => {
     splitPane(pane("a"), null, "right");
     const firstTabId = runtimeLayoutStore.cells[0].tabs[0].id;
