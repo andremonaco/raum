@@ -901,7 +901,7 @@ fn worktree_status_for_path(path: &str) -> Result<WorktreeStatus, String> {
             "status",
             "--porcelain=v2",
             "--branch",
-            "--untracked-files=normal",
+            "--untracked-files=all",
         ])
         .output()
         .map_err(|e| format!("git status: {e}"))?;
