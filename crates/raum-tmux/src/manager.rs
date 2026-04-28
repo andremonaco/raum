@@ -600,7 +600,11 @@ impl TmuxManager {
 
     fn capture_pane(&self, id: &str, alternate_mode: bool) -> Result<Vec<u8>, TmuxError> {
         let mut cmd = self.cmd();
-        cmd.args(["capture-pane", "-p", "-e"]);
+        // `-J` joins lines tmux marked as hard-wrapped when they were stored
+        // in scrollback. Without it, replaying this capture into xterm.js
+        // paints old rows at the pane's previous (narrower) width — tmux
+        // never reflows stored history on resize.
+        cmd.args(["capture-pane", "-p", "-e", "-J"]);
         if alternate_mode {
             cmd.arg("-a");
         }
@@ -622,7 +626,8 @@ impl TmuxManager {
         line_count: u16,
     ) -> Result<Vec<u8>, TmuxError> {
         let mut cmd = self.cmd();
-        cmd.args(["capture-pane", "-p", "-e"]);
+        // See `capture_pane` for why `-J` is required here.
+        cmd.args(["capture-pane", "-p", "-e", "-J"]);
         if alternate_mode {
             cmd.arg("-a");
         }
