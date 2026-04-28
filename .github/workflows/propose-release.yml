@@ -37,6 +37,10 @@ jobs:
           # the PR will still open, CI just won't run on it.)
           token: ${{ secrets.RELEASE_BOT_TOKEN || secrets.GITHUB_TOKEN }}
 
+      # Needed solely so `cargo update -p raum` can rewrite Cargo.lock
+      # after the version bump. No compilation happens in this workflow.
+      - uses: dtolnay/rust-toolchain@stable
+
       - name: compute bump
         id: bump
         env:
@@ -168,6 +172,16 @@ jobs:
           set -euo pipefail
           sed -i "0,/^version = \"[^\"]*\"/ s//version = \"${NEXT_VERSION}\"/" src-tauri/Cargo.toml
 
+      # Refresh Cargo.lock so the `raum` entry tracks the new manifest
+      # version. Without this, every `cargo … --locked` step on main
+      # (CI hooks/clippy/test, the release.yml build matrix' tauri-action)
+      # fails with "cannot update the lock file because --locked was
+      # passed". `-p raum` scopes the update to that single package so
+      # other transitive deps don't drift in a release commit.
+      - name: sync Cargo.lock
+        if: steps.bump.outputs.bump != 'none'
+        run: cargo update -p raum
+
       - name: open or update release PR
         if: steps.bump.outputs.bump != 'none'
         env:
@@ -185,7 +199,7 @@ jobs:
           # runs stay idempotent: each push to main recomputes the bump
           # from the latest history and force-pushes the release branch.
           git checkout -B "${branch}"
-          git add src-tauri/Cargo.toml src-tauri/CHANGELOG.md
+          git add src-tauri/Cargo.toml src-tauri/CHANGELOG.md Cargo.lock
           if git diff --cached --quiet; then
             echo "nothing to commit — release branch already up to date" >&2
             exit 0
