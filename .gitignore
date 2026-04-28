@@ -35,6 +35,7 @@ openspec/**/*
 .claude/**/*
 .opencode/**/*
 .codex/**/*
+.agents/**/*
 passphrase/**/*
 .raum-updater-key.pem
 

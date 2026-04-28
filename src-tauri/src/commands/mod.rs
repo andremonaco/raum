@@ -18,6 +18,7 @@ pub mod search;
 pub mod terminal;
 pub mod updater;
 pub mod worktree;
+pub mod worktree_progress;
 
 // Each submodule's `#[tauri::command]` items are referenced fully-qualified from
 // `lib.rs::generate_handler!`, so we only re-export the small + small surfaces

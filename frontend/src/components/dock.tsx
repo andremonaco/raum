@@ -20,18 +20,31 @@
  */
 
 import { Component, For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js";
+import { invoke } from "@tauri-apps/api/core";
 
 import { leafIds as treeLeafIds } from "../lib/layoutTree";
+import { kindDisplayLabel, type AgentKind } from "../lib/agentKind";
+import { listTerminals } from "../lib/terminalRegistry";
 import {
+  adoptOrphanSession,
   compactTree,
   equalizeAllRatios,
   minimizedPaneIds,
   runtimeLayoutStore,
+  setFocusedPaneId,
   tileAll,
 } from "../stores/runtimeLayoutStore";
-import type { RuntimeCell } from "../stores/runtimeLayoutStore";
+import type { PaneContent, RuntimeCell } from "../stores/runtimeLayoutStore";
 import { agentStore } from "../stores/agentStore";
 import type { AgentState, Reliability } from "../stores/agentStore";
+import { activeProjectSlug } from "../stores/projectStore";
+import {
+  clearTerminalClosing,
+  closingTerminalIds,
+  markTerminalClosing,
+  terminalStore,
+  type TerminalRecord,
+} from "../stores/terminalStore";
 import {
   AlertCircleIcon,
   CheckIcon,
@@ -116,7 +129,7 @@ function attentionPriority(state: AgentState | null): number {
 
 // ── Cell-level state (resolved across all tabs of the cell) ──────────────────
 
-function resolvedCellState(cell: RuntimeCell): AgentState | null {
+function resolvedCellState(cell: PaneContent): AgentState | null {
   let best: AgentState | null = null;
   let bestP = Infinity;
   for (const tab of cell.tabs) {
@@ -135,7 +148,7 @@ function resolvedCellState(cell: RuntimeCell): AgentState | null {
  * resolved state). Used by the Waiting-state badge to distinguish a
  * deterministic hook-driven wait from a silence-heuristic guess.
  */
-function resolvedCellReliability(cell: RuntimeCell): Reliability | null {
+function resolvedCellReliability(cell: PaneContent): Reliability | null {
   let bestP = Infinity;
   let reliability: Reliability | null = null;
   for (const tab of cell.tabs) {
@@ -150,11 +163,60 @@ function resolvedCellReliability(cell: RuntimeCell): Reliability | null {
   return reliability;
 }
 
+const DOCK_TOOLTIP_CLASS =
+  "w-[min(24rem,calc(100vw-1rem))] max-w-[calc(100vw-1rem)] overflow-hidden space-y-1 bg-surface-raised p-2 text-foreground ring-1 ring-border";
+
 // ── Dock ──────────────────────────────────────────────────────────────────────
 
 export interface DockProps {
+  /** Off-tree minimized panes. The dock chip path used to filter the
+   *  in-tree `RuntimeCell[]` by `minimizedPaneIds`; now that minimize
+   *  removes the leaf from the BSP tree, those panes live exclusively in
+   *  `runtimeLayoutStore.panes` and don't carry geometry — `PaneContent`
+   *  is everything the dock needs. */
+  minimizedPanes: readonly PaneContent[];
   /** Fires when user clicks a chip. The cell should be restored to the grid. */
   onRestore: (cellId: string) => void;
+}
+
+/**
+ * Pure derivation of orphan terminal sessions for a given project. An "orphan"
+ * is a backend-known tmux session that:
+ *   • belongs to the active project
+ *   • is **alive** (not flagged `dead` by the rehydrate path)
+ *   • is **not** owned by any persisted layout tab or live layout terminal
+ *
+ * Dead sessions are excluded: dead-pane recovery still happens via the
+ * in-pane Recover overlay if the pane is mounted.
+ *
+ * Pulled out of the component so unit tests exercise it without rendering.
+ */
+export function selectOrphanRecords(
+  slug: string | undefined,
+  cells: ReadonlyArray<RuntimeCell>,
+  byId: Readonly<Record<string, TerminalRecord>>,
+  mountedLayoutSessionIds: ReadonlySet<string> = new Set(),
+  closingSessionIds: ReadonlySet<string> = new Set(),
+): TerminalRecord[] {
+  if (!slug) return [];
+  const inLayout = new Set<string>(mountedLayoutSessionIds);
+  for (const c of cells) {
+    for (const t of c.tabs) {
+      if (t.sessionId) inLayout.add(t.sessionId);
+    }
+  }
+  const out: TerminalRecord[] = [];
+  for (const r of Object.values(byId)) {
+    if (r.dead) continue;
+    if (r.project_slug !== slug) continue;
+    if (inLayout.has(r.session_id)) continue;
+    if (closingSessionIds.has(r.session_id)) continue;
+    out.push(r);
+  }
+  // Most recently created sits left so the user's last-spawned orphan is
+  // easiest to grab.
+  out.sort((a, b) => b.created_unix - a.created_unix);
+  return out;
 }
 
 export const Dock: Component<DockProps> = (props) => {
@@ -168,7 +230,10 @@ export const Dock: Component<DockProps> = (props) => {
   const minimizedCells = createMemo(() => {
     void tick(); // refresh timestamps
     const ids = minimizedPaneIds();
-    let list = runtimeLayoutStore.cells.filter((c) => ids.has(c.id)).slice();
+    // The caller hands us only the off-tree minimized panes; defensively
+    // re-filter here so a stale prop snapshot never resurrects a chip after
+    // its pane was restored or removed.
+    let list = props.minimizedPanes.filter((p) => ids.has(p.id)).slice();
     const mode = dockFilterMode();
 
     // Filter first, then apply the mode-specific ordering. When no filter is
@@ -201,6 +266,26 @@ export const Dock: Component<DockProps> = (props) => {
     );
   });
 
+  // Orphan terminal sessions for the active project. Filter pills intentionally
+  // don't apply: a live tmux session that fell out of the layout should always
+  // stay reachable until the user restores or kills it.
+  const orphanRecords = createMemo<TerminalRecord[]>(() => {
+    void tick();
+    const slug = activeProjectSlug();
+    const mountedLayoutSessionIds = new Set<string>();
+    for (const terminal of listTerminals()) {
+      if (terminal.paneId.startsWith("orphan:")) continue;
+      if (terminal.sessionId) mountedLayoutSessionIds.add(terminal.sessionId);
+    }
+    return selectOrphanRecords(
+      slug,
+      runtimeLayoutStore.cells,
+      terminalStore.byId,
+      mountedLayoutSessionIds,
+      closingTerminalIds(),
+    );
+  });
+
   return (
     <div class="flex h-8 shrink-0 items-center bg-background" aria-label="Dock">
       <div class="flex shrink-0 items-center gap-2 px-2">
@@ -211,6 +296,10 @@ export const Dock: Component<DockProps> = (props) => {
         <For each={minimizedCells()}>
           {(cell) => <DockChip cell={cell} tick={tick()} onRestore={props.onRestore} />}
         </For>
+        <Show when={orphanRecords().length > 0 && minimizedCells().length > 0}>
+          <span class="h-4 w-px shrink-0 bg-border" aria-hidden />
+        </Show>
+        <For each={orphanRecords()}>{(record) => <OrphanChip record={record} />}</For>
       </div>
     </div>
   );
@@ -347,7 +436,7 @@ const LayoutActions: Component = () => {
 // ── DockChip ──────────────────────────────────────────────────────────────────
 
 interface DockChipProps {
-  cell: RuntimeCell;
+  cell: PaneContent;
   tick: number;
   onRestore: (cellId: string) => void;
 }
@@ -375,7 +464,7 @@ const DockChip: Component<DockChipProps> = (props) => {
     return s
       .split(" ↵ ")
       .map((line) => (
-        <span class="block max-w-xs truncate font-mono text-[10px] text-foreground">{line}</span>
+        <span class="block max-w-full truncate font-mono text-[10px] text-foreground">{line}</span>
       ));
   };
 
@@ -403,10 +492,10 @@ const DockChip: Component<DockChipProps> = (props) => {
         </Show>
       </TooltipTrigger>
       <TooltipPortal>
-        <TooltipContent class="max-w-xs space-y-1 bg-surface-raised p-2 text-foreground ring-1 ring-border">
-          <div class="flex items-center gap-1.5">
+        <TooltipContent class={DOCK_TOOLTIP_CLASS}>
+          <div class="flex min-w-0 items-center gap-1.5">
             <Icon />
-            <span class="font-medium">{label()}</span>
+            <span class="min-w-0 flex-1 truncate font-medium">{label()}</span>
             <Show when={tabCount() > 1}>
               <span class="rounded bg-active px-1 text-[9px] text-foreground-subtle">
                 {tabCount()} tabs
@@ -415,12 +504,121 @@ const DockChip: Component<DockChipProps> = (props) => {
             <DockStateLabel state={state()} />
           </div>
           <Show when={tooltipSnippet()}>
-            <div class="mt-1 space-y-0.5 border-t border-border pt-1">{tooltipSnippet()}</div>
+            <div class="mt-1 min-w-0 space-y-0.5 overflow-hidden border-t border-border pt-1">
+              {tooltipSnippet()}
+            </div>
           </Show>
           <Show when={timestamp()}>
             <p class="text-[9px] text-foreground-dim">{timestamp()}</p>
           </Show>
           <p class="text-[9px] text-foreground-dim">Click to restore</p>
+        </TooltipContent>
+      </TooltipPortal>
+    </Tooltip>
+  );
+};
+
+// ── OrphanChip ───────────────────────────────────────────────────────────────
+//
+// Renders an alive project session that exists on the tmux socket but
+// isn't mounted in any cell of the current runtime layout. Two affordances:
+//
+//   • Click body  → recover into the grid via `adoptOrphanSession`.
+//                   `<TerminalPane>` reattaches via `terminal_reattach` on
+//                   mount.
+//   • Click ×     → permanently kill the session via `terminal_kill`. The
+//                   backend's `terminal-session-removed` event flows
+//                   through `subscribeTerminalEvents` and the chip drops
+//                   on its own — no local optimistic state.
+//
+// Dead sessions are filtered out upstream (`selectOrphanRecords`), so this
+// component never has to handle the `dead` branch.
+
+function shortSessionId(id: string): string {
+  // Session ids look like `claude-code-1714235692-12`. Trim to a 6-char
+  // suffix when there's no other label so the chip stays narrow but
+  // distinguishable.
+  if (id.length <= 6) return id;
+  return id.slice(-6);
+}
+
+function orphanLabel(record: TerminalRecord): string {
+  const kindLabel = kindDisplayLabel(record.kind as AgentKind);
+  if (record.worktree_id) return `${kindLabel} · ${record.worktree_id}`;
+  return `${kindLabel} · ${shortSessionId(record.session_id)}`;
+}
+
+interface OrphanChipProps {
+  record: TerminalRecord;
+}
+
+const OrphanChip: Component<OrphanChipProps> = (props) => {
+  const Icon = () => {
+    const I = HARNESS_ICONS[props.record.kind as keyof typeof HARNESS_ICONS];
+    return I ? <I class="h-3 w-3 shrink-0" /> : null;
+  };
+
+  const state = () => agentStore.sessions[props.record.session_id]?.state ?? null;
+  const reliability = () => agentStore.sessions[props.record.session_id]?.reliability ?? null;
+
+  const onAdopt = (): void => {
+    const newPaneId = adoptOrphanSession({
+      sessionId: props.record.session_id,
+      kind: props.record.kind,
+      projectSlug: props.record.project_slug ?? undefined,
+      worktreeId: props.record.worktree_id ?? undefined,
+    });
+    setFocusedPaneId(newPaneId);
+  };
+
+  const onKill = (e: MouseEvent): void => {
+    e.stopPropagation();
+    const sessionId = props.record.session_id;
+    markTerminalClosing(sessionId);
+    void invoke("terminal_kill", { sessionId }).catch((err: unknown) => {
+      clearTerminalClosing(sessionId);
+      // Non-fatal — the chip stays visible until the backend confirms
+      // removal. Surface to the console so a CI bisect can find the
+      // root cause if this ever starts failing silently.
+      console.warn("[dock] terminal_kill failed", err);
+    });
+  };
+
+  return (
+    <Tooltip openDelay={150} closeDelay={0} placement="top">
+      <TooltipTrigger
+        as="div"
+        class="group flex h-6 max-w-56 shrink-0 items-center rounded-md bg-surface-raised text-[10px] text-muted-foreground transition-colors hover:bg-hover hover:text-foreground"
+      >
+        <button
+          type="button"
+          class="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 px-2 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+          onClick={onAdopt}
+          title="Restore to grid"
+        >
+          <Icon />
+          <DockStateIndicator state={state()} reliability={reliability()} />
+          <span class="min-w-0 truncate text-[10px]">{orphanLabel(props.record)}</span>
+        </button>
+        <button
+          type="button"
+          aria-label={`Close ${orphanLabel(props.record)}`}
+          class="mr-1 flex h-4 w-4 shrink-0 items-center justify-center rounded text-[12px] leading-none text-foreground-dim opacity-0 transition-opacity hover:bg-active hover:text-foreground group-hover:opacity-100 focus-visible:opacity-100"
+          onClick={onKill}
+        >
+          ×
+        </button>
+      </TooltipTrigger>
+      <TooltipPortal>
+        <TooltipContent class={DOCK_TOOLTIP_CLASS}>
+          <div class="flex min-w-0 items-center gap-1.5">
+            <Icon />
+            <span class="min-w-0 flex-1 truncate font-medium">
+              {orphanLabel(props.record)} — not in grid
+            </span>
+            <DockStateLabel state={state()} />
+          </div>
+          <p class="text-[9px] text-foreground-dim">Click to restore into the grid; × to kill</p>
         </TooltipContent>
       </TooltipPortal>
     </Tooltip>

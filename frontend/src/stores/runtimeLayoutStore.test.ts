@@ -16,12 +16,21 @@ import {
   focusPaneByIndex,
   LAYOUT_UNIT,
   layoutRev,
+  maximizeLayoutSnap,
   maximizedPaneId,
+  isTabAlive,
+  isTabPendingReset,
+  markTabPendingReset,
   removePane,
   removeCellTab,
+  removeTabsBySessionId,
   runtimeLayoutStore,
   setActiveTabId,
   setRuntimeLayout,
+  setFocusedPaneId,
+  minimizedPaneIds,
+  minimizePane,
+  restorePane,
   setSessionId,
   setSplitRatios,
   setTabLabel,
@@ -269,6 +278,89 @@ describe("runtimeLayoutStore (BSP)", () => {
     expect(runtimeLayoutStore.cells.map((c) => c.id)).toEqual(["b"]);
   });
 
+  it("isTabAlive reflects tab presence; false for missing pane or tab", () => {
+    splitPane(pane("a"), null, "right");
+    const firstTabId = runtimeLayoutStore.cells[0].tabs[0].id;
+    expect(isTabAlive("a", firstTabId)).toBe(true);
+    expect(isTabAlive("a", "nonexistent")).toBe(false);
+    expect(isTabAlive("missing-pane", firstTabId)).toBe(false);
+  });
+
+  it("markTabPendingReset flags the tab; flag survives until tab/pane removal", () => {
+    splitPane(pane("a"), null, "right");
+    const firstTabId = runtimeLayoutStore.cells[0].tabs[0].id;
+    expect(isTabPendingReset("a", firstTabId)).toBe(false);
+    markTabPendingReset("a", firstTabId);
+    expect(isTabPendingReset("a", firstTabId)).toBe(true);
+    // Independent tabs don't share the flag.
+    const secondTabId = addCellTab("a");
+    expect(isTabPendingReset("a", secondTabId)).toBe(false);
+    expect(isTabPendingReset("a", firstTabId)).toBe(true);
+  });
+
+  it("removeCellTab clears the pending-reset flag for the removed tab", () => {
+    splitPane(pane("a"), null, "right");
+    const firstTabId = runtimeLayoutStore.cells[0].tabs[0].id;
+    addCellTab("a");
+    markTabPendingReset("a", firstTabId);
+    removeCellTab("a", firstTabId);
+    // The tab is gone, but the pending-reset registry must not retain stale
+    // entries — otherwise a future tab reusing the same id would inherit a
+    // bogus "pending" status.
+    expect(isTabPendingReset("a", firstTabId)).toBe(false);
+  });
+
+  it("removePane clears pending-reset flags for all tabs in the pane", () => {
+    splitPane(pane("a"), null, "right");
+    splitPane(pane("b"), "a", "right");
+    const aTab = runtimeLayoutStore.cells.find((c) => c.id === "a")!.tabs[0].id;
+    addCellTab("a");
+    const aTab2 = runtimeLayoutStore.cells.find((c) => c.id === "a")!.tabs[1].id;
+    markTabPendingReset("a", aTab);
+    markTabPendingReset("a", aTab2);
+    removePane("a");
+    expect(isTabPendingReset("a", aTab)).toBe(false);
+    expect(isTabPendingReset("a", aTab2)).toBe(false);
+  });
+
+  it("removeTabsBySessionId removes stale session tabs from the persisted layout", () => {
+    setRuntimeLayout([
+      cell("a", {
+        tabs: [
+          { id: "tab-a-1", sessionId: "stale" },
+          { id: "tab-a-2", sessionId: "live" },
+        ],
+        activeTabId: "tab-a-1",
+      }),
+      cell("b", {
+        x: LAYOUT_UNIT / 2,
+        w: LAYOUT_UNIT / 2,
+        tabs: [{ id: "tab-b-1", sessionId: "stale" }],
+        activeTabId: "tab-b-1",
+      }),
+    ]);
+
+    removeTabsBySessionId("stale");
+
+    expect(runtimeLayoutStore.cells.map((c) => c.id)).toEqual(["a"]);
+    expect(runtimeLayoutStore.cells[0].tabs).toEqual([{ id: "tab-a-2", sessionId: "live" }]);
+    expect(runtimeLayoutStore.cells[0].activeTabId).toBe("tab-a-2");
+  });
+
+  it("persists an empty active layout when the last pane is removed", async () => {
+    vi.useFakeTimers();
+    splitPane(pane("a"), null, "right");
+    vi.mocked(invoke).mockClear();
+
+    removePane("a");
+    await vi.advanceTimersByTimeAsync(500);
+
+    expect(runtimeLayoutStore.cells).toEqual([]);
+    expect(invoke).toHaveBeenCalledWith("active_layout_save", {
+      layout: expect.objectContaining({ cells: [] }),
+    });
+  });
+
   it("setActiveTabId switches the visible tab", () => {
     splitPane(pane("a"), null, "right");
     const firstTabId = runtimeLayoutStore.cells[0].tabs[0].id;
@@ -287,6 +379,18 @@ describe("runtimeLayoutStore (BSP)", () => {
     toggleMaximize("a");
     clearMaximize();
     expect(maximizedPaneId()).toBeNull();
+  });
+
+  it("snaps maximize geometry briefly so restored panes do not block clicks", () => {
+    vi.useFakeTimers();
+    splitPane(pane("a"), null, "right");
+    expect(maximizeLayoutSnap()).toBe(false);
+
+    toggleMaximize("a");
+    expect(maximizeLayoutSnap()).toBe(true);
+
+    vi.advanceTimersByTime(50);
+    expect(maximizeLayoutSnap()).toBe(false);
   });
 
   it("focusPaneByIndex is 1-based over in-order traversal", () => {
@@ -425,5 +529,109 @@ describe("runtimeLayoutStore (BSP)", () => {
     const stable = layoutRev();
     setTabAutoLabel("a", tabId, "label");
     expect(layoutRev()).toBe(stable);
+  });
+
+  // ── minimize / restore ──────────────────────────────────────────────────
+  it("minimizePane removes the leaf from the tree but keeps PaneContent", () => {
+    splitPane(pane("a"), null, "right");
+    splitPane(pane("b"), "a", "right");
+    minimizePane("a");
+    expect(runtimeLayoutStore.cells.map((c) => c.id)).toEqual(["b"]);
+    expect(runtimeLayoutStore.panes["a"]).toBeDefined();
+    expect(minimizedPaneIds().has("a")).toBe(true);
+    // Surviving pane absorbs the freed space (no ghost slot left behind).
+    expect(runtimeLayoutStore.cells[0].w).toBe(LAYOUT_UNIT);
+  });
+
+  it("minimizePane clears focus / maximize when the minimized pane held them", () => {
+    splitPane(pane("a"), null, "right");
+    splitPane(pane("b"), "a", "right");
+    setFocusedPaneId("a");
+    toggleMaximize("a");
+    expect(focusedPaneId()).toBe("a");
+    expect(maximizedPaneId()).toBe("a");
+    minimizePane("a");
+    expect(focusedPaneId()).toBeNull();
+    expect(maximizedPaneId()).toBeNull();
+  });
+
+  it("restorePane re-inserts the existing pane next to the focused one", () => {
+    splitPane(pane("a"), null, "right");
+    splitPane(pane("b"), "a", "right");
+    minimizePane("a");
+    setFocusedPaneId("b");
+    restorePane("a");
+    expect(minimizedPaneIds().has("a")).toBe(false);
+    const ids = runtimeLayoutStore.cells.map((c) => c.id).sort();
+    expect(ids).toEqual(["a", "b"]);
+    // Tabs and pane content survive the round-trip.
+    expect(runtimeLayoutStore.cells.find((c) => c.id === "a")?.tabs).toHaveLength(1);
+  });
+
+  it("restorePane installs the pane as root when the tree is empty", () => {
+    splitPane(pane("a"), null, "right");
+    minimizePane("a");
+    expect(runtimeLayoutStore.cells).toEqual([]);
+    expect(runtimeLayoutStore.tree).toBeNull();
+    restorePane("a");
+    expect(runtimeLayoutStore.cells.map((c) => c.id)).toEqual(["a"]);
+    expect(minimizedPaneIds().has("a")).toBe(false);
+  });
+
+  it("active_layout_save round-trips minimized panes off-tree", async () => {
+    vi.useFakeTimers();
+    splitPane(pane("a"), null, "right");
+    splitPane(
+      pane("b", {
+        kind: "claude-code",
+        tabs: [{ id: "tab-b", sessionId: "raum-b" }],
+        activeTabId: "tab-b",
+      }),
+      "a",
+      "right",
+    );
+    minimizePane("b");
+    vi.mocked(invoke).mockClear();
+    await vi.advanceTimersByTimeAsync(500);
+
+    expect(invoke).toHaveBeenCalledWith(
+      "active_layout_save",
+      expect.objectContaining({
+        layout: expect.objectContaining({
+          cells: expect.arrayContaining([
+            expect.objectContaining({ id: "a" }),
+            expect.objectContaining({
+              id: "b",
+              minimized: true,
+              x: 0,
+              y: 0,
+              w: 0,
+              h: 0,
+              tabs: [expect.objectContaining({ session_id: "raum-b" })],
+            }),
+          ]),
+        }),
+      }),
+    );
+  });
+
+  it("setRuntimeLayout rehydrates minimized cells off-tree", () => {
+    setRuntimeLayout([
+      cell("a", { x: 0, y: 0, w: LAYOUT_UNIT, h: LAYOUT_UNIT }),
+      {
+        id: "b",
+        x: 0,
+        y: 0,
+        w: 0,
+        h: 0,
+        kind: "claude-code",
+        tabs: [{ id: "tab-b", sessionId: "raum-b" }],
+        activeTabId: "tab-b",
+        minimized: true,
+      } as RuntimeCell & { minimized: boolean },
+    ]);
+    expect(runtimeLayoutStore.cells.map((c) => c.id)).toEqual(["a"]);
+    expect(runtimeLayoutStore.panes["b"]).toBeDefined();
+    expect(minimizedPaneIds().has("b")).toBe(true);
   });
 });

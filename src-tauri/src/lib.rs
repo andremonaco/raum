@@ -26,6 +26,59 @@ use tracing::{info, warn};
 #[cfg(target_os = "macos")]
 const MENU_ID_OPEN_SETTINGS: &str = "open-settings";
 
+/// Bump `RLIMIT_NOFILE` to the hard cap on macOS.
+///
+/// GUI apps launched by Finder/Dock inherit launchd's soft limit (256 by
+/// default). raum holds ~10–20 fds per terminal between PTY masters, tmux
+/// client pipes, hook IPC sockets, and per-project file watchers, so 12
+/// terminals saturates the cap and `tmux new-session` returns
+/// `EMFILE` ("Too many open files"). The hard cap is `kern.maxfilesperproc`,
+/// usually 24 576, which gives plenty of headroom for any sane number of
+/// terminals.
+///
+/// Linux distros leave the soft limit at the per-user value (1024+) and the
+/// system bus does not need help here, so the bump is macOS-only.
+#[cfg(target_os = "macos")]
+fn raise_nofile_limit() {
+    use libc::{RLIMIT_NOFILE, getrlimit, rlimit, setrlimit};
+    let mut lim = rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `getrlimit`/`setrlimit` are documented to take a pointer to a
+    // valid `rlimit` and write/read it; we own `lim` for the call.
+    #[allow(unsafe_code)]
+    unsafe {
+        if getrlimit(RLIMIT_NOFILE, &raw mut lim) != 0 {
+            warn!("raise_nofile_limit: getrlimit failed");
+            return;
+        }
+        let prev_soft = lim.rlim_cur;
+        if lim.rlim_cur >= lim.rlim_max {
+            info!(
+                soft = prev_soft,
+                hard = lim.rlim_max,
+                "RLIMIT_NOFILE already at hard cap"
+            );
+            return;
+        }
+        lim.rlim_cur = lim.rlim_max;
+        if setrlimit(RLIMIT_NOFILE, &raw const lim) != 0 {
+            warn!(
+                requested = lim.rlim_max,
+                prev_soft = prev_soft,
+                "raise_nofile_limit: setrlimit failed"
+            );
+        } else {
+            info!(
+                prev_soft = prev_soft,
+                new_soft = lim.rlim_cur,
+                "raised RLIMIT_NOFILE"
+            );
+        }
+    }
+}
+
 pub fn run() {
     // §2.7 — no user CLI surface. Inspect args; print GUI-only --help and exit before window.
     if !cli::handle_args() {
@@ -34,6 +87,12 @@ pub fn run() {
 
     let _log_guard = logging::init_tracing(&paths::logs_dir());
     info!("raum starting");
+
+    // Lift the launchd-imposed 256-fd ceiling before anything opens
+    // descriptors (tmux, file watchers, hook sockets). Must happen after
+    // tracing init so the bump is visible in the log.
+    #[cfg(target_os = "macos")]
+    raise_nofile_limit();
 
     // Bundled apps launched from Finder inherit a minimal PATH that doesn't
     // see Homebrew, nvm, or other dev tool locations — so harness binaries
@@ -86,13 +145,17 @@ pub fn run() {
             commands::harnesses_check,
             commands::terminal::terminal_spawn,
             commands::terminal::terminal_reattach,
+            commands::terminal::terminal_self_heal,
+            commands::terminal::terminal_respawn_dead,
             commands::terminal::terminal_kill,
             commands::terminal::terminal_resize,
             commands::terminal::terminal_list,
             commands::terminal::terminal_send_keys,
             commands::terminal::terminal_paste_paths,
             commands::terminal::terminal_pane_context,
+            commands::terminal::terminal_pane_context_batch,
             commands::terminal::terminal_reap_stale,
+            commands::terminal::terminal_kill_orphans,
             commands::agent::agent_list,
             commands::agent::agent_spawn,
             commands::agent::agent_state,
@@ -124,6 +187,7 @@ pub fn run() {
             commands::worktree_preview_manifest,
             commands::worktree_create,
             commands::worktree_list,
+            commands::worktree_list_all,
             commands::worktree_branches,
             commands::worktree_branch_merged,
             commands::git_checkout_branch,
@@ -131,6 +195,7 @@ pub fn run() {
             commands::worktree_config_write,
             // §9 — sidebar surface (Wave 3C).
             commands::worktree_status,
+            commands::worktree_status_batch,
             commands::git_stage,
             commands::git_unstage,
             commands::git_diff,
@@ -238,6 +303,22 @@ pub fn run() {
             // transitions work from the first frame of the webview).
             bootstrap_rehydrate_sessions(app);
 
+            // Auto-sweep orphan tmux sessions on boot, on a 5-min timer,
+            // and on window focus. Each orphan holds ~10–20 fds (PTY +
+            // client pipes + hook IPC), so without this the same
+            // `EMFILE`-driven `git_watcher` failures we saw in
+            // `raum.log.2026-04-27` recur after a few rapid Cmd+R cycles.
+            // Manual sweep button in `top-row.tsx` still works for
+            // explicit "something feels off" gestures.
+            bootstrap_orphan_reaper(app);
+
+            // 5-min fd-count probe. Existence of this line in the log
+            // turns the next leak repro into "read one number" instead
+            // of "replay the day from grep". macOS + Linux only;
+            // Windows lacks `/dev/fd`.
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            spawn_fd_probe();
+
             Ok(())
         })
         .run(tauri::generate_context!())
@@ -261,13 +342,16 @@ pub fn run() {
 /// handle.
 fn bootstrap_event_socket(app: &mut tauri::App) {
     let sock_path = paths::event_socket_path();
-    let bus_tx = {
+    let (bus_tx, prompt_bus_tx) = {
         let state: tauri::State<'_, state::AppHandleState> = app.state();
         // Make sure the bridge task is running _before_ we start draining
         // socket events — otherwise early transitions emitted before the
         // first `agent_spawn` call would be lost on the broadcast bus.
         commands::agent::ensure_bridge_running(app.handle(), &state.agent_events);
-        state.agent_events.tx.clone()
+        (
+            state.agent_events.tx.clone(),
+            state.agent_events.prompt_tx.clone(),
+        )
     };
     let app_handle = app.handle().clone();
 
@@ -326,7 +410,10 @@ fn bootstrap_event_socket(app: &mut tauri::App) {
             }
         });
 
-        let bus = commands::agent::AgentEventBus { tx: bus_tx };
+        let bus = commands::agent::AgentEventBus {
+            tx: bus_tx,
+            prompt_tx: prompt_bus_tx,
+        };
         commands::agent::drive_event_socket(merged_rx, bus, app_handle).await;
     });
 }
@@ -467,6 +554,139 @@ fn bootstrap_rehydrate_sessions(app: &mut tauri::App) {
         let state: tauri::State<'_, state::AppHandleState> = app_handle.state();
         let _report = commands::agent_hydrate::apply_rehydrate_plan(&app_handle, &state, plan);
     });
+}
+
+/// Spawn a long-lived task that reports the process's open-fd count
+/// every 5 minutes. The 7 993 `git_watcher: notify error` warnings in
+/// `raum.log.2026-04-27` told us *that* fds were exhausted but not when
+/// the count started climbing or which user action did it. Counting
+/// entries in `/dev/fd` is cheap (one `read_dir`) and uniquely
+/// disambiguates "slow leak" from "single-step jump".
+///
+/// macOS + Linux only — Windows has no `/dev/fd` analogue.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn spawn_fd_probe() {
+    use std::time::Duration;
+    const INTERVAL: Duration = Duration::from_secs(300);
+
+    tauri::async_runtime::spawn(async move {
+        let mut tick = tokio::time::interval(INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Skip the immediate first tick — let the app finish booting
+        // before we report.
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            report_fd_count();
+        }
+    });
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn report_fd_count() {
+    let count = match std::fs::read_dir("/dev/fd") {
+        Ok(iter) => iter.count(),
+        Err(e) => {
+            warn!(error = %e, "fd_probe: read_dir(/dev/fd) failed");
+            return;
+        }
+    };
+
+    let soft = current_nofile_soft_limit();
+    info!(fd_count = count, soft = soft, "raum: fd_count");
+}
+
+/// Read the current `RLIMIT_NOFILE` soft cap. Returns 0 on failure so
+/// the log line is still useful (`soft=0` is obviously wrong and
+/// indicates the probe couldn't read its budget).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn current_nofile_soft_limit() -> u64 {
+    use libc::{RLIMIT_NOFILE, getrlimit, rlimit};
+    let mut lim = rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `getrlimit` writes through a valid `rlimit` pointer; we
+    // own `lim` for the duration of the call.
+    #[allow(unsafe_code)]
+    let rc = unsafe { getrlimit(RLIMIT_NOFILE, &raw mut lim) };
+    if rc == 0 { lim.rlim_cur } else { 0 }
+}
+
+/// Auto-trigger `terminal_kill_orphans` at startup, on a slow timer, and
+/// on window focus. Without this, `EMFILE`-driven failures (the
+/// `git_watcher: notify error` storm in `raum.log.2026-04-27`) recur after
+/// a few rapid Cmd+R cycles because each orphan tmux session holds
+/// ~10–20 fds (PTY + client pipes + hook IPC). The function itself is
+/// cheap when there's nothing to do, and the 30 s age floor inside
+/// `kill_orphans_inner` prevents it from racing freshly-spawned sessions
+/// — so triggering it on every focus event is safe.
+fn bootstrap_orphan_reaper(app: &mut tauri::App) {
+    use std::time::Duration;
+    const BOOT_DELAY: Duration = Duration::from_secs(30);
+    const PERIODIC_INTERVAL: Duration = Duration::from_secs(300);
+
+    let handle = app.handle().clone();
+    let main_window = app.get_webview_window("main");
+
+    // Boot reap. Delayed so `bootstrap_rehydrate_sessions` finishes
+    // registering surviving sessions and any *genuinely* leaked
+    // session is past the age floor.
+    let boot_handle = handle.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(BOOT_DELAY).await;
+        run_orphan_reaper(&boot_handle, "boot").await;
+    });
+
+    // Periodic sweep every 5 minutes.
+    let timer_handle = handle.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut tick = tokio::time::interval(PERIODIC_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Skip the immediate first tick — interval fires once at start
+        // and we already have the boot reap above.
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            run_orphan_reaper(&timer_handle, "timer").await;
+        }
+    });
+
+    // Window-focus reap. The callback runs on Tauri's event thread —
+    // dispatch onto the async runtime so we don't block it.
+    if let Some(win) = main_window {
+        let focus_handle = handle.clone();
+        win.on_window_event(move |event| {
+            if let tauri::WindowEvent::Focused(true) = event {
+                let h = focus_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    run_orphan_reaper(&h, "focus").await;
+                });
+            }
+        });
+    } else {
+        warn!("bootstrap_orphan_reaper: main window not found");
+    }
+}
+
+/// Run one pass of the orphan reaper. Quiet on the happy path so a
+/// 5-min timer doesn't pollute the log; only logs when sessions were
+/// actually reaped or when the call itself failed.
+async fn run_orphan_reaper(handle: &tauri::AppHandle, trigger: &'static str) {
+    let state: tauri::State<'_, state::AppHandleState> = handle.state();
+    match commands::terminal::kill_orphans_inner(&state).await {
+        Ok(killed) if !killed.is_empty() => {
+            info!(
+                trigger = trigger,
+                killed = killed.len(),
+                "terminal_kill_orphans: reaped orphan tmux sessions",
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            warn!(trigger = trigger, error = %e, "terminal_kill_orphans: failed");
+        }
+    }
 }
 
 /// Start a `GitHeadWatcher` for every already-registered project so branch

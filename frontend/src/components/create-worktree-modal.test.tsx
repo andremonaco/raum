@@ -5,6 +5,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const mockInvoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: (...args: unknown[]) => mockInvoke(...args),
+  // Minimal Channel shim — the modal constructs `new Channel()` to receive
+  // progress events from the backend; tests don't exercise the submit path,
+  // but the constructor still has to be callable at module load.
+  Channel: class {
+    onmessage: ((data: unknown) => void) | null = null;
+  },
 }));
 
 import { CreateWorktreeModal } from "./create-worktree-modal";

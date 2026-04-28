@@ -24,6 +24,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { Button } from "./ui/button";
 import { Scrollable } from "./ui/scrollable";
 import { tildify } from "../lib/pathDisplay";
+import { LoaderIcon } from "./icons";
 
 export interface DiffViewerModalProps {
   open: boolean;
@@ -152,20 +153,30 @@ export const DiffViewerModal: Component<DiffViewerModalProps> = (props) => {
   const [diff, setDiff] = createSignal<string>("");
   const [loading, setLoading] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
+  let requestId = 0;
 
   createEffect(() => {
     const worktreePath = props.worktreePath;
     const file = props.file;
-    if (!worktreePath || !file || !props.open) return;
+    if (!worktreePath || !file || !props.open) {
+      requestId += 1;
+      setLoading(false);
+      setDiff("");
+      setError(null);
+      return;
+    }
+    const currentRequest = ++requestId;
     setError(null);
     setLoading(true);
     setDiff("");
     invoke<string>("git_diff", { worktreePath, file, staged: props.staged })
       .then((text) => {
+        if (currentRequest !== requestId) return;
         setDiff(text);
         setLoading(false);
       })
       .catch((e: unknown) => {
+        if (currentRequest !== requestId) return;
         setError(String(e));
         setLoading(false);
       });
@@ -234,7 +245,10 @@ export const DiffViewerModal: Component<DiffViewerModalProps> = (props) => {
           <Scrollable axis="both" class="relative min-h-0 flex-1">
             <Show when={loading()}>
               <div class="absolute inset-0 flex items-center justify-center bg-terminal-bg">
-                <span class="text-xs text-muted-foreground/60">Loading…</span>
+                <span class="flex items-center gap-2 text-xs text-muted-foreground/60">
+                  <LoaderIcon class="size-4 animate-spin" />
+                  <span>Loading...</span>
+                </span>
               </div>
             </Show>
             <Show when={error() && !loading()}>

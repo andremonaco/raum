@@ -1,4 +1,4 @@
-import { Show, createResource, createSignal, onMount, type Component } from "solid-js";
+import { Show, createResource, createSignal, onCleanup, onMount, type Component } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { check as checkForUpdate } from "@tauri-apps/plugin-updater";
 import { isPermissionGranted, sendNotification } from "@tauri-apps/plugin-notification";
@@ -21,6 +21,8 @@ import { loadThemeFromConfig } from "./lib/theme/themeController";
 import { initHomeDir } from "./lib/pathDisplay";
 import { installFileDrop } from "./lib/fileDrop";
 import { previewOnboarding, setPreviewOnboarding } from "./lib/devOnboardingPreview";
+import { startShellContextPoller } from "./lib/shellContextPoller";
+import { prewarmAllWorktrees } from "./stores/worktreeStore";
 import "overlayscrollbars/overlayscrollbars.css";
 
 interface RaumConfigSnapshot {
@@ -119,6 +121,7 @@ async function hydrateActiveLayout(): Promise<void> {
         projectSlug: t.project_slug,
         worktreeId: t.worktree_id,
       })),
+      minimized: c.minimized === true,
     }));
 
     setRuntimeLayout(cells);
@@ -144,6 +147,8 @@ const App: Component = () => {
     void loadThemeFromConfig().catch((e) => console.warn("loadThemeFromConfig failed", e));
     void initHomeDir();
     void installFileDrop().catch((e) => console.warn("installFileDrop failed", e));
+    const stopShellContextPoller = startShellContextPoller();
+    onCleanup(stopShellContextPoller);
   });
 
   // §13.2 — mount the onboarding wizard on first launch (config.onboarded =
@@ -156,6 +161,7 @@ const App: Component = () => {
       const c = await invoke<RaumConfigSnapshot>("config_get");
       // Hydrate the grid after confirming we're inside a Tauri host.
       await hydrateActiveLayout();
+      void prewarmAllWorktrees();
       void scheduleBackgroundUpdateCheck(c);
       return c;
     } catch {

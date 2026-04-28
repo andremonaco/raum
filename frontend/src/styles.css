@@ -496,6 +496,68 @@ body,
     0 20px 50px -10px rgba(0, 0, 0, 0.85);
 }
 
+/* Maximize/restore is an interaction mode, not a layout rearrangement.
+   Snap that geometry change so the previously full-canvas pane cannot keep
+   hit-testing over other panes while its normal spring transition unwinds. */
+[data-dnd-root].maximize-layout-snap .leaf-frame {
+  transition: none !important;
+}
+
+.terminal-surface-layer {
+  z-index: 1;
+}
+
+.terminal-surface-frame {
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+  transition: none;
+}
+
+/* Source surface during a drag: rides the same `--drag-dx`/`--drag-dy`
+   transform the chrome card uses, so the live terminal content tracks the
+   cursor in lockstep with its frame. The chrome's `.pane-dragging` rule
+   carries the visible card lift (border, glow, tilt); this rule just keeps
+   the terminal pixels glued to it. `transition: transform 0ms` is critical
+   — the inherited 220 ms transform easing from `.leaf-frame` would lag the
+   surface a fraction of a second behind the cursor, breaking the ghost. */
+.terminal-surface-frame.surface-dragging-source {
+  transform: translate(var(--drag-dx), var(--drag-dy)) rotate(-0.6deg) scale(1.02);
+  transition: transform 0ms;
+  will-change: transform;
+}
+
+.terminal-surface-body {
+  position: absolute;
+  top: 28px;
+  right: 1px;
+  bottom: 1px;
+  left: 1px;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border-bottom-right-radius: var(--pane-radius);
+  border-bottom-left-radius: var(--pane-radius);
+}
+
+.terminal-chrome-layer {
+  z-index: 20;
+  pointer-events: none;
+}
+
+.terminal-chrome-frame {
+  background: transparent;
+  pointer-events: none;
+}
+
+.terminal-chrome-frame .pane-drag-handle {
+  pointer-events: auto;
+}
+
+.terminal-chrome-body {
+  pointer-events: none;
+}
+
 /* Header: matches the pane's rounded top corners and the subtle gradient.
    Background is a small top-down sheen on `--surface-raised` so the header
    reads as a shallow lift over the pane body on any theme — replaces the
@@ -648,6 +710,20 @@ body,
 }
 .wiggle {
   animation: wiggle 0.35s ease-in-out;
+}
+
+@keyframes harness-pulse {
+  0%,
+  100% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(1.25);
+  }
+}
+.harness-pulse {
+  animation: harness-pulse 1.1s ease-in-out infinite;
+  transform-origin: center;
 }
 
 .no-scrollbar {

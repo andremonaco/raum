@@ -9,9 +9,19 @@
 
 import { Component, For, Show, createMemo, createSignal } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
+import { toast } from "solid-sonner";
 import type { ProjectListItem } from "../stores/projectStore";
 import { idsByProjectSlug, terminalStore, type TerminalRecord } from "../stores/terminalStore";
-import { FolderIcon, GitBranchIcon, HARNESS_ICONS, ShellIcon, type HarnessIconKind } from "./icons";
+import { createOperationProgress } from "../lib/operationProgress";
+import {
+  FolderIcon,
+  GitBranchIcon,
+  HARNESS_ICONS,
+  LoaderIcon,
+  ShellIcon,
+  type HarnessIconKind,
+} from "./icons";
+import { OperationProgress } from "./operation-progress";
 import { Alert, AlertDescription } from "./ui/alert";
 import { Button } from "./ui/button";
 import {
@@ -37,6 +47,17 @@ const HARNESS_LABEL: Record<HarnessIconKind, string> = {
   codex: "Codex",
   opencode: "OpenCode",
 };
+
+/**
+ * Step list rendered by the unlink-project progress panel. The `id` strings
+ * MUST stay in sync with the backend `PROJECT_STEP_*` constants in
+ * `src-tauri/src/commands/project.rs`.
+ */
+const UNLINK_STEPS = [
+  { id: "kill-terminals", label: "Stopping terminals" },
+  { id: "delete-config", label: "Removing project from config" },
+  { id: "unregister-watcher", label: "Releasing git watcher" },
+] as const;
 
 function groupSessionsByKind(
   sessions: TerminalRecord[],
@@ -67,23 +88,24 @@ export const UnlinkProjectModal: Component<UnlinkProjectModalProps> = (props) =>
   const runningCount = () => runningSessions().length;
   const runningByKind = createMemo(() => groupSessionsByKind(runningSessions()));
 
+  const progress = createOperationProgress(UNLINK_STEPS);
+
   const submit = async () => {
     if (submitting()) return;
     setSubmitting(true);
     setError(null);
+    const channel = progress.start();
     try {
-      // Kill any terminals tied to this project first — the tmux sessions are
-      // owned by raum, not by the user's shell, and leaving them running
-      // after the project is unlinked would leak tmux state.
-      for (const t of runningSessions()) {
-        try {
-          await invoke<void>("terminal_kill", { sessionId: t.session_id });
-        } catch {
-          // Best-effort; the unlink itself still runs.
-        }
-      }
-
-      await invoke<void>("project_remove", { slug: props.project.slug });
+      // The terminal-kill loop now lives in the backend `project_remove`
+      // command — it streams per-session progress over the channel and
+      // doesn't return until tmux + config + watcher are all torn down.
+      await invoke<void>("project_remove", {
+        slug: props.project.slug,
+        onProgress: channel,
+      });
+      toast.success("Project unlinked", {
+        description: props.project.name,
+      });
       props.onUnlinked();
       props.onClose();
     } catch (e) {
@@ -97,7 +119,12 @@ export const UnlinkProjectModal: Component<UnlinkProjectModalProps> = (props) =>
     <Dialog
       open={props.open}
       onOpenChange={(isOpen) => {
-        if (!isOpen) props.onClose();
+        if (!isOpen) {
+          // Don't let the user dismiss while the unlink is in flight — the
+          // progress panel needs to stay visible until the backend resolves.
+          if (submitting()) return;
+          props.onClose();
+        }
       }}
     >
       <DialogPortal>
@@ -204,7 +231,15 @@ export const UnlinkProjectModal: Component<UnlinkProjectModalProps> = (props) =>
               </ul>
             </section>
 
-            <Show when={error()}>
+            <Show when={submitting() || progress.failure()}>
+              <OperationProgress
+                steps={progress.steps()}
+                counter={progress.counter()}
+                failure={progress.failure()}
+              />
+            </Show>
+
+            <Show when={error() && !progress.failure()}>
               <Alert variant="destructive" class="text-xs">
                 <AlertDescription>{error()}</AlertDescription>
               </Alert>
@@ -212,7 +247,12 @@ export const UnlinkProjectModal: Component<UnlinkProjectModalProps> = (props) =>
           </div>
 
           <DialogFooter>
-            <Button type="button" variant="ghost" onClick={() => props.onClose()}>
+            <Button
+              type="button"
+              variant="ghost"
+              disabled={submitting()}
+              onClick={() => props.onClose()}
+            >
               Cancel
             </Button>
             <Button
@@ -222,6 +262,9 @@ export const UnlinkProjectModal: Component<UnlinkProjectModalProps> = (props) =>
                 void submit();
               }}
             >
+              <Show when={submitting()}>
+                <LoaderIcon class="mr-1.5 size-3.5 animate-spin" />
+              </Show>
               {submitting() ? "Unlinking…" : `Unlink ${props.project.name}`}
             </Button>
           </DialogFooter>

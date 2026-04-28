@@ -9,16 +9,20 @@
 
 import { Component, For, Show, createEffect, createMemo, createSignal } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
+import { toast } from "solid-sonner";
 import { clearWorktreeListCache, type Worktree } from "../stores/worktreeStore";
 import { idsByWorktreeId, terminalStore, type TerminalRecord } from "../stores/terminalStore";
+import { createOperationProgress } from "../lib/operationProgress";
 import {
   AlertCircleIcon,
   FolderIcon,
   GitBranchIcon,
   HARNESS_ICONS,
+  LoaderIcon,
   ShellIcon,
   type HarnessIconKind,
 } from "./icons";
+import { OperationProgress } from "./operation-progress";
 import { Alert, AlertDescription } from "./ui/alert";
 import { Button } from "./ui/button";
 import {
@@ -81,6 +85,19 @@ function groupTerminalsByKind(
   const order: HarnessIconKind[] = ["shell", "claude-code", "codex", "opencode"];
   return order.filter((k) => bucket.has(k)).map((k) => ({ kind: k, sessions: bucket.get(k)! }));
 }
+
+/**
+ * Step list rendered by the delete-worktree progress panel. The `id`
+ * strings MUST stay in sync with the backend `REMOVE_STEP_*` constants in
+ * `src-tauri/src/commands/worktree.rs`.
+ */
+const REMOVE_STEPS = [
+  { id: "kill-terminals", label: "Stopping terminals" },
+  { id: "drop-stashes", label: "Dropping branch stashes" },
+  { id: "git-remove", label: "Removing git worktree" },
+  { id: "delete-branch", label: "Deleting local branch" },
+  { id: "rescan", label: "Refreshing git status" },
+] as const;
 
 function emptyStatus(): WorktreeStatus {
   return {
@@ -179,25 +196,19 @@ export const DeleteWorktreeModal: Component<DeleteWorktreeModalProps> = (props) 
     }
   });
 
+  const progress = createOperationProgress(REMOVE_STEPS);
+
   const submit = async () => {
     if (submitting()) return;
     setSubmitting(true);
     setError(null);
 
+    const channel = progress.start();
     try {
-      if (runningCount() > 0) {
-        for (const group of runningTerminals()) {
-          for (const session of group.sessions) {
-            try {
-              await invoke<void>("terminal_kill", { sessionId: session.session_id });
-            } catch {
-              // Best-effort; the worktree remove still runs.
-            }
-          }
-        }
-      }
-
       const shouldDeleteBranch = branch() !== null && deleteBranch();
+      // The terminal-kill loop now lives in the backend `worktree_remove`
+      // command — it streams per-session progress over the channel and
+      // doesn't return until tmux + git + branch cleanup all finish.
       await invoke<void>("worktree_remove", {
         projectSlug: props.projectSlug,
         path: props.worktree.path,
@@ -205,9 +216,13 @@ export const DeleteWorktreeModal: Component<DeleteWorktreeModalProps> = (props) 
         deleteBranch: shouldDeleteBranch,
         forceDeleteBranch: shouldDeleteBranch && !isMerged(),
         clearStash: hasStash(),
+        onProgress: channel,
       });
 
       clearWorktreeListCache(props.projectSlug);
+      toast.success("Worktree removed", {
+        description: branch() ?? props.worktree.path,
+      });
       props.onDeleted();
       props.onClose();
     } catch (e) {
@@ -238,7 +253,12 @@ export const DeleteWorktreeModal: Component<DeleteWorktreeModalProps> = (props) 
     <Dialog
       open={props.open}
       onOpenChange={(isOpen) => {
-        if (!isOpen) props.onClose();
+        if (!isOpen) {
+          // Don't let the user dismiss while a delete is in flight — the
+          // progress panel needs to stay mounted until the backend resolves.
+          if (submitting()) return;
+          props.onClose();
+        }
       }}
     >
       <DialogPortal>
@@ -529,7 +549,15 @@ export const DeleteWorktreeModal: Component<DeleteWorktreeModalProps> = (props) 
               </div>
             </Show>
 
-            <Show when={error()}>
+            <Show when={submitting() || progress.failure()}>
+              <OperationProgress
+                steps={progress.steps()}
+                counter={progress.counter()}
+                failure={progress.failure()}
+              />
+            </Show>
+
+            <Show when={error() && !progress.failure()}>
               <Alert variant="destructive" class="text-xs">
                 <AlertDescription>{error()}</AlertDescription>
               </Alert>
@@ -537,7 +565,12 @@ export const DeleteWorktreeModal: Component<DeleteWorktreeModalProps> = (props) 
           </div>
 
           <DialogFooter>
-            <Button type="button" variant="ghost" onClick={() => props.onClose()}>
+            <Button
+              type="button"
+              variant="ghost"
+              disabled={submitting()}
+              onClick={() => props.onClose()}
+            >
               Cancel
             </Button>
             <Button
@@ -548,6 +581,9 @@ export const DeleteWorktreeModal: Component<DeleteWorktreeModalProps> = (props) 
                 void submit();
               }}
             >
+              <Show when={submitting()}>
+                <LoaderIcon class="mr-1.5 size-3.5 animate-spin" />
+              </Show>
               {primaryLabel()}
             </Button>
           </DialogFooter>

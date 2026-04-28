@@ -24,19 +24,25 @@
 //! * `config_set_sidebar_width` — §9.7 persist the sidebar width drag handle
 //!   into `config.toml.sidebar.width_px` (debounced client-side).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use raum_core::config::{BranchPrefixMode, PathStrategy, QUICKFIRE_HISTORY_LIMIT, WorktreeConfig};
 use raum_hydration::{
     CreateOptions, HookContext, HookError, HookPhase, PatternInputs, PrefixContext,
-    apply_branch_prefix, apply_hydration, preview_path_pattern, resolve_hook_path,
-    resolve_worktree_pattern, run_hook, validate_path_pattern,
+    apply_branch_prefix, apply_hydration_async_with_progress, preview_path_pattern,
+    resolve_hook_path, resolve_worktree_pattern, run_hook, validate_path_pattern,
     worktree_create as git_worktree_create, worktree_list as git_worktree_list,
     worktree_remove as git_worktree_remove,
 };
 use serde::{Deserialize, Serialize};
+use tauri::ipc::Channel;
 
+use crate::commands::terminal::kill_session_inner;
+use crate::commands::worktree_progress::{
+    ProgressEvent, StepStatus, emit_counter, emit_done, emit_failed, emit_step, emit_step_detail,
+};
 use crate::state::AppHandleState;
 
 #[derive(Debug, Serialize)]
@@ -114,6 +120,34 @@ pub struct WorktreeCreateOptions {
 
 fn default_true() -> bool {
     true
+}
+
+fn list_worktree_items_for_root(root_path: &Path) -> Result<Vec<WorktreeListItem>, String> {
+    let entries = git_worktree_list(root_path).map_err(|e| format!("list: {e}"))?;
+    let root = root_path.to_string_lossy().into_owned();
+    Ok(entries
+        .into_iter()
+        .map(|e| {
+            let path_str = e.path.to_string_lossy().into_owned();
+            let upstream = e
+                .branch
+                .as_deref()
+                .and_then(|branch| fetch_upstream_branch(&path_str, branch));
+            let base_branch = e
+                .branch
+                .as_deref()
+                .and_then(|branch| get_raum_base_branch(&root, branch));
+            WorktreeListItem {
+                branch: e.branch,
+                path: path_str,
+                head: e.head,
+                locked: e.locked,
+                detached: e.detached,
+                upstream,
+                base_branch,
+            }
+        })
+        .collect())
 }
 
 #[derive(Debug, Serialize)]
@@ -215,12 +249,48 @@ pub fn worktree_preview_manifest(
 
 // ---- mutations -------------------------------------------------------------
 
+/// Per-step labels emitted by [`worktree_create`]. Kept here (not in
+/// `worktree_progress`) because they're command-specific. The frontend's
+/// progress modal uses the same `id` strings as the source of truth.
+const STEP_VALIDATE: (&str, &str) = ("validate", "Validating settings");
+const STEP_PRE_HOOK: (&str, &str) = ("pre-hook", "Running preCreate hook");
+const STEP_GIT_ADD: (&str, &str) = ("git-add", "Creating git worktree");
+const STEP_BASE_META: (&str, &str) = ("base-meta", "Recording base branch");
+const STEP_HYDRATE: (&str, &str) = ("hydrate", "Hydrating files");
+const STEP_POST_HOOK: (&str, &str) = ("post-hook", "Running postCreate hook");
+const STEP_RESCAN: (&str, &str) = ("rescan", "Refreshing git status");
+
+/// Run a closure on the blocking pool, mapping a `JoinError` into a `String`
+/// so call sites can `?`-propagate cleanly.
+async fn blocking<T, F>(label: &str, f: F) -> Result<T, String>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| format!("{label} join: {e}"))
+}
+
+/// Mark a step Failed (with detail), push a terminal `Failed` event, and
+/// return the same message as the command's error string.
+fn fail_step(
+    channel: &Channel<ProgressEvent>,
+    step: (&str, &str),
+    msg: String,
+) -> Result<WorktreeCreated, String> {
+    emit_step_detail(channel, step.0, step.1, StepStatus::Failed, msg.clone());
+    emit_failed(channel, msg.clone());
+    Err(msg)
+}
+
 #[tauri::command]
-pub fn worktree_create(
+pub async fn worktree_create(
     state: tauri::State<'_, AppHandleState>,
     project_slug: String,
     branch: String,
     options: Option<WorktreeCreateOptions>,
+    on_progress: Channel<ProgressEvent>,
 ) -> Result<WorktreeCreated, String> {
     let opts = options.unwrap_or(WorktreeCreateOptions {
         create_branch: true,
@@ -230,7 +300,18 @@ pub fn worktree_create(
         path_strategy: None,
         path_pattern_override: None,
     });
-    let mut effective = load_effective(&state, &project_slug)?;
+
+    // ---- Step 1: validate (synchronous, very cheap) -----------------------
+    emit_step(
+        &on_progress,
+        STEP_VALIDATE.0,
+        STEP_VALIDATE.1,
+        StepStatus::Running,
+    );
+    let mut effective = match load_effective(&state, &project_slug) {
+        Ok(e) => e,
+        Err(e) => return fail_step(&on_progress, STEP_VALIDATE, e),
+    };
     apply_strategy_override(
         &mut effective.worktree,
         opts.path_strategy,
@@ -239,7 +320,9 @@ pub fn worktree_create(
     // Reject typos (e.g. `{root}` instead of `{repo-root}`) before we mkdir a
     // literal-token folder on disk. Preset patterns are valid by construction;
     // this really guards Custom.
-    validate_path_pattern(&effective.worktree.path_pattern).map_err(|e| e.to_string())?;
+    if let Err(e) = validate_path_pattern(&effective.worktree.path_pattern) {
+        return fail_step(&on_progress, STEP_VALIDATE, e.to_string());
+    }
     let prefix_ctx = PrefixContext {
         username: &os_username(),
     };
@@ -274,91 +357,325 @@ pub fn worktree_create(
         }
     }
     if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir parent: {e}"))?;
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return fail_step(&on_progress, STEP_VALIDATE, format!("mkdir parent: {e}"));
+        }
     }
+    emit_step(
+        &on_progress,
+        STEP_VALIDATE.0,
+        STEP_VALIDATE.1,
+        StepStatus::Completed,
+    );
 
-    let hooks = &effective.worktree.hooks;
+    // Snapshot data we need across spawn_blocking boundaries.
+    let root_path = effective.root_path.clone();
+    let slug = effective.slug.clone();
+    let hooks = effective.worktree.hooks.clone();
+    let manifest = effective.hydration.clone();
     let timeout_secs = hooks.timeout_secs;
     let mut hooks_ran: Vec<String> = Vec::new();
 
-    // Pre-create hook: runs with the project root as cwd, before git creates
-    // anything. Failure aborts creation — no worktree ends up on disk.
+    // ---- Step 2: preCreate hook ------------------------------------------
     if let Some(raw) = hooks.pre_create.as_deref() {
-        let script = resolve_hook_path(&effective.root_path, raw);
-        let ctx = HookContext {
-            project_slug: &effective.slug,
-            project_root: &effective.root_path,
-            worktree_path: &target,
-            branch: &prefixed,
-        };
-        run_hook(HookPhase::PreCreate, &script, &ctx, timeout_secs)
-            .map_err(|e| format_hook_error("preCreate", &e))?;
-        hooks_ran.push("preCreate".into());
+        emit_step(
+            &on_progress,
+            STEP_PRE_HOOK.0,
+            STEP_PRE_HOOK.1,
+            StepStatus::Running,
+        );
+        let script = resolve_hook_path(&root_path, raw);
+        let root_for_hook = root_path.clone();
+        let target_for_hook = target.clone();
+        let prefixed_for_hook = prefixed.clone();
+        let slug_for_hook = slug.clone();
+        let res = blocking("preCreate", move || {
+            let ctx = HookContext {
+                project_slug: &slug_for_hook,
+                project_root: &root_for_hook,
+                worktree_path: &target_for_hook,
+                branch: &prefixed_for_hook,
+            };
+            run_hook(HookPhase::PreCreate, &script, &ctx, timeout_secs)
+        })
+        .await;
+        match res {
+            Ok(Ok(_report)) => {
+                emit_step(
+                    &on_progress,
+                    STEP_PRE_HOOK.0,
+                    STEP_PRE_HOOK.1,
+                    StepStatus::Completed,
+                );
+                hooks_ran.push("preCreate".into());
+            }
+            Ok(Err(hook_err)) => {
+                return fail_step(
+                    &on_progress,
+                    STEP_PRE_HOOK,
+                    format_hook_error("preCreate", &hook_err),
+                );
+            }
+            Err(msg) => return fail_step(&on_progress, STEP_PRE_HOOK, msg),
+        }
+    } else {
+        emit_step(
+            &on_progress,
+            STEP_PRE_HOOK.0,
+            STEP_PRE_HOOK.1,
+            StepStatus::Skipped,
+        );
     }
 
-    git_worktree_create(
-        &effective.root_path,
-        &target,
-        &CreateOptions {
-            branch: prefixed.clone(),
-            create_branch: opts.create_branch,
-            from_ref: opts.from_ref.clone(),
-        },
-    )
-    .map_err(|e| format!("worktree add: {e}"))?;
+    // ---- Step 3: git worktree add ----------------------------------------
+    emit_step(
+        &on_progress,
+        STEP_GIT_ADD.0,
+        STEP_GIT_ADD.1,
+        StepStatus::Running,
+    );
+    {
+        let root_for_git = root_path.clone();
+        let target_for_git = target.clone();
+        let prefixed_for_git = prefixed.clone();
+        let create_branch = opts.create_branch;
+        let from_ref = opts.from_ref.clone();
+        let res = blocking("git worktree add", move || {
+            git_worktree_create(
+                &root_for_git,
+                &target_for_git,
+                &CreateOptions {
+                    branch: prefixed_for_git,
+                    create_branch,
+                    from_ref,
+                },
+            )
+        })
+        .await;
+        match res {
+            Ok(Ok(())) => {
+                emit_step(
+                    &on_progress,
+                    STEP_GIT_ADD.0,
+                    STEP_GIT_ADD.1,
+                    StepStatus::Completed,
+                );
+            }
+            Ok(Err(e)) => {
+                return fail_step(&on_progress, STEP_GIT_ADD, format!("worktree add: {e}"));
+            }
+            Err(msg) => return fail_step(&on_progress, STEP_GIT_ADD, msg),
+        }
+    }
 
-    // Persist the base branch name on the new branch so the sidebar can
-    // render `base -> branch` after a restart. Failure here is non-fatal —
-    // the worktree is already created and the UI falls back to the upstream
-    // tracking branch.
-    if opts.create_branch {
-        if let Some(base) = opts.base_branch.as_deref().filter(|s| !s.is_empty()) {
-            if let Err(e) = set_raum_base_branch(&effective.root_path, &prefixed, base) {
+    // ---- Step 4: persist base-branch metadata ----------------------------
+    let base = opts
+        .base_branch
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    if opts.create_branch && base.is_some() {
+        emit_step(
+            &on_progress,
+            STEP_BASE_META.0,
+            STEP_BASE_META.1,
+            StepStatus::Running,
+        );
+        let base_owned = base.clone().unwrap();
+        let prefixed_for_meta = prefixed.clone();
+        let root_for_meta = root_path.clone();
+        let res = blocking("set raumBase", move || {
+            set_raum_base_branch(&root_for_meta, &prefixed_for_meta, &base_owned)
+        })
+        .await;
+        match res {
+            Ok(Ok(())) => emit_step(
+                &on_progress,
+                STEP_BASE_META.0,
+                STEP_BASE_META.1,
+                StepStatus::Completed,
+            ),
+            Ok(Err(e)) => {
                 tracing::warn!(
                     branch = %prefixed,
-                    base = %base,
+                    base = %base.as_deref().unwrap_or(""),
                     error = %e,
                     "worktree_create: failed to persist raumBase",
                 );
+                // Non-fatal — the worktree exists, sidebar falls back to upstream.
+                emit_step_detail(
+                    &on_progress,
+                    STEP_BASE_META.0,
+                    STEP_BASE_META.1,
+                    StepStatus::Skipped,
+                    format!("warn: {e}"),
+                );
+            }
+            Err(msg) => {
+                tracing::warn!(error = %msg, "worktree_create: set_raum_base_branch join failed");
+                emit_step_detail(
+                    &on_progress,
+                    STEP_BASE_META.0,
+                    STEP_BASE_META.1,
+                    StepStatus::Skipped,
+                    format!("warn: {msg}"),
+                );
+            }
+        }
+    } else {
+        emit_step(
+            &on_progress,
+            STEP_BASE_META.0,
+            STEP_BASE_META.1,
+            StepStatus::Skipped,
+        );
+    }
+
+    // ---- Step 5: hydrate (per-rule counter) ------------------------------
+    let mut copied = 0usize;
+    let mut symlinked = 0usize;
+    let mut skipped = 0usize;
+    if opts.skip_hydration {
+        emit_step(
+            &on_progress,
+            STEP_HYDRATE.0,
+            STEP_HYDRATE.1,
+            StepStatus::Skipped,
+        );
+    } else {
+        emit_step(
+            &on_progress,
+            STEP_HYDRATE.0,
+            STEP_HYDRATE.1,
+            StepStatus::Running,
+        );
+        let progress_clone = on_progress.clone();
+        let res = apply_hydration_async_with_progress(
+            root_path.clone(),
+            target.clone(),
+            manifest,
+            move |cur, tot| emit_counter(&progress_clone, STEP_HYDRATE.0, cur, tot),
+        )
+        .await;
+        match res {
+            Ok(report) => {
+                copied = report.copied.len();
+                symlinked = report.symlinked.len();
+                skipped = report.skipped.len();
+                emit_step(
+                    &on_progress,
+                    STEP_HYDRATE.0,
+                    STEP_HYDRATE.1,
+                    StepStatus::Completed,
+                );
+            }
+            Err(e) => {
+                return fail_step(&on_progress, STEP_HYDRATE, format!("hydration: {e}"));
             }
         }
     }
 
-    let mut copied = 0usize;
-    let mut symlinked = 0usize;
-    let mut skipped = 0usize;
-    if !opts.skip_hydration {
-        let report = apply_hydration(&effective.root_path, &target, &effective.hydration)
-            .map_err(|e| format!("hydration: {e}"))?;
-        copied = report.copied.len();
-        symlinked = report.symlinked.len();
-        skipped = report.skipped.len();
-    }
-
-    // Post-create hook: cwd is the fresh worktree. Failure does NOT roll back —
-    // the worktree exists, so we surface the error with a note so the user can
-    // inspect or delete manually.
+    // ---- Step 6: postCreate hook -----------------------------------------
     if let Some(raw) = hooks.post_create.as_deref() {
-        let script = resolve_hook_path(&effective.root_path, raw);
-        let ctx = HookContext {
-            project_slug: &effective.slug,
-            project_root: &effective.root_path,
-            worktree_path: &target,
-            branch: &prefixed,
-        };
-        if let Err(e) = run_hook(HookPhase::PostCreate, &script, &ctx, timeout_secs) {
-            rescan_git_watcher(&state, &project_slug, &effective.root_path);
-            return Err(format!(
-                "{} (worktree was created at {} — inspect or remove manually)",
-                format_hook_error("postCreate", &e),
-                target.display()
-            ));
+        emit_step(
+            &on_progress,
+            STEP_POST_HOOK.0,
+            STEP_POST_HOOK.1,
+            StepStatus::Running,
+        );
+        let script = resolve_hook_path(&root_path, raw);
+        let root_for_hook = root_path.clone();
+        let target_for_hook = target.clone();
+        let prefixed_for_hook = prefixed.clone();
+        let slug_for_hook = slug.clone();
+        let res = blocking("postCreate", move || {
+            let ctx = HookContext {
+                project_slug: &slug_for_hook,
+                project_root: &root_for_hook,
+                worktree_path: &target_for_hook,
+                branch: &prefixed_for_hook,
+            };
+            run_hook(HookPhase::PostCreate, &script, &ctx, timeout_secs)
+        })
+        .await;
+        match res {
+            Ok(Ok(_report)) => {
+                emit_step(
+                    &on_progress,
+                    STEP_POST_HOOK.0,
+                    STEP_POST_HOOK.1,
+                    StepStatus::Completed,
+                );
+                hooks_ran.push("postCreate".into());
+            }
+            Ok(Err(hook_err)) => {
+                let msg = format!(
+                    "{} (worktree was created at {} — inspect or remove manually)",
+                    format_hook_error("postCreate", &hook_err),
+                    target.display()
+                );
+                emit_step_detail(
+                    &on_progress,
+                    STEP_POST_HOOK.0,
+                    STEP_POST_HOOK.1,
+                    StepStatus::Failed,
+                    msg.clone(),
+                );
+                // Still rescan so the watcher knows about the partial worktree.
+                emit_step(
+                    &on_progress,
+                    STEP_RESCAN.0,
+                    STEP_RESCAN.1,
+                    StepStatus::Running,
+                );
+                rescan_git_watcher(&state, &project_slug, &root_path);
+                emit_step(
+                    &on_progress,
+                    STEP_RESCAN.0,
+                    STEP_RESCAN.1,
+                    StepStatus::Completed,
+                );
+                emit_failed(&on_progress, msg.clone());
+                return Err(msg);
+            }
+            Err(msg) => {
+                emit_step_detail(
+                    &on_progress,
+                    STEP_POST_HOOK.0,
+                    STEP_POST_HOOK.1,
+                    StepStatus::Failed,
+                    msg.clone(),
+                );
+                rescan_git_watcher(&state, &project_slug, &root_path);
+                emit_failed(&on_progress, msg.clone());
+                return Err(msg);
+            }
         }
-        hooks_ran.push("postCreate".into());
+    } else {
+        emit_step(
+            &on_progress,
+            STEP_POST_HOOK.0,
+            STEP_POST_HOOK.1,
+            StepStatus::Skipped,
+        );
     }
 
-    rescan_git_watcher(&state, &project_slug, &effective.root_path);
+    // ---- Step 7: rescan watcher ------------------------------------------
+    emit_step(
+        &on_progress,
+        STEP_RESCAN.0,
+        STEP_RESCAN.1,
+        StepStatus::Running,
+    );
+    rescan_git_watcher(&state, &project_slug, &root_path);
+    emit_step(
+        &on_progress,
+        STEP_RESCAN.0,
+        STEP_RESCAN.1,
+        StepStatus::Completed,
+    );
 
+    emit_done(&on_progress);
     Ok(WorktreeCreated {
         path: target.to_string_lossy().into_owned(),
         branch: prefixed,
@@ -379,31 +696,52 @@ pub fn worktree_list(
     project_slug: String,
 ) -> Result<Vec<WorktreeListItem>, String> {
     let effective = load_effective(&state, &project_slug)?;
-    let entries = git_worktree_list(&effective.root_path).map_err(|e| format!("list: {e}"))?;
-    let root = effective.root_path.to_string_lossy().into_owned();
-    Ok(entries
-        .into_iter()
-        .map(|e| {
-            let path_str = e.path.to_string_lossy().into_owned();
-            let upstream = e
-                .branch
-                .as_deref()
-                .and_then(|branch| fetch_upstream_branch(&path_str, branch));
-            let base_branch = e
-                .branch
-                .as_deref()
-                .and_then(|branch| get_raum_base_branch(&root, branch));
-            WorktreeListItem {
-                branch: e.branch,
-                path: path_str,
-                head: e.head,
-                locked: e.locked,
-                detached: e.detached,
-                upstream,
-                base_branch,
+    list_worktree_items_for_root(&effective.root_path)
+}
+
+#[tauri::command]
+pub fn worktree_list_all(
+    state: tauri::State<'_, AppHandleState>,
+) -> Result<HashMap<String, Vec<WorktreeListItem>>, String> {
+    let projects = {
+        let store = state
+            .config_store
+            .lock()
+            .map_err(|e| format!("config_store lock: {e}"))?;
+        let slugs = store
+            .list_project_slugs()
+            .map_err(|e| format!("list_project_slugs: {e}"))?;
+        let mut projects = Vec::with_capacity(slugs.len());
+        for slug in slugs {
+            match store.effective_project(&slug) {
+                Ok(Some(mut effective)) => {
+                    effective.worktree.normalize();
+                    projects.push(effective);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(slug = %slug, error = %e, "worktree_list_all: skipping malformed project");
+                }
             }
-        })
-        .collect())
+        }
+        projects
+    };
+
+    let mut out = HashMap::with_capacity(projects.len());
+    for project in projects {
+        let slug = project.slug;
+        let root_path = project.root_path;
+        match list_worktree_items_for_root(&root_path) {
+            Ok(items) => {
+                out.insert(slug, items);
+            }
+            Err(e) => {
+                tracing::warn!(slug = %slug, error = %e, "worktree_list_all: list failed");
+                out.insert(slug, Vec::new());
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Response from `worktree_branches`: all local branches plus the one currently
@@ -577,8 +915,18 @@ fn fetch_upstream_branch(path: &str, branch: &str) -> Option<String> {
     None
 }
 
+/// Per-step labels emitted by [`worktree_remove`]. Same id contract as the
+/// create-side constants — the FE step list keys off these.
+const REMOVE_STEP_KILL: (&str, &str) = ("kill-terminals", "Stopping terminals");
+const REMOVE_STEP_STASH: (&str, &str) = ("drop-stashes", "Dropping branch stashes");
+const REMOVE_STEP_GIT_REMOVE: (&str, &str) = ("git-remove", "Removing git worktree");
+const REMOVE_STEP_DELETE_BRANCH: (&str, &str) = ("delete-branch", "Deleting local branch");
+const REMOVE_STEP_RESCAN: (&str, &str) = ("rescan", "Refreshing git status");
+
 #[tauri::command]
-pub fn worktree_remove(
+#[allow(clippy::too_many_arguments)]
+pub async fn worktree_remove<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: tauri::State<'_, AppHandleState>,
     project_slug: String,
     path: String,
@@ -586,42 +934,259 @@ pub fn worktree_remove(
     delete_branch: Option<bool>,
     force_delete_branch: Option<bool>,
     clear_stash: Option<bool>,
+    on_progress: Channel<ProgressEvent>,
 ) -> Result<(), String> {
-    let effective = load_effective(&state, &project_slug)?;
-    // Resolve the branch name for the worktree before we blow the worktree
-    // away — after `git worktree remove`, the branch info is only reachable
-    // via the bare repository.
+    // Cheap synchronous prep — load config under the lock.
+    let effective = match load_effective(&state, &project_slug) {
+        Ok(e) => e,
+        Err(e) => {
+            emit_step_detail(
+                &on_progress,
+                REMOVE_STEP_KILL.0,
+                REMOVE_STEP_KILL.1,
+                StepStatus::Failed,
+                e.clone(),
+            );
+            emit_failed(&on_progress, e.clone());
+            return Err(e);
+        }
+    };
+    let root_path = effective.root_path.clone();
+
+    // ---- Step 1: kill any terminals attached to this worktree ------------
+    let session_ids = sessions_for_worktree_strs(&state, &path);
+    if session_ids.is_empty() {
+        emit_step(
+            &on_progress,
+            REMOVE_STEP_KILL.0,
+            REMOVE_STEP_KILL.1,
+            StepStatus::Skipped,
+        );
+    } else {
+        let label = format!(
+            "Stopping {} terminal{}",
+            session_ids.len(),
+            if session_ids.len() == 1 { "" } else { "s" }
+        );
+        emit_step(
+            &on_progress,
+            REMOVE_STEP_KILL.0,
+            &label,
+            StepStatus::Running,
+        );
+        let total = session_ids.len() as u64;
+        for (i, sid) in session_ids.iter().enumerate() {
+            // Best-effort — a stuck kill shouldn't block worktree removal.
+            if let Err(e) = kill_session_inner(&app, &state, sid).await {
+                tracing::warn!(session_id = %sid, error = %e, "worktree_remove: terminal kill failed");
+            }
+            emit_counter(&on_progress, REMOVE_STEP_KILL.0, (i + 1) as u64, total);
+        }
+        emit_step(
+            &on_progress,
+            REMOVE_STEP_KILL.0,
+            &label,
+            StepStatus::Completed,
+        );
+    }
+
+    // Resolve the branch name for the worktree before we blow it away —
+    // after `git worktree remove`, the branch info is only reachable via the
+    // bare repository.
     let branch_to_delete: Option<String> = if delete_branch.unwrap_or(false) {
-        worktree_branch_at_path(&effective.root_path, Path::new(&path))
+        let root = root_path.clone();
+        let p = path.clone();
+        blocking("worktree_branch_at_path", move || {
+            worktree_branch_at_path(&root, Path::new(&p))
+        })
+        .await
+        .ok()
+        .flatten()
     } else {
         None
     };
 
-    // Drop stash entries belonging to this branch *before* removing the
-    // worktree — `git stash drop` needs to resolve the branch ref, which
-    // lives in the shared repo but is easier to target while the worktree is
-    // still on disk. Best-effort: failures are logged but don't abort.
+    // ---- Step 2: drop stashes for the branch -----------------------------
     if clear_stash.unwrap_or(false) {
-        if let Some(branch) = worktree_branch_at_path(&effective.root_path, Path::new(&path)) {
-            drop_stashes_for_branch(&path, &branch);
+        emit_step(
+            &on_progress,
+            REMOVE_STEP_STASH.0,
+            REMOVE_STEP_STASH.1,
+            StepStatus::Running,
+        );
+        let root = root_path.clone();
+        let p = path.clone();
+        let resolved_branch = blocking("resolve branch", move || {
+            worktree_branch_at_path(&root, Path::new(&p))
+        })
+        .await
+        .ok()
+        .flatten();
+        if let Some(branch) = resolved_branch {
+            let p2 = path.clone();
+            let _ = blocking("drop_stashes_for_branch", move || {
+                drop_stashes_for_branch(&p2, &branch);
+            })
+            .await;
+        }
+        emit_step(
+            &on_progress,
+            REMOVE_STEP_STASH.0,
+            REMOVE_STEP_STASH.1,
+            StepStatus::Completed,
+        );
+    } else {
+        emit_step(
+            &on_progress,
+            REMOVE_STEP_STASH.0,
+            REMOVE_STEP_STASH.1,
+            StepStatus::Skipped,
+        );
+    }
+
+    // ---- Step 3: git worktree remove -------------------------------------
+    emit_step(
+        &on_progress,
+        REMOVE_STEP_GIT_REMOVE.0,
+        REMOVE_STEP_GIT_REMOVE.1,
+        StepStatus::Running,
+    );
+    {
+        let root = root_path.clone();
+        let p = path.clone();
+        let res = blocking("git worktree remove", move || {
+            git_worktree_remove(&root, Path::new(&p), force)
+        })
+        .await;
+        match res {
+            Ok(Ok(())) => emit_step(
+                &on_progress,
+                REMOVE_STEP_GIT_REMOVE.0,
+                REMOVE_STEP_GIT_REMOVE.1,
+                StepStatus::Completed,
+            ),
+            Ok(Err(e)) => {
+                let msg = format!("remove: {e}");
+                emit_step_detail(
+                    &on_progress,
+                    REMOVE_STEP_GIT_REMOVE.0,
+                    REMOVE_STEP_GIT_REMOVE.1,
+                    StepStatus::Failed,
+                    msg.clone(),
+                );
+                emit_failed(&on_progress, msg.clone());
+                return Err(msg);
+            }
+            Err(msg) => {
+                emit_step_detail(
+                    &on_progress,
+                    REMOVE_STEP_GIT_REMOVE.0,
+                    REMOVE_STEP_GIT_REMOVE.1,
+                    StepStatus::Failed,
+                    msg.clone(),
+                );
+                emit_failed(&on_progress, msg.clone());
+                return Err(msg);
+            }
         }
     }
 
-    git_worktree_remove(&effective.root_path, Path::new(&path), force)
-        .map_err(|e| format!("remove: {e}"))?;
-
+    // ---- Step 4: delete local branch -------------------------------------
     if let Some(branch) = branch_to_delete {
+        emit_step(
+            &on_progress,
+            REMOVE_STEP_DELETE_BRANCH.0,
+            REMOVE_STEP_DELETE_BRANCH.1,
+            StepStatus::Running,
+        );
         let force_branch = force_delete_branch.unwrap_or(false);
-        if let Err(e) = delete_local_branch(&effective.root_path, &branch, force_branch) {
-            // Surface as an error: the worktree is gone but the branch
-            // lingers. The UI can re-run or the user can clean up by hand.
-            rescan_git_watcher(&state, &project_slug, &effective.root_path);
-            return Err(format!("delete branch {branch}: {e}"));
+        let root = root_path.clone();
+        let branch_for_call = branch.clone();
+        let res = blocking("delete_local_branch", move || {
+            delete_local_branch(&root, &branch_for_call, force_branch)
+        })
+        .await;
+        match res {
+            Ok(Ok(())) => emit_step(
+                &on_progress,
+                REMOVE_STEP_DELETE_BRANCH.0,
+                REMOVE_STEP_DELETE_BRANCH.1,
+                StepStatus::Completed,
+            ),
+            Ok(Err(e)) => {
+                // Worktree is gone but the branch lingers — surface so the user
+                // can clean up. Still rescan first.
+                let msg = format!("delete branch {branch}: {e}");
+                emit_step_detail(
+                    &on_progress,
+                    REMOVE_STEP_DELETE_BRANCH.0,
+                    REMOVE_STEP_DELETE_BRANCH.1,
+                    StepStatus::Failed,
+                    msg.clone(),
+                );
+                emit_step(
+                    &on_progress,
+                    REMOVE_STEP_RESCAN.0,
+                    REMOVE_STEP_RESCAN.1,
+                    StepStatus::Running,
+                );
+                rescan_git_watcher(&state, &project_slug, &root_path);
+                emit_step(
+                    &on_progress,
+                    REMOVE_STEP_RESCAN.0,
+                    REMOVE_STEP_RESCAN.1,
+                    StepStatus::Completed,
+                );
+                emit_failed(&on_progress, msg.clone());
+                return Err(msg);
+            }
+            Err(msg) => {
+                emit_step_detail(
+                    &on_progress,
+                    REMOVE_STEP_DELETE_BRANCH.0,
+                    REMOVE_STEP_DELETE_BRANCH.1,
+                    StepStatus::Failed,
+                    msg.clone(),
+                );
+                emit_failed(&on_progress, msg.clone());
+                return Err(msg);
+            }
         }
+    } else {
+        emit_step(
+            &on_progress,
+            REMOVE_STEP_DELETE_BRANCH.0,
+            REMOVE_STEP_DELETE_BRANCH.1,
+            StepStatus::Skipped,
+        );
     }
 
-    rescan_git_watcher(&state, &project_slug, &effective.root_path);
+    // ---- Step 5: rescan watcher ------------------------------------------
+    emit_step(
+        &on_progress,
+        REMOVE_STEP_RESCAN.0,
+        REMOVE_STEP_RESCAN.1,
+        StepStatus::Running,
+    );
+    rescan_git_watcher(&state, &project_slug, &root_path);
+    emit_step(
+        &on_progress,
+        REMOVE_STEP_RESCAN.0,
+        REMOVE_STEP_RESCAN.1,
+        StepStatus::Completed,
+    );
+
+    emit_done(&on_progress);
     Ok(())
+}
+
+/// Thin wrapper so callers don't have to think about owned Strings vs the
+/// Vec returned by [`crate::commands::terminal::sessions_for_worktree`].
+fn sessions_for_worktree_strs(
+    state: &tauri::State<'_, AppHandleState>,
+    worktree_path: &str,
+) -> Vec<String> {
+    crate::commands::terminal::sessions_for_worktree(state, worktree_path)
 }
 
 /// Response from `worktree_branch_merged`. `merged_into` lists local branches
@@ -843,84 +1408,114 @@ pub struct WorktreeStatus {
 /// A single path can appear in both `modified` and `staged` when it has both
 /// index and worktree changes; the sidebar surfaces both buckets so the user
 /// can see it in each.
+fn worktree_status_for_path(path: &str) -> Result<WorktreeStatus, String> {
+    let output = Command::new("git")
+        .args([
+            "-C",
+            path,
+            "status",
+            "--porcelain=v2",
+            "--branch",
+            "--untracked-files=all",
+        ])
+        .output()
+        .map_err(|e| format!("git status: {e}"))?;
+    if !output.status.success() {
+        // Non-zero exit is usually "not a git repository" when a
+        // worktree path was deleted out from under us. Treat as empty /
+        // clean rather than poisoning the sidebar with an error row.
+        return Ok(WorktreeStatus::default());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let (mut status, branch) = parse_porcelain_v2_with_branch(stdout.as_ref());
+
+    // Also fetch line-level diff stats vs HEAD. `git diff --shortstat HEAD`
+    // covers both staged and unstaged changes in the working tree.
+    // On a brand-new repo with no commits, this will fail — treat as 0/0.
+    let diff_out = Command::new("git")
+        .args(["-C", path, "diff", "--shortstat", "HEAD"])
+        .output();
+    if let Ok(diff_out) = diff_out {
+        if diff_out.status.success() {
+            let diff_str = String::from_utf8_lossy(&diff_out.stdout);
+            let (ins, del) = parse_shortstat(diff_str.as_ref());
+            status.insertions = ins;
+            status.deletions = del;
+        }
+    }
+
+    if let Some(ref br) = branch {
+        status.stash_count = count_stash_for_branch(path, br);
+    }
+
+    Ok(status)
+}
+
 #[tauri::command]
 pub async fn worktree_status(path: String) -> Result<WorktreeStatus, String> {
     // `git status` shells out — offload to the blocking pool so a slow repo
     // (fsck-in-progress, cold cache) doesn't stall the tokio runtime the
     // webview IPC uses. The 2-second poll cadence means this is the hottest
     // blocking-pool customer in the sidebar.
-    tokio::task::spawn_blocking(move || {
-        let output = Command::new("git")
-            .args([
-                "-C",
-                path.as_str(),
-                "status",
-                "--porcelain=v2",
-                "--untracked-files=normal",
-            ])
-            .output()
-            .map_err(|e| format!("git status: {e}"))?;
-        if !output.status.success() {
-            // Non-zero exit is usually "not a git repository" when a
-            // worktree path was deleted out from under us. Treat as empty /
-            // clean rather than poisoning the sidebar with an error row.
-            return Ok(WorktreeStatus::default());
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut status = parse_porcelain_v2(stdout.as_ref());
+    tokio::task::spawn_blocking(move || worktree_status_for_path(&path))
+        .await
+        .map_err(|e| format!("spawn_blocking join: {e}"))?
+}
 
-        // Also fetch line-level diff stats vs HEAD. `git diff --shortstat HEAD`
-        // covers both staged and unstaged changes in the working tree.
-        // On a brand-new repo with no commits, this will fail — treat as 0/0.
-        let diff_out = Command::new("git")
-            .args(["-C", path.as_str(), "diff", "--shortstat", "HEAD"])
-            .output();
-        if let Ok(diff_out) = diff_out {
-            if diff_out.status.success() {
-                let diff_str = String::from_utf8_lossy(&diff_out.stdout);
-                let (ins, del) = parse_shortstat(diff_str.as_ref());
-                status.insertions = ins;
-                status.deletions = del;
-            }
-        }
+#[tauri::command]
+pub async fn worktree_status_batch(
+    paths: Vec<String>,
+) -> Result<HashMap<String, WorktreeStatus>, String> {
+    let mut tasks = tokio::task::JoinSet::new();
+    for path in paths {
+        tasks.spawn_blocking(move || {
+            let status = worktree_status_for_path(&path).unwrap_or_default();
+            (path, status)
+        });
+    }
 
-        // Current branch (short name). Detached HEAD yields "HEAD" — treat as
-        // no branch so we skip the upstream/stash queries below.
-        let branch = Command::new("git")
-            .args(["-C", path.as_str(), "symbolic-ref", "--short", "HEAD"])
-            .output()
-            .ok()
-            .and_then(|o| {
-                if o.status.success() {
-                    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                    if s.is_empty() { None } else { Some(s) }
-                } else {
-                    None
-                }
-            });
-
-        if let Some(ref br) = branch {
-            status.upstream = fetch_upstream_branch(path.as_str(), br);
-            if status.upstream.is_some() {
-                let (ahead, behind) = count_ahead_behind(path.as_str());
-                status.ahead = ahead;
-                status.behind = behind;
-            }
-            status.stash_count = count_stash_for_branch(path.as_str(), br);
-        }
-
-        Ok(status)
-    })
-    .await
-    .map_err(|e| format!("spawn_blocking join: {e}"))?
+    let mut out = HashMap::new();
+    while let Some(result) = tasks.join_next().await {
+        let (path, status) = result.map_err(|e| format!("spawn_blocking join: {e}"))?;
+        out.insert(path, status);
+    }
+    Ok(out)
 }
 
 /// Parse `git status --porcelain=v2` output into the three buckets the sidebar
 /// renders. Split out for unit testing without a live repo.
+#[cfg(test)]
 fn parse_porcelain_v2(stdout: &str) -> WorktreeStatus {
+    parse_porcelain_v2_with_branch(stdout).0
+}
+
+fn parse_porcelain_v2_with_branch(stdout: &str) -> (WorktreeStatus, Option<String>) {
     let mut status = WorktreeStatus::default();
+    let mut branch = None;
     for line in stdout.lines() {
         if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("# branch.head ") {
+            if rest != "(detached)" {
+                branch = Some(rest.to_string());
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("# branch.upstream ") {
+            if !rest.is_empty() {
+                status.upstream = Some(rest.to_string());
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("# branch.ab ") {
+            for part in rest.split_whitespace() {
+                if let Some(n) = part.strip_prefix('+').and_then(|n| n.parse().ok()) {
+                    status.ahead = n;
+                } else if let Some(n) = part.strip_prefix('-').and_then(|n| n.parse().ok()) {
+                    status.behind = n;
+                }
+            }
             continue;
         }
         let mut parts = line.splitn(2, ' ');
@@ -948,7 +1543,7 @@ fn parse_porcelain_v2(stdout: &str) -> WorktreeStatus {
     }
     status.dirty =
         !status.untracked.is_empty() || !status.modified.is_empty() || !status.staged.is_empty();
-    status
+    (status, branch)
 }
 
 fn push_changed_path(marker: &str, rest: &str, out: &mut WorktreeStatus) {
@@ -976,31 +1571,6 @@ fn push_changed_path(marker: &str, rest: &str, out: &mut WorktreeStatus) {
     if worktree_char != '.' {
         out.modified.push(path);
     }
-}
-
-/// Count commits local-only vs upstream-only for the branch at HEAD. Shells
-/// out to `git rev-list --left-right --count HEAD...@{u}`. Returns `(0, 0)`
-/// when git fails or there is no upstream.
-fn count_ahead_behind(path: &str) -> (u32, u32) {
-    let out = Command::new("git")
-        .args([
-            "-C",
-            path,
-            "rev-list",
-            "--left-right",
-            "--count",
-            "HEAD...@{u}",
-        ])
-        .output();
-    let Ok(out) = out else { return (0, 0) };
-    if !out.status.success() {
-        return (0, 0);
-    }
-    let s = String::from_utf8_lossy(&out.stdout);
-    let mut parts = s.split_whitespace();
-    let ahead = parts.next().and_then(|n| n.parse().ok()).unwrap_or(0);
-    let behind = parts.next().and_then(|n| n.parse().ok()).unwrap_or(0);
-    (ahead, behind)
 }
 
 /// Count the stash entries whose `WIP on <branch>` / `On <branch>` header

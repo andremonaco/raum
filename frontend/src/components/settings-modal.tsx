@@ -1862,15 +1862,23 @@ type UpdatePhase =
   | { kind: "error"; message: string };
 
 /** How this binary was installed — reported by the Rust `updater_install_flavor`
- *  command. `deb` is the only flavor that must NOT try in-app install (apt
- *  owns the file); for everything else `update.downloadAndInstall()` works. */
-type InstallFlavor = "macos" | "appimage" | "deb" | "unknown";
+ *  command. `deb` and `homebrew` must NOT try in-app install: apt owns the
+ *  Linux `.deb` file, and Homebrew owns the macOS cask record (replacing the
+ *  bundle out of band leaves `brew list` stale and breaks later
+ *  `brew upgrade`/`uninstall`). For everything else
+ *  `update.downloadAndInstall()` works. */
+type InstallFlavor = "macos" | "homebrew" | "appimage" | "deb" | "unknown";
 
 /** GitHub release page for a given raum version, used as the fallback
  *  "open in browser" target for `.deb` installs. Matches the repo owner +
  *  tag convention baked into `release.yml`. */
 const releasePageUrl = (version: string) =>
   `https://github.com/andremonaco/raum/releases/tag/v${version}`;
+
+/** Command surfaced for Homebrew-cask installs; copied to the clipboard so
+ *  users can paste it into a terminal. The cask is published from the
+ *  release workflow's `bump-homebrew` job. */
+const BREW_UPGRADE_COMMAND = "brew upgrade --cask raum";
 
 const UpdatesSection: Component = () => {
   const [currentVersion] = createResource<string>(async () => {
@@ -1893,9 +1901,14 @@ const UpdatesSection: Component = () => {
   });
 
   /** True when this install can accept `downloadAndInstall()` — i.e. it's
-   *  not a distro-managed `.deb`. For `deb` we surface a link to the
-   *  release page instead, since apt owns the binary. */
-  const canSelfUpdate = () => installFlavor() !== "deb";
+   *  neither a distro-managed `.deb` nor a Homebrew cask install. For
+   *  `deb` we surface a link to the release page; for `homebrew` we
+   *  surface the `brew upgrade --cask raum` command so brew stays
+   *  authoritative. */
+  const canSelfUpdate = () => {
+    const f = installFlavor();
+    return f !== "deb" && f !== "homebrew";
+  };
 
   const [initialPref] = createResource<boolean>(async () => {
     try {
@@ -2006,6 +2019,16 @@ const UpdatesSection: Component = () => {
     }
   };
 
+  /** Transient "Copied" affordance for the Homebrew-flow button. Flips
+   *  back to the default label after 2 s so the row stays quiet. */
+  const [brewCopied, setBrewCopied] = createSignal(false);
+  const copyBrewCommand = async () => {
+    const ok = await copyToClipboard(BREW_UPGRADE_COMMAND);
+    if (!ok) return;
+    setBrewCopied(true);
+    setTimeout(() => setBrewCopied(false), 2000);
+  };
+
   const primaryLabel = () => {
     const p = phase();
     switch (p.kind) {
@@ -2044,9 +2067,7 @@ const UpdatesSection: Component = () => {
         <div class="flex items-center justify-between rounded border border-border bg-card/30 px-3 py-2">
           <div class="min-w-0 flex-1">
             <p class="text-xs text-foreground">Current version</p>
-            <p class="text-[10px] text-muted-foreground">
-              raum is distributed as signed macOS DMGs and Linux AppImage/.deb bundles.
-            </p>
+            <p class="text-[10px] text-muted-foreground">The version of raum you're running.</p>
           </div>
           <code class="shrink-0 rounded bg-background px-2 py-0.5 font-mono text-[11px] text-foreground">
             {currentVersion() ?? "…"}
@@ -2067,7 +2088,7 @@ const UpdatesSection: Component = () => {
                     : "Check for a newer build."}
                 </p>
                 <p class="text-[10px] text-muted-foreground">
-                  Signed releases only — the public key in tauri.conf.json verifies each bundle.
+                  Every update is verified before it's installed, so you only get genuine releases.
                 </p>
               </Show>
               <Show when={phase().kind === "up-to-date"}>
@@ -2080,6 +2101,12 @@ const UpdatesSection: Component = () => {
                 {(() => {
                   const p = phase();
                   if (p.kind !== "available") return null;
+                  const fallbackCopy = () => {
+                    if (installFlavor() === "homebrew") {
+                      return "You installed raum with Homebrew, so updates go through brew. Run the command below in your terminal to upgrade.";
+                    }
+                    return "raum was installed through your system's package manager, so in-app updates are off. Grab the latest build from the release page or update the way you usually do.";
+                  };
                   return (
                     <>
                       <p class="text-xs text-foreground">
@@ -2091,8 +2118,23 @@ const UpdatesSection: Component = () => {
                           ? `Released ${
                               p.update.date ?? "recently"
                             }. Click "Install" to download and relaunch.`
-                          : "You installed raum as a .deb package — apt owns that file, so in-app install is disabled. Download the new .deb from the release page or update via your package manager."}
+                          : fallbackCopy()}
                       </p>
+                      <Show when={!canSelfUpdate() && installFlavor() === "homebrew"}>
+                        <div class="mt-2 flex items-center gap-2 rounded border border-border bg-background px-2 py-1">
+                          <code class="min-w-0 flex-1 truncate font-mono text-[11px] text-foreground">
+                            {BREW_UPGRADE_COMMAND}
+                          </code>
+                          <button
+                            type="button"
+                            class="shrink-0 rounded border border-border bg-card/30 px-2 py-0.5 text-[10px] text-foreground transition-colors hover:bg-accent"
+                            onClick={() => void copyBrewCommand()}
+                            title={brewCopied() ? "Copied to clipboard" : "Copy to clipboard"}
+                          >
+                            {brewCopied() ? "Copied" : "Copy"}
+                          </button>
+                        </div>
+                      </Show>
                     </>
                   );
                 })()}
@@ -2128,8 +2170,8 @@ const UpdatesSection: Component = () => {
                     <>
                       <p class="text-xs text-success">Installed {p.version} — ready to relaunch.</p>
                       <p class="text-[10px] text-muted-foreground">
-                        tmux sessions survive the restart, so your terminals and agents come back
-                        exactly where they were.
+                        Your terminals and running agents will come back exactly where they left
+                        off.
                       </p>
                     </>
                   );
@@ -2155,16 +2197,19 @@ const UpdatesSection: Component = () => {
                 {(() => {
                   const p = phase();
                   if (p.kind !== "available") return null;
-                  return canSelfUpdate() ? (
-                    <button
-                      type="button"
-                      class="rounded-md border border-warning/40 bg-warning/10 px-2 py-0.5 text-[10px] text-warning transition-colors hover:bg-warning/20 disabled:pointer-events-none disabled:opacity-45"
-                      onClick={() => void runInstall()}
-                      disabled={isBusy()}
-                    >
-                      Install
-                    </button>
-                  ) : (
+                  if (canSelfUpdate()) {
+                    return (
+                      <button
+                        type="button"
+                        class="rounded-md border border-warning/40 bg-warning/10 px-2 py-0.5 text-[10px] text-warning transition-colors hover:bg-warning/20 disabled:pointer-events-none disabled:opacity-45"
+                        onClick={() => void runInstall()}
+                        disabled={isBusy()}
+                      >
+                        Install
+                      </button>
+                    );
+                  }
+                  return (
                     <button
                       type="button"
                       class="rounded-md border border-warning/40 bg-warning/10 px-2 py-0.5 text-[10px] text-warning transition-colors hover:bg-warning/20"
@@ -2204,7 +2249,7 @@ const UpdatesSection: Component = () => {
         <div class="flex flex-col gap-1">
           <ToggleRow
             label="Check for updates on launch"
-            description="Quietly checks GitHub Releases a few seconds after raum opens."
+            description="Quietly checks for new versions a few seconds after raum opens."
             checked={prefSeeded() ? checkOnLaunch() : true}
             onChange={(v) => void handlePrefToggle(v)}
             disabled={prefSaving() || !prefSeeded()}

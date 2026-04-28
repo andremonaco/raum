@@ -33,6 +33,8 @@ interface PaneEntry {
   renderer: RendererKind;
   /** If true, we've already lost a WebGL context here; never try again. */
   forbidWebgl: boolean;
+  /** Hidden terminal surfaces stay alive but may not hold scarce WebGL slots. */
+  visible: boolean;
   /** Monotonic counter used for LRU ordering. Higher = more recently used. */
   mru: number;
 }
@@ -132,7 +134,7 @@ async function installWebgl(entry: PaneEntry): Promise<boolean> {
 export function registerPane(
   paneId: string,
   terminal: Terminal,
-  opts: { forbidWebgl?: boolean } = {},
+  opts: { forbidWebgl?: boolean; visible?: boolean } = {},
 ): void {
   if (panes.has(paneId)) return;
   const entry: PaneEntry = {
@@ -141,6 +143,7 @@ export function registerPane(
     addon: null,
     renderer: "canvas",
     forbidWebgl: !!opts.forbidWebgl,
+    visible: opts.visible !== false,
     mru: mruCounter++,
   };
   panes.set(paneId, entry);
@@ -158,6 +161,15 @@ export function unregisterPane(paneId: string): void {
   panes.delete(paneId);
 }
 
+export function setPaneVisibility(paneId: string, visible: boolean): void {
+  const entry = panes.get(paneId);
+  if (!entry) return;
+  entry.visible = visible;
+  if (!visible && entry.renderer === "webgl") {
+    installCanvas(entry);
+  }
+}
+
 /**
  * Promote `paneId` to WebGL, evicting the LRU WebGL pane to canvas if the
  * cap would otherwise be exceeded. No-op if the pane is already WebGL, or if
@@ -169,6 +181,7 @@ export async function requestWebgl(paneId: string): Promise<void> {
   entry.mru = mruCounter++;
   if (entry.renderer === "webgl") return;
   if (entry.forbidWebgl) return;
+  if (!entry.visible) return;
 
   if (currentWebglCount() >= MAX_WEBGL_PANES) {
     const lru = findLruWebgl(paneId);

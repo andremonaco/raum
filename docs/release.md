@@ -62,17 +62,28 @@ cannot sign / notarize them.
 
 ### macOS code signing + notarization
 
+Notarization runs via the App Store Connect API key path (durable for
+CI, rotation-friendly). The Apple ID + app-specific password path is
+the documented alternative; switching back means swapping the three
+`APPLE_API_*` secrets for `APPLE_ID` + `APPLE_PASSWORD` and dropping
+the decode step in `release.yml`.
+
 | Secret                        | Purpose                                                     |
 | ----------------------------- | ----------------------------------------------------------- |
 | `APPLE_CERTIFICATE`           | Base64-encoded `.p12` containing the Developer ID Application cert. |
 | `APPLE_CERTIFICATE_PASSWORD`  | Password for the `.p12` bundle.                             |
 | `APPLE_SIGNING_IDENTITY`      | Identity string, e.g. `"Developer ID Application: Your Name (TEAMID)"`. |
-| `APPLE_ID`                    | Apple Developer account email (notarization submitter).     |
-| `APPLE_PASSWORD`              | App-specific password for `APPLE_ID`.                       |
 | `APPLE_TEAM_ID`               | Developer Team ID (10-character string).                    |
+| `APPLE_API_ISSUER`            | App Store Connect Issuer ID (UUID, top of the Team Keys page). |
+| `APPLE_API_KEY`               | App Store Connect Key ID (10-character alphanumeric).       |
+| `APPLE_API_KEY_BASE64`        | Base64-encoded `.p8` private key. The release workflow decodes this to a file at runtime and sets `APPLE_API_KEY_PATH` for `tauri-action`. |
 
-Apple issues app-specific passwords at <https://appleid.apple.com/>. You
-must have an active Developer Program membership to run notarization.
+Generate the `.p8` once at App Store Connect → Users and Access →
+Integrations → App Store Connect API → Team Keys (Developer role is
+sufficient for notarization). Apple lets you download the `.p8`
+exactly once — store the original alongside the secrets in your
+password manager, since revocation + regeneration is the only recovery
+path.
 
 ### Tauri updater signing
 

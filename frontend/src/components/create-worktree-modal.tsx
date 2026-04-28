@@ -20,11 +20,14 @@ import {
   createResource,
   createSignal,
 } from "solid-js";
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
+import { toast } from "solid-sonner";
 import { cacheWorktreeList, clearWorktreeListCache, type Worktree } from "../stores/worktreeStore";
 import { projectStore } from "../stores/projectStore";
 import { tildify } from "../lib/pathDisplay";
-import { GitBranchIcon } from "./icons";
+import { createOperationProgress, type ProgressEvent } from "../lib/operationProgress";
+import { GitBranchIcon, LoaderIcon } from "./icons";
+import { OperationProgress } from "./operation-progress";
 import { Alert, AlertDescription } from "./ui/alert";
 import { Button } from "./ui/button";
 import {
@@ -173,7 +176,7 @@ interface CreateArgs {
  * worktree (if any) and a `create` trigger function.
  */
 export function useWorktreeCreate(projectSlug: () => string): {
-  create: (args: CreateArgs) => Promise<WorktreeCreated>;
+  create: (args: CreateArgs, channel: Channel<ProgressEvent>) => Promise<WorktreeCreated>;
   lastCreated: () => WorktreeCreated | undefined;
   error: () => string | undefined;
   pending: () => boolean;
@@ -182,7 +185,10 @@ export function useWorktreeCreate(projectSlug: () => string): {
   const [error, setError] = createSignal<string | undefined>(undefined);
   const [pending, setPending] = createSignal(false);
 
-  async function create(args: CreateArgs): Promise<WorktreeCreated> {
+  async function create(
+    args: CreateArgs,
+    channel: Channel<ProgressEvent>,
+  ): Promise<WorktreeCreated> {
     setPending(true);
     setError(undefined);
     try {
@@ -198,6 +204,7 @@ export function useWorktreeCreate(projectSlug: () => string): {
           pathStrategy: args.strategyOverride,
           pathPatternOverride: args.patternOverride,
         },
+        onProgress: channel,
       });
       setLastCreated(out);
       clearWorktreeListCache(slug);
@@ -221,6 +228,22 @@ export function useWorktreeCreate(projectSlug: () => string): {
 
   return { create, lastCreated, error, pending };
 }
+
+/**
+ * Step list rendered by the create-worktree progress panel. The `id` strings
+ * MUST stay in sync with the backend constants in
+ * `src-tauri/src/commands/worktree.rs` (`STEP_*` tuples) — the runtime UI
+ * matches incoming events to template entries by `id`.
+ */
+const CREATE_STEPS = [
+  { id: "validate", label: "Validating settings" },
+  { id: "pre-hook", label: "Running preCreate hook" },
+  { id: "git-add", label: "Creating git worktree" },
+  { id: "base-meta", label: "Recording base branch" },
+  { id: "hydrate", label: "Hydrating files" },
+  { id: "post-hook", label: "Running postCreate hook" },
+  { id: "rescan", label: "Refreshing git status" },
+] as const;
 
 export const CreateWorktreeModal: Component<CreateWorktreeModalProps> = (props) => {
   const [branch, setBranch] = createSignal("");
@@ -343,6 +366,7 @@ export const CreateWorktreeModal: Component<CreateWorktreeModalProps> = (props) 
   );
 
   const creator = useWorktreeCreate(() => projectSlug());
+  const progress = createOperationProgress(CREATE_STEPS);
 
   // True when the user hasn't typed anything yet — drives the "ghost example"
   // styling on the preview cards so they stay the same height as when filled.
@@ -351,21 +375,29 @@ export const CreateWorktreeModal: Component<CreateWorktreeModalProps> = (props) 
   async function onSubmit(ev: SubmitEvent) {
     ev.preventDefault();
     if (!branch().trim()) return;
+    const channel = progress.start();
     try {
-      const out = await creator.create({
-        branch: branch(),
-        baseBranch: baseBranch(),
-        strategyOverride: strategyOverride(),
-        patternOverride: patternOverride(),
-      });
+      const out = await creator.create(
+        {
+          branch: branch(),
+          baseBranch: baseBranch(),
+          strategyOverride: strategyOverride(),
+          patternOverride: patternOverride(),
+        },
+        channel,
+      );
       props.onCreated?.(out);
+      toast.success("Worktree created", {
+        description: out.branch,
+      });
       setBranch("");
       setStrategyOverride(null);
       setCustomPattern("");
       setCustomPatternSeeded(false);
       props.onClose();
     } catch {
-      // error() signal already captured the message.
+      // error() signal already captured the message; keep the modal open so the
+      // user can see which step failed in the progress panel.
     }
   }
 
@@ -374,6 +406,9 @@ export const CreateWorktreeModal: Component<CreateWorktreeModalProps> = (props) 
       open={props.open}
       onOpenChange={(isOpen) => {
         if (!isOpen) {
+          // Don't let the user dismiss while a create is mid-flight — the
+          // progress panel needs to stay visible until the backend resolves.
+          if (creator.pending()) return;
           setBranch("");
           setStrategyOverride(null);
           setCustomPattern("");
@@ -628,17 +663,34 @@ export const CreateWorktreeModal: Component<CreateWorktreeModalProps> = (props) 
               </Show>
             </div>
 
-            <Show when={creator.error()}>
+            <Show when={creator.pending() || progress.failure()}>
+              <OperationProgress
+                steps={progress.steps()}
+                counter={progress.counter()}
+                failure={progress.failure()}
+              />
+            </Show>
+
+            <Show when={creator.error() && !progress.failure()}>
               <Alert variant="destructive" class="text-xs">
                 <AlertDescription>{creator.error()}</AlertDescription>
               </Alert>
             </Show>
 
             <DialogFooter>
-              <Button type="button" variant="ghost" size="sm" onClick={() => props.onClose()}>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                disabled={creator.pending()}
+                onClick={() => props.onClose()}
+              >
                 Cancel
               </Button>
               <Button type="submit" size="sm" disabled={creator.pending() || !branch().trim()}>
+                <Show when={creator.pending()}>
+                  <LoaderIcon class="mr-1.5 size-3.5 animate-spin" />
+                </Show>
                 {creator.pending() ? "Creating…" : "Create worktree"}
               </Button>
             </DialogFooter>

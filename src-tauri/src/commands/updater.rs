@@ -26,20 +26,42 @@ pub fn config_set_updater_check_on_launch(
 /// How this binary was delivered, as far as the update flow cares.
 ///
 /// Tauri v2's updater can replace a macOS `.app` in place and can swap out
-/// an AppImage on Linux, but it cannot update a distro-managed `.deb` — apt
-/// owns those files. The frontend uses this to hide the in-app Install
-/// button when we know it would fail, and fall back to "open the release
-/// page" so Linux `.deb` users can update via their package manager or a
-/// manual re-download instead of seeing a raw plugin error.
+/// an AppImage on Linux, but two cases must NOT self-update:
+///
+/// * Linux `.deb` — apt owns the file.
+/// * macOS Homebrew cask — brew owns the cask record. Replacing
+///   `/Applications/raum.app` out of band leaves `brew list --cask` stuck on
+///   the old version, and a later `brew upgrade` becomes a confused no-op.
+///
+/// In both cases the frontend hides the in-app Install button and surfaces
+/// a package-manager-friendly path instead (release page for `.deb`, copy
+/// `brew upgrade --cask raum` for Homebrew).
 ///
 /// Linux detection relies on `APPIMAGE`, which the AppImage runtime sets
 /// automatically when it mounts + executes the bundle. Its absence on
 /// Linux is taken as `.deb` (the only other bundle we ship).
+///
+/// macOS Homebrew detection probes the Caskroom metadata directory rather
+/// than shelling out to `brew`. The directory is created by
+/// `brew install --cask raum` and removed by `brew uninstall --cask raum`,
+/// so its presence is a reliable signal even though brew copies (rather
+/// than symlinks) the bundle into `/Applications`. Both prefixes are
+/// checked because Homebrew lives at `/opt/homebrew` on Apple Silicon and
+/// `/usr/local` on Intel.
 #[tauri::command]
 pub fn updater_install_flavor() -> &'static str {
     #[cfg(target_os = "macos")]
     {
-        "macos"
+        const CASKROOM_PATHS: [&str; 2] =
+            ["/opt/homebrew/Caskroom/raum", "/usr/local/Caskroom/raum"];
+        if CASKROOM_PATHS
+            .iter()
+            .any(|p| std::fs::metadata(p).is_ok_and(|m| m.is_dir()))
+        {
+            "homebrew"
+        } else {
+            "macos"
+        }
     }
     #[cfg(target_os = "linux")]
     {

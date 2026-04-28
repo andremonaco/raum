@@ -56,6 +56,17 @@ export interface DragState {
 const [dragState, setDragState] = createSignal<DragState | null>(null);
 export { dragState };
 
+/**
+ * Test-only hook for driving `dragState` directly. Production code MUST go
+ * through `beginDrag` / `cancelDrag`; this is purely for unit tests that
+ * need to assert downstream consumers (e.g. `terminalSurfaces` projection)
+ * react correctly to drag-state transitions without simulating a full
+ * pointer-event sequence in jsdom.
+ */
+export function __setDragStateForTests(next: DragState | null): void {
+  setDragState(next);
+}
+
 // Zone-boundary hysteresis. The pointer has to cross the *enter* threshold
 // to step into a zone, then must travel back past the wider *exit* threshold
 // before the classifier will let go of it. Without this band, sub-pixel
@@ -206,6 +217,19 @@ export function beginDrag(opts: BeginDragOptions): void {
     onDrop({ sourceId, targetId: null, zone: null });
   }
 
+  // Escape mid-drag is a hard cancel — the live preview tree clears as
+  // `dragState` becomes null, sibling panes ease back to their committed
+  // rects, and `onDrop` is invoked with no target so no mutation commits.
+  // Capture-phase + stopPropagation so the keystroke can't be swallowed
+  // upstream (e.g. by the cross-project view's own Escape handler in
+  // terminal-grid.tsx) before we get it.
+  function onKeyDown(e: KeyboardEvent): void {
+    if (e.key !== "Escape") return;
+    e.preventDefault();
+    e.stopPropagation();
+    onCancel();
+  }
+
   function cleanup(): void {
     if (rafId !== 0) {
       cancelAnimationFrame(rafId);
@@ -215,9 +239,13 @@ export function beginDrag(opts: BeginDragOptions): void {
     document.removeEventListener("pointermove", onMove);
     document.removeEventListener("pointerup", onUp);
     document.removeEventListener("pointercancel", onCancel);
+    document.removeEventListener("keydown", onKeyDown, true);
     document.body.style.cursor = "";
     document.body.style.userSelect = "";
-    rootEl.classList.remove("dnd-active");
+    // `is-resizing` removal triggers each TerminalPane's MutationObserver
+    // (terminal-pane.tsx) to flush the throttled resize pump — sibling panes
+    // that reflowed during the drag end at the exact committed cols/rows.
+    rootEl.classList.remove("dnd-active", "is-resizing");
     setDragState(null);
     activeCleanup = null;
   }
@@ -226,9 +254,14 @@ export function beginDrag(opts: BeginDragOptions): void {
   document.addEventListener("pointermove", onMove);
   document.addEventListener("pointerup", onUp);
   document.addEventListener("pointercancel", onCancel);
+  document.addEventListener("keydown", onKeyDown, true);
   document.body.style.cursor = "grabbing";
   document.body.style.userSelect = "none";
-  rootEl.classList.add("dnd-active");
+  // `dnd-active` drives the chrome's drag affordances (sibling rings,
+  // ease-out reflow, etc.). `is-resizing` tells TerminalPane that the
+  // speculative preview tree is active, so it can keep sending throttled live
+  // resizes and force one final measurement when the drag commits/cancels.
+  rootEl.classList.add("dnd-active", "is-resizing");
 
   // Clear any pre-existing native text selection — otherwise a stale
   // selection rectangle stays painted on xterm while the user drags, and

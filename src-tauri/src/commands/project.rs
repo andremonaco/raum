@@ -30,9 +30,14 @@ use raum_core::config::{
 use raum_core::project::project_with_defaults;
 use raum_core::sigil::{is_valid_sigil, resolve_sigil};
 use serde::{Deserialize, Serialize};
+use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter, Runtime};
 
 use crate::commands::git_watcher::GitHeadWatcher;
+use crate::commands::terminal::{kill_session_inner, sessions_for_project};
+use crate::commands::worktree_progress::{
+    ProgressEvent, StepStatus, emit_counter, emit_done, emit_failed, emit_step, emit_step_detail,
+};
 use crate::state::AppHandleState;
 
 /// UI-facing projection of a `ProjectConfig`. Mirrors the canonical fields the
@@ -336,23 +341,121 @@ pub fn project_update<R: Runtime>(
     Ok(ProjectListItem::from_project(&project, has_raum_toml))
 }
 
-/// §5.3 / §5.4 — remove a project. Deletes `projects/<slug>/` only; the caller
-/// is responsible for killing tagged tmux sessions (the Solid UI walks
-/// `terminal_list()` and issues `terminal_kill` for each matching session).
-#[tauri::command]
-pub fn project_remove(state: tauri::State<'_, AppHandleState>, slug: String) -> Result<(), String> {
-    let store = state
-        .config_store
-        .lock()
-        .map_err(|e| format!("config_store lock: {e}"))?;
-    store
-        .delete_project(&slug)
-        .map_err(|e| format!("delete_project: {e}"))?;
-    drop(store);
+/// Per-step labels emitted by [`project_remove`]. Same id contract as the
+/// worktree commands — the FE step list keys off these.
+const PROJECT_STEP_KILL: (&str, &str) = ("kill-terminals", "Stopping terminals");
+const PROJECT_STEP_DELETE: (&str, &str) = ("delete-config", "Removing project from config");
+const PROJECT_STEP_WATCHER: (&str, &str) = ("unregister-watcher", "Releasing git watcher");
 
+/// §5.3 / §5.4 — remove a project. Folds the previously FE-driven
+/// `terminal_kill` loop into a single async backend call so we can stream
+/// per-session progress over a `Channel<ProgressEvent>` instead of round-
+/// tripping through the FE per session.
+#[tauri::command]
+pub async fn project_remove<R: Runtime>(
+    app: AppHandle<R>,
+    state: tauri::State<'_, AppHandleState>,
+    slug: String,
+    on_progress: Channel<ProgressEvent>,
+) -> Result<(), String> {
+    // ---- Step 1: kill any terminals tagged with this project --------------
+    let session_ids = sessions_for_project(&state, &slug);
+    if session_ids.is_empty() {
+        emit_step(
+            &on_progress,
+            PROJECT_STEP_KILL.0,
+            PROJECT_STEP_KILL.1,
+            StepStatus::Skipped,
+        );
+    } else {
+        let label = format!(
+            "Stopping {} terminal{}",
+            session_ids.len(),
+            if session_ids.len() == 1 { "" } else { "s" }
+        );
+        emit_step(
+            &on_progress,
+            PROJECT_STEP_KILL.0,
+            &label,
+            StepStatus::Running,
+        );
+        let total = session_ids.len() as u64;
+        for (i, sid) in session_ids.iter().enumerate() {
+            // Best-effort — orphaned tmux sessions are reaped on next launch.
+            if let Err(e) = kill_session_inner(&app, &state, sid).await {
+                tracing::warn!(session_id = %sid, error = %e, "project_remove: terminal kill failed");
+            }
+            emit_counter(&on_progress, PROJECT_STEP_KILL.0, (i + 1) as u64, total);
+        }
+        emit_step(
+            &on_progress,
+            PROJECT_STEP_KILL.0,
+            &label,
+            StepStatus::Completed,
+        );
+    }
+
+    // ---- Step 2: drop project from on-disk config -------------------------
+    emit_step(
+        &on_progress,
+        PROJECT_STEP_DELETE.0,
+        PROJECT_STEP_DELETE.1,
+        StepStatus::Running,
+    );
+    {
+        let store = match state.config_store.lock() {
+            Ok(s) => s,
+            Err(e) => {
+                let msg = format!("config_store lock: {e}");
+                emit_step_detail(
+                    &on_progress,
+                    PROJECT_STEP_DELETE.0,
+                    PROJECT_STEP_DELETE.1,
+                    StepStatus::Failed,
+                    msg.clone(),
+                );
+                emit_failed(&on_progress, msg.clone());
+                return Err(msg);
+            }
+        };
+        if let Err(e) = store.delete_project(&slug) {
+            let msg = format!("delete_project: {e}");
+            emit_step_detail(
+                &on_progress,
+                PROJECT_STEP_DELETE.0,
+                PROJECT_STEP_DELETE.1,
+                StepStatus::Failed,
+                msg.clone(),
+            );
+            emit_failed(&on_progress, msg.clone());
+            return Err(msg);
+        }
+    }
+    emit_step(
+        &on_progress,
+        PROJECT_STEP_DELETE.0,
+        PROJECT_STEP_DELETE.1,
+        StepStatus::Completed,
+    );
+
+    // ---- Step 3: unregister the per-project git watcher -------------------
+    emit_step(
+        &on_progress,
+        PROJECT_STEP_WATCHER.0,
+        PROJECT_STEP_WATCHER.1,
+        StepStatus::Running,
+    );
     if let Ok(mut watchers) = state.git_watchers.lock() {
         watchers.remove(&slug);
     }
+    emit_step(
+        &on_progress,
+        PROJECT_STEP_WATCHER.0,
+        PROJECT_STEP_WATCHER.1,
+        StepStatus::Completed,
+    );
+
+    emit_done(&on_progress);
     Ok(())
 }
 

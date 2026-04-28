@@ -21,8 +21,10 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { createStore, reconcile } from "solid-js/store";
 import { agentStore, type AgentKind, type AgentState } from "./agentStore";
+import { removeTabsBySessionId } from "./runtimeLayoutStore";
 
 const TERMINAL_PANE_CONTEXT_CHANGED_EVENT = "terminal-pane-context-changed";
+const PANE_PROMPT_UPDATED_EVENT = "pane:prompt-updated";
 
 export interface TerminalListItem {
   session_id: string;
@@ -30,6 +32,10 @@ export interface TerminalListItem {
   worktree_id: string | null;
   kind: AgentKind;
   created_unix: number;
+  /** True when the rehydrate path detected this session's tmux pane was
+   *  dead and could not auto-revive it. Backend skips the field on the wire
+   *  when false (see `TerminalListItem` in terminal.rs). */
+  dead?: boolean;
 }
 
 export type TerminalWorkingState = "idle" | "working" | "waiting";
@@ -41,9 +47,15 @@ export interface TerminalPaneContext {
   windowName: string;
 }
 
+export interface LastPrompt {
+  text: string;
+  submittedAtMs: number;
+}
+
 export interface TerminalRecord extends TerminalListItem {
   workingState: TerminalWorkingState;
   paneContext?: TerminalPaneContext;
+  lastPrompt?: LastPrompt;
 }
 
 export interface HarnessCounts {
@@ -93,6 +105,7 @@ const [idsByWorktreeId, setIdsByWorktreeId] = createSignal<
 const [lastOutputBySession, setLastOutputBySession] = createSignal<ReadonlyMap<string, number>>(
   new Map(),
 );
+const [closingTerminalIds, setClosingTerminalIds] = createSignal<ReadonlySet<string>>(EMPTY_SET);
 
 export {
   workingIds,
@@ -102,6 +115,7 @@ export {
   idsByProjectSlug,
   idsByWorktreeId,
   lastOutputBySession,
+  closingTerminalIds,
 };
 
 const pendingWorkingStateById: Record<string, TerminalWorkingState> = {};
@@ -116,6 +130,7 @@ function hydrateTerminalRecord(item: TerminalListItem, existing?: TerminalRecord
   const sameLifecycle = existing?.created_unix === item.created_unix;
   return {
     ...item,
+    dead: item.dead ?? false,
     workingState: existing?.workingState ?? pending ?? mapAgentState(agentState),
     paneContext: sameLifecycle ? existing?.paneContext : undefined,
   };
@@ -138,6 +153,7 @@ function shallowEqualRecord(a: TerminalRecord, b: TerminalRecord): boolean {
     a.worktree_id === b.worktree_id &&
     a.kind === b.kind &&
     a.created_unix === b.created_unix &&
+    (a.dead ?? false) === (b.dead ?? false) &&
     a.workingState === b.workingState &&
     a.paneContext === b.paneContext
   );
@@ -318,6 +334,7 @@ function applyTerminalPatch(patch: TerminalPatch): void {
           next.delete(sessionId);
           return next;
         });
+        clearTerminalClosing(sessionId);
         return;
       }
       case "setWorkingState": {
@@ -375,6 +392,25 @@ export function removeTerminal(sessionId: string): void {
   applyTerminalPatch({ op: "remove", sessionId });
   setMru((prev) => (prev.includes(sessionId) ? prev.filter((id) => id !== sessionId) : prev));
   delete pendingWorkingStateById[sessionId];
+  clearTerminalClosing(sessionId);
+}
+
+export function markTerminalClosing(sessionId: string): void {
+  setClosingTerminalIds((prev) => {
+    if (prev.has(sessionId)) return prev;
+    const next = new Set(prev);
+    next.add(sessionId);
+    return next;
+  });
+}
+
+export function clearTerminalClosing(sessionId: string): void {
+  setClosingTerminalIds((prev) => {
+    if (!prev.has(sessionId)) return prev;
+    const next = new Set(prev);
+    next.delete(sessionId);
+    return next.size === 0 ? EMPTY_SET : next;
+  });
 }
 
 /** Feed the terminal store from the agent state-machine. */
@@ -416,7 +452,7 @@ function samePaneContext(
   );
 }
 
-function setTerminalPaneContext(sessionId: string, paneContext: TerminalPaneContext): void {
+export function setTerminalPaneContext(sessionId: string, paneContext: TerminalPaneContext): void {
   const existing = terminalStore.byId[sessionId];
   if (!existing) return;
   if (samePaneContext(existing.paneContext, paneContext)) return;
@@ -424,6 +460,51 @@ function setTerminalPaneContext(sessionId: string, paneContext: TerminalPaneCont
   // any index, so it's safe to write past the chokepoint. Keep the write
   // targeted to the specific sub-path.
   setTerminalStore("byId", sessionId, "paneContext", paneContext);
+}
+
+export function setTerminalPaneContexts(contexts: Record<string, TerminalPaneContext>): void {
+  batch(() => {
+    for (const [sessionId, paneContext] of Object.entries(contexts)) {
+      setTerminalPaneContext(sessionId, paneContext);
+    }
+  });
+}
+
+export function setLastPrompt(sessionId: string, entry: LastPrompt): void {
+  const existing = terminalStore.byId[sessionId];
+  if (!existing) return;
+  if (
+    existing.lastPrompt?.text === entry.text &&
+    existing.lastPrompt?.submittedAtMs === entry.submittedAtMs
+  ) {
+    return;
+  }
+  // Like paneContext, lastPrompt is observational metadata that doesn't
+  // feed any membership index. Targeted write past the chokepoint.
+  setTerminalStore("byId", sessionId, "lastPrompt", entry);
+}
+
+/**
+ * Seed `lastPrompt` on every terminal record using the per-session
+ * `last_prompt` field returned by `agent_snapshot`. Called after the
+ * snapshot has populated `terminalStore.byId` so the lookup hits a real
+ * record. Missing or null prompts are no-ops.
+ */
+export function seedLastPromptsFromAgents(
+  agents: ReadonlyArray<{
+    session_id: string | null;
+    last_prompt?: { text: string; submitted_at_ms: number };
+  }>,
+): void {
+  batch(() => {
+    for (const a of agents) {
+      if (!a.session_id || !a.last_prompt) continue;
+      setLastPrompt(a.session_id, {
+        text: a.last_prompt.text,
+        submittedAtMs: a.last_prompt.submitted_at_ms,
+      });
+    }
+  });
 }
 
 async function hydrateHarnessPaneContext(item: TerminalListItem): Promise<void> {
@@ -654,6 +735,13 @@ interface TerminalPaneContextChanged extends TerminalPaneContext {
   sessionId: string;
 }
 
+interface PanePromptUpdated {
+  session_id: AgentStateChanged["session_id"];
+  harness: AgentKind;
+  text: string;
+  submitted_at_ms: number;
+}
+
 function sessionIdFromPayload(id: AgentStateChanged["session_id"]): string {
   if (typeof id === "string") return id;
   if (id && typeof id === "object") {
@@ -671,6 +759,7 @@ export async function subscribeTerminalEvents(): Promise<UnlistenFn> {
   const unlistenRemoved = await listen<TerminalSessionRemoved>("terminal-session-removed", (ev) => {
     if (!ev.payload.session_id) return;
     removeTerminal(ev.payload.session_id);
+    removeTabsBySessionId(ev.payload.session_id);
   });
   const unlistenPaneContext = await listen<TerminalPaneContextChanged>(
     TERMINAL_PANE_CONTEXT_CHANGED_EVENT,
@@ -689,11 +778,20 @@ export async function subscribeTerminalEvents(): Promise<UnlistenFn> {
     if (!id) return;
     applyAgentStateToTerminal(id, ev.payload.to);
   });
+  const unlistenPrompt = await listen<PanePromptUpdated>(PANE_PROMPT_UPDATED_EVENT, (ev) => {
+    const id = sessionIdFromPayload(ev.payload.session_id);
+    if (!id) return;
+    setLastPrompt(id, {
+      text: ev.payload.text,
+      submittedAtMs: ev.payload.submitted_at_ms,
+    });
+  });
   return () => {
     unlistenUpsert();
     unlistenRemoved();
     unlistenPaneContext();
     unlistenAgentState();
+    unlistenPrompt();
   };
 }
 

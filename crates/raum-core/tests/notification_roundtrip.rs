@@ -583,26 +583,31 @@ async fn codex_hook_dispatcher_forwards_lifecycle_events_to_event_socket() {
     let script = prepare_hook_scripts(&tmp, "codex.sh").await;
 
     for event_name in ["UserPromptSubmit", "Stop"] {
-        let payload = match event_name {
-            "UserPromptSubmit" => "{\"prompt\":\"hi\"}",
-            "Stop" => "{\"last_assistant_message\":\"done\"}",
+        let (payload, expected_field, expected_value) = match event_name {
+            "UserPromptSubmit" => ("{\"prompt\":\"hi\"}", "prompt", "hi"),
+            "Stop" => (
+                "{\"last_assistant_message\":\"done\"}",
+                "last_assistant_message",
+                "done",
+            ),
             other => panic!("unexpected event name {other}"),
         };
+        // Codex hands the payload as the LAST argv (matches
+        // `legacy_notify.rs::command.arg(notify_payload)` upstream),
+        // and inherits its own stdin into the child without closing
+        // it. We mirror both: payload-as-argv + Stdio::null() for stdin.
         let mut child = Command::new("sh")
             .arg("-x")
             .arg(&script)
             .arg(event_name)
+            .arg(payload)
             .env("RAUM_EVENT_SOCK", &sock_path)
             .env("RAUM_SESSION", "raum-codex-1")
-            .stdin(Stdio::piped())
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(payload.as_bytes()).await.unwrap();
-            stdin.shutdown().await.ok();
-        }
         let mut child_stderr = child.stderr.take();
         let stderr_handle = tokio::spawn(async move {
             let mut buf = Vec::new();
@@ -638,9 +643,13 @@ async fn codex_hook_dispatcher_forwards_lifecycle_events_to_event_socket() {
         assert_eq!(ev.harness, "codex");
         assert_eq!(ev.event, event_name);
         assert_eq!(ev.session_id.as_deref(), Some("raum-codex-1"));
-        assert!(
-            ev.payload.is_string(),
-            "hook payload should arrive as a JSON string"
+        // Payload arrives as a structured JSON object (verbatim
+        // from Codex), not a JSON-escaped string.
+        assert_eq!(
+            ev.payload[expected_field].as_str(),
+            Some(expected_value),
+            "payload shape: {}",
+            ev.payload
         );
     }
 }

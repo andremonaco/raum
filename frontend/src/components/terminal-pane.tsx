@@ -38,7 +38,13 @@ import "@xterm/xterm/css/xterm.css";
 import type { AgentKind } from "../lib/agentKind";
 import { applyAgentStateToTerminal, isHarnessKind, markOutput } from "../stores/terminalStore";
 import { type AgentState, updateSessionState } from "../stores/agentStore";
-import { registerPane, requestWebgl, unregisterPane } from "../lib/rendererScheduler";
+import { isTabAlive, isTabPendingReset } from "../stores/runtimeLayoutStore";
+import {
+  registerPane,
+  requestWebgl,
+  setPaneVisibility,
+  unregisterPane,
+} from "../lib/rendererScheduler";
 import {
   registerTerminal,
   unregisterTerminal,
@@ -53,14 +59,26 @@ import { FALLBACK_XTERM_THEME } from "../lib/theme/toXtermTheme";
 import { ChevronDownIcon, CopyIcon } from "./icons";
 
 export interface TerminalPaneProps {
+  /** Stable identity for a persistent surface. Defaults to a component-local id. */
+  surfaceKey?: string;
   /** Pre-existing tmux session to re-attach to; omit to spawn a fresh one. */
   sessionId?: string;
   kind: AgentKind;
   cwd?: string;
   projectSlug?: string;
   worktreeId?: string;
+  /** Layout cell id owning this surface. Set only for layout-bound surfaces
+   *  (orphan surfaces leave it undefined). Used to detect spawns whose owning
+   *  tab was removed mid-flight so we can self-destruct the resolved session. */
+  cellId?: string;
+  /** Layout tab id owning this surface. Pairs with `cellId`. */
+  tabId?: string;
   /** Hex string like `#ff00aa` (§4.6). Prop changes only update the border. */
   borderColor?: string;
+  /** Hidden surfaces stay mounted and streaming, but skip renderer promotion and resizes. */
+  visible?: boolean;
+  /** Whether this surface is the active/focused view owner. */
+  active?: boolean;
   /** Called once after `terminal_spawn` resolves with the new session id. */
   onSpawned?: (sessionId: string) => void;
   /** Called when the user clicks the exit overlay to dismiss the pane. */
@@ -124,8 +142,13 @@ interface SpawnArgs {
   rows?: number;
 }
 
-/** §4.4 — debounce resize pushes so gridstack drag doesn't flood tmux. */
-const RESIZE_DEBOUNCE_MS = 100;
+/**
+ * §4.4 — throttle resize pushes. ResizeObserver can fire at display refresh
+ * rate while the user drags a divider or previews a pane drop; tmux cannot
+ * usefully consume every frame, but it must receive regular updates so TUIs
+ * repaint live instead of jumping after the interaction ends.
+ */
+const RESIZE_THROTTLE_MS = 32;
 
 /** Spawn gate: below these dims the host isn't laid out yet and fit returns junk. */
 const MIN_SPAWN_COLS = 20;
@@ -135,24 +158,70 @@ const MIN_REATTACH_COLS = 8;
 const MIN_REATTACH_ROWS = 2;
 
 /** Upper bound before we give up waiting for `document.fonts.ready`. */
-const FONTS_READY_TIMEOUT_MS = 500;
+const FONTS_READY_TIMEOUT_MS = 120;
 
 /** Duration the "Copied" flash stays visible after an auto-copy (ms). */
 const COPY_FLASH_MS = 900;
+
+const MAX_BRIDGE_RECOVERY_ATTEMPTS = 3;
+const BRIDGE_RECOVERY_RETRY_MS = 500;
+
+type TerminalLifecycleEvent = "mount" | "cleanup" | "spawn" | "reattach" | "recover" | "self-heal";
+
+const lifecycleCounts: Record<TerminalLifecycleEvent, number> = {
+  mount: 0,
+  cleanup: 0,
+  spawn: 0,
+  reattach: 0,
+  recover: 0,
+  "self-heal": 0,
+};
+
+function logLifecycle(
+  event: TerminalLifecycleEvent,
+  surfaceKey: string,
+  sessionId: string | null | undefined,
+): void {
+  if (!import.meta.env.DEV) return;
+  lifecycleCounts[event] += 1;
+  console.log(`%c[perf] terminal-surface:${event} #${lifecycleCounts[event]}`, "color:#888", {
+    surfaceKey,
+    sessionId: sessionId ?? null,
+  });
+}
 
 interface HistoryOverlayState {
   lines: string[];
   highlightRow: number | null;
 }
 
+interface TerminalSelfHealEventDetail {
+  cellId?: string;
+  tabId?: string;
+  sessionId?: string;
+}
+
 export const TerminalPane: Component<TerminalPaneProps> = (props) => {
-  const paneId = createUniqueId();
+  const fallbackPaneId = createUniqueId();
+  const paneId = props.surfaceKey ?? fallbackPaneId;
   let host: HTMLDivElement | undefined;
   let historyViewport: HTMLDivElement | undefined;
 
   // Exit overlay state: set when the backend reports the process exited naturally.
   const [exitState, setExitState] = createSignal<{ code: number } | null>(null);
+  // Bridge-loss recovery UX. `"reconnecting"` is shown during the
+  // 3-attempt retry window after `terminal:bridge-lost`; `"lost"` is the
+  // persistent banner shown once retries are exhausted, exposing a
+  // manual Reconnect button. Reset to `"idle"` on the first chunk
+  // through the data channel after a successful reattach.
+  const [bridgeRecoveryUiState, setBridgeRecoveryUiState] = createSignal<
+    "idle" | "reconnecting" | "lost"
+  >("idle");
+  // Whether a `terminal_respawn_dead` is in flight from the Recover
+  // button. Disables the button + dims the overlay for visual feedback.
+  const [respawningDead, setRespawningDead] = createSignal<boolean>(false);
   let unlistenProcessExited: UnlistenFn | null = null;
+  let unlistenBridgeLost: UnlistenFn | null = null;
 
   // §4.6 — Solid signal for the border so prop changes don't re-init xterm.
   // The effect below keeps the signal in sync with `props.borderColor`; the
@@ -180,18 +249,32 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
   let resizeRepinDisposable: IDisposable | null = null;
   let unsubscribeTheme: (() => void) | null = null;
   let resizeRepinRaf: number | null = null;
-  // Observes the grid root's `.is-resizing` class so we can defer the real
-  // `terminal_resize` invoke until a divider drag ends instead of firing
-  // every debounced ResizeObserver tick. Tmux emits a full composite
-  // repaint on each resize; every repaint's trailing `\r\n` at the bottom
-  // row pushes a line into xterm's scrollback. Doing ONE resize per drag
-  // instead of ~20 cuts the per-drag pollution to a single line.
+  // Observes the grid root's `.is-resizing` class so we can force one final
+  // resize flush when an interactive divider/pane drag ends. During the drag
+  // itself the latest-wins resize pump below still sends throttled updates,
+  // keeping tmux, the PTY, and xterm's fitted geometry close enough that TUI
+  // redraws remain live and correctly wrapped.
   let gridMutationObserver: MutationObserver | null = null;
-  // Whether a drag ended with a fit/resize still pending. If the final
-  // ResizeObserver tick happened while `is-resizing` was still set, we
-  // skipped the tmux resize; the MutationObserver flushes it once the
-  // class is removed.
+  // Whether an interactive drag saw at least one ResizeObserver tick. The
+  // MutationObserver uses this as a cheap "final flush owed" flag because the
+  // last pointerup style mutation and the last ResizeObserver callback do not
+  // have a guaranteed ordering across WebKit/Chromium.
   let resizePendingFromDrag = false;
+  let requestVisibleResize: ((force?: boolean) => void) | null = null;
+  let bridgeRecoveryInFlight = false;
+  // Reactive so the "Reconnecting… (N/3)" overlay can show the count
+  // live; underlying mutation still uses the setter from inside the
+  // closure-style retry handlers below.
+  const [bridgeRecoveryAttempts, setBridgeRecoveryAttempts] = createSignal<number>(0);
+  let bridgeRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
+  // Refs populated inside `onMount` so the JSX overlay can call into
+  // the recovery handlers (which need closures over `term`, `fit`, and
+  // the data `channel`). The JSX doesn't render the buttons until the
+  // overlay is shown, by which point onMount has run and the refs are
+  // set. Ref-pattern is the smallest change that keeps the existing
+  // closure structure intact.
+  let recoverDeadPaneRef: (() => void) | null = null;
+  let manualReconnectRef: (() => void) | null = null;
 
   const normalBuffer = () => term?.buffer.normal ?? null;
   const hasDetachedHistory = (): boolean => {
@@ -264,8 +347,17 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
     }
   };
 
+  createEffect(() => {
+    const visible = props.visible !== false;
+    setPaneVisibility(paneId, visible);
+    if (!visible) return;
+    requestVisibleResize?.(true);
+    if (props.active) void requestWebgl(paneId);
+  });
+
   onMount(() => {
     if (!host) return;
+    logLifecycle("mount", paneId, props.sessionId ?? null);
 
     try {
       term = new Terminal(
@@ -334,9 +426,9 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
     void (async () => {
       const forbid = await shouldForbidWebgl();
       if (!term) return;
-      registerPane(paneId, term, { forbidWebgl: forbid });
+      registerPane(paneId, term, { forbidWebgl: forbid, visible: props.visible !== false });
       // Focusing the pane promotes it to WebGL (§4.2).
-      if (!forbid) requestWebgl(paneId);
+      if (!forbid && props.visible !== false && props.active) requestWebgl(paneId);
     })();
 
     // Subscribe to process-exit events from the backend monitor task. When the
@@ -386,16 +478,28 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       }
     };
 
-    // §4.4 — debounced resize plumbing. Every observer tick runs fit.fit() and
-    // pushes cols/rows to tmux, but we coalesce rapid-fire ticks (gridstack
-    // drag, window resize) so the harness sees at most one SIGWINCH per settle.
+    // §4.4 — throttled resize plumbing. ResizeObserver ticks can arrive at
+    // display refresh rate while pane geometry is changing; every dispatched
+    // resize still runs against the latest measured xterm dimensions, but
+    // in-flight tmux round-trips collapse to a single follow-up resize.
     //
     // Crucially: we DO NOT hook `term.onResize` — fit.fit() triggers it, which
     // would produce a duplicate `terminal_resize` invoke per host change.
     let lastCols = -1;
     let lastRows = -1;
+    let resizeInFlight = false;
+    let resizeQueued = false;
+    let forceNextResize = false;
+    let lastResizeDispatchMs = 0;
     const pushResize = (): void => {
+      if (props.visible === false) return;
       if (!term || !fit) return;
+      if (resizeInFlight) {
+        resizeQueued = true;
+        return;
+      }
+      const force = forceNextResize;
+      forceNextResize = false;
       const shouldRepin = shouldAutoStickToBottomOnResize(props.kind) && isViewportAtBottom(term);
       try {
         fit.fit();
@@ -404,10 +508,12 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       }
       const id = sessionId();
       if (!id) return;
-      if (term.cols === lastCols && term.rows === lastRows) return;
+      if (!force && term.cols === lastCols && term.rows === lastRows) return;
       lastCols = term.cols;
       lastRows = term.rows;
       if (shouldRepin) scheduleResizeRepin(false);
+      resizeInFlight = true;
+      lastResizeDispatchMs = performance.now();
       void invoke("terminal_resize", {
         sessionId: id,
         cols: term.cols,
@@ -417,17 +523,34 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
           if (shouldRepin) scheduleResizeRepin(true);
         })
         .catch((e) => {
+          lastCols = -1;
+          lastRows = -1;
           console.error("[TerminalPane] terminal_resize failed", e);
+        })
+        .finally(() => {
+          resizeInFlight = false;
+          if (!resizeQueued) return;
+          resizeQueued = false;
+          scheduleResize(true);
         });
     };
-    const scheduleResize = (): void => {
-      if (resizeTimer !== null) clearTimeout(resizeTimer);
+    const scheduleResize = (force = false): void => {
+      if (props.visible === false) return;
+      if (force) forceNextResize = true;
+      resizeQueued = true;
+      if (resizeTimer !== null) {
+        if (!force) return;
+        clearTimeout(resizeTimer);
+        resizeTimer = null;
+      }
+      const elapsed = performance.now() - lastResizeDispatchMs;
+      const delay = force ? 0 : Math.max(0, RESIZE_THROTTLE_MS - elapsed);
       resizeTimer = setTimeout(() => {
         resizeTimer = null;
+        resizeQueued = false;
         pushResize();
-      }, RESIZE_DEBOUNCE_MS);
+      }, delay);
     };
-
     // §4.1 — gated spawn. Harnesses (Ink-based TUIs) paint their banner at
     // the moment of attach, so the very first PTY frame should land at the
     // real viewport dimensions. Wait until we have fitted dims before the
@@ -442,9 +565,18 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
     // backend returns a structured "not-found" string for that case.
     let hasSpawned = false;
     const persistedSessionId = props.sessionId;
+    let persistedSessionMissing = false;
 
-    const tryReattach = (): void => {
-      if (hasSpawned || !persistedSessionId) return;
+    const owningTabAlive = (): boolean => {
+      if (!props.cellId || !props.tabId) return true;
+      return isTabAlive(props.cellId, props.tabId) && !isTabPendingReset(props.cellId, props.tabId);
+    };
+
+    const reattachSession = (
+      targetSessionId: string,
+      options: { fallbackToSpawn: boolean; reason: "reattach" | "recover" },
+    ): void => {
+      if (!targetSessionId) return;
       if (!term || !fit) return;
       // Measure xterm's current dims so the backend opens the PTY at the
       // right size — tmux's attached client uses the PTY size as the
@@ -463,10 +595,15 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       hasSpawned = true;
       lastCols = cols;
       lastRows = rows;
-      setSessionId(persistedSessionId);
+      setSessionId(targetSessionId);
+      if (options.reason === "recover") {
+        bridgeRecoveryInFlight = true;
+        setBridgeRecoveryUiState("reconnecting");
+      }
+      logLifecycle(options.reason, paneId, targetSessionId);
       void invoke<string>("terminal_reattach", {
         args: {
-          session_id: persistedSessionId,
+          session_id: targetSessionId,
           kind: props.kind,
           project_slug: props.projectSlug,
           worktree_id: props.worktreeId,
@@ -478,6 +615,11 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         .then((id) => {
           // Success — the output channel is live. Resize will be pushed by
           // the observer's first post-attach tick below.
+          bridgeRecoveryInFlight = false;
+          setBridgeRecoveryAttempts(0);
+          setBridgeRecoveryUiState("idle");
+          setErrorMsg(null);
+          setExitState(null);
           props.onSpawned?.(id);
           // Pull the harness state the backend seeded from `sessions.toml`.
           // Runs once per reattach; the live `agent-state-changed` stream
@@ -489,12 +631,39 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
           }
         })
         .catch((e) => {
+          bridgeRecoveryInFlight = false;
+          const message = String(e);
+          if (message.includes("reattach-in-flight")) {
+            hasSpawned = false;
+            setSessionId(null);
+            return;
+          }
+          if (!options.fallbackToSpawn) {
+            console.warn("[TerminalPane] bridge recovery reattach failed", e);
+            if (bridgeRecoveryAttempts() < MAX_BRIDGE_RECOVERY_ATTEMPTS) {
+              setBridgeRecoveryUiState("reconnecting");
+              bridgeRecoveryTimer = setTimeout(() => {
+                bridgeRecoveryTimer = null;
+                recoverBridge(targetSessionId);
+              }, BRIDGE_RECOVERY_RETRY_MS);
+              return;
+            }
+            // Retries exhausted — show the persistent "Connection
+            // lost — Reconnect" banner instead of the dead-process
+            // exit overlay. The bridge died; the inner harness may
+            // still be alive on the tmux server.
+            setBridgeRecoveryUiState("lost");
+            return;
+          }
           // Either the tmux session is gone (expected after `kill-server`
           // or a long absence past reap_stale) or something transient
           // failed. Either way: release the gate and let `trySpawn` create
-          // a fresh session. The user's scrollback from last time is lost,
-          // but the pane works.
+          // a fresh session only when this surface is still a visible,
+          // layout-owned tab. Hidden stale tabs are removed by the
+          // `terminal-session-removed` event emitted by the backend; spawning
+          // here would recreate the invisible harness the user just closed.
           console.warn("[TerminalPane] terminal_reattach failed — spawning fresh", e);
+          persistedSessionMissing = true;
           hasSpawned = false;
           setSessionId(null);
           // Next ResizeObserver tick will call trySpawn via the dual-mode
@@ -504,8 +673,76 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         });
     };
 
+    const tryReattach = (): void => {
+      if (hasSpawned || !persistedSessionId) return;
+      if (persistedSessionMissing) {
+        trySpawn();
+        return;
+      }
+      reattachSession(persistedSessionId, { fallbackToSpawn: true, reason: "reattach" });
+    };
+
+    function recoverBridge(targetSessionId: string): void {
+      if (bridgeRecoveryInFlight) return;
+      if (!term || !fit) return;
+      setBridgeRecoveryAttempts((n) => n + 1);
+      reattachSession(targetSessionId, { fallbackToSpawn: false, reason: "recover" });
+    }
+    // Surface the closure-bound handlers to the JSX layer below.
+    manualReconnectRef = (): void => {
+      const id = sessionId();
+      if (!id) return;
+      setBridgeRecoveryAttempts(0);
+      setBridgeRecoveryUiState("reconnecting");
+      recoverBridge(id);
+    };
+    recoverDeadPaneRef = (): void => {
+      if (respawningDead()) return;
+      if (!isHarnessKind(props.kind)) return;
+      const id = sessionId();
+      if (!id || !term || !fit) return;
+      try {
+        fit.fit();
+      } catch {
+        return;
+      }
+      const cols = term.cols;
+      const rows = term.rows;
+      if (cols < MIN_REATTACH_COLS || rows < MIN_REATTACH_ROWS) return;
+      setRespawningDead(true);
+      logLifecycle("recover", paneId, id);
+      void invoke<string>("terminal_respawn_dead", {
+        args: {
+          session_id: id,
+          kind: props.kind,
+          project_slug: props.projectSlug,
+          worktree_id: props.worktreeId,
+          cols,
+          rows,
+        },
+        onData: channel,
+      })
+        .then(() => {
+          setRespawningDead(false);
+          setExitState(null);
+          setErrorMsg(null);
+          setBridgeRecoveryAttempts(0);
+          setBridgeRecoveryUiState("idle");
+          if (isHarnessKind(props.kind)) {
+            void hydrateHarnessStateAfterReattach(id, props.kind);
+          }
+        })
+        .catch((e) => {
+          console.warn("[TerminalPane] terminal_respawn_dead failed", e);
+          setRespawningDead(false);
+          setErrorMsg(String(e));
+        });
+    };
+
     const trySpawn = (): void => {
       if (hasSpawned) return;
+      if (props.visible === false) return;
+      if (!owningTabAlive()) return;
       if (!term || !fit) return;
       try {
         fit.fit();
@@ -527,11 +764,27 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         cols,
         rows,
       };
+      logLifecycle("spawn", paneId, sessionId());
       void invoke<string>("terminal_spawn", {
         args,
         onData: channel,
       })
         .then((id) => {
+          // Cmd+R "reset-harness" can pull the owning tab while this spawn was
+          // still in flight (oldSessionId was undefined when the user fired
+          // Cmd+R). If the tab is gone or flagged for reset, the resolved
+          // session is doomed — kill it instead of plumbing it into the store
+          // as an invisible zombie.
+          if (props.cellId && props.tabId) {
+            const stillAlive = isTabAlive(props.cellId, props.tabId);
+            const flagged = isTabPendingReset(props.cellId, props.tabId);
+            if (!stillAlive || flagged) {
+              void invoke("terminal_kill", { sessionId: id }).catch((e: unknown) => {
+                console.warn("[TerminalPane] post-spawn cleanup kill failed", e);
+              });
+              return;
+            }
+          }
           setSessionId(id);
           props.onSpawned?.(id);
         })
@@ -543,47 +796,129 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         });
     };
 
+    requestVisibleResize = (force = false): void => {
+      scheduleResize(force);
+      if (hasSpawned) return;
+      if (persistedSessionId && !persistedSessionMissing) {
+        tryReattach();
+      } else {
+        trySpawn();
+      }
+    };
+
+    let selfHealInFlight = false;
+    const selfHeal = (): void => {
+      if (selfHealInFlight) return;
+      if (!isHarnessKind(props.kind)) return;
+      const id = sessionId();
+      if (!id || !term || !fit) return;
+      try {
+        fit.fit();
+      } catch {
+        return;
+      }
+      const cols = term.cols;
+      const rows = term.rows;
+      if (cols < MIN_REATTACH_COLS || rows < MIN_REATTACH_ROWS) return;
+
+      selfHealInFlight = true;
+      hasSpawned = true;
+      lastCols = cols;
+      lastRows = rows;
+      setExitState(null);
+      setErrorMsg(null);
+      setBridgeRecoveryAttempts(0);
+      setBridgeRecoveryUiState("reconnecting");
+      try {
+        term.reset();
+      } catch {
+        // A failed local reset should not block the backend repair.
+      }
+
+      logLifecycle("self-heal", paneId, id);
+      void invoke<string>("terminal_self_heal", {
+        args: {
+          session_id: id,
+          kind: props.kind,
+          project_slug: props.projectSlug,
+          worktree_id: props.worktreeId,
+          cols,
+          rows,
+        },
+        onData: channel,
+      })
+        .then((nextId) => {
+          selfHealInFlight = false;
+          setSessionId(nextId);
+          props.onSpawned?.(nextId);
+          updateSessionState(nextId, props.kind, "idle");
+          applyAgentStateToTerminal(nextId, "idle");
+          setBridgeRecoveryAttempts(0);
+          setBridgeRecoveryUiState("idle");
+          requestVisibleResize?.(true);
+        })
+        .catch((e) => {
+          selfHealInFlight = false;
+          console.warn("[TerminalPane] terminal_self_heal failed; spawning fresh", e);
+          void invoke("terminal_kill", { sessionId: id }).catch(() => {
+            /* best-effort cleanup before fallback spawn */
+          });
+          setSessionId(null);
+          setBridgeRecoveryUiState("idle");
+          hasSpawned = false;
+          trySpawn();
+        });
+    };
+
+    function onTerminalSelfHeal(ev: Event): void {
+      const detail = (ev as CustomEvent<TerminalSelfHealEventDetail>).detail;
+      if (!detail) return;
+      if (props.cellId && detail.cellId !== props.cellId) return;
+      if (props.tabId && detail.tabId !== props.tabId) return;
+      if (detail.sessionId && detail.sessionId !== sessionId()) return;
+      selfHeal();
+    }
+    window.addEventListener("raum:terminal-self-heal", onTerminalSelfHeal);
+
+    void (async () => {
+      unlistenBridgeLost = await listen<{ sessionId: string; exitCode: number }>(
+        "terminal:bridge-lost",
+        (ev) => {
+          const id = sessionId();
+          if (!id || ev.payload.sessionId !== id) return;
+          if (exitState()) return;
+          if (bridgeRecoveryAttempts() >= MAX_BRIDGE_RECOVERY_ATTEMPTS) {
+            // Auto-retries already exhausted — surface the persistent
+            // "Connection lost" banner so the user can manually trigger
+            // another attempt.
+            setBridgeRecoveryUiState("lost");
+            return;
+          }
+          recoverBridge(id);
+        },
+      );
+    })();
+
     // §4.4 — dual-mode observer: pre-spawn it triggers trySpawn; post-spawn
-    // it decides whether to debounce-resize or defer-until-drag-end. Solid's
+    // it schedules a throttled latest-wins resize. Solid's
     // ref assignment has already run by the time onMount fires, so `host`
     // is guaranteed non-null here.
     //
     // When the user drags a grid divider, `<DividerLayer>` stamps
     // `.is-resizing` on the root `[data-dnd-root="true"]` element and clears
-    // it on pointerup. ResizeObserver fires ~60Hz during the drag; firing
-    // a tmux resize per tick triggers ~20 tmux composite repaints per drag,
-    // each of which ships a full-screen redraw to xterm.js. Each repaint's
-    // trailing `\r\n` at the bottom of the viewport pushes a line into
-    // scrollback — the "flipbook of ghost frames" users saw.
-    //
-    // Strategy: during a drag, update xterm's internal dims locally (so the
-    // viewport stays visually aligned with the container) but suppress the
-    // tmux + PTY resize. When the drag ends, fire ONE resize with the
-    // final dims. Net repaint count per drag: 1.
+    // it on pointerup. Pane DnD uses the same class while the preview tree is
+    // active. We still resize tmux during those interactions; the class only
+    // tells us to issue an immediate final flush on pointerup so the harness
+    // ends at the exact committed geometry.
     const gridRoot = (host as HTMLElement).closest<HTMLElement>('[data-dnd-root="true"]');
     const isDragging = (): boolean => gridRoot?.classList.contains("is-resizing") ?? false;
-
-    const fitLocalOnly = (): void => {
-      if (!term || !fit) return;
-      const shouldRepin = shouldAutoStickToBottomOnResize(props.kind) && isViewportAtBottom(term);
-      try {
-        fit.fit();
-      } catch {
-        /* xterm not laid out yet — harmless, retry next tick */
-      }
-      if (shouldRepin) scheduleResizeRepin(false);
-    };
 
     if (typeof ResizeObserver !== "undefined") {
       resizeObserver = new ResizeObserver(() => {
         if (hasSpawned) {
+          if (props.visible === false) return;
           if (isDragging()) {
-            // Keep xterm's buffer sized to the container so the user sees
-            // smooth visual feedback during the drag, but hold off on the
-            // tmux resize. MutationObserver below flushes it on drag-end.
-            fitLocalOnly();
             resizePendingFromDrag = true;
-            return;
           }
           scheduleResize();
           return;
@@ -603,10 +938,10 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         if (gridRoot.classList.contains("is-resizing")) return;
         if (!resizePendingFromDrag) return;
         resizePendingFromDrag = false;
-        // Drag just ended and we owe tmux a resize. Use the debounced
-        // `scheduleResize` so a brief class-flip flurry (drag → snap →
-        // divider reset, etc.) still collapses to one tmux round-trip.
-        scheduleResize();
+        // Drag just ended and the last ResizeObserver tick may have raced
+        // with pointerup. Force the pump to measure now so tmux lands on the
+        // committed geometry without waiting for the next throttle window.
+        scheduleResize(true);
       });
       gridMutationObserver.observe(gridRoot, {
         attributes: true,
@@ -659,7 +994,7 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
 
     // §4.2 — focus promotes to WebGL.
     term.textarea?.addEventListener("focus", () => {
-      requestWebgl(paneId);
+      if (props.visible !== false) requestWebgl(paneId);
     });
 
     // Auto-copy on selection release (Zellij-style). Fires on mouseup so a
@@ -707,6 +1042,7 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
     onCleanup(() => {
       host?.removeEventListener("mousedown", onMouseDown);
       window.removeEventListener("mouseup", onWindowMouseUp);
+      window.removeEventListener("raum:terminal-self-heal", onTerminalSelfHeal);
     });
 
     // §4.7 — register with the global search registry.
@@ -742,7 +1078,10 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
   });
 
   onCleanup(() => {
+    logLifecycle("cleanup", paneId, sessionId());
+    requestVisibleResize = null;
     unlistenProcessExited?.();
+    unlistenBridgeLost?.();
     unsubscribeTheme?.();
     unsubscribeTheme = null;
     unregisterTerminal(paneId);
@@ -754,6 +1093,10 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
     if (copyFlashTimer !== null) {
       clearTimeout(copyFlashTimer);
       copyFlashTimer = null;
+    }
+    if (bridgeRecoveryTimer !== null) {
+      clearTimeout(bridgeRecoveryTimer);
+      bridgeRecoveryTimer = null;
     }
     clearResizeRepin();
     try {
@@ -896,16 +1239,57 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
           </div>
         )}
       </Show>
-      <Show when={exitState()}>
-        <button
-          type="button"
-          class="absolute inset-0 z-10 flex cursor-pointer items-center justify-center bg-scrim"
-          onClick={() => props.onRequestClose?.()}
-        >
+      <Show when={exitState() && bridgeRecoveryUiState() !== "lost"}>
+        <div class="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-scrim">
           <span class="select-none font-mono text-sm text-muted-foreground">
             exited: {exitState()!.code}
           </span>
-        </button>
+          <div class="flex items-center gap-2">
+            <Show when={isHarnessKind(props.kind)}>
+              <button
+                type="button"
+                class="rounded border border-border bg-surface-2 px-3 py-1 font-mono text-xs text-foreground hover:bg-surface-3 disabled:opacity-50"
+                disabled={respawningDead()}
+                onClick={() => recoverDeadPaneRef?.()}
+              >
+                {respawningDead() ? "Recovering…" : "Recover"}
+              </button>
+            </Show>
+            <button
+              type="button"
+              class="rounded border border-border bg-surface-2 px-3 py-1 font-mono text-xs text-muted-foreground hover:bg-surface-3"
+              onClick={() => props.onRequestClose?.()}
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      </Show>
+      <Show when={bridgeRecoveryUiState() === "reconnecting"}>
+        <div class="pointer-events-none absolute right-2 top-2 z-10 select-none rounded border border-border bg-surface-2/90 px-2 py-1 font-mono text-[11px] text-muted-foreground">
+          Reconnecting… ({bridgeRecoveryAttempts()}/{MAX_BRIDGE_RECOVERY_ATTEMPTS})
+        </div>
+      </Show>
+      <Show when={bridgeRecoveryUiState() === "lost"}>
+        <div class="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-scrim">
+          <span class="select-none font-mono text-sm text-muted-foreground">Connection lost</span>
+          <div class="flex items-center gap-2">
+            <button
+              type="button"
+              class="rounded border border-border bg-surface-2 px-3 py-1 font-mono text-xs text-foreground hover:bg-surface-3"
+              onClick={() => manualReconnectRef?.()}
+            >
+              Reconnect
+            </button>
+            <button
+              type="button"
+              class="rounded border border-border bg-surface-2 px-3 py-1 font-mono text-xs text-muted-foreground hover:bg-surface-3"
+              onClick={() => props.onRequestClose?.()}
+            >
+              Close
+            </button>
+          </div>
+        </div>
       </Show>
     </div>
   );

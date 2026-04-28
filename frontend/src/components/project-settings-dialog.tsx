@@ -9,7 +9,8 @@
 import { Component, For, Show, createEffect, createResource, createSignal } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { upsertProject, type ProjectListItem } from "../stores/projectStore";
+import { removeProject, upsertProject, type ProjectListItem } from "../stores/projectStore";
+import { clearWorktreeListCache } from "../stores/worktreeStore";
 import { PROJECT_COLOR_PALETTE } from "../lib/projectColors";
 import { PROJECT_SIGIL_PALETTE, SIGIL_RESET, deriveSigilFromSlug } from "../lib/projectSigils";
 import { Button } from "./ui/button";
@@ -21,6 +22,7 @@ import {
   type FileTreeNode,
   type HydrationChoice,
 } from "./hydration-file-tree";
+import { UnlinkProjectModal } from "./unlink-project-modal";
 import { Dynamic } from "solid-js/web";
 
 interface WorktreeHooksDto {
@@ -108,6 +110,7 @@ export const ProjectSettingsDialog: Component<ProjectSettingsDialogProps> = (pro
   const [hookTimeoutSecs, setHookTimeoutSecs] = createSignal(DEFAULT_HOOK_TIMEOUT_SECS);
   const [saving, setSaving] = createSignal(false);
   const [error, setError] = createSignal<string | undefined>(undefined);
+  const [unlinkOpen, setUnlinkOpen] = createSignal(false);
 
   const [effective] = createResource(
     () => (props.open ? props.project.slug : null),
@@ -430,17 +433,38 @@ export const ProjectSettingsDialog: Component<ProjectSettingsDialogProps> = (pro
                 {error()}
               </div>
             </Show>
-            <div class="flex justify-end gap-2">
-              <Button type="button" variant="ghost" size="sm" onClick={() => props.onClose()}>
-                Cancel
+            <div class="flex items-center justify-between gap-2">
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                class="text-destructive hover:bg-destructive/10 hover:text-destructive"
+                onClick={() => setUnlinkOpen(true)}
+              >
+                Unlink project…
               </Button>
-              <Button type="button" size="sm" disabled={saving()} onClick={() => void save()}>
-                {saving() ? "Saving…" : "Save changes"}
-              </Button>
+              <div class="flex gap-2">
+                <Button type="button" variant="ghost" size="sm" onClick={() => props.onClose()}>
+                  Cancel
+                </Button>
+                <Button type="button" size="sm" disabled={saving()} onClick={() => void save()}>
+                  {saving() ? "Saving…" : "Save changes"}
+                </Button>
+              </div>
             </div>
           </div>
         </DialogContent>
       </DialogPortal>
+      <UnlinkProjectModal
+        open={unlinkOpen()}
+        project={props.project}
+        onClose={() => setUnlinkOpen(false)}
+        onUnlinked={() => {
+          removeProject(props.project.slug);
+          clearWorktreeListCache(props.project.slug);
+          props.onClose();
+        }}
+      />
     </Dialog>
   );
 };

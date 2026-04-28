@@ -53,6 +53,7 @@ import {
   focusPaneByIndex,
   LAYOUT_UNIT,
   layoutRev,
+  maximizeLayoutSnap,
   maximizedPaneId,
   minimizedPaneIds,
   movePaneToEdge,
@@ -71,7 +72,8 @@ import {
   splitFocusedOrRoot,
   swapPanes,
   toggleMaximize,
-  toggleMinimize,
+  minimizePane,
+  restorePane,
   type CellKind,
   type CellTab,
   type PaneContent,
@@ -79,7 +81,12 @@ import {
 } from "../stores/runtimeLayoutStore";
 import { agentStore } from "../stores/agentStore";
 import type { AgentState } from "../stores/agentStore";
-import { listCrossProjectHarnessSessions, terminalStore } from "../stores/terminalStore";
+import {
+  clearTerminalClosing,
+  listCrossProjectHarnessSessions,
+  markTerminalClosing,
+  terminalStore,
+} from "../stores/terminalStore";
 import {
   activeWorktreeStore,
   ALL_WORKTREES_SCOPE,
@@ -87,12 +94,13 @@ import {
 } from "../stores/worktreeStore";
 import { kindDisplayLabel, type AgentKind } from "../lib/agentKind";
 import { resolveSpawnWorktree } from "../lib/resolveSpawnWorktree";
-import { AlertCircleIcon, CheckIcon, HARNESS_ICONS, LoaderIcon } from "./icons";
-import { activeProjectSlug, projectBySlug } from "../stores/projectStore";
+import { HARNESS_ICONS } from "./icons";
+import { activeProjectSlug, projectBySlug, setActiveProjectSlug } from "../stores/projectStore";
 import { timeMemoSettle } from "../lib/perf";
 import { projectStore } from "../stores/projectStore";
 import {
   getScopedProjection as getScopedProjectionCached,
+  prewarmProjectionCache,
   setProjectionCacheMaxSize,
   type ScopedProjection,
 } from "../lib/scopedProjection";
@@ -100,7 +108,13 @@ import {
   getCrossProjectProjection,
   setCrossProjectProjectionCacheMaxSize,
 } from "../lib/crossProjectProjection";
+import {
+  projectTerminalSurfaces,
+  type TerminalSurfaceDescriptor,
+} from "../lib/terminalSurfaceProjection";
+import { listTerminals } from "../lib/terminalRegistry";
 import { crossProjectViewMode, setCrossProjectViewMode } from "./top-row";
+import { Tooltip, TooltipContent, TooltipPortal, TooltipTrigger } from "./ui/tooltip";
 
 function getScopedProjection(
   rev: number,
@@ -144,6 +158,15 @@ const KIND_LABELS: Record<string, string> = {
   empty: "Empty",
 };
 
+function requestTerminalKill(sessionId: string | undefined, context: string): void {
+  if (!sessionId) return;
+  markTerminalClosing(sessionId);
+  void invoke("terminal_kill", { sessionId }).catch((e: unknown) => {
+    clearTerminalClosing(sessionId);
+    console.warn(`[${context}] terminal_kill failed`, e);
+  });
+}
+
 // ---- TerminalGrid ---------------------------------------------------------
 
 export const TerminalGrid: Component = () => {
@@ -160,6 +183,19 @@ export const TerminalGrid: Component = () => {
     () => activeWorktreeStore.byProject[activeProjectSlug() ?? ""] ?? ALL_WORKTREES_SCOPE,
   );
 
+  createEffect(() => {
+    const projects = projectStore.items;
+    if (projects.length === 0) return;
+    setProjectionCacheMaxSize(Math.max(16, projects.length * 2));
+    prewarmProjectionCache({
+      layoutRev: layoutRev(),
+      tree: runtimeLayoutStore.tree,
+      panes: runtimeLayoutStore.panes,
+      projects,
+      scopesByProject: activeWorktreeStore.byProject,
+    });
+  });
+
   // Pruned tree + rect projection for the active project tab. Both drop
   // every leaf whose pane belongs to a different project or worktree.
   // Results are keyed on the layout revision + scope, so repeat tab
@@ -170,6 +206,49 @@ export const TerminalGrid: Component = () => {
   const activeTree = createMemo<LayoutNode | null>(() => projection().tree);
   const activeRectMap = createMemo<ReadonlyMap<string, Rect>>(() => projection().rects);
 
+  // LIVE-PREVIEW TREE.
+  //
+  // As the user hovers over a drop zone, replay the would-be mutation
+  // *locally* using the same pure tree ops that the commit path uses. Panes
+  // then render at their projected positions, so the grid reflows under
+  // the cursor and the user sees the final layout before releasing. Nothing
+  // touches the real store until pointerup — if the user drifts away from
+  // the zone, the preview clears and the real layout is untouched.
+  //
+  // Mutation replay mirrors onDrop exactly (swap vs. split, root vs. pane).
+  // Defined here (above `terminalSurfaces`) so the surface projection memo
+  // can route preview rects to non-source surfaces without a forward TDZ.
+  const previewTree = createMemo<LayoutNode | null>(() => {
+    const s = dragState();
+    const base = activeTree();
+    if (!s || !s.targetId || !s.zone || !base) return null;
+    if (s.sourceId === s.targetId) return null;
+
+    if (s.zone === "center") {
+      if (s.targetId === ROOT_TARGET) return null;
+      return swapLeaves(base, s.sourceId, s.targetId);
+    }
+
+    const direction = zoneToDirection(s.zone);
+    if (!direction) return null;
+    const removed = removeLeaf(base, s.sourceId);
+    if (!removed) return null;
+    const newLeaf: LayoutNode = { kind: "leaf", id: s.sourceId };
+    return s.targetId === ROOT_TARGET
+      ? splitAtRoot(removed, direction, newLeaf)
+      : splitAtLeaf(removed, s.targetId, direction, newLeaf);
+  });
+
+  // Projected cell geometry keyed by pane id. Both `LeafFrame` (chrome) and
+  // `terminalSurfaces` (live PTY) consume this so chrome and surfaces reflow
+  // in lockstep during a drag.
+  const previewCellMap = createMemo<Map<string, Rect> | null>(() => {
+    const pt = previewTree();
+    if (!pt) return null;
+    const rects = projectToRects(pt, LAYOUT_UNIT);
+    return new Map(rects.map((r) => [r.id, r]));
+  });
+
   // Cells that belong to the active tree, preserving store identity so xterm
   // instances stay mounted across `activeTree` recomputes.
   const activeCells = createMemo(() => {
@@ -177,11 +256,6 @@ export const TerminalGrid: Component = () => {
     return runtimeLayoutStore.cells.filter((c) => map.has(c.id));
   });
   timeMemoSettle("project-switch:active", activeCells);
-
-  const visibleCells = createMemo(() => {
-    const minimized = minimizedPaneIds();
-    return activeCells().filter((c) => !minimized.has(c.id));
-  });
 
   // Maximize is global runtime state but must only affect the active project's
   // view. If the maximized pane isn't in the current project's active cells,
@@ -216,6 +290,43 @@ export const TerminalGrid: Component = () => {
       orderedIds: projectedSessionIds(),
     }).rects;
   });
+
+  // Panes registered in the store but not in the BSP tree — minimized
+  // harnesses living in the dock. Feed them into the surface projector so
+  // xterm stays mounted across the in-tree → off-tree transition (preserves
+  // scrollback). Geometry is null; the surface layer hides them.
+  const offTreePanes = createMemo(() => {
+    const inTreeIds = new Set(runtimeLayoutStore.cells.map((c) => c.id));
+    const mins = minimizedPaneIds();
+    const out = [];
+    for (const pane of Object.values(runtimeLayoutStore.panes)) {
+      if (!mins.has(pane.id)) continue;
+      if (inTreeIds.has(pane.id)) continue;
+      out.push(pane);
+    }
+    return out;
+  });
+
+  const terminalSurfaces = createMemo<TerminalSurfaceDescriptor[]>(() =>
+    projectTerminalSurfaces({
+      cells: runtimeLayoutStore.cells,
+      offTreePanes: offTreePanes(),
+      activeRectMap: activeRectMap(),
+      minimizedPaneIds: minimizedPaneIds(),
+      crossProjectMode: crossProjectMode(),
+      projectedSessionIds: projectedSessionIds(),
+      projectedRectMap: projectedRectMap(),
+      terminalById: terminalStore.byId,
+      focusedPaneId: focusedPaneId(),
+      maximizedPaneId: effectiveMaximizedPaneId(),
+      // Live drag preview: route sibling cells to their projected rects so
+      // their terminals reflow in lockstep with the chrome layer's
+      // `previewCellMap`. Source cell stays at committed rect; the
+      // `surface-dragging-source` class translates it to follow the cursor.
+      previewRectMap: previewCellMap(),
+      dragSourceId: dragState()?.sourceId ?? null,
+    }),
+  );
 
   type SpawnKind = "shell" | "claude-code" | "codex" | "opencode";
   const [availableKinds] = createResource<SpawnKind[]>(async () => {
@@ -255,18 +366,16 @@ export const TerminalGrid: Component = () => {
         const pane = runtimeLayoutStore.panes[paneId];
         if (!pane || pane.kind === "empty") return;
         const activeTab = pane.tabs.find((t) => t.id === pane.activeTabId);
-        const oldTabId = activeTab?.id;
-        const oldSessionId = activeTab?.sessionId;
-        addCellTab(paneId, {
-          projectSlug: activeTab?.projectSlug ?? pane.projectSlug,
-          worktreeId: activeTab?.worktreeId ?? pane.worktreeId,
-        });
-        if (oldTabId) removeCellTab(paneId, oldTabId);
-        if (oldSessionId) {
-          invoke("terminal_kill", { sessionId: oldSessionId }).catch((e: unknown) => {
-            console.warn("[reset-harness] terminal_kill failed", e);
-          });
-        }
+        if (!activeTab?.sessionId) return;
+        window.dispatchEvent(
+          new CustomEvent("raum:terminal-self-heal", {
+            detail: {
+              cellId: paneId,
+              tabId: activeTab.id,
+              sessionId: activeTab.sessionId,
+            },
+          }),
+        );
       }),
     );
     unregs.push(
@@ -330,8 +439,54 @@ export const TerminalGrid: Component = () => {
     onCleanup(() => window.removeEventListener("raum:spawn-requested", onSpawn));
   });
 
+  function focusRegisteredSession(sessionId: string): void {
+    requestAnimationFrame(() => {
+      const registered = listTerminals().find((terminal) => terminal.sessionId === sessionId);
+      registered?.focus();
+    });
+  }
+
+  function findLayoutOwner(
+    sessionId: string,
+  ): { cellId: string; tabId: string; projectSlug?: string } | null {
+    for (const cell of runtimeLayoutStore.cells) {
+      for (const tab of cell.tabs) {
+        if (tab.sessionId !== sessionId) continue;
+        return {
+          cellId: cell.id,
+          tabId: tab.id,
+          projectSlug: tab.projectSlug ?? cell.projectSlug,
+        };
+      }
+    }
+    return null;
+  }
+
+  onMount(() => {
+    function onTerminalFocusRequested(ev: Event): void {
+      const sessionId = (ev as CustomEvent<{ sessionId?: string }>).detail?.sessionId;
+      if (!sessionId) return;
+
+      const owner = findLayoutOwner(sessionId);
+      if (owner) {
+        if (owner.projectSlug) setActiveProjectSlug(owner.projectSlug);
+        setActiveTabId(owner.cellId, owner.tabId);
+        if (minimizedPaneIds().has(owner.cellId)) restorePane(owner.cellId);
+        setFocusedPaneId(owner.cellId);
+        setCrossProjectViewMode(null);
+      }
+
+      focusRegisteredSession(sessionId);
+    }
+
+    window.addEventListener("terminal-focus-requested", onTerminalFocusRequested);
+    onCleanup(() =>
+      window.removeEventListener("terminal-focus-requested", onTerminalFocusRequested),
+    );
+  });
+
   function onRestoreFromDock(cellId: string): void {
-    toggleMinimize(cellId);
+    restorePane(cellId);
     setFocusedPaneId(cellId);
   }
 
@@ -352,49 +507,11 @@ export const TerminalGrid: Component = () => {
     }
   });
 
-  // LIVE-PREVIEW TREE.
-  //
-  // As the user hovers over a drop zone, replay the would-be mutation
-  // *locally* using the same pure tree ops that the commit path uses. Panes
-  // then render at their projected positions, so the grid reflows under
-  // the cursor and the user sees the final layout before releasing. Nothing
-  // touches the real store until pointerup — if the user drifts away from
-  // the zone, the preview clears and the real layout is untouched.
-  //
-  // Mutation replay mirrors onDrop exactly (swap vs. split, root vs. pane).
-  const previewTree = createMemo<LayoutNode | null>(() => {
-    const s = dragState();
-    const base = activeTree();
-    if (!s || !s.targetId || !s.zone || !base) return null;
-    if (s.sourceId === s.targetId) return null;
-
-    if (s.zone === "center") {
-      if (s.targetId === ROOT_TARGET) return null;
-      return swapLeaves(base, s.sourceId, s.targetId);
-    }
-
-    const direction = zoneToDirection(s.zone);
-    if (!direction) return null;
-    const removed = removeLeaf(base, s.sourceId);
-    if (!removed) return null;
-    const newLeaf: LayoutNode = { kind: "leaf", id: s.sourceId };
-    return s.targetId === ROOT_TARGET
-      ? splitAtRoot(removed, direction, newLeaf)
-      : splitAtLeaf(removed, s.targetId, direction, newLeaf);
-  });
-
-  // Projected cell geometry keyed by pane id. Each LeafFrame looks up its
-  // own id and renders at that position while preview is active.
-  const previewCellMap = createMemo<Map<string, Rect> | null>(() => {
-    const pt = previewTree();
-    if (!pt) return null;
-    const rects = projectToRects(pt, LAYOUT_UNIT);
-    return new Map(rects.map((r) => [r.id, r]));
-  });
-
   // Tree passed to DividerLayer — preview while hovering a zone so dividers
   // reflow with the panes (otherwise they'd be stuck at pre-drag positions
   // while panes animate to projected ones). Falls back to the real tree.
+  // (`previewTree` and `previewCellMap` are defined above so the surface
+  // projection memo can read them.)
   const renderTree = createMemo<LayoutNode | null>(() => previewTree() ?? activeTree());
 
   return (
@@ -410,10 +527,11 @@ export const TerminalGrid: Component = () => {
       <div class="flex-1 min-h-0 overflow-hidden bg-background">
         <div
           class="relative h-full w-full overflow-hidden rounded-xl"
+          classList={{ "maximize-layout-snap": maximizeLayoutSnap() }}
           ref={setRootEl}
           data-dnd-root="true"
         >
-          <Show when={crossProjectMode() === null && visibleCells().length === 0}>
+          <Show when={crossProjectMode() === null && activeCells().length === 0}>
             <div
               class="absolute inset-0 z-10 grid h-full w-full gap-px bg-border-subtle"
               style={{
@@ -432,9 +550,14 @@ export const TerminalGrid: Component = () => {
                       title={disabled() ? "Add a project before spawning a harness" : undefined}
                       onClick={() => {
                         if (disabled()) return;
+                        const slug = activeProjectSlug();
                         window.dispatchEvent(
                           new CustomEvent("raum:spawn-requested", {
-                            detail: { kind, projectSlug: activeProjectSlug() },
+                            detail: {
+                              kind,
+                              projectSlug: slug,
+                              worktreeId: slug ? resolveSpawnWorktree(slug) : undefined,
+                            },
                           }),
                         );
                       }}
@@ -454,49 +577,62 @@ export const TerminalGrid: Component = () => {
             </div>
           </Show>
 
+          <TerminalSurfaceLayer surfaces={terminalSurfaces()} />
+
           <Show when={crossProjectMode() === null}>
             <Show when={activeCells().length > 0}>
-              <For each={activeCells()}>
-                {(cell) => {
-                  const effective = createMemo<RuntimeCell>(() => {
-                    if (dragState()?.sourceId === cell.id) return cell;
-                    const preview = previewCellMap()?.get(cell.id);
-                    if (preview) {
+              <div class="terminal-chrome-layer absolute inset-0">
+                <For each={activeCells()}>
+                  {(cell) => {
+                    const effective = createMemo<RuntimeCell>(() => {
+                      if (dragState()?.sourceId === cell.id) return cell;
+                      const preview = previewCellMap()?.get(cell.id);
+                      if (preview) {
+                        return {
+                          ...cell,
+                          x: preview.x,
+                          y: preview.y,
+                          w: preview.w,
+                          h: preview.h,
+                        };
+                      }
+                      const active = activeRectMap().get(cell.id);
+                      if (!active) return cell;
                       return {
                         ...cell,
-                        x: preview.x,
-                        y: preview.y,
-                        w: preview.w,
-                        h: preview.h,
+                        x: active.x,
+                        y: active.y,
+                        w: active.w,
+                        h: active.h,
                       };
-                    }
-                    const active = activeRectMap().get(cell.id);
-                    if (!active) return cell;
-                    return {
-                      ...cell,
-                      x: active.x,
-                      y: active.y,
-                      w: active.w,
-                      h: active.h,
-                    };
-                  });
-                  return (
-                    <LeafFrame cell={effective()} maximizedPaneId={effectiveMaximizedPaneId()} />
-                  );
-                }}
-              </For>
+                    });
+                    return (
+                      <LeafFrame cell={effective()} maximizedPaneId={effectiveMaximizedPaneId()} />
+                    );
+                  }}
+                </For>
+              </div>
             </Show>
 
-            <DividerLayer tree={renderTree()} />
+            {/* Hide dividers while a pane is maximized: there's nothing to
+                resize when one pane fills the canvas, and the chrome frame
+                renders transparent (only the 28 px header is opaque), so
+                the small grip pills would otherwise show through the
+                maximized terminal. */}
+            <Show when={effectiveMaximizedPaneId() === null}>
+              <DividerLayer tree={renderTree()} />
+            </Show>
           </Show>
 
           <Show when={crossProjectMode() !== null && projectedSessionIds().length > 0}>
-            <For each={projectedSessionIds()}>
-              {(sessionId) => {
-                const rect = createMemo(() => projectedRectMap().get(sessionId) ?? null);
-                return <ProjectedSessionFrame sessionId={sessionId} rect={rect()} />;
-              }}
-            </For>
+            <div class="terminal-chrome-layer absolute inset-0">
+              <For each={projectedSessionIds()}>
+                {(sessionId) => {
+                  const rect = createMemo(() => projectedRectMap().get(sessionId) ?? null);
+                  return <ProjectedSessionFrame sessionId={sessionId} rect={rect()} />;
+                }}
+              </For>
+            </div>
           </Show>
 
           {/* No drop-zone or landing overlays. The live reflow of the grid
@@ -504,7 +640,7 @@ export const TerminalGrid: Component = () => {
           continuous repaints on the xterm canvases beneath them. */}
         </div>
       </div>
-      <Dock onRestore={onRestoreFromDock} />
+      <Dock minimizedPanes={offTreePanes()} onRestore={onRestoreFromDock} />
     </div>
   );
 };
@@ -518,14 +654,12 @@ export default TerminalGrid;
 // exposes generic names (for example `node` or a bare version), fall back to
 // the existing `kind · project/branch` synthesis from raum-side state.
 //
-// Shell panes: the inner command/cwd IS the interesting signal, so this does
-// poll `terminal_pane_context` every 2 s and composes
-// `"Shell · <cwd-basename> · <command>"` (dropping the command when it equals
-// the login shell).
+// Shell panes: the inner command/cwd IS the interesting signal, so the global
+// shell context poller writes paneContext into terminalStore and this binder
+// composes `"Shell · <cwd-basename> · <command>"` from the cached value.
 //
 // Returns null — the effect is the side effect.
 
-const AUTO_LABEL_POLL_MS = 2000;
 const SHELL_IDLE_COMMANDS = new Set(["zsh", "bash", "fish", "sh", "-zsh", "-bash"]);
 
 interface AutoLabelBinderProps {
@@ -585,7 +719,7 @@ const AutoLabelBinder: Component<AutoLabelBinderProps> = (props) => {
     setTabAutoLabel(props.cellId, props.tabId, label);
   });
 
-  // Shell-pane branch: tmux-polled context.
+  // Shell-pane branch: globally-polled tmux context.
   createEffect(() => {
     if (props.kind !== "shell") return;
     const sid = props.sessionId;
@@ -594,41 +728,147 @@ const AutoLabelBinder: Component<AutoLabelBinderProps> = (props) => {
       return;
     }
 
-    let cancelled = false;
-    const tick = async () => {
-      try {
-        const ctx = await invoke<{ currentCommand: string; currentPath: string }>(
-          "terminal_pane_context",
-          { sessionId: sid },
-        );
-        if (cancelled) return;
-        const basename = ctx.currentPath ? ctx.currentPath.split("/").pop() || "" : "";
-        const cmd = ctx.currentCommand.trim();
-        const showCmd = cmd && !SHELL_IDLE_COMMANDS.has(cmd);
-        const parts = ["Shell"];
-        if (basename) parts.push(basename);
-        if (showCmd) parts.push(cmd);
-        setTabAutoLabel(props.cellId, props.tabId, parts.join(" · "));
-      } catch {
-        /* non-fatal: keep the previous label */
-      }
-    };
-
-    void tick();
-    const timer = setInterval(tick, AUTO_LABEL_POLL_MS);
-    onCleanup(() => {
-      cancelled = true;
-      clearInterval(timer);
-    });
+    const ctx = livePaneContext();
+    if (!ctx) return;
+    const basename = ctx.currentPath ? ctx.currentPath.split("/").pop() || "" : "";
+    const cmd = ctx.currentCommand.trim();
+    const showCmd = cmd && !SHELL_IDLE_COMMANDS.has(cmd);
+    const parts = ["Shell"];
+    if (basename) parts.push(basename);
+    if (showCmd) parts.push(cmd);
+    setTabAutoLabel(props.cellId, props.tabId, parts.join(" · "));
   });
 
   return null;
 };
 
+// ---- TerminalSurfaceLayer: one persistent terminal per tab/session ----------
+
+const TerminalSurfaceLayer: Component<{ surfaces: TerminalSurfaceDescriptor[] }> = (props) => {
+  const byKey = createMemo(() => new Map(props.surfaces.map((surface) => [surface.key, surface])));
+  const keys = createMemo(() => props.surfaces.map((surface) => surface.key));
+
+  return (
+    <div class="terminal-surface-layer absolute inset-0">
+      <For each={keys()}>
+        {(key) => {
+          const surface = createMemo(() => byKey().get(key) ?? null);
+          return (
+            <Show when={surface()}>{(current) => <TerminalSurfaceHost surface={current()} />}</Show>
+          );
+        }}
+      </For>
+    </div>
+  );
+};
+
+const TerminalSurfaceHost: Component<{ surface: TerminalSurfaceDescriptor }> = (props) => {
+  const [lastRect, setLastRect] = createSignal<Rect | null>(null);
+  createEffect(() => {
+    const rect = props.surface.rect;
+    if (rect && rect.w > 0 && rect.h > 0) setLastRect(rect);
+  });
+
+  const rect = createMemo(() => props.surface.rect ?? lastRect());
+  const visible = createMemo(() => props.surface.visible && rect() !== null);
+  // True when this surface owns the pane currently being dragged. The
+  // `.surface-dragging-source` CSS rule then translates it with the same
+  // `--drag-dx`/`--drag-dy` the chrome uses, so the live terminal rides
+  // alongside its chrome card while the rest of the grid reflows underneath.
+  const isDragSource = createMemo(
+    () => !!props.surface.cellId && props.surface.cellId === dragState()?.sourceId,
+  );
+  const style = createMemo<Record<string, string>>(() => {
+    const r = rect() ?? { id: props.surface.key, x: 0, y: 0, w: LAYOUT_UNIT, h: LAYOUT_UNIT };
+    return {
+      ...rectStyle(r),
+      visibility: visible() ? "visible" : "hidden",
+      // Ghost surface must pass pointer events through so destination panes
+      // remain hit-testable during the drag.
+      "pointer-events": visible() && !isDragSource() ? "auto" : "none",
+    };
+  });
+
+  function claimFocus(): void {
+    const { cellId, tabId } = props.surface;
+    if (!cellId) return;
+    if (tabId && runtimeLayoutStore.panes[cellId]?.activeTabId !== tabId) {
+      setActiveTabId(cellId, tabId);
+    }
+    setFocusedPaneId(cellId);
+  }
+
+  function onSurfaceDoubleClick(e: MouseEvent): void {
+    const { cellId } = props.surface;
+    if (!cellId) return;
+    const target = e.target as HTMLElement | null;
+    if (target?.closest("input")) return;
+    e.stopPropagation();
+    e.preventDefault();
+    toggleMaximize(cellId);
+  }
+
+  function closeSurface(): void {
+    const { sessionId, cellId, tabId } = props.surface;
+    requestTerminalKill(sessionId, "TerminalSurfaceHost");
+    if (cellId && tabId) removeCellTab(cellId, tabId);
+  }
+
+  return (
+    <div
+      class="leaf-frame terminal-surface-frame flex min-h-0 min-w-0 flex-col"
+      classList={{
+        "pane-maximized": props.surface.maximized,
+        "surface-dragging-source": isDragSource(),
+      }}
+      data-surface-key={props.surface.key}
+      data-cell-id={props.surface.cellId}
+      data-session-id={props.surface.sessionId ?? ""}
+      data-dragging={isDragSource() ? "true" : "false"}
+      style={style()}
+      onFocusIn={claimFocus}
+      onClick={claimFocus}
+      onDblClick={onSurfaceDoubleClick}
+    >
+      <Show when={props.surface.cellId && props.surface.tabId}>
+        <AutoLabelBinder
+          cellId={props.surface.cellId!}
+          tabId={props.surface.tabId!}
+          kind={props.surface.kind}
+          projectSlug={props.surface.projectSlug}
+          worktreeId={props.surface.worktreeId}
+          sessionId={props.surface.sessionId}
+        />
+      </Show>
+      <div class="terminal-surface-body">
+        <TerminalPane
+          surfaceKey={props.surface.key}
+          kind={props.surface.kind}
+          sessionId={props.surface.sessionId}
+          projectSlug={props.surface.projectSlug}
+          worktreeId={props.surface.worktreeId}
+          cellId={props.surface.cellId}
+          tabId={props.surface.tabId}
+          borderColor="transparent"
+          visible={visible()}
+          active={props.surface.active}
+          onSpawned={(sessionId) => {
+            if (props.surface.cellId && props.surface.tabId) {
+              setTabSessionId(props.surface.cellId, props.surface.tabId, sessionId);
+            }
+          }}
+          onRequestClose={() => {
+            closeSurface();
+          }}
+        />
+      </div>
+    </div>
+  );
+};
+
 // ---- LeafFrame: absolute-positioned pane ----------------------------------
 
 const LeafFrame: Component<{ cell: RuntimeCell; maximizedPaneId: string | null }> = (props) => {
-  const isMinimized = () => minimizedPaneIds().has(props.cell.id);
   const isMaximized = () => props.maximizedPaneId === props.cell.id;
   const anyMaximized = () => props.maximizedPaneId !== null;
   const isFocused = () => focusedPaneId() === props.cell.id;
@@ -677,15 +917,17 @@ const LeafFrame: Component<{ cell: RuntimeCell; maximizedPaneId: string | null }
 
   return (
     <div
-      ref={cellRef}
+      ref={(el) => {
+        cellRef = el;
+      }}
       data-dnd-target-pane-id={props.cell.id}
       data-cell-id={props.cell.id}
-      class="leaf-frame flex min-h-0 min-w-0 flex-col"
+      class="leaf-frame terminal-chrome-frame flex min-h-0 min-w-0 flex-col"
       classList={{
         "pane-selected": isFocused(),
         "pane-dragging": isDragSource(),
         "pane-maximized": isMaximized(),
-        hidden: isMinimized() || (anyMaximized() && !isMaximized()),
+        hidden: anyMaximized() && !isMaximized(),
       }}
       style={style()}
       onFocusIn={onFocusCapture}
@@ -699,7 +941,7 @@ const LeafFrame: Component<{ cell: RuntimeCell; maximizedPaneId: string | null }
         activeTabId={props.cell.activeTabId}
         isMaximized={isMaximized()}
       />
-      <div class="relative min-h-0 min-w-0 flex-1 overflow-hidden">
+      <div class="terminal-chrome-body relative min-h-0 min-w-0 flex-1 overflow-hidden">
         <Show
           when={props.cell.kind !== "empty"}
           fallback={
@@ -708,43 +950,7 @@ const LeafFrame: Component<{ cell: RuntimeCell; maximizedPaneId: string | null }
             </div>
           }
         >
-          <For each={props.cell.tabs}>
-            {(tab) => (
-              <div
-                class="absolute inset-0"
-                style={{
-                  visibility: tab.id === props.cell.activeTabId ? "visible" : "hidden",
-                }}
-              >
-                <AutoLabelBinder
-                  cellId={props.cell.id}
-                  tabId={tab.id}
-                  kind={props.cell.kind}
-                  projectSlug={tab.projectSlug ?? props.cell.projectSlug}
-                  worktreeId={tab.worktreeId ?? props.cell.worktreeId}
-                  sessionId={tab.sessionId}
-                />
-                <TerminalPane
-                  kind={props.cell.kind as Parameters<typeof TerminalPane>[0]["kind"]}
-                  sessionId={tab.sessionId}
-                  projectSlug={tab.projectSlug ?? props.cell.projectSlug}
-                  worktreeId={tab.worktreeId ?? props.cell.worktreeId}
-                  borderColor="transparent"
-                  onSpawned={(sid) => setTabSessionId(props.cell.id, tab.id, sid)}
-                  onRequestClose={async () => {
-                    try {
-                      if (tab.sessionId) {
-                        await invoke("terminal_kill", { sessionId: tab.sessionId });
-                      }
-                    } catch (e) {
-                      console.warn("[LeafFrame] terminal_kill on exit failed", e);
-                    }
-                    removeCellTab(props.cell.id, tab.id);
-                  }}
-                />
-              </div>
-            )}
-          </For>
+          <div class="h-full w-full" />
         </Show>
       </div>
     </div>
@@ -763,24 +969,15 @@ interface PaneHeaderProps {
 }
 
 const PaneHeader: Component<PaneHeaderProps> = (props) => {
-  async function killSession(sessionId: string | undefined) {
-    if (!sessionId) return;
-    try {
-      await invoke("terminal_kill", { sessionId });
-    } catch (e) {
-      console.warn("[PaneHeader] terminal_kill failed", e);
-    }
-  }
-
-  async function onCloseTab(ev: MouseEvent, tab: CellTab) {
+  function onCloseTab(ev: MouseEvent, tab: CellTab) {
     ev.stopPropagation();
-    await killSession(tab.sessionId);
+    requestTerminalKill(tab.sessionId, "PaneHeader");
     removeCellTab(props.cellId, tab.id);
   }
 
-  async function onCloseCell(ev: MouseEvent) {
+  function onCloseCell(ev: MouseEvent) {
     ev.stopPropagation();
-    for (const tab of props.tabs) await killSession(tab.sessionId);
+    for (const tab of props.tabs) requestTerminalKill(tab.sessionId, "PaneHeader");
     removePane(props.cellId);
   }
 
@@ -868,7 +1065,7 @@ const PaneHeader: Component<PaneHeaderProps> = (props) => {
 
   return (
     <div
-      class="pane-drag-handle flex h-7 shrink-0 cursor-grab items-center border-b border-border-subtle active:cursor-grabbing"
+      class="pane-drag-handle flex h-8 shrink-0 cursor-grab items-center border-b border-border-subtle active:cursor-grabbing"
       data-testid={`pane-header-${props.cellId}`}
       onPointerDown={onHeaderPointerDown}
     >
@@ -905,7 +1102,7 @@ const PaneHeader: Component<PaneHeaderProps> = (props) => {
             const activeTab = props.tabs.find((t) => t.id === props.activeTabId);
             const snippet = extractSnippet(activeTab?.sessionId, props.kind as AgentKind);
             setLastSnippet(props.cellId, snippet, Date.now());
-            toggleMinimize(props.cellId);
+            minimizePane(props.cellId);
           }}
         >
           <MinusGlyph />
@@ -919,13 +1116,7 @@ const PaneHeader: Component<PaneHeaderProps> = (props) => {
         >
           {props.isMaximized ? <RestoreGlyph /> : <MaximizeGlyph />}
         </ChromeButton>
-        <ChromeButton
-          label="Close"
-          danger
-          onClick={(e) => {
-            void onCloseCell(e);
-          }}
-        >
+        <ChromeButton label="Close" danger onClick={onCloseCell}>
           <CloseGlyph />
         </ChromeButton>
       </div>
@@ -962,17 +1153,43 @@ const TabItem: Component<{
   let prevTabState: AgentState | null = null;
   createEffect(() => {
     const s = tabState();
-    if (s === "waiting" && prevTabState !== "waiting") {
+    const transitioned =
+      (s === "waiting" && prevTabState !== "waiting") ||
+      (s === "completed" && prevTabState === "working");
+    if (transitioned) {
       setBumping(true);
       setTimeout(() => setBumping(false), 400);
     }
     prevTabState = s;
   });
 
+  const harnessAnimating = () => {
+    const s = tabState();
+    return s === "working" || s === "waiting";
+  };
+
   const HarnessIcon = () => {
     const Icon = HARNESS_ICONS[props.kind as keyof typeof HARNESS_ICONS];
     if (!Icon) return null;
-    return <Icon class="h-3 w-3 shrink-0" />;
+    return <Icon class="h-3 w-3 shrink-0" classList={{ "harness-pulse": harnessAnimating() }} />;
+  };
+
+  const lastPromptText = (): string | undefined => {
+    const sid = props.tab.sessionId;
+    if (!sid) return undefined;
+    const text = terminalStore.byId[sid]?.lastPrompt?.text;
+    if (!text) return undefined;
+    return text;
+  };
+
+  // Subtitles render only the first line of multi-line prompts. The
+  // `title=` tooltip carries the full text (newlines preserved) so the
+  // user can hover for the rest.
+  const lastPromptSubtitle = (): string | undefined => {
+    const text = lastPromptText();
+    if (!text) return undefined;
+    const idx = text.indexOf("\n");
+    return idx >= 0 ? text.slice(0, idx) : text;
   };
 
   function openMenu(e: MouseEvent) {
@@ -1000,118 +1217,119 @@ const TabItem: Component<{
   }
 
   return (
-    <div
-      class="pane-header-tab group relative flex h-[18px] shrink-0 cursor-pointer items-center gap-1 rounded-md px-2 text-[10px] uppercase tracking-wide transition-colors"
-      classList={{
-        "bg-selected text-foreground": props.isActive && tabState() !== "waiting",
-        "bg-selected text-warning": props.isActive && tabState() === "waiting",
-        "text-foreground-subtle hover:bg-hover hover:text-foreground":
-          !props.isActive && tabState() !== "waiting",
-        "bg-warning/15 text-warning hover:bg-warning/25":
-          !props.isActive && tabState() === "waiting",
-        wiggle: bumping(),
-      }}
-      title={tabLabel()}
-      onClick={(e) => {
-        if (editing()) return;
-        e.stopPropagation();
-        setActiveTabId(props.cellId, props.tab.id);
-      }}
-      onContextMenu={openMenu}
-      onDblClick={(e) => {
-        e.stopPropagation();
-        startRename();
-      }}
-    >
-      <HarnessIcon />
-      <StateIndicator state={tabState()} />
-      <Show when={editing()}>
-        <input
-          type="text"
-          class="h-4 w-28 rounded-sm border border-border bg-background px-1 text-[10px] uppercase tracking-wide text-foreground outline-none focus:border-ring"
-          value={draft()}
-          onInput={(e) => setDraft(e.currentTarget.value)}
-          onClick={(e) => e.stopPropagation()}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") {
-              e.preventDefault();
-              commitRename();
-            } else if (e.key === "Escape") {
-              e.preventDefault();
-              cancelRename();
-            }
-          }}
-          onBlur={commitRename}
-          ref={(el) => {
-            queueMicrotask(() => {
-              el.focus();
-              el.select();
-            });
-          }}
-        />
-      </Show>
-      <Show when={!editing() && tabLabel()}>
-        <span class="max-w-[14ch] truncate normal-case">{tabLabel()}</span>
-      </Show>
-      <Show when={props.showClose && !editing()}>
-        <button
-          type="button"
-          title="Close tab"
-          aria-label="Close tab"
-          class="pane-header-tab-close ml-0.5 hidden rounded-sm p-0.5 hover:bg-hover hover:text-foreground group-hover:flex"
-          onClick={(e) => {
-            props.onClose(e);
-          }}
-        >
-          <CloseGlyph />
-        </button>
-      </Show>
-
-      <Show when={menuOpen()}>
-        <div
-          class="floating-surface fixed z-50 w-40 rounded-xl border border-border bg-popover p-1 text-xs normal-case"
-          role="menu"
-          style={{ left: `${menuX()}px`, top: `${menuY()}px` }}
-          onMouseLeave={() => setMenuOpen(false)}
-          onClick={(e) => e.stopPropagation()}
-        >
-          <button
-            type="button"
-            class="block w-full rounded px-2 py-1 text-left hover:bg-accent hover:text-accent-foreground"
-            onClick={startRename}
-          >
-            Rename…
-          </button>
+    <Tooltip>
+      <TooltipTrigger
+        as="div"
+        class="pane-header-tab group relative flex min-w-[120px] max-w-[300px] grow basis-[180px] cursor-pointer flex-col justify-center rounded-md px-2 text-[10px] uppercase leading-none tracking-wide transition-colors"
+        classList={{
+          "h-[26px]": !!lastPromptSubtitle(),
+          "h-[18px]": !lastPromptSubtitle(),
+          "bg-selected text-foreground": props.isActive && tabState() !== "waiting",
+          "bg-selected text-warning": props.isActive && tabState() === "waiting",
+          "text-foreground-subtle hover:bg-hover hover:text-foreground":
+            !props.isActive && tabState() !== "waiting",
+          "bg-warning/15 text-warning hover:bg-warning/25":
+            !props.isActive && tabState() === "waiting",
+          wiggle: bumping(),
+        }}
+        onClick={(e: MouseEvent) => {
+          if (editing()) return;
+          e.stopPropagation();
+          setActiveTabId(props.cellId, props.tab.id);
+        }}
+        onContextMenu={openMenu}
+        onDblClick={(e: MouseEvent) => {
+          e.stopPropagation();
+          startRename();
+        }}
+      >
+        <div class="flex min-w-0 items-center gap-1">
+          <HarnessIcon />
+          <Show when={editing()}>
+            <input
+              type="text"
+              class="h-4 w-28 rounded-sm border border-border bg-background px-1 text-[10px] uppercase tracking-wide text-foreground outline-none focus:border-ring"
+              value={draft()}
+              onInput={(e) => setDraft(e.currentTarget.value)}
+              onClick={(e) => e.stopPropagation()}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  commitRename();
+                } else if (e.key === "Escape") {
+                  e.preventDefault();
+                  cancelRename();
+                }
+              }}
+              onBlur={commitRename}
+              ref={(el) => {
+                queueMicrotask(() => {
+                  el.focus();
+                  el.select();
+                });
+              }}
+            />
+          </Show>
+          <Show when={!editing() && tabLabel()}>
+            <span class="min-w-0 flex-1 truncate normal-case">{tabLabel()}</span>
+          </Show>
+          <Show when={props.showClose && !editing()}>
+            <button
+              type="button"
+              aria-label="Close tab"
+              class="pane-header-tab-close ml-0.5 hidden shrink-0 rounded-sm p-0.5 hover:bg-hover hover:text-foreground group-hover:flex"
+              onClick={(e) => {
+                props.onClose(e);
+              }}
+            >
+              <CloseGlyph />
+            </button>
+          </Show>
         </div>
-      </Show>
-    </div>
+        <Show when={lastPromptSubtitle()}>
+          <div class="mt-px min-w-0 truncate pl-4 text-[9px] font-normal normal-case tracking-normal opacity-85">
+            {lastPromptSubtitle()}
+          </div>
+        </Show>
+
+        <Show when={menuOpen()}>
+          <div
+            class="floating-surface fixed z-50 w-40 rounded-xl border border-border bg-popover p-1 text-xs normal-case"
+            role="menu"
+            style={{ left: `${menuX()}px`, top: `${menuY()}px` }}
+            onMouseLeave={() => setMenuOpen(false)}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <button
+              type="button"
+              class="block w-full rounded px-2 py-1 text-left hover:bg-accent hover:text-accent-foreground"
+              onClick={startRename}
+            >
+              Rename…
+            </button>
+          </div>
+        </Show>
+      </TooltipTrigger>
+      <TooltipPortal>
+        <TooltipContent class="max-w-md">
+          <Show when={tabLabel()}>
+            <div class="text-[10px] font-medium uppercase tracking-wide">{tabLabel()}</div>
+          </Show>
+          <Show when={lastPromptText()}>
+            <div
+              class="whitespace-pre-wrap text-[11px] leading-snug text-popover-foreground/85"
+              classList={{ "mt-1": !!tabLabel() }}
+            >
+              {lastPromptText()}
+            </div>
+          </Show>
+        </TooltipContent>
+      </TooltipPortal>
+    </Tooltip>
   );
 };
 
-// ---- StateIndicator + ChromeButton + glyphs -------------------------------
-
-function StateIndicator(props: { state: AgentState | null }) {
-  const title = () => props.state ?? "unknown";
-  return (
-    <span class="flex items-center" title={title()}>
-      <Show when={props.state === "working"}>
-        <LoaderIcon class="h-3 w-3 animate-spin text-success" />
-      </Show>
-      <Show when={props.state === "waiting"}>
-        <AlertCircleIcon class="h-3 w-3 animate-pulse text-warning" />
-      </Show>
-      <Show when={props.state === "idle" || props.state === null}>
-        <CheckIcon class="h-3 w-3 text-foreground-subtle" />
-      </Show>
-      <Show when={props.state === "completed"}>
-        <CheckIcon class="h-3 w-3 text-info" />
-      </Show>
-      <Show when={props.state === "errored"}>
-        <AlertCircleIcon class="h-3 w-3 text-destructive" />
-      </Show>
-    </span>
-  );
-}
+// ---- ChromeButton + glyphs ------------------------------------------------
 
 function ChromeButton(props: {
   label: string;
@@ -1230,13 +1448,18 @@ const ProjectedSessionFrame: Component<{ sessionId: string; rect: Rect | null }>
     const slug = terminal()?.project_slug;
     return slug ? projectBySlug().get(slug) : undefined;
   });
+  const state = () => agentStore.sessions[props.sessionId]?.state ?? null;
   const HarnessIcon = () => {
     const kind = terminal()?.kind;
     if (!kind) return null;
     const I = HARNESS_ICONS[kind as keyof typeof HARNESS_ICONS];
-    return I ? <I class="size-3.5 shrink-0" /> : null;
+    if (!I) return null;
+    const animating = () => {
+      const s = state();
+      return s === "working" || s === "waiting";
+    };
+    return <I class="size-3.5 shrink-0" classList={{ "harness-pulse": animating() }} />;
   };
-  const state = () => agentStore.sessions[props.sessionId]?.state ?? null;
   const label = createMemo(() => {
     const current = terminal();
     const ctx = current?.paneContext;
@@ -1250,12 +1473,17 @@ const ProjectedSessionFrame: Component<{ sessionId: string; rect: Rect | null }>
       fallbackLabel: kindDisplayLabel(kind),
     });
   });
-  const accent = () => `color-mix(in oklab, ${project()?.color ?? "#6b7280"} 18%, transparent)`;
   const headerStyle = () =>
     ({
       "box-shadow": `inset 0 1px 0 color-mix(in oklab, ${project()?.color ?? "#6b7280"} 26%, transparent)`,
       "background-image": `linear-gradient(180deg, color-mix(in oklab, ${project()?.color ?? "#6b7280"} 7%, transparent) 0%, transparent 100%)`,
     }) as Record<string, string>;
+  const projectedSubtitle = (): string | undefined => {
+    const text = terminal()?.lastPrompt?.text;
+    if (!text) return undefined;
+    const idx = text.indexOf("\n");
+    return idx >= 0 ? text.slice(0, idx) : text;
+  };
 
   return (
     <Show when={terminal()}>
@@ -1263,33 +1491,64 @@ const ProjectedSessionFrame: Component<{ sessionId: string; rect: Rect | null }>
         <Show when={props.rect}>
           {(rect) => (
             <div
-              class="leaf-frame flex min-h-0 min-w-0 flex-col"
+              class="leaf-frame terminal-chrome-frame flex min-h-0 min-w-0 flex-col"
               data-session-id={props.sessionId}
               data-testid={`projected-session-${props.sessionId}`}
               style={rectStyle(rect())}
               title={currentTerminal().project_slug ?? ""}
+              onClick={() => {
+                window.dispatchEvent(
+                  new CustomEvent("terminal-focus-requested", {
+                    detail: { sessionId: props.sessionId },
+                  }),
+                );
+              }}
             >
               <div
-                class="flex h-7 shrink-0 items-center border-b border-border-subtle"
+                class="flex h-8 shrink-0 items-center border-b border-border-subtle"
                 style={headerStyle()}
               >
                 <div class="no-scrollbar flex min-w-0 flex-1 items-center overflow-x-auto pl-1.5">
-                  <div class="pane-header-tab relative flex h-[18px] shrink-0 items-center gap-1 rounded-md px-2 text-[10px] uppercase tracking-wide text-foreground">
-                    <HarnessIcon />
-                    <StateIndicator state={state()} />
-                    <span class="max-w-[16ch] truncate normal-case">{label()}</span>
-                  </div>
+                  <Tooltip>
+                    <TooltipTrigger
+                      as="div"
+                      class="pane-header-tab relative flex min-w-[120px] max-w-[300px] grow basis-[180px] flex-col justify-center rounded-md px-2 text-[10px] uppercase leading-none tracking-wide text-foreground"
+                      classList={{
+                        "h-[26px]": !!projectedSubtitle(),
+                        "h-[18px]": !projectedSubtitle(),
+                      }}
+                    >
+                      <div class="flex min-w-0 items-center gap-1">
+                        <HarnessIcon />
+                        <span class="min-w-0 flex-1 truncate normal-case">{label()}</span>
+                      </div>
+                      <Show when={projectedSubtitle()}>
+                        <div class="mt-px min-w-0 truncate pl-[18px] text-[9px] font-normal normal-case tracking-normal opacity-85">
+                          {projectedSubtitle()}
+                        </div>
+                      </Show>
+                    </TooltipTrigger>
+                    <TooltipPortal>
+                      <TooltipContent class="max-w-md">
+                        <Show when={label()}>
+                          <div class="text-[10px] font-medium uppercase tracking-wide">
+                            {label()}
+                          </div>
+                        </Show>
+                        <Show when={terminal()?.lastPrompt?.text}>
+                          <div
+                            class="whitespace-pre-wrap text-[11px] leading-snug text-popover-foreground/85"
+                            classList={{ "mt-1": !!label() }}
+                          >
+                            {terminal()?.lastPrompt?.text}
+                          </div>
+                        </Show>
+                      </TooltipContent>
+                    </TooltipPortal>
+                  </Tooltip>
                 </div>
               </div>
-              <div class="relative min-h-0 min-w-0 flex-1 overflow-hidden">
-                <TerminalPane
-                  kind={currentTerminal().kind}
-                  sessionId={props.sessionId}
-                  projectSlug={currentTerminal().project_slug ?? undefined}
-                  worktreeId={currentTerminal().worktree_id ?? undefined}
-                  borderColor={accent()}
-                />
-              </div>
+              <div class="terminal-chrome-body relative min-h-0 min-w-0 flex-1 overflow-hidden" />
             </div>
           )}
         </Show>

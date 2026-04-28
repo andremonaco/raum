@@ -29,7 +29,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use raum_core::agent::{AgentAdapter, AgentKind, SessionId};
-use raum_core::agent_state::{AgentStateChanged, AgentStateMachine, HookEvent as CoreHookEvent};
+use raum_core::agent_state::{
+    AgentStateChanged, AgentStateMachine, HookEvent as CoreHookEvent, PromptEntry, PromptUpdated,
+    extract_user_prompt,
+};
 use raum_core::harness::setup::{SetupContext, SetupExecutor};
 use raum_core::harness::traits::SessionSpec;
 use raum_core::harness::{Reliability, decode_payload, default_registry};
@@ -40,7 +43,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::commands::harness_runtime::{SessionRuntime, harness_wire_name, spawn_channel_task};
 use crate::state::AppHandleState;
@@ -57,6 +60,12 @@ pub struct AgentListItem {
     pub harness: AgentKind,
     pub state: raum_core::agent::AgentState,
     pub supports_native_events: bool,
+    /// The user's most recently submitted prompt for this session, if
+    /// any. Surfaced on the snapshot so the frontend can render the tab
+    /// subtitle on rehydrate without waiting for a fresh
+    /// `pane:prompt-updated` emit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_prompt: Option<PromptEntry>,
 }
 
 /// Shared agent registry + state-machine map. Stored behind `Arc<Mutex<_>>`
@@ -246,6 +255,41 @@ impl AgentRegistry {
         self.machines.get_mut(session_id)?.on_permission_reply()
     }
 
+    /// Record the user's most recently submitted prompt for `session_id`.
+    /// Returns the resulting [`PromptUpdated`] record so the caller can
+    /// broadcast it on the prompt bus and persist it. Returns `None` when
+    /// no machine is registered for the session yet (the spawn path
+    /// occasionally races the first hook).
+    pub fn record_user_prompt(
+        &mut self,
+        session_id: &str,
+        text: String,
+        submitted_at_ms: u64,
+    ) -> Option<PromptUpdated> {
+        Some(
+            self.machines
+                .get_mut(session_id)?
+                .record_user_prompt(text, submitted_at_ms),
+        )
+    }
+
+    /// Seed a session machine with a previously-persisted prompt. Used
+    /// by the rehydration path so a freshly-relaunched raum repopulates
+    /// the tab subtitle without waiting for a fresh submit.
+    pub fn seed_last_prompt(&mut self, session_id: &str, entry: PromptEntry) -> bool {
+        let Some(machine) = self.machines.get_mut(session_id) else {
+            return false;
+        };
+        machine.seed_last_prompt(entry);
+        true
+    }
+
+    /// Snapshot the last-known prompt for a session, if any.
+    #[must_use]
+    pub fn last_prompt(&self, session_id: &str) -> Option<PromptEntry> {
+        self.machines.get(session_id)?.last_prompt().cloned()
+    }
+
     #[must_use]
     pub fn list(&self) -> Vec<AgentListItem> {
         let mut out = Vec::new();
@@ -255,6 +299,7 @@ impl AgentRegistry {
                 harness: adapter.kind(),
                 state: raum_core::agent::AgentState::Idle,
                 supports_native_events: adapter.supports_native_events(),
+                last_prompt: None,
             });
         }
         for (id, machine) in &self.machines {
@@ -265,6 +310,7 @@ impl AgentRegistry {
                 supports_native_events: self
                     .find_adapter(machine.harness())
                     .is_some_and(|a| a.supports_native_events()),
+                last_prompt: machine.last_prompt().cloned(),
             });
         }
         out
@@ -274,14 +320,21 @@ impl AgentRegistry {
 /// Broadcast channel owner. Instantiated lazily via `OnceLock` so we don't
 /// need to touch `AppHandleState::default()` unnecessarily — the first call
 /// to any agent command populates the channel and spawns the re-emit task.
+///
+/// Two parallel channels: state changes and prompt updates. They share the
+/// same backlog budget — a sibling channel for prompts keeps the wire
+/// schema for `agent-state-changed` unchanged while still letting the
+/// bridge task fan-out a separate `pane:prompt-updated` event.
 pub struct AgentEventBus {
     pub tx: broadcast::Sender<AgentStateChanged>,
+    pub prompt_tx: broadcast::Sender<PromptUpdated>,
 }
 
 impl std::fmt::Debug for AgentEventBus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AgentEventBus")
             .field("receiver_count", &self.tx.receiver_count())
+            .field("prompt_receiver_count", &self.prompt_tx.receiver_count())
             .finish()
     }
 }
@@ -290,7 +343,8 @@ impl AgentEventBus {
     #[must_use]
     pub fn new() -> Self {
         let (tx, _rx) = broadcast::channel(AGENT_EVENT_CHANNEL_CAPACITY);
-        Self { tx }
+        let (prompt_tx, _prompt_rx) = broadcast::channel(AGENT_EVENT_CHANNEL_CAPACITY);
+        Self { tx, prompt_tx }
     }
 }
 
@@ -406,20 +460,55 @@ pub async fn drive_event_socket<R: Runtime>(
                 event: ev.event.clone(),
             });
         }
-        let changes: Vec<AgentStateChanged> = {
+        let (changes, prompt_update): (Vec<AgentStateChanged>, Option<PromptUpdated>) = {
             let Ok(mut registry) = state.agents.lock() else {
                 warn!("event-socket drain: agent registry lock poisoned; dropping event");
                 continue;
             };
-            match ev.session_id.as_deref() {
+            let changes = match ev.session_id.as_deref() {
                 Some(sid) => registry.apply_hook_for_session(kind, sid, &core_event),
                 None => registry.apply_hook_to_matching(kind, &core_event),
-            }
+            };
+            // For UserPromptSubmit, the harness pipes the user's prompt
+            // to the hook script on stdin; the script forwards that
+            // through `json_escape` as a JSON-encoded *string*, so
+            // `ev.payload` is a `Value::String("{...}")` rather than a
+            // parsed object. `decode_payload` unwraps that wrapper. The
+            // `session_id` route is strict — without it, broadcast
+            // routing can't distinguish multiple Claude panes, so we
+            // silently skip the update rather than over-write the wrong
+            // tab's subtitle.
+            let prompt_update = if ev.event == "UserPromptSubmit" {
+                let decoded = decode_payload(&ev.payload);
+                let extracted = extract_user_prompt(kind, decoded.as_ref());
+                debug!(
+                    harness = %ev.harness,
+                    session_id = ?ev.session_id,
+                    has_prompt = extracted.is_some(),
+                    payload_kind = if ev.payload.is_string() { "string" } else { "object" },
+                    "UserPromptSubmit prompt extraction",
+                );
+                ev.session_id
+                    .as_deref()
+                    .zip(extracted)
+                    .and_then(|(sid, text)| {
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| d.as_millis() as u64);
+                        registry.record_user_prompt(sid, text, now_ms)
+                    })
+            } else {
+                None
+            };
+            (changes, prompt_update)
         };
         for change in changes {
             // Broadcast buffer fills silently when the bridge task is
             // behind; the `ensure_bridge_running` task logs the lag.
             let _ = bus.tx.send(change);
+        }
+        if let Some(update) = prompt_update {
+            let _ = bus.prompt_tx.send(update);
         }
 
         // Surface every permission-needed event to the webview. Some
@@ -449,7 +538,9 @@ pub fn ensure_bridge_running<R: Runtime>(app: &AppHandle<R>, bus: &AgentEventBus
         return;
     }
     let mut rx = bus.tx.subscribe();
+    let mut prompt_rx = bus.prompt_tx.subscribe();
     let app = app.clone();
+    let prompt_app = app.clone();
     tauri::async_runtime::spawn(async move {
         loop {
             match rx.recv().await {
@@ -464,6 +555,22 @@ pub fn ensure_bridge_running<R: Runtime>(app: &AppHandle<R>, bus: &AgentEventBus
                 Err(broadcast::error::RecvError::Closed) => break,
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     warn!(dropped = n, "agent event bus lagged");
+                }
+            }
+        }
+    });
+    tauri::async_runtime::spawn(async move {
+        loop {
+            match prompt_rx.recv().await {
+                Ok(update) => {
+                    persist_last_prompt(&prompt_app, &update);
+                    if let Err(e) = prompt_app.emit("pane:prompt-updated", &update) {
+                        warn!(error=%e, "pane:prompt-updated emit failed");
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    warn!(dropped = n, "prompt event bus lagged");
                 }
             }
         }
@@ -490,6 +597,24 @@ fn persist_last_state<R: Runtime>(app: &AppHandle<R>, change: &AgentStateChanged
         now_ms,
     ) {
         warn!(error=%e, session_id=%change.session_id.as_str(), "persist last_state failed");
+    }
+}
+
+fn persist_last_prompt<R: Runtime>(app: &AppHandle<R>, update: &PromptUpdated) {
+    let state: tauri::State<'_, AppHandleState> = app.state();
+    let store = match state.config_store.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            warn!("persist last_prompt: config_store lock poisoned");
+            return;
+        }
+    };
+    if let Err(e) = store.update_session_last_prompt(
+        update.session_id.as_str(),
+        &update.text,
+        update.submitted_at_ms,
+    ) {
+        warn!(error=%e, session_id=%update.session_id.as_str(), "persist last_prompt failed");
     }
 }
 
@@ -1036,6 +1161,103 @@ pub async fn prepare_harness_launch<R: Runtime>(
     })
 }
 
+/// Fast spawn-time preflight for `terminal_spawn`.
+///
+/// This intentionally avoids version probing, `git worktree list`, setup-plan
+/// writes, and selftests. Those are useful health checks, but they should not
+/// sit between the user's click and the harness process starting. We still
+/// verify the binary exists and do a cheap on-disk scan so sessions with hooks
+/// missing can start in silence-fallback mode until the background refresh
+/// catches up.
+pub fn prepare_harness_launch_fast<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &AppHandleState,
+    harness: AgentKind,
+    project_slug: Option<&str>,
+    project_dir: PathBuf,
+) -> Result<AgentSpawnReport, String> {
+    ensure_bridge_running(app, &state.agent_events);
+
+    let adapter = {
+        let registry = state
+            .agents
+            .lock()
+            .map_err(|e| format!("agent registry lock: {e}"))?;
+        registry
+            .find_adapter(harness)
+            .ok_or_else(|| format!("no adapter registered for {:?}", harness))?
+    };
+
+    if which::which(adapter.binary_path()).is_err() {
+        info!(
+            binary = adapter.binary_path(),
+            harness = ?harness,
+            "prepare_harness_launch_fast: binary missing on PATH"
+        );
+        emit_missing_binary_notification(app, adapter.binary_path(), harness);
+        return Ok(AgentSpawnReport {
+            session_id: String::new(),
+            binary_missing: true,
+            binary: adapter.binary_path().to_string(),
+            version_ok: None,
+            version_raw: None,
+            hook_fallback: false,
+            supports_native_events: adapter.supports_native_events(),
+        });
+    }
+
+    let mut hook_fallback = state
+        .channel_event_tx
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .is_none();
+
+    if adapter.supports_native_events() && !hook_fallback {
+        let home_dir = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from);
+        let ctx = SetupContext::new(
+            paths::hooks_dir(),
+            paths::event_socket_path(),
+            project_slug.unwrap_or_default().to_string(),
+        )
+        .with_project_dir(project_dir)
+        .with_home_dir(home_dir);
+        let scan = state.harness_runtimes.scan(harness, &ctx);
+        hook_fallback = !scan.raum_hooks_installed;
+    }
+
+    Ok(AgentSpawnReport {
+        session_id: String::new(),
+        binary_missing: false,
+        binary: adapter.binary_path().to_string(),
+        version_ok: None,
+        version_raw: None,
+        hook_fallback,
+        supports_native_events: adapter.supports_native_events(),
+    })
+}
+
+pub fn spawn_harness_launch_refresh<R: Runtime + 'static>(
+    app: AppHandle<R>,
+    harness: AgentKind,
+    project_slug: Option<String>,
+    project_dir: PathBuf,
+) {
+    tauri::async_runtime::spawn(async move {
+        let state: tauri::State<'_, AppHandleState> = app.state();
+        if let Err(e) =
+            prepare_harness_launch(&app, &state, harness, project_slug.as_deref(), project_dir)
+                .await
+        {
+            warn!(
+                harness = ?harness,
+                error = %e,
+                "background harness launch refresh failed"
+            );
+        }
+    });
+}
+
 pub fn infer_reattach_hook_fallback(
     state: &AppHandleState,
     harness: AgentKind,
@@ -1143,11 +1365,17 @@ pub fn register_harness_session_runtime_opts<R: Runtime>(
     // frontend right after `terminal_reattach` resolves) returns that state.
     // A live event (hook, SSE, silence tick) later overrides the seed, so
     // any stale value self-corrects within ≤500 ms.
-    let persisted_state = state
-        .config_store
-        .lock()
-        .ok()
-        .and_then(|store| store.last_session_state(session_id));
+    let (persisted_state, persisted_prompt) =
+        state
+            .config_store
+            .lock()
+            .ok()
+            .map_or((None, None), |store| {
+                (
+                    store.last_session_state(session_id),
+                    store.last_session_prompt(session_id),
+                )
+            });
 
     let silence_only = hook_fallback || channel_tx_opt.is_none();
 
@@ -1164,12 +1392,32 @@ pub fn register_harness_session_runtime_opts<R: Runtime>(
         if let Some(seed) = persisted_state {
             machine = machine.with_initial_state(seed);
         }
+        if let Some((text, submitted_at_ms)) = persisted_prompt.clone() {
+            machine.seed_last_prompt(PromptEntry {
+                text,
+                submitted_at_ms,
+            });
+        }
         if silence_only {
             machine.set_silence_only(true);
         }
         let newly_inserted = registry.register_machine_if_absent(machine);
         if !newly_inserted {
             registry.set_silence_only(session_id, silence_only);
+            // Reattach to a pre-populated machine — only seed the prompt
+            // if the machine doesn't already carry one, so a live submit
+            // that arrived between bootstrap and reattach isn't clobbered.
+            if let Some((text, submitted_at_ms)) = persisted_prompt
+                && registry.last_prompt(session_id).is_none()
+            {
+                registry.seed_last_prompt(
+                    session_id,
+                    PromptEntry {
+                        text,
+                        submitted_at_ms,
+                    },
+                );
+            }
         }
         newly_inserted
     };
