@@ -9,6 +9,7 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -21,11 +22,20 @@ fn tmux_available() -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
+/// Per-process socket counter. `SystemTime::now()` alone collides between
+/// parallel test threads on fast macOS-arm64 runners (two threads can
+/// observe the same nanosecond) — when that happened the threads shared a
+/// tmux server and whichever finished first killed it out from under the
+/// other, surfacing as `no server running` in capture-pane. Bumping a
+/// monotonic counter here guarantees uniqueness even on a tie.
+static SOCKET_SEQ: AtomicU64 = AtomicU64::new(0);
+
 fn unique_socket() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
-    format!("raum-test-{}-{}", std::process::id(), nanos)
+    let seq = SOCKET_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("raum-test-{}-{}-{}", std::process::id(), nanos, seq)
 }
 
 /// Bring up a tmux server on `socket` with the lifetime options
