@@ -121,6 +121,7 @@ async function hydrateActiveLayout(): Promise<void> {
         projectSlug: t.project_slug,
         worktreeId: t.worktree_id,
       })),
+      minimized: c.minimized === true,
     }));
 
     setRuntimeLayout(cells);

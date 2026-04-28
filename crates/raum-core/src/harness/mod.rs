@@ -25,6 +25,7 @@ pub mod claude_code;
 pub mod codex;
 pub mod event;
 pub mod hook_script;
+pub mod launch;
 pub mod opencode;
 pub mod opencode_reply;
 pub mod opencode_sse;
@@ -39,6 +40,7 @@ pub use event::{
     NotificationEvent, NotificationKind, PermissionRequestId, Reliability, SourceId,
     classify_notification_event, classify_notification_kind, decode_payload,
 };
+pub use launch::{harness_launch_command, parse_opencode_port_arg};
 pub use opencode::OpenCodeAdapter;
 pub use reply::{Decision, PermissionReplier, ReplyError, ReplyMode};
 pub use setup::{

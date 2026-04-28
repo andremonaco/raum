@@ -404,6 +404,11 @@ export const TopRow: Component = () => {
   const [appSettingsOpen, setAppSettingsOpen] = createSignal(false);
   const [keymapSettingsOpen, setKeymapSettingsOpen] = createSignal(false);
   const [confirmRemove, setConfirmRemove] = createSignal<ProjectListItem | undefined>(undefined);
+  const [orphanSweepResult, setOrphanSweepResult] = createSignal<
+    | { count: number; ids?: string[]; error?: undefined }
+    | { count: 0; ids?: undefined; error: string }
+    | null
+  >(null);
 
   const [compactTabs, setCompactTabs] = createSignal(false);
   let tabsScrollRef: HTMLElement | undefined;
@@ -1144,21 +1149,55 @@ export const TopRow: Component = () => {
                 <AlertCircleIcon class="size-3" />0
               </span>
             </Show>
-            <Tooltip>
-              <TooltipTrigger
+            <HoverCard>
+              <HoverCardTrigger
                 as="span"
                 class="inline-flex items-center gap-1 rounded px-1 py-0.5 font-mono text-muted-foreground"
                 data-testid="done-count"
               >
                 <CheckIcon class="size-3" />
                 {idleCount()}
-              </TooltipTrigger>
-              <TooltipPortal>
-                <TooltipContent>
-                  {idleCount()} idle harness{idleCount() === 1 ? "" : "es"}
-                </TooltipContent>
-              </TooltipPortal>
-            </Tooltip>
+              </HoverCardTrigger>
+              <HoverCardPortal>
+                <HoverCardContent class="w-64 p-2 text-xs">
+                  <div class="text-foreground/90">
+                    {idleCount()} idle harness{idleCount() === 1 ? "" : "es"}
+                  </div>
+                  <Show when={idleCount() > 0}>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      class="mt-2 h-7 w-full justify-start text-[11px]"
+                      onClick={() => {
+                        void (async () => {
+                          try {
+                            const killed = await invoke<string[]>("terminal_kill_orphans");
+                            setOrphanSweepResult({
+                              count: killed.length,
+                              ids: killed,
+                            });
+                          } catch (e) {
+                            console.error("[top-row] terminal_kill_orphans failed", e);
+                            setOrphanSweepResult({
+                              count: 0,
+                              error: String(e),
+                            });
+                          }
+                        })();
+                      }}
+                    >
+                      Sweep orphan tmux sessions
+                    </Button>
+                    <p class="mt-1 text-[10px] leading-snug text-muted-foreground">
+                      Kills tmux sessions on the raum socket that aren&apos;t tracked by the app.
+                      Safety floor: ignores sessions newer than 30 s so it can&apos;t race a fresh
+                      spawn.
+                    </p>
+                  </Show>
+                </HoverCardContent>
+              </HoverCardPortal>
+            </HoverCard>
           </div>
         </div>
       </header>
@@ -1215,6 +1254,55 @@ export const TopRow: Component = () => {
         open={keymapSettingsOpen()}
         onClose={() => setKeymapSettingsOpen(false)}
       />
+
+      <Dialog
+        open={orphanSweepResult() !== null}
+        onOpenChange={(isOpen) => {
+          if (!isOpen) setOrphanSweepResult(null);
+        }}
+      >
+        <DialogPortal>
+          <DialogContent showCloseButton={false} class="sm:max-w-[420px]">
+            <Show when={orphanSweepResult()}>
+              {(res) => (
+                <>
+                  <DialogHeader>
+                    <DialogTitle>
+                      <Show when={!res().error} fallback={<>Orphan sweep failed</>}>
+                        Orphan sweep complete
+                      </Show>
+                    </DialogTitle>
+                    <DialogDescription>
+                      <Show
+                        when={!res().error}
+                        fallback={<span class="text-destructive">{res().error}</span>}
+                      >
+                        <Show
+                          when={res().count > 0}
+                          fallback={<>No orphan tmux sessions to kill.</>}
+                        >
+                          Killed {res().count} orphan tmux session
+                          {res().count === 1 ? "" : "s"}.
+                        </Show>
+                      </Show>
+                    </DialogDescription>
+                  </DialogHeader>
+                  <DialogFooter>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => setOrphanSweepResult(null)}
+                    >
+                      OK
+                    </Button>
+                  </DialogFooter>
+                </>
+              )}
+            </Show>
+          </DialogContent>
+        </DialogPortal>
+      </Dialog>
     </>
   );
 };

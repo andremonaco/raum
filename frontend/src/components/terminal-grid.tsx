@@ -53,6 +53,7 @@ import {
   focusPaneByIndex,
   LAYOUT_UNIT,
   layoutRev,
+  maximizeLayoutSnap,
   maximizedPaneId,
   minimizedPaneIds,
   movePaneToEdge,
@@ -71,7 +72,8 @@ import {
   splitFocusedOrRoot,
   swapPanes,
   toggleMaximize,
-  toggleMinimize,
+  minimizePane,
+  restorePane,
   type CellKind,
   type CellTab,
   type PaneContent,
@@ -79,7 +81,12 @@ import {
 } from "../stores/runtimeLayoutStore";
 import { agentStore } from "../stores/agentStore";
 import type { AgentState } from "../stores/agentStore";
-import { listCrossProjectHarnessSessions, terminalStore } from "../stores/terminalStore";
+import {
+  clearTerminalClosing,
+  listCrossProjectHarnessSessions,
+  markTerminalClosing,
+  terminalStore,
+} from "../stores/terminalStore";
 import {
   activeWorktreeStore,
   ALL_WORKTREES_SCOPE,
@@ -150,6 +157,15 @@ const KIND_LABELS: Record<string, string> = {
   opencode: "OpenCode",
   empty: "Empty",
 };
+
+function requestTerminalKill(sessionId: string | undefined, context: string): void {
+  if (!sessionId) return;
+  markTerminalClosing(sessionId);
+  void invoke("terminal_kill", { sessionId }).catch((e: unknown) => {
+    clearTerminalClosing(sessionId);
+    console.warn(`[${context}] terminal_kill failed`, e);
+  });
+}
 
 // ---- TerminalGrid ---------------------------------------------------------
 
@@ -241,11 +257,6 @@ export const TerminalGrid: Component = () => {
   });
   timeMemoSettle("project-switch:active", activeCells);
 
-  const visibleCells = createMemo(() => {
-    const minimized = minimizedPaneIds();
-    return activeCells().filter((c) => !minimized.has(c.id));
-  });
-
   // Maximize is global runtime state but must only affect the active project's
   // view. If the maximized pane isn't in the current project's active cells,
   // treat it as "no maximize" for render purposes — without clearing the
@@ -280,9 +291,26 @@ export const TerminalGrid: Component = () => {
     }).rects;
   });
 
+  // Panes registered in the store but not in the BSP tree — minimized
+  // harnesses living in the dock. Feed them into the surface projector so
+  // xterm stays mounted across the in-tree → off-tree transition (preserves
+  // scrollback). Geometry is null; the surface layer hides them.
+  const offTreePanes = createMemo(() => {
+    const inTreeIds = new Set(runtimeLayoutStore.cells.map((c) => c.id));
+    const mins = minimizedPaneIds();
+    const out = [];
+    for (const pane of Object.values(runtimeLayoutStore.panes)) {
+      if (!mins.has(pane.id)) continue;
+      if (inTreeIds.has(pane.id)) continue;
+      out.push(pane);
+    }
+    return out;
+  });
+
   const terminalSurfaces = createMemo<TerminalSurfaceDescriptor[]>(() =>
     projectTerminalSurfaces({
       cells: runtimeLayoutStore.cells,
+      offTreePanes: offTreePanes(),
       activeRectMap: activeRectMap(),
       minimizedPaneIds: minimizedPaneIds(),
       crossProjectMode: crossProjectMode(),
@@ -338,18 +366,16 @@ export const TerminalGrid: Component = () => {
         const pane = runtimeLayoutStore.panes[paneId];
         if (!pane || pane.kind === "empty") return;
         const activeTab = pane.tabs.find((t) => t.id === pane.activeTabId);
-        const oldTabId = activeTab?.id;
-        const oldSessionId = activeTab?.sessionId;
-        addCellTab(paneId, {
-          projectSlug: activeTab?.projectSlug ?? pane.projectSlug,
-          worktreeId: activeTab?.worktreeId ?? pane.worktreeId,
-        });
-        if (oldTabId) removeCellTab(paneId, oldTabId);
-        if (oldSessionId) {
-          invoke("terminal_kill", { sessionId: oldSessionId }).catch((e: unknown) => {
-            console.warn("[reset-harness] terminal_kill failed", e);
-          });
-        }
+        if (!activeTab?.sessionId) return;
+        window.dispatchEvent(
+          new CustomEvent("raum:terminal-self-heal", {
+            detail: {
+              cellId: paneId,
+              tabId: activeTab.id,
+              sessionId: activeTab.sessionId,
+            },
+          }),
+        );
       }),
     );
     unregs.push(
@@ -445,7 +471,7 @@ export const TerminalGrid: Component = () => {
       if (owner) {
         if (owner.projectSlug) setActiveProjectSlug(owner.projectSlug);
         setActiveTabId(owner.cellId, owner.tabId);
-        if (minimizedPaneIds().has(owner.cellId)) toggleMinimize(owner.cellId);
+        if (minimizedPaneIds().has(owner.cellId)) restorePane(owner.cellId);
         setFocusedPaneId(owner.cellId);
         setCrossProjectViewMode(null);
       }
@@ -460,7 +486,7 @@ export const TerminalGrid: Component = () => {
   });
 
   function onRestoreFromDock(cellId: string): void {
-    toggleMinimize(cellId);
+    restorePane(cellId);
     setFocusedPaneId(cellId);
   }
 
@@ -501,10 +527,11 @@ export const TerminalGrid: Component = () => {
       <div class="flex-1 min-h-0 overflow-hidden bg-background">
         <div
           class="relative h-full w-full overflow-hidden rounded-xl"
+          classList={{ "maximize-layout-snap": maximizeLayoutSnap() }}
           ref={setRootEl}
           data-dnd-root="true"
         >
-          <Show when={crossProjectMode() === null && visibleCells().length === 0}>
+          <Show when={crossProjectMode() === null && activeCells().length === 0}>
             <div
               class="absolute inset-0 z-10 grid h-full w-full gap-px bg-border-subtle"
               style={{
@@ -523,9 +550,14 @@ export const TerminalGrid: Component = () => {
                       title={disabled() ? "Add a project before spawning a harness" : undefined}
                       onClick={() => {
                         if (disabled()) return;
+                        const slug = activeProjectSlug();
                         window.dispatchEvent(
                           new CustomEvent("raum:spawn-requested", {
-                            detail: { kind, projectSlug: activeProjectSlug() },
+                            detail: {
+                              kind,
+                              projectSlug: slug,
+                              worktreeId: slug ? resolveSpawnWorktree(slug) : undefined,
+                            },
                           }),
                         );
                       }}
@@ -608,7 +640,7 @@ export const TerminalGrid: Component = () => {
           continuous repaints on the xterm canvases beneath them. */}
         </div>
       </div>
-      <Dock onRestore={onRestoreFromDock} />
+      <Dock minimizedPanes={offTreePanes()} onRestore={onRestoreFromDock} />
     </div>
   );
 };
@@ -776,13 +808,9 @@ const TerminalSurfaceHost: Component<{ surface: TerminalSurfaceDescriptor }> = (
     toggleMaximize(cellId);
   }
 
-  async function closeSurface(): Promise<void> {
+  function closeSurface(): void {
     const { sessionId, cellId, tabId } = props.surface;
-    try {
-      if (sessionId) await invoke("terminal_kill", { sessionId });
-    } catch (e) {
-      console.warn("[TerminalSurfaceHost] terminal_kill on exit failed", e);
-    }
+    requestTerminalKill(sessionId, "TerminalSurfaceHost");
     if (cellId && tabId) removeCellTab(cellId, tabId);
   }
 
@@ -819,6 +847,8 @@ const TerminalSurfaceHost: Component<{ surface: TerminalSurfaceDescriptor }> = (
           sessionId={props.surface.sessionId}
           projectSlug={props.surface.projectSlug}
           worktreeId={props.surface.worktreeId}
+          cellId={props.surface.cellId}
+          tabId={props.surface.tabId}
           borderColor="transparent"
           visible={visible()}
           active={props.surface.active}
@@ -828,7 +858,7 @@ const TerminalSurfaceHost: Component<{ surface: TerminalSurfaceDescriptor }> = (
             }
           }}
           onRequestClose={() => {
-            void closeSurface();
+            closeSurface();
           }}
         />
       </div>
@@ -839,7 +869,6 @@ const TerminalSurfaceHost: Component<{ surface: TerminalSurfaceDescriptor }> = (
 // ---- LeafFrame: absolute-positioned pane ----------------------------------
 
 const LeafFrame: Component<{ cell: RuntimeCell; maximizedPaneId: string | null }> = (props) => {
-  const isMinimized = () => minimizedPaneIds().has(props.cell.id);
   const isMaximized = () => props.maximizedPaneId === props.cell.id;
   const anyMaximized = () => props.maximizedPaneId !== null;
   const isFocused = () => focusedPaneId() === props.cell.id;
@@ -898,7 +927,7 @@ const LeafFrame: Component<{ cell: RuntimeCell; maximizedPaneId: string | null }
         "pane-selected": isFocused(),
         "pane-dragging": isDragSource(),
         "pane-maximized": isMaximized(),
-        hidden: isMinimized() || (anyMaximized() && !isMaximized()),
+        hidden: anyMaximized() && !isMaximized(),
       }}
       style={style()}
       onFocusIn={onFocusCapture}
@@ -940,24 +969,15 @@ interface PaneHeaderProps {
 }
 
 const PaneHeader: Component<PaneHeaderProps> = (props) => {
-  async function killSession(sessionId: string | undefined) {
-    if (!sessionId) return;
-    try {
-      await invoke("terminal_kill", { sessionId });
-    } catch (e) {
-      console.warn("[PaneHeader] terminal_kill failed", e);
-    }
-  }
-
-  async function onCloseTab(ev: MouseEvent, tab: CellTab) {
+  function onCloseTab(ev: MouseEvent, tab: CellTab) {
     ev.stopPropagation();
-    await killSession(tab.sessionId);
+    requestTerminalKill(tab.sessionId, "PaneHeader");
     removeCellTab(props.cellId, tab.id);
   }
 
-  async function onCloseCell(ev: MouseEvent) {
+  function onCloseCell(ev: MouseEvent) {
     ev.stopPropagation();
-    for (const tab of props.tabs) await killSession(tab.sessionId);
+    for (const tab of props.tabs) requestTerminalKill(tab.sessionId, "PaneHeader");
     removePane(props.cellId);
   }
 
@@ -1082,7 +1102,7 @@ const PaneHeader: Component<PaneHeaderProps> = (props) => {
             const activeTab = props.tabs.find((t) => t.id === props.activeTabId);
             const snippet = extractSnippet(activeTab?.sessionId, props.kind as AgentKind);
             setLastSnippet(props.cellId, snippet, Date.now());
-            toggleMinimize(props.cellId);
+            minimizePane(props.cellId);
           }}
         >
           <MinusGlyph />
@@ -1096,13 +1116,7 @@ const PaneHeader: Component<PaneHeaderProps> = (props) => {
         >
           {props.isMaximized ? <RestoreGlyph /> : <MaximizeGlyph />}
         </ChromeButton>
-        <ChromeButton
-          label="Close"
-          danger
-          onClick={(e) => {
-            void onCloseCell(e);
-          }}
-        >
+        <ChromeButton label="Close" danger onClick={onCloseCell}>
           <CloseGlyph />
         </ChromeButton>
       </div>

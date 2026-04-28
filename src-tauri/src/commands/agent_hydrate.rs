@@ -31,7 +31,8 @@ use std::path::PathBuf;
 use raum_core::agent::{AgentKind, AgentState, SessionId};
 use raum_core::agent_state::AgentStateChanged;
 use raum_core::config::TrackedSession;
-use raum_core::harness::Reliability;
+use raum_core::harness::{Reliability, harness_launch_command};
+use serde::Serialize;
 use tauri::{AppHandle, Emitter, Runtime};
 use tracing::{info, warn};
 
@@ -39,8 +40,23 @@ use crate::commands::agent::{
     RegisterOptions, infer_reattach_hook_fallback, register_harness_session_runtime_opts,
     resolve_project_dir,
 };
-use crate::commands::terminal::{GhostEntry, TerminalListItem, emit_terminal_session_upserted};
+use crate::commands::terminal::{
+    GhostEntry, TerminalListItem, emit_terminal_session_upserted, reserve_localhost_port,
+};
 use crate::state::AppHandleState;
+
+/// Tauri event payload summarising the rehydrate pass — emitted once
+/// after `apply_rehydrate_plan` returns so the frontend can show a
+/// quiet "Recovered N harness panes" toast.
+const REHYDRATE_SUMMARY_EVENT: &str = "rehydrate:summary";
+
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct RehydrateSummary {
+    pub revived: usize,
+    pub alive: usize,
+    pub dead: usize,
+    pub forgotten: usize,
+}
 
 /// One classified tracked session. The planner produces these; the
 /// applier consumes them.
@@ -71,6 +87,14 @@ pub struct RehydrateReport {
     pub rehydrated: Vec<String>,
     pub forgotten: Vec<String>,
     pub errors: Vec<(String, String)>,
+    /// Sessions whose tmux pane was dead and which raum successfully
+    /// respawned in place via `tmux respawn-pane`.
+    pub revived: Vec<String>,
+    /// Sessions whose tmux pane was dead and which raum could NOT
+    /// auto-revive — Shell sessions (no harness command), respawn
+    /// failures, or harnesses with no derivable launch command. The
+    /// frontend renders these with the Recover overlay.
+    pub dead_skipped: Vec<String>,
 }
 
 impl RehydrateReport {
@@ -85,6 +109,27 @@ impl RehydrateReport {
     #[must_use]
     pub fn count_errors(&self) -> usize {
         self.errors.len()
+    }
+    #[must_use]
+    pub fn count_revived(&self) -> usize {
+        self.revived.len()
+    }
+    #[must_use]
+    pub fn count_dead_skipped(&self) -> usize {
+        self.dead_skipped.len()
+    }
+    #[must_use]
+    pub fn summary(&self) -> RehydrateSummary {
+        // Live = rehydrated minus revived (revived sessions also land
+        // in `rehydrated` because the register-job path runs after a
+        // successful respawn).
+        let alive = self.rehydrated.len().saturating_sub(self.revived.len());
+        RehydrateSummary {
+            revived: self.revived.len(),
+            alive,
+            dead: self.dead_skipped.len(),
+            forgotten: self.forgotten.len(),
+        }
     }
 }
 
@@ -165,7 +210,7 @@ pub fn apply_rehydrate_plan<R: Runtime>(
                 last_state,
                 created_at_unix_ms,
             } => {
-                if let Err(e) = apply_register_job(
+                let outcome = apply_register_job(
                     app,
                     state,
                     &session_id,
@@ -175,22 +220,57 @@ pub fn apply_rehydrate_plan<R: Runtime>(
                     opencode_port,
                     last_state,
                     created_at_unix_ms,
-                ) {
-                    warn!(error=%e, session_id=%session_id, "rehydrate: register failed");
-                    report.errors.push((session_id.clone(), e));
-                } else {
-                    report.rehydrated.push(session_id);
+                );
+                match outcome {
+                    Ok(RegisterOutcome::Alive) => {
+                        report.rehydrated.push(session_id);
+                    }
+                    Ok(RegisterOutcome::Revived) => {
+                        report.rehydrated.push(session_id.clone());
+                        report.revived.push(session_id);
+                    }
+                    Ok(RegisterOutcome::DeadSkipped) => {
+                        report.rehydrated.push(session_id.clone());
+                        report.dead_skipped.push(session_id);
+                    }
+                    Err(e) => {
+                        warn!(error=%e, session_id=%session_id, "rehydrate: register failed");
+                        report.errors.push((session_id, e));
+                    }
                 }
             }
         }
     }
     info!(
         rehydrated = report.count_rehydrated(),
+        revived = report.count_revived(),
+        dead_skipped = report.count_dead_skipped(),
         forgotten = report.count_forgotten(),
         errors = report.count_errors(),
         "rehydrate: plan applied",
     );
+    let summary = report.summary();
+    if let Err(e) = app.emit(REHYDRATE_SUMMARY_EVENT, &summary) {
+        warn!(error=%e, "rehydrate: summary emit failed");
+    }
     report
+}
+
+/// What `apply_register_job` did with a single live tmux session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegisterOutcome {
+    /// Pane was alive; nothing extra to do beyond the standard
+    /// register flow.
+    Alive,
+    /// Pane was dead and we ran `tmux respawn-pane` to revive it in
+    /// place. The state machine seeds with `Idle` instead of the
+    /// stale persisted `last_state`.
+    Revived,
+    /// Pane was dead and could not be auto-revived (Shell session, no
+    /// harness command derivable, or respawn failed). The ghost is
+    /// inserted with `dead: true` so the frontend renders the Recover
+    /// overlay.
+    DeadSkipped,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -204,15 +284,96 @@ fn apply_register_job<R: Runtime>(
     opencode_port: Option<u16>,
     last_state: Option<AgentState>,
     created_at_unix_ms: u64,
-) -> Result<(), String> {
+) -> Result<RegisterOutcome, String> {
     let project_dir: PathBuf = resolve_project_dir(state, project_slug, worktree_id);
+
+    // Probe pane health before registering. `remain-on-exit on` keeps
+    // dead panes visible on the tmux socket — `list_sessions` happily
+    // reports them as live, so without this probe the user gets a
+    // sidebar full of zombie panes that show "lost tty" the moment
+    // they're clicked. See plan §1 of the recovery work.
+    let pane_dead_status: Option<i32> = state.tmux.check_pane_dead(session_id).ok().flatten();
+    let mut outcome = RegisterOutcome::Alive;
+    let mut effective_opencode_port = opencode_port;
+    let mut state_seed = last_state;
+    let mut ghost_dead = false;
+
+    if let Some(exit_code) = pane_dead_status {
+        info!(
+            session_id = %session_id,
+            harness = ?harness,
+            exit_code,
+            "rehydrate: detected dead pane; attempting revival",
+        );
+        if matches!(harness, AgentKind::Shell) {
+            // No harness command for shells — leave the dead pane in
+            // place and let the frontend offer Close.
+            outcome = RegisterOutcome::DeadSkipped;
+            ghost_dead = true;
+        } else {
+            // Reconstruct the harness command from the persisted state.
+            let extra_flags = read_extra_flags(state, harness);
+            // OpenCode wants a port. Prefer the persisted one (it was
+            // probably released when the harness died); only reserve
+            // a fresh ephemeral port if the persisted value is gone.
+            let port_for_revival = if matches!(harness, AgentKind::OpenCode) {
+                opencode_port.or_else(|| match reserve_localhost_port() {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        warn!(error=%e, session_id=%session_id, "rehydrate: port reserve failed");
+                        None
+                    }
+                })
+            } else {
+                None
+            };
+            if matches!(harness, AgentKind::OpenCode) {
+                effective_opencode_port = port_for_revival;
+            }
+            let cmd = harness_launch_command(harness, extra_flags.as_deref(), port_for_revival);
+            match cmd {
+                Some(cmd) => match state.tmux.respawn_with(session_id, &cmd) {
+                    Ok(()) => {
+                        info!(
+                            session_id = %session_id,
+                            harness = ?harness,
+                            "rehydrate: revived dead pane via respawn",
+                        );
+                        // Fresh process — discard the stale persisted
+                        // state. The new harness starts at Idle.
+                        state_seed = None;
+                        outcome = RegisterOutcome::Revived;
+                    }
+                    Err(e) => {
+                        warn!(error=%e, session_id=%session_id, "rehydrate: respawn failed");
+                        outcome = RegisterOutcome::DeadSkipped;
+                        ghost_dead = true;
+                    }
+                },
+                None => {
+                    warn!(
+                        session_id = %session_id,
+                        harness = ?harness,
+                        "rehydrate: no launch command derivable for dead pane",
+                    );
+                    outcome = RegisterOutcome::DeadSkipped;
+                    ghost_dead = true;
+                }
+            }
+        }
+    }
 
     // Skip state-machine + channel registration for shell sessions —
     // they have no harness, and the counters explicitly exclude them.
     // We still want a ghost so the tab row can show them if the
     // frontend ever decides to. Currently no frontend surface consumes
     // shell ghosts, but inserting one is cheap.
-    if !matches!(harness, AgentKind::Shell) {
+    //
+    // Skip it too for harnesses we couldn't auto-revive — there's no
+    // live process to bind state to. The frontend will route the user
+    // through `terminal_respawn_dead`, which re-runs the standard
+    // register path on success.
+    if !matches!(harness, AgentKind::Shell) && outcome != RegisterOutcome::DeadSkipped {
         let hook_fallback =
             infer_reattach_hook_fallback(state, harness, project_slug, project_dir.clone());
         register_harness_session_runtime_opts(
@@ -225,7 +386,7 @@ fn apply_register_job<R: Runtime>(
             project_dir,
             hook_fallback,
             RegisterOptions {
-                opencode_port,
+                opencode_port: effective_opencode_port,
                 ..RegisterOptions::default()
             },
         )?;
@@ -243,6 +404,7 @@ fn apply_register_job<R: Runtime>(
             worktree_id: worktree_id.map(str::to_string),
             kind: harness,
             created_unix,
+            dead: ghost_dead,
         });
         drop(reg);
         if inserted {
@@ -252,6 +414,7 @@ fn apply_register_job<R: Runtime>(
                 worktree_id: worktree_id.map(str::to_string),
                 kind: harness,
                 created_unix,
+                dead: ghost_dead,
             };
             emit_terminal_session_upserted(app, &item);
         }
@@ -269,9 +432,14 @@ fn apply_register_job<R: Runtime>(
     // machine was already present (e.g. second call in a test), we
     // didn't emit the seed above. Explicitly emit once here for
     // non-Idle seeds so the frontend's listener wakes up.
-    if let Some(seed) = last_state
+    //
+    // Skip the seed entirely when we just revived the pane — the
+    // persisted state belonged to the dead process; the fresh harness
+    // is at Idle.
+    if let Some(seed) = state_seed
         && seed != AgentState::Idle
         && !matches!(harness, AgentKind::Shell)
+        && outcome != RegisterOutcome::DeadSkipped
     {
         let change = AgentStateChanged {
             session_id: SessionId::new(session_id.to_string()),
@@ -285,7 +453,24 @@ fn apply_register_job<R: Runtime>(
         }
     }
 
-    Ok(())
+    Ok(outcome)
+}
+
+/// Pull the per-harness `extra_flags` from the user's config so the
+/// revival path renders the same launch command the user gets when
+/// spawning a fresh session.
+fn read_extra_flags(state: &AppHandleState, harness: AgentKind) -> Option<String> {
+    let store = state.config_store.lock().ok()?;
+    store
+        .read_config()
+        .ok()
+        .and_then(|cfg| match harness {
+            AgentKind::ClaudeCode => cfg.harnesses.claude_code.extra_flags,
+            AgentKind::Codex => cfg.harnesses.codex.extra_flags,
+            AgentKind::OpenCode => cfg.harnesses.opencode.extra_flags,
+            AgentKind::Shell => None,
+        })
+        .filter(|s| !s.trim().is_empty())
 }
 
 #[cfg(test)]

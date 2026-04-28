@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { LAYOUT_UNIT, type RuntimeCell } from "../stores/runtimeLayoutStore";
+import { LAYOUT_UNIT, type PaneContent, type RuntimeCell } from "../stores/runtimeLayoutStore";
 import type { TerminalRecord } from "../stores/terminalStore";
 import type { Rect } from "./layoutTree";
 import { projectTerminalSurfaces } from "./terminalSurfaceProjection";
@@ -120,6 +120,31 @@ describe("terminalSurfaceProjection", () => {
     expect(surfaces[0].visible).toBe(true);
   });
 
+  it("does not mount unsessioned tabs outside the active projection", () => {
+    const alpha = cell("alpha", "alpha", {
+      tabs: [{ id: "tab-alpha" }],
+      activeTabId: "tab-alpha",
+    });
+    const beta = cell("beta", "beta", {
+      tabs: [{ id: "tab-beta" }],
+      activeTabId: "tab-beta",
+    });
+
+    const surfaces = projectTerminalSurfaces({
+      cells: [alpha, beta],
+      activeRectMap: new Map([["alpha", rect("alpha")]]),
+      minimizedPaneIds: new Set(),
+      crossProjectMode: null,
+      projectedSessionIds: [],
+      projectedRectMap: new Map(),
+      terminalById: {},
+      focusedPaneId: "alpha",
+      maximizedPaneId: null,
+    });
+
+    expect(surfaces.map((surface) => surface.key)).toEqual(["tab-alpha"]);
+  });
+
   it("hides layout surfaces behind another maximized pane", () => {
     const alpha = cell("alpha", "alpha");
     const beta = cell("beta", "alpha");
@@ -212,7 +237,40 @@ describe("terminalSurfaceProjection", () => {
     expect(surfaces[0].rect).toEqual(projected);
   });
 
-  it("pre-owns orphan harness sessions and only shows projected ones", () => {
+  it("emits invisible no-rect surfaces for off-tree minimized panes", () => {
+    const offTree: PaneContent = {
+      id: "stashed",
+      kind: "claude-code",
+      tabs: [{ id: "tab-stashed", sessionId: "session-stashed" }],
+      activeTabId: "tab-stashed",
+      projectSlug: "alpha",
+    };
+    const surfaces = projectTerminalSurfaces({
+      cells: [],
+      offTreePanes: [offTree],
+      activeRectMap: new Map(),
+      minimizedPaneIds: new Set(["stashed"]),
+      crossProjectMode: null,
+      projectedSessionIds: [],
+      projectedRectMap: new Map(),
+      terminalById: {},
+      focusedPaneId: null,
+      maximizedPaneId: null,
+    });
+    expect(surfaces).toHaveLength(1);
+    expect(surfaces[0]).toMatchObject({
+      key: "tab-stashed",
+      source: "layout",
+      cellId: "stashed",
+      sessionId: "session-stashed",
+      rect: null,
+      visible: false,
+      active: false,
+      maximized: false,
+    });
+  });
+
+  it("only mounts projected orphan harness sessions", () => {
     const surfaces = projectTerminalSurfaces({
       cells: [],
       activeRectMap: new Map(),
@@ -228,16 +286,12 @@ describe("terminalSurfaceProjection", () => {
       maximizedPaneId: null,
     });
 
-    expect(surfaces).toHaveLength(2);
+    expect(surfaces).toHaveLength(1);
     expect(surfaces.find((surface) => surface.key === "orphan:orphan-session")).toMatchObject({
       key: "orphan:orphan-session",
       source: "orphan",
       visible: true,
     });
-    expect(surfaces.find((surface) => surface.key === "orphan:hidden-orphan")).toMatchObject({
-      key: "orphan:hidden-orphan",
-      source: "orphan",
-      visible: false,
-    });
+    expect(surfaces.find((surface) => surface.key === "orphan:hidden-orphan")).toBeUndefined();
   });
 });

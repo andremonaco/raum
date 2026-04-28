@@ -585,6 +585,11 @@ pub struct ActiveLayoutCell {
     pub active_tab_id: String,
     #[serde(default, alias = "tab")]
     pub tabs: Vec<ActiveLayoutTab>,
+    /// Off-tree state: pane is registered but not in the BSP layout. Lives
+    /// in the dock; restored to the grid via `splitFocusedOrRoot` on click.
+    /// When true, `x/y/w/h` are not used at load time.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub minimized: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -808,34 +813,57 @@ mod tests {
             saved_at: 1_714_000_001,
             project_slug: Some("acme".into()),
             worktree_id: Some("/path/to/wt".into()),
-            cells: vec![ActiveLayoutCell {
-                id: "cell-1".into(),
-                x: 0,
-                y: 0,
-                w: 6,
-                h: 10,
-                kind: AgentKind::ClaudeCode,
-                title: Some("Main".into()),
-                project_slug: Some("acme".into()),
-                worktree_id: Some("/path/to/wt".into()),
-                active_tab_id: "tab-1".into(),
-                tabs: vec![
-                    ActiveLayoutTab {
-                        id: "tab-1".into(),
-                        session_id: Some("raum-claude-123".into()),
-                        label: Some("Main agent".into()),
-                        project_slug: Some("acme".into()),
-                        worktree_id: Some("/path/to/wt".into()),
-                    },
-                    ActiveLayoutTab {
-                        id: "tab-2".into(),
-                        session_id: None,
+            cells: vec![
+                ActiveLayoutCell {
+                    id: "cell-1".into(),
+                    x: 0,
+                    y: 0,
+                    w: 6,
+                    h: 10,
+                    kind: AgentKind::ClaudeCode,
+                    title: Some("Main".into()),
+                    project_slug: Some("acme".into()),
+                    worktree_id: Some("/path/to/wt".into()),
+                    active_tab_id: "tab-1".into(),
+                    tabs: vec![
+                        ActiveLayoutTab {
+                            id: "tab-1".into(),
+                            session_id: Some("raum-claude-123".into()),
+                            label: Some("Main agent".into()),
+                            project_slug: Some("acme".into()),
+                            worktree_id: Some("/path/to/wt".into()),
+                        },
+                        ActiveLayoutTab {
+                            id: "tab-2".into(),
+                            session_id: None,
+                            label: None,
+                            project_slug: None,
+                            worktree_id: None,
+                        },
+                    ],
+                    minimized: false,
+                },
+                ActiveLayoutCell {
+                    id: "cell-2-min".into(),
+                    x: 0,
+                    y: 0,
+                    w: 0,
+                    h: 0,
+                    kind: AgentKind::Codex,
+                    title: None,
+                    project_slug: Some("acme".into()),
+                    worktree_id: Some("/path/to/wt".into()),
+                    active_tab_id: "tab-3".into(),
+                    tabs: vec![ActiveLayoutTab {
+                        id: "tab-3".into(),
+                        session_id: Some("raum-codex-456".into()),
                         label: None,
                         project_slug: None,
                         worktree_id: None,
-                    },
-                ],
-            }],
+                    }],
+                    minimized: true,
+                },
+            ],
         };
         roundtrip(state);
     }

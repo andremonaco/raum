@@ -496,6 +496,13 @@ body,
     0 20px 50px -10px rgba(0, 0, 0, 0.85);
 }
 
+/* Maximize/restore is an interaction mode, not a layout rearrangement.
+   Snap that geometry change so the previously full-canvas pane cannot keep
+   hit-testing over other panes while its normal spring transition unwinds. */
+[data-dnd-root].maximize-layout-snap .leaf-frame {
+  transition: none !important;
+}
+
 .terminal-surface-layer {
   z-index: 1;
 }

@@ -15,17 +15,21 @@
 //! future copy-mode exposure. The scrollback cap is exported as
 //! [`raum_core::config::XTERM_SCROLLBACK_LINES`] and consumed by the frontend.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use raum_core::AgentKind;
 use raum_core::config::XTERM_SCROLLBACK_LINES;
 use raum_core::harness::codex::{Osc9Parser, classify_osc9_payload};
-use raum_core::harness::{NotificationKind, Reliability};
-use raum_tmux::{PaneContext, PaneSnapshot, PtyBridgeHandle, TmuxManager, attach_via_pty};
+use raum_core::harness::{
+    NotificationKind, Reliability, harness_launch_command, parse_opencode_port_arg,
+};
+use raum_tmux::{
+    PaneContext, PaneSnapshot, PtyBridgeHandle, TmuxError, TmuxManager, attach_via_pty,
+};
 use serde::{Deserialize, Serialize};
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
@@ -39,25 +43,7 @@ use crate::commands::agent::{
 };
 use crate::state::AppHandleState;
 
-fn parse_opencode_port_arg(flags: &str) -> Option<u16> {
-    let mut parts = flags.split_whitespace();
-    while let Some(part) = parts.next() {
-        if let Some(raw) = part.strip_prefix("--port=") {
-            if let Ok(port) = raw.parse::<u16>() {
-                return Some(port);
-            }
-        }
-        if part == "--port"
-            && let Some(raw) = parts.next()
-            && let Ok(port) = raw.parse::<u16>()
-        {
-            return Some(port);
-        }
-    }
-    None
-}
-
-fn reserve_localhost_port() -> Result<u16, String> {
+pub(crate) fn reserve_localhost_port() -> Result<u16, String> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|e| e.to_string())?;
     listener
         .local_addr()
@@ -83,6 +69,13 @@ pub struct TerminalListItem {
     pub worktree_id: Option<String>,
     pub kind: AgentKind,
     pub created_unix: u64,
+    /// True when the rehydrate path detected this session's tmux pane
+    /// is dead (`pane_dead == 1`) and could not auto-revive it — so the
+    /// frontend should render the Recover overlay instead of attaching
+    /// a PTY bridge. Skipped from the wire when false to keep the
+    /// shape stable for the common case.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dead: bool,
 }
 
 /// Identity-only terminal record. Populated by the startup rehydrate
@@ -101,6 +94,11 @@ pub struct GhostEntry {
     pub worktree_id: Option<String>,
     pub kind: AgentKind,
     pub created_unix: u64,
+    /// Carried into the emitted `TerminalListItem` so the sidebar can
+    /// render a Recover affordance for dead panes that the rehydrate
+    /// path couldn't auto-revive (Shell sessions, or harnesses where
+    /// `respawn_with` failed).
+    pub dead: bool,
 }
 
 impl GhostEntry {
@@ -112,6 +110,7 @@ impl GhostEntry {
             worktree_id: self.worktree_id.clone(),
             kind: self.kind,
             created_unix: self.created_unix,
+            dead: self.dead,
         }
     }
 }
@@ -126,6 +125,10 @@ pub struct TerminalRegistry {
     /// startup rehydrate task). Promoted via `promote_ghost` at the
     /// start of `terminal_reattach`.
     ghosts: HashMap<String, GhostEntry>,
+    /// Session ids with a `terminal_reattach` currently opening a fresh PTY
+    /// bridge. Guards against duplicate frontend surfaces repeatedly tearing
+    /// down and replacing each other's bridge for the same tmux session.
+    reattaching: HashSet<String>,
 }
 
 impl TerminalRegistry {
@@ -228,6 +231,9 @@ impl TerminalRegistry {
                 worktree_id: e.worktree_id.clone(),
                 kind: e.kind,
                 created_unix: e.created_unix,
+                // Real entries are by definition live — the bridge is
+                // attached. Dead-pane sessions stay as ghosts.
+                dead: false,
             })
             .collect();
         // Only include ghosts whose id isn't already represented by a
@@ -262,6 +268,14 @@ impl TerminalRegistry {
     pub fn promote_ghost(&mut self, session_id: &str) -> Option<GhostEntry> {
         self.ghosts.remove(session_id)
     }
+
+    pub fn begin_reattach(&mut self, session_id: &str) -> bool {
+        self.reattaching.insert(session_id.to_string())
+    }
+
+    pub fn finish_reattach(&mut self, session_id: &str) {
+        self.reattaching.remove(session_id);
+    }
 }
 
 impl std::fmt::Debug for TerminalRegistry {
@@ -269,6 +283,7 @@ impl std::fmt::Debug for TerminalRegistry {
         f.debug_struct("TerminalRegistry")
             .field("count", &self.entries.len())
             .field("ghosts", &self.ghosts.len())
+            .field("reattaching", &self.reattaching.len())
             .finish()
     }
 }
@@ -310,6 +325,7 @@ impl TerminalEntry {
             worktree_id: self.worktree_id.clone(),
             kind: self.kind,
             created_unix: self.created_unix,
+            dead: false,
         }
     }
 }
@@ -687,31 +703,19 @@ pub async fn terminal_spawn<R: Runtime>(
             })
             .filter(|s| !s.trim().is_empty())
     };
-    let mut opencode_port: Option<u16> = None;
-    let harness_cmd: Option<String> = match args.kind {
-        AgentKind::ClaudeCode => Some(match extra_flags.as_deref() {
-            Some(flags) => format!("claude {flags}"),
-            None => "claude".to_string(),
-        }),
-        AgentKind::Codex => Some(match extra_flags.as_deref() {
-            Some(flags) => format!("codex {flags}"),
-            None => "codex".to_string(),
-        }),
-        AgentKind::OpenCode => {
-            let explicit_port = extra_flags.as_deref().and_then(parse_opencode_port_arg);
-            let port = match explicit_port {
-                Some(port) => port,
+    // Pick / reserve OpenCode port up front so we can both feed it to
+    // `harness_launch_command` and persist it on the registered session.
+    let opencode_port: Option<u16> = if matches!(args.kind, AgentKind::OpenCode) {
+        Some(
+            match extra_flags.as_deref().and_then(parse_opencode_port_arg) {
+                Some(explicit) => explicit,
                 None => reserve_localhost_port()?,
-            };
-            opencode_port = Some(port);
-            Some(match extra_flags.as_deref() {
-                Some(flags) if explicit_port.is_some() => format!("opencode {flags}"),
-                Some(flags) => format!("opencode --port {port} {flags}"),
-                None => format!("opencode --port {port}"),
-            })
-        }
-        AgentKind::Shell => None,
+            },
+        )
+    } else {
+        None
     };
+    let harness_cmd = harness_launch_command(args.kind, extra_flags.as_deref(), opencode_port);
 
     let mgr_for_new = tmux.clone();
     let id_for_new = session_id.clone();
@@ -786,34 +790,17 @@ pub async fn terminal_spawn<R: Runtime>(
         }
     }
 
-    // Boot the harness (or warm the shell), then attach the PTY bridge so
-    // xterm receives the attached client's first frame already including the
-    // process's banner.
-    if let Some(cmd) = harness_cmd {
-        let tmux_for_boot = tmux.clone();
-        let id_for_boot = session_id.clone();
-        if let Err(err) =
-            tokio::task::spawn_blocking(move || tmux_for_boot.respawn_with(&id_for_boot, &cmd))
-                .await
-                .map_err(|e| format!("spawn_blocking join: {e}"))?
-                .map_err(|e| format!("tmux respawn: {e}"))
-        {
-            cleanup_harness_session(&state, &session_id);
-            let tmux_cleanup = tmux.clone();
-            let id_cleanup = session_id.clone();
-            let _ =
-                tokio::task::spawn_blocking(move || tmux_cleanup.kill_session(&id_cleanup)).await;
-            return Err(err);
-        }
-    }
-
     let (cols, rows) = match args.cols.zip(args.rows) {
         Some((c, r)) => clamp_pty_dims(c, r),
         None => (200, 50),
     };
 
+    // Attach the PTY bridge before booting harness TUIs. Harness sessions were
+    // created with a silent placeholder above; swapping in the real command
+    // after the bridge is live guarantees xterm receives the first paint
+    // instead of showing a blank pane while tmux already has content.
     if let Err(err) = attach_pipeline(
-        app,
+        app.clone(),
         &state,
         session_id.clone(),
         args.kind,
@@ -831,6 +818,36 @@ pub async fn terminal_spawn<R: Runtime>(
         let id_cleanup = session_id.clone();
         let _ = tokio::task::spawn_blocking(move || tmux_cleanup.kill_session(&id_cleanup)).await;
         return Err(err);
+    }
+
+    if let Some(cmd) = harness_cmd {
+        let tmux_for_boot = tmux.clone();
+        let id_for_boot = session_id.clone();
+        if let Err(err) =
+            tokio::task::spawn_blocking(move || tmux_for_boot.respawn_with(&id_for_boot, &cmd))
+                .await
+                .map_err(|e| format!("spawn_blocking join: {e}"))?
+                .map_err(|e| format!("tmux respawn: {e}"))
+        {
+            cleanup_harness_session(&state, &session_id);
+            let tmux_cleanup = tmux.clone();
+            let id_cleanup = session_id.clone();
+            let _ =
+                tokio::task::spawn_blocking(move || tmux_cleanup.kill_session(&id_cleanup)).await;
+            let removed = {
+                let mut reg = state
+                    .terminals
+                    .lock()
+                    .map_err(|e| format!("terminals lock: {e}"))?;
+                reg.remove(&session_id)
+            };
+            if let Some(entry) = removed {
+                shutdown_removed_entry(entry, true);
+            }
+            emit_terminal_session_removed(&app, &session_id);
+            emit_agent_session_removed(&app, &session_id);
+            return Err(err);
+        }
     }
 
     Ok(session_id)
@@ -1107,6 +1124,19 @@ fn tracked_session_context(
         .map_or((None, None), |row| (row.project_slug, row.worktree_id))
 }
 
+struct ReattachInFlightGuard<'a> {
+    terminals: &'a Mutex<TerminalRegistry>,
+    session_id: String,
+}
+
+impl Drop for ReattachInFlightGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut reg) = self.terminals.lock() {
+            reg.finish_reattach(&self.session_id);
+        }
+    }
+}
+
 /// §3.6 — reattach to a pre-existing tmux session that survived a previous
 /// raum run. Verifies the session still exists on the `-L raum` socket, then
 /// opens a fresh PTY-attached client the same way `terminal_spawn` does (minus
@@ -1163,6 +1193,24 @@ pub async fn terminal_reattach<R: Runtime>(
         emit_agent_session_removed(&app_handle, &session_id);
         return Err("not-found".to_string());
     }
+
+    let _reattach_guard = {
+        let mut reg = state
+            .terminals
+            .lock()
+            .map_err(|e| format!("terminals lock: {e}"))?;
+        if !reg.begin_reattach(&session_id) {
+            tracing::debug!(
+                session_id = %session_id,
+                "terminal_reattach: duplicate request ignored while attach is in flight"
+            );
+            return Err("reattach-in-flight".to_string());
+        }
+        ReattachInFlightGuard {
+            terminals: &state.terminals,
+            session_id: session_id.clone(),
+        }
+    };
 
     // Shut down the stale bridge on the existing registry entry WITHOUT
     // removing it. The entry stays visible to `terminal_list` for the
@@ -1420,14 +1468,272 @@ pub async fn terminal_reattach<R: Runtime>(
     Ok(session_id)
 }
 
+/// Revive a dead tmux pane in place: re-run the harness command in the
+/// same session id, then attach a fresh PTY bridge.
+///
+/// The frontend invokes this from the Recover overlay shown on a
+/// `dead: true` ghost (rehydrated dead pane) or after a
+/// `terminal:process-exited` event for a harness session. The command:
+///
+/// 1. Verifies the tmux pane really is dead via `check_pane_dead`
+///    (otherwise the user's still-live harness would be replaced).
+/// 2. Reconstructs the harness launch command from the user's config
+///    (`extra_flags`) and the persisted `opencode_port`, allocating a
+///    fresh port for OpenCode when none is persisted.
+/// 3. Calls `tmux respawn-pane -k` so the same session id now hosts a
+///    fresh harness process.
+/// 4. Hands off to `terminal_reattach` to wire up the PTY bridge and
+///    state machine — same flow the user gets after a normal restart,
+///    minus the "session not found" fallback (we just respawned, so
+///    the session is definitely live).
+#[tauri::command]
+pub async fn terminal_respawn_dead<R: Runtime>(
+    app: AppHandle<R>,
+    state: tauri::State<'_, AppHandleState>,
+    args: ReattachArgs,
+    on_data: Channel<InvokeResponseBody>,
+) -> Result<String, String> {
+    let tmux: Arc<TmuxManager> = state.tmux.clone();
+    let session_id = args.session_id.clone();
+
+    // Step 1 — verify the pane really is dead. If the harness happens
+    // to be alive (race after the frontend last looked) we bail out so
+    // the user's existing process isn't kill-respawned.
+    let pane_dead = {
+        let tmux_for_check = tmux.clone();
+        let id_for_check = session_id.clone();
+        tokio::task::spawn_blocking(move || tmux_for_check.check_pane_dead(&id_for_check))
+            .await
+            .map_err(|e| format!("spawn_blocking join: {e}"))?
+            .map_err(|e| format!("tmux check pane: {e}"))?
+    };
+    if pane_dead.is_none() && !matches!(args.kind, AgentKind::Shell) {
+        // Pane is alive but the frontend asked us to respawn — pass
+        // through to reattach so the user's pane keeps working.
+        return terminal_reattach(app, state, args, on_data).await;
+    }
+
+    // Step 2 — build the harness command. Shells have no command;
+    // fall through to reattach (kill-respawn won't work without a
+    // command and the reattach path will surface the dead-pane via
+    // the existing exit overlay).
+    if matches!(args.kind, AgentKind::Shell) {
+        return terminal_reattach(app, state, args, on_data).await;
+    }
+    let extra_flags = {
+        let store = state.config_store.lock().expect("config store poisoned");
+        store
+            .read_config()
+            .ok()
+            .and_then(|cfg| match args.kind {
+                AgentKind::ClaudeCode => cfg.harnesses.claude_code.extra_flags,
+                AgentKind::Codex => cfg.harnesses.codex.extra_flags,
+                AgentKind::OpenCode => cfg.harnesses.opencode.extra_flags,
+                AgentKind::Shell => None,
+            })
+            .filter(|s| !s.trim().is_empty())
+    };
+    // Re-pick OpenCode port: prefer the persisted one (its port is
+    // probably free now that the harness is dead), otherwise reserve
+    // a fresh ephemeral one.
+    let persisted_port = tracked_session_opencode_port(&state, &session_id);
+    let opencode_port: Option<u16> = if matches!(args.kind, AgentKind::OpenCode) {
+        Some(
+            match extra_flags.as_deref().and_then(parse_opencode_port_arg) {
+                Some(explicit) => explicit,
+                None => persisted_port.unwrap_or(reserve_localhost_port()?),
+            },
+        )
+    } else {
+        None
+    };
+    let cmd = match harness_launch_command(args.kind, extra_flags.as_deref(), opencode_port) {
+        Some(c) => c,
+        None => return Err("no launch command derivable for this kind".to_string()),
+    };
+
+    // Step 3 — respawn. tmux's `-k` kills whatever was in the pane
+    // (the dead process record) and starts the new command. If the
+    // pane is genuinely dead this is a no-op kill; if a stale
+    // remain-on-exit record is still hanging around we want it gone.
+    {
+        let tmux_for_respawn = tmux.clone();
+        let id_for_respawn = session_id.clone();
+        let cmd_for_respawn = cmd.clone();
+        tokio::task::spawn_blocking(move || {
+            tmux_for_respawn.respawn_with(&id_for_respawn, &cmd_for_respawn)
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking join: {e}"))?
+        .map_err(|e| format!("tmux respawn-pane: {e}"))?;
+    }
+
+    tracing::info!(
+        session_id = %session_id,
+        kind = ?args.kind,
+        "terminal_respawn_dead: revived pane via respawn",
+    );
+
+    // Step 4 — hand off to the standard reattach path. It clears any
+    // stale ghost/entry, opens a fresh PTY bridge, and registers the
+    // state machine. The persisted `last_state` will get applied as a
+    // seed; that's wrong for a freshly-respawned harness, but the
+    // first hook event from the new process overrides it within a
+    // few hundred ms — close enough to "Idle" for UX purposes.
+    terminal_reattach(app, state, args, on_data).await
+}
+
+/// Force-repair a live harness pane in place.
+///
+/// Unlike `terminal_respawn_dead`, this intentionally uses `respawn-pane -k`
+/// even when the process is still alive. It is the Cmd+R "self-heal" path:
+/// keep the same tmux session id and frontend tab, but replace the process and
+/// open a fresh PTY bridge at the measured xterm size so the new TUI paints
+/// against a clean viewport.
+#[tauri::command]
+pub async fn terminal_self_heal<R: Runtime>(
+    app: AppHandle<R>,
+    state: tauri::State<'_, AppHandleState>,
+    args: ReattachArgs,
+    on_data: Channel<InvokeResponseBody>,
+) -> Result<String, String> {
+    if matches!(args.kind, AgentKind::Shell) {
+        return terminal_reattach(app, state, args, on_data).await;
+    }
+
+    let tmux: Arc<TmuxManager> = state.tmux.clone();
+    let session_id = args.session_id.clone();
+    let extra_flags = {
+        let store = state.config_store.lock().expect("config store poisoned");
+        store
+            .read_config()
+            .ok()
+            .and_then(|cfg| match args.kind {
+                AgentKind::ClaudeCode => cfg.harnesses.claude_code.extra_flags,
+                AgentKind::Codex => cfg.harnesses.codex.extra_flags,
+                AgentKind::OpenCode => cfg.harnesses.opencode.extra_flags,
+                AgentKind::Shell => None,
+            })
+            .filter(|s| !s.trim().is_empty())
+    };
+    let persisted_port = tracked_session_opencode_port(&state, &session_id);
+    let opencode_port: Option<u16> = if matches!(args.kind, AgentKind::OpenCode) {
+        Some(
+            match extra_flags.as_deref().and_then(parse_opencode_port_arg) {
+                Some(explicit) => explicit,
+                None => persisted_port.unwrap_or(reserve_localhost_port()?),
+            },
+        )
+    } else {
+        None
+    };
+    let cmd = harness_launch_command(args.kind, extra_flags.as_deref(), opencode_port)
+        .ok_or_else(|| "no launch command derivable for this kind".to_string())?;
+
+    let (cols, rows) = match args.cols.zip(args.rows) {
+        Some((c, r)) => clamp_pty_dims(c, r),
+        None => (200, 50),
+    };
+
+    {
+        let tmux_for_respawn = tmux.clone();
+        let id_for_respawn = session_id.clone();
+        let cmd_for_respawn = cmd.clone();
+        tokio::task::spawn_blocking(move || {
+            tmux_for_respawn.resize(&id_for_respawn, u32::from(cols), u32::from(rows))?;
+            tmux_for_respawn.respawn_with(&id_for_respawn, &cmd_for_respawn)
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking join: {e}"))?
+        .map_err(|e| format!("tmux self-heal respawn: {e}"))?;
+    }
+
+    tracing::info!(
+        session_id = %session_id,
+        kind = ?args.kind,
+        cols,
+        rows,
+        "terminal_self_heal: respawned pane in place",
+    );
+
+    terminal_reattach(app, state, args, on_data).await
+}
+
+/// Look up the persisted OpenCode port for a session, if any. Used by
+/// the revival path to prefer the previous port when respawning.
+fn tracked_session_opencode_port(state: &AppHandleState, session_id: &str) -> Option<u16> {
+    let store = state.config_store.lock().ok()?;
+    let sessions = store.read_sessions().ok()?;
+    sessions
+        .sessions
+        .iter()
+        .find(|s| s.session_id == session_id)
+        .and_then(|s| s.opencode_port)
+}
+
 #[tauri::command]
 pub async fn terminal_kill<R: Runtime>(
     app: AppHandle<R>,
     state: tauri::State<'_, AppHandleState>,
     session_id: String,
 ) -> Result<(), String> {
+    kill_session_interactive(&app, &state, &session_id)
+}
+
+/// Interactive pane/tab close path. The UI must become usable immediately even
+/// if tmux or an attached client is slow to die, so raum's own registries are
+/// detached synchronously and the tmux kill runs in the background.
+fn kill_session_interactive<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &tauri::State<'_, AppHandleState>,
+    session_id: &str,
+) -> Result<(), String> {
+    let removed = {
+        let mut reg = state
+            .terminals
+            .lock()
+            .map_err(|e| format!("terminals lock: {e}"))?;
+        reg.remove(session_id)
+    };
+    if let Some(entry) = removed {
+        shutdown_removed_entry(entry, true);
+    }
+
+    cleanup_harness_session(state, session_id);
+    emit_terminal_session_removed(app, session_id);
+    emit_agent_session_removed(app, session_id);
+
     let tmux = state.tmux.clone();
-    let id = session_id.clone();
+    let id = session_id.to_string();
+    tauri::async_runtime::spawn(async move {
+        let kill_id = id.clone();
+        let kill_res = tokio::task::spawn_blocking(move || tmux.kill_session(&kill_id)).await;
+        match kill_res {
+            Ok(Ok(())) => {}
+            Ok(Err(TmuxError::NonZero { stderr, .. })) if is_session_not_found(&stderr) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(session_id = %id, error = %e, "terminal_kill: background tmux kill failed");
+            }
+            Err(e) => {
+                tracing::warn!(session_id = %id, error = %e, "terminal_kill: background tmux kill join failed");
+            }
+        }
+    });
+
+    Ok(())
+}
+
+/// Shared implementation of [`terminal_kill`] usable from other commands
+/// (`worktree_remove`, `project_remove`) that need to fold the per-session
+/// kill loop into a single backend call so they can stream progress over a
+/// `Channel<ProgressEvent>` instead of round-tripping through the FE.
+pub(crate) async fn kill_session_inner<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &tauri::State<'_, AppHandleState>,
+    session_id: &str,
+) -> Result<(), String> {
+    let tmux = state.tmux.clone();
+    let id = session_id.to_string();
     let kill_res = tokio::task::spawn_blocking(move || tmux.kill_session(&id))
         .await
         .map_err(|e| format!("spawn_blocking join: {e}"))?;
@@ -1439,7 +1745,7 @@ pub async fn terminal_kill<R: Runtime>(
             .terminals
             .lock()
             .map_err(|e| format!("terminals lock: {e}"))?;
-        reg.remove(&session_id)
+        reg.remove(session_id)
     };
     if let Some(entry) = removed {
         // Abort the monitor first so it can't fire a spurious process-exited
@@ -1447,11 +1753,73 @@ pub async fn terminal_kill<R: Runtime>(
         shutdown_removed_entry(entry, true);
     }
 
-    cleanup_harness_session(&state, &session_id);
-    emit_terminal_session_removed(&app, &session_id);
-    emit_agent_session_removed(&app, &session_id);
+    cleanup_harness_session(state, session_id);
+    emit_terminal_session_removed(app, session_id);
+    emit_agent_session_removed(app, session_id);
 
-    kill_res.map_err(|e| format!("tmux kill-session: {e}"))
+    // Idempotent: callers (Cmd+R, X-button) can race the pane-death monitor or
+    // each other. If tmux already reaped the session, treat it as success — we
+    // already cleaned up our side above.
+    match kill_res {
+        Ok(()) => Ok(()),
+        Err(TmuxError::NonZero { stderr, .. }) if is_session_not_found(&stderr) => {
+            tracing::debug!(
+                session_id = %session_id,
+                "terminal_kill: session already gone in tmux, treating as success"
+            );
+            Ok(())
+        }
+        Err(e) => Err(format!("tmux kill-session: {e}")),
+    }
+}
+
+/// Snapshot the live + ghost session ids whose `worktree_id` matches `path`.
+/// Returns an empty Vec on lock errors so callers degrade to "delete the
+/// worktree anyway"; the FE used to do the same loop best-effort.
+pub(crate) fn sessions_for_worktree(
+    state: &tauri::State<'_, AppHandleState>,
+    worktree_path: &str,
+) -> Vec<String> {
+    state
+        .terminals
+        .lock()
+        .map(|reg| {
+            reg.list()
+                .into_iter()
+                .filter(|t| t.worktree_id.as_deref() == Some(worktree_path))
+                .map(|t| t.session_id)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Snapshot the session ids tagged with `project_slug`. Sibling of
+/// [`sessions_for_worktree`] used by `project_remove`.
+pub(crate) fn sessions_for_project(
+    state: &tauri::State<'_, AppHandleState>,
+    project_slug: &str,
+) -> Vec<String> {
+    state
+        .terminals
+        .lock()
+        .map(|reg| {
+            reg.list()
+                .into_iter()
+                .filter(|t| t.project_slug.as_deref() == Some(project_slug))
+                .map(|t| t.session_id)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// tmux's `kill-session` exits non-zero when the target session doesn't exist.
+/// Different tmux versions phrase the error slightly differently — match the
+/// substrings we've observed in the wild rather than an exact string.
+fn is_session_not_found(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    s.contains("can't find session")
+        || s.contains("session not found")
+        || s.contains("no such session")
 }
 
 #[tauri::command]
@@ -1642,6 +2010,7 @@ mod ghost_tests {
             worktree_id: None,
             kind: AgentKind::ClaudeCode,
             created_unix: 42,
+            dead: false,
         }
     }
 
@@ -2046,6 +2415,98 @@ pub async fn terminal_pane_context_batch(
     .await
     .map_err(|e| format!("spawn_blocking join: {e}"))?;
     Ok(res)
+}
+
+/// One-shot orphan reaper: kills any tmux session on the `-L raum` socket
+/// that is NOT in the live `TerminalRegistry` AND NOT in `sessions.toml`,
+/// provided it has aged past a 30-second floor (so we can't race a
+/// freshly-spawned session whose registry insert / config debounce hasn't
+/// completed yet). Surfaces the user's "23 idle harnesses while I see 8"
+/// case: pre-fix Cmd+R could leak tmux windows, and the only way to recover
+/// without restarting was to hand-run `tmux -L raum kill-session`.
+///
+/// Returns the list of session ids that were killed.
+#[tauri::command]
+pub async fn terminal_kill_orphans(
+    state: tauri::State<'_, AppHandleState>,
+) -> Result<Vec<String>, String> {
+    kill_orphans_inner(&state).await
+}
+
+/// Shared body for [`terminal_kill_orphans`]. Lives here so the boot-time
+/// reap, the periodic sweep, and the window-focus trigger in `lib.rs` can
+/// run the same code path as the manual UI button without needing an IPC
+/// round-trip. Each leaked tmux session holds ~10–20 fds (PTY master +
+/// client pipes + hook IPC), so under load this is the main lever we have
+/// to keep `EMFILE` from breaking the git watcher and other background
+/// IO.
+pub(crate) async fn kill_orphans_inner(
+    state: &tauri::State<'_, AppHandleState>,
+) -> Result<Vec<String>, String> {
+    const ORPHAN_AGE_FLOOR_SECS: u64 = 30;
+
+    let tmux = state.tmux.clone();
+    let live = {
+        let tmux = tmux.clone();
+        tokio::task::spawn_blocking(move || tmux.list_sessions())
+            .await
+            .map_err(|e| format!("spawn_blocking join: {e}"))?
+            .map_err(|e| format!("tmux list-sessions: {e}"))?
+    };
+
+    let mut tracked: HashSet<String> = HashSet::new();
+    {
+        let reg = state
+            .terminals
+            .lock()
+            .map_err(|e| format!("terminals lock: {e}"))?;
+        for item in reg.list() {
+            tracked.insert(item.session_id);
+        }
+    }
+    {
+        let store = state
+            .config_store
+            .lock()
+            .map_err(|e| format!("config_store lock: {e}"))?;
+        if let Ok(persisted) = store.read_sessions() {
+            for row in persisted.sessions {
+                tracked.insert(row.session_id);
+            }
+        }
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+
+    let mut killed = Vec::new();
+    for s in live {
+        if tracked.contains(&s.id) {
+            continue;
+        }
+        if s.created_unix == 0 {
+            // tmux didn't report a creation timestamp — be conservative.
+            continue;
+        }
+        let age = now.saturating_sub(s.created_unix);
+        if age < ORPHAN_AGE_FLOOR_SECS {
+            continue;
+        }
+        let kill_id = s.id.clone();
+        let kill_tmux = tmux.clone();
+        let kill_res = tokio::task::spawn_blocking(move || kill_tmux.kill_session(&kill_id))
+            .await
+            .map_err(|e| format!("spawn_blocking join: {e}"))?;
+        if kill_res.is_ok() {
+            tracing::info!(session_id = %s.id, age_secs = age, "killed orphan tmux session");
+            killed.push(s.id);
+        } else if let Err(e) = kill_res {
+            tracing::warn!(session_id = %s.id, error = %e, "orphan kill failed");
+        }
+    }
+
+    Ok(killed)
 }
 
 /// §3.7 — stale-session reaper, invoked from the in-app "Orphaned sessions"

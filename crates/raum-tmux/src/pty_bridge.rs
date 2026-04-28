@@ -261,6 +261,7 @@ pub fn attach_via_pty(
     // Reader thread: pulls bytes off the master and hands them to `on_data`.
     // Detached — the reader exits when the master fd is closed (drop) or
     // when `on_data` returns false (frontend channel gone).
+    let reader_session = session_id.to_string();
     std::thread::Builder::new()
         .name(format!("raum-pty-reader-{session_id}"))
         .spawn(move || {
@@ -275,7 +276,20 @@ pub fn attach_via_pty(
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                    Err(_) => break,
+                    Err(e) => {
+                        // Convert the previously-silent swallow into an
+                        // actionable diagnostic. Lands in the daily
+                        // `raum.log` and (in dev) the stderr mirror so
+                        // "lost tty" investigations have something to
+                        // grep for.
+                        tracing::warn!(
+                            session_id = %reader_session,
+                            kind = ?e.kind(),
+                            error = %e,
+                            "pty bridge: reader exited on I/O error",
+                        );
+                        break;
+                    }
                 }
             }
         })

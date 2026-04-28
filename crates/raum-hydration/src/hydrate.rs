@@ -35,19 +35,47 @@ pub fn apply_hydration(
     target: &Path,
     manifest: &HydrationManifest,
 ) -> Result<HydrationReport, HydrationError> {
+    apply_hydration_with_progress(source, target, manifest, |_, _| {})
+}
+
+/// Apply `manifest` synchronously, invoking `on_progress(current, total)` after
+/// each rule (copy or symlink) is processed. `current` is 1-indexed; `total`
+/// is the count of rules in the manifest (post-dedup). Skipped rules still
+/// tick the counter so the UI sees a smooth advance even if some sources are
+/// missing on disk.
+///
+/// Intended for callers that want to surface per-file progress to a UI; the
+/// simpler [`apply_hydration`] wrapper is provided for callers that don't.
+pub fn apply_hydration_with_progress<F>(
+    source: &Path,
+    target: &Path,
+    manifest: &HydrationManifest,
+    mut on_progress: F,
+) -> Result<HydrationReport, HydrationError>
+where
+    F: FnMut(u64, u64),
+{
     let mut report = HydrationReport::default();
 
     // Symlinks win over duplicate copies — collect symlink set first.
     let symlink_set: std::collections::HashSet<&String> = manifest.symlink.iter().collect();
 
-    for rel in &manifest.copy {
-        if symlink_set.contains(rel) {
-            continue;
-        }
+    // Compute total before we iterate so the progress fraction is stable.
+    let copy_effective: Vec<&String> = manifest
+        .copy
+        .iter()
+        .filter(|rel| !symlink_set.contains(*rel))
+        .collect();
+    let total: u64 = (copy_effective.len() + manifest.symlink.len()) as u64;
+    let mut done: u64 = 0;
+
+    for rel in &copy_effective {
         let src = safe_join(source, rel)?;
         let dst = safe_join(target, rel)?;
         if !src.exists() {
             report.skipped.push(src);
+            done += 1;
+            on_progress(done, total);
             continue;
         }
         if let Some(parent) = dst.parent() {
@@ -61,6 +89,8 @@ pub fn apply_hydration(
             std::fs::copy(&src, &dst)?;
         }
         report.copied.push(dst);
+        done += 1;
+        on_progress(done, total);
     }
 
     for rel in &manifest.symlink {
@@ -68,6 +98,8 @@ pub fn apply_hydration(
         let dst = safe_join(target, rel)?;
         if !src.exists() {
             report.skipped.push(src);
+            done += 1;
+            on_progress(done, total);
             continue;
         }
         if let Some(parent) = dst.parent() {
@@ -83,6 +115,8 @@ pub fn apply_hydration(
         }
         symlink(&src, &dst)?;
         report.symlinked.push(dst);
+        done += 1;
+        on_progress(done, total);
     }
 
     debug!(
@@ -104,6 +138,26 @@ pub async fn apply_hydration_async(
     tokio::task::spawn_blocking(move || apply_hydration(&source, &target, &manifest))
         .await
         .map_err(|e| HydrationError::Join(e.to_string()))?
+}
+
+/// Async-friendly variant of [`apply_hydration_with_progress`]. The
+/// `on_progress` closure runs inside the `spawn_blocking` worker — keep it
+/// cheap (e.g. forwarding to a non-blocking `Channel::send`).
+pub async fn apply_hydration_async_with_progress<F>(
+    source: PathBuf,
+    target: PathBuf,
+    manifest: HydrationManifest,
+    on_progress: F,
+) -> Result<HydrationReport, HydrationError>
+where
+    F: FnMut(u64, u64) + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let mut on_progress = on_progress;
+        apply_hydration_with_progress(&source, &target, &manifest, &mut on_progress)
+    })
+    .await
+    .map_err(|e| HydrationError::Join(e.to_string()))?
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
@@ -356,6 +410,45 @@ mod tests {
         };
         let err = apply_hydration(src.path(), dst.path(), &manifest).unwrap_err();
         assert!(matches!(err, HydrationError::EscapingPath(_)));
+    }
+
+    #[test]
+    fn progress_callback_ticks_per_rule_and_reaches_total() {
+        // Two copy rules + one symlink = three ticks; the last tick must be (3, 3).
+        let src = tempdir().unwrap();
+        let dst = tempdir().unwrap();
+        write(&src.path().join("a.txt"), "a");
+        write(&src.path().join("b.txt"), "b");
+        std::fs::create_dir_all(src.path().join("link_target")).unwrap();
+        let manifest = HydrationManifest {
+            copy: vec!["a.txt".into(), "b.txt".into()],
+            symlink: vec!["link_target".into()],
+        };
+        let mut ticks: Vec<(u64, u64)> = Vec::new();
+        let report = apply_hydration_with_progress(src.path(), dst.path(), &manifest, |c, t| {
+            ticks.push((c, t));
+        })
+        .unwrap();
+        assert_eq!(report.copied.len(), 2);
+        assert_eq!(report.symlinked.len(), 1);
+        assert_eq!(ticks, vec![(1, 3), (2, 3), (3, 3)]);
+    }
+
+    #[test]
+    fn progress_callback_ticks_for_skipped_rules() {
+        // Missing source still ticks the counter so the UI doesn't appear stuck.
+        let src = tempdir().unwrap();
+        let dst = tempdir().unwrap();
+        let manifest = HydrationManifest {
+            copy: vec!["missing.txt".into()],
+            symlink: vec![],
+        };
+        let mut ticks: Vec<(u64, u64)> = Vec::new();
+        apply_hydration_with_progress(src.path(), dst.path(), &manifest, |c, t| {
+            ticks.push((c, t));
+        })
+        .unwrap();
+        assert_eq!(ticks, vec![(1, 1)]);
     }
 
     #[tokio::test]

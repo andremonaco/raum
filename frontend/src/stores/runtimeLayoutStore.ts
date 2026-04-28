@@ -79,6 +79,9 @@ export interface ActiveLayoutCell {
   worktree_id?: string;
   active_tab_id: string;
   tabs: ActiveLayoutTab[];
+  /** Pane is registered but not in the BSP layout (lives in the dock).
+   *  When true, x/y/w/h are unused on rehydrate. */
+  minimized?: boolean;
 }
 
 export interface ActiveLayoutState {
@@ -149,8 +152,19 @@ const [runtimeLayoutStore, setRuntimeLayoutStore] = createStore<RuntimeLayoutSta
 });
 
 const [maximizedPaneId, setMaximizedPaneId] = createSignal<string | null>(null);
+const [maximizeLayoutSnap, setMaximizeLayoutSnap] = createSignal(false);
 const [focusedPaneId, setFocusedPaneId] = createSignal<string | null>(null);
 const [minimizedPaneIds, setMinimizedPaneIds] = createSignal<ReadonlySet<string>>(new Set());
+let maximizeLayoutSnapTimer: ReturnType<typeof setTimeout> | null = null;
+
+function snapMaximizeLayoutOnce(): void {
+  setMaximizeLayoutSnap(true);
+  if (maximizeLayoutSnapTimer !== null) clearTimeout(maximizeLayoutSnapTimer);
+  maximizeLayoutSnapTimer = setTimeout(() => {
+    maximizeLayoutSnapTimer = null;
+    setMaximizeLayoutSnap(false);
+  }, 50);
+}
 
 // Monotonic layout revision, bumped inside `rebuildCells()` after every
 // tree or pane mutation. Consumers that cache layout-derived projections
@@ -162,6 +176,7 @@ const [layoutRev, setLayoutRev] = createSignal(0);
 export {
   runtimeLayoutStore,
   maximizedPaneId,
+  maximizeLayoutSnap,
   focusedPaneId,
   setFocusedPaneId,
   minimizedPaneIds,
@@ -214,12 +229,55 @@ export function isPaneMinimized(id: string): boolean {
   return minimizedPaneIds().has(id);
 }
 
-export function toggleMinimize(paneId: string): void {
-  const curr = minimizedPaneIds();
-  const next = new Set(curr);
-  if (next.has(paneId)) next.delete(paneId);
-  else next.add(paneId);
-  setMinimizedPaneIds(next);
+/** Take a pane out of the active BSP layout and stash it to the dock.
+ *  Removes its leaf from `tree` so siblings reflow to fill the freed space.
+ *  The `PaneContent` stays in `panes` and the xterm surface keeps mounting
+ *  off-tree (see `projectTerminalSurfaces`), so scrollback survives. */
+export function minimizePane(paneId: string): void {
+  if (!runtimeLayoutStore.panes[paneId]) return;
+  const mins = minimizedPaneIds();
+  if (mins.has(paneId)) return;
+
+  const tree = currentTree();
+  if (tree && treeContains(tree, paneId)) {
+    const next = removeLeaf(tree, paneId);
+    setRuntimeLayoutStore("tree", next);
+  }
+  if (maximizedPaneId() === paneId) {
+    snapMaximizeLayoutOnce();
+    setMaximizedPaneId(null);
+  }
+  if (focusedPaneId() === paneId) setFocusedPaneId(null);
+  const nextSet = new Set(mins);
+  nextSet.add(paneId);
+  setMinimizedPaneIds(nextSet);
+  rebuildCells();
+  scheduleActiveSave();
+}
+
+/** Lift a previously-minimized pane back into the grid. Reuses the
+ *  spawn-style auto-placement (`splitFocusedOrRoot`) so the pane lands
+ *  next to the focused leaf — same gesture as opening a new harness. */
+export function restorePane(paneId: string): void {
+  const mins = minimizedPaneIds();
+  if (!mins.has(paneId)) return;
+  const nextSet = new Set(mins);
+  nextSet.delete(paneId);
+  setMinimizedPaneIds(nextSet);
+
+  const pane = runtimeLayoutStore.panes[paneId];
+  if (!pane) {
+    rebuildCells();
+    scheduleActiveSave();
+    return;
+  }
+  const tree = currentTree();
+  if (tree && treeContains(tree, paneId)) {
+    rebuildCells();
+    scheduleActiveSave();
+    return;
+  }
+  insertExistingPaneFocused(paneId);
 }
 
 export function setLastSnippet(cellId: string, snippet: string, activityMs: number): void {
@@ -334,28 +392,55 @@ function scheduleActiveSave(): void {
   if (_saveTimer !== null) clearTimeout(_saveTimer);
   _saveTimer = setTimeout(() => {
     _saveTimer = null;
-    const cells = runtimeLayoutStore.cells;
+    const inTreeCells = runtimeLayoutStore.cells;
+    const inTreeIds = new Set(inTreeCells.map((c) => c.id));
+    const mins = minimizedPaneIds();
+    const offTreePanes: PaneContent[] = [];
+    for (const pane of Object.values(runtimeLayoutStore.panes)) {
+      if (inTreeIds.has(pane.id)) continue;
+      // Only persist off-tree panes that are tracked as minimized; any other
+      // off-tree pane is in-flight (mid-mutation) and shouldn't ride along.
+      if (mins.has(pane.id)) offTreePanes.push(unwrap(pane) as PaneContent);
+    }
+    const serializeTabs = (tabs: CellTab[]): ActiveLayoutTab[] =>
+      tabs.map((t) => ({
+        id: t.id,
+        session_id: t.sessionId,
+        ...(t.label ? { label: t.label } : {}),
+        ...(t.projectSlug ? { project_slug: t.projectSlug } : {}),
+        ...(t.worktreeId ? { worktree_id: t.worktreeId } : {}),
+      }));
     const payload: ActiveLayoutState = {
       saved_at: Math.floor(Date.now() / 1000),
-      cells: cells.map((c) => ({
-        id: c.id,
-        x: c.x,
-        y: c.y,
-        w: c.w,
-        h: c.h,
-        kind: c.kind,
-        title: c.title,
-        project_slug: c.projectSlug,
-        worktree_id: c.worktreeId,
-        active_tab_id: c.activeTabId,
-        tabs: c.tabs.map((t) => ({
-          id: t.id,
-          session_id: t.sessionId,
-          ...(t.label ? { label: t.label } : {}),
-          ...(t.projectSlug ? { project_slug: t.projectSlug } : {}),
-          ...(t.worktreeId ? { worktree_id: t.worktreeId } : {}),
+      cells: [
+        ...inTreeCells.map((c) => ({
+          id: c.id,
+          x: c.x,
+          y: c.y,
+          w: c.w,
+          h: c.h,
+          kind: c.kind,
+          title: c.title,
+          project_slug: c.projectSlug,
+          worktree_id: c.worktreeId,
+          active_tab_id: c.activeTabId,
+          tabs: serializeTabs(c.tabs),
         })),
-      })),
+        ...offTreePanes.map((p) => ({
+          id: p.id,
+          x: 0,
+          y: 0,
+          w: 0,
+          h: 0,
+          kind: p.kind,
+          title: p.title,
+          project_slug: p.projectSlug,
+          worktree_id: p.worktreeId,
+          active_tab_id: p.activeTabId,
+          tabs: serializeTabs(p.tabs),
+          minimized: true,
+        })),
+      ],
     };
     invoke("active_layout_save", { layout: payload }).catch(console.warn);
   }, 500);
@@ -370,7 +455,11 @@ function scheduleActiveSave(): void {
 export function setRuntimeLayout(
   cells: Array<
     | RuntimeCell
-    | (Omit<RuntimeCell, "tabs" | "activeTabId"> & { tabs?: CellTab[]; activeTabId?: string })
+    | (Omit<RuntimeCell, "tabs" | "activeTabId"> & {
+        tabs?: CellTab[];
+        activeTabId?: string;
+        minimized?: boolean;
+      })
   >,
 ): void {
   if (cells.length === 0) {
@@ -380,12 +469,14 @@ export function setRuntimeLayout(
       cells: [],
     });
     setMaximizedPaneId(null);
+    setMinimizedPaneIds(new Set<string>());
     scheduleActiveSave();
     return;
   }
 
   const panes: Record<string, PaneContent> = {};
   const rects: Rect[] = [];
+  const minimizedIds = new Set<string>();
   for (const raw of cells) {
     const tabs = raw.tabs && raw.tabs.length > 0 ? raw.tabs : [{ id: nextTabId() }];
     const activeTabId = raw.activeTabId ?? tabs[0].id;
@@ -400,6 +491,11 @@ export function setRuntimeLayout(
       lastSnippet: (raw as Partial<PaneContent>).lastSnippet,
       lastActivityMs: (raw as Partial<PaneContent>).lastActivityMs,
     };
+    const isMinimized = (raw as { minimized?: boolean }).minimized === true;
+    if (isMinimized) {
+      minimizedIds.add(raw.id);
+      continue;
+    }
     rects.push({
       id: raw.id,
       x: raw.x,
@@ -411,7 +507,7 @@ export function setRuntimeLayout(
   // Normalize rectangles onto the LAYOUT_UNIT grid even if the incoming data
   // used a different scale (e.g. legacy 12×12 presets). buildFromRects is
   // scale-invariant as long as all rects share the same extent.
-  const rebuilt = buildFromRects(rects, LAYOUT_UNIT);
+  const rebuilt = rects.length > 0 ? buildFromRects(rects, LAYOUT_UNIT) : null;
 
   setRuntimeLayoutStore({
     tree: rebuilt,
@@ -419,6 +515,7 @@ export function setRuntimeLayout(
   });
   rebuildCells();
   setMaximizedPaneId(null);
+  setMinimizedPaneIds(minimizedIds);
   scheduleActiveSave();
 }
 
@@ -454,27 +551,73 @@ export function splitPane(
 /** Split the focused pane (if any) along its longer axis, or at the root
  *  otherwise. Returns nothing; this is the "new terminal" gesture. */
 export function splitFocusedOrRoot(newPane: PaneContent): void {
+  setRuntimeLayoutStore("panes", newPane.id, newPane);
+  insertExistingPaneFocused(newPane.id);
+}
+
+/** Insert an already-registered pane (must already exist in
+ *  `runtimeLayoutStore.panes`) into the tree using the same focused-or-root
+ *  auto-placement rule as `splitFocusedOrRoot`. Used by both spawn
+ *  (`splitFocusedOrRoot`) and `restorePane`. */
+function insertExistingPaneFocused(paneId: string): void {
   const focus = focusedPaneId();
   const tree = currentTree();
+  const newLeaf = leaf(paneId);
+  let nextTree: LayoutNode;
   if (!tree) {
-    splitPane(newPane, null, "right");
-    return;
-  }
-  if (focus && treeContains(tree, focus)) {
+    nextTree = newLeaf;
+  } else if (focus && focus !== paneId && treeContains(tree, focus)) {
     // Bias toward bottom splits so the grid grows row-first: only split
     // right when the focused pane is substantially wider than tall. On a
     // typical 16:9 viewport this still produces a first 2-column split
     // (w/h ≈ 1.78), but once columns exist further splits stack rows.
     const cell = runtimeLayoutStore.cells.find((c) => c.id === focus);
     const direction: Direction = cell && cell.w > cell.h * 1.6 ? "right" : "bottom";
-    splitPane(newPane, focus, direction);
-    return;
+    nextTree = splitAtLeaf(tree, focus, direction, newLeaf);
+  } else {
+    nextTree = splitAtRoot(tree, "right", newLeaf);
   }
-  splitPane(newPane, null, "right");
+  setRuntimeLayoutStore("tree", nextTree);
+  rebuildCells();
+  scheduleActiveSave();
+}
+
+/** Mount an existing tmux session into a freshly-created pane. Used by the
+ *  dock to adopt orphan sessions back into the grid: the new pane carries the
+ *  supplied `sessionId` on its sole tab so `<TerminalPane>` reattaches via
+ *  `terminal_reattach` instead of spawning a new harness. Returns the new
+ *  pane id so the caller can focus it. */
+export function adoptOrphanSession(args: {
+  sessionId: string;
+  kind: CellKind;
+  projectSlug?: string;
+  worktreeId?: string;
+}): string {
+  const paneId = nextCellId();
+  const tabId = nextTabId();
+  const tab: CellTab = { id: tabId, sessionId: args.sessionId };
+  if (args.projectSlug !== undefined) tab.projectSlug = args.projectSlug;
+  if (args.worktreeId !== undefined) tab.worktreeId = args.worktreeId;
+  const pane: PaneContent = {
+    id: paneId,
+    kind: args.kind,
+    tabs: [tab],
+    activeTabId: tabId,
+    projectSlug: args.projectSlug,
+    worktreeId: args.worktreeId,
+  };
+  splitFocusedOrRoot(pane);
+  return paneId;
 }
 
 /** Remove a pane and its content. Collapses unary parents automatically. */
 export function removePane(id: string): void {
+  // Drop any pending-reset keys for this pane's tabs before we delete it from
+  // the store so the spawn-cleanup helpers don't keep stale entries around.
+  const pane = runtimeLayoutStore.panes[id];
+  if (pane) {
+    for (const t of pane.tabs) pendingResetKeys.delete(tabResetKey(id, t.id));
+  }
   const tree = currentTree();
   if (tree) {
     const next = removeLeaf(tree, id);
@@ -482,7 +625,10 @@ export function removePane(id: string): void {
   }
   setRuntimeLayoutStore("panes", id, undefined as unknown as PaneContent);
   // Clear volatile per-pane state.
-  if (maximizedPaneId() === id) setMaximizedPaneId(null);
+  if (maximizedPaneId() === id) {
+    snapMaximizeLayoutOnce();
+    setMaximizedPaneId(null);
+  }
   if (focusedPaneId() === id) setFocusedPaneId(null);
   const mins = minimizedPaneIds();
   if (mins.has(id)) {
@@ -642,6 +788,7 @@ export function removeCellTab(cellId: string, tabId: string): void {
   if (!pane) return;
   if (pane.tabs.length <= 1) {
     removePane(cellId);
+    pendingResetKeys.delete(tabResetKey(cellId, tabId));
     return;
   }
   if (pane.activeTabId === tabId) {
@@ -652,8 +799,63 @@ export function removeCellTab(cellId: string, tabId: string): void {
     }
   }
   setRuntimeLayoutStore("panes", cellId, "tabs", (prev) => prev.filter((t) => t.id !== tabId));
+  pendingResetKeys.delete(tabResetKey(cellId, tabId));
   rebuildCells();
   scheduleActiveSave();
+}
+
+/** Remove every layout tab that points at a backend session id.
+ *
+ * Used when the backend emits `terminal-session-removed` (explicit kill,
+ * natural process exit, stale reattach miss). The terminal registry is the
+ * source of truth for whether a session exists; once it is gone, keeping a
+ * persisted tab around just makes the next reload reattach-miss and spawn
+ * confusing replacement harnesses.
+ */
+export function removeTabsBySessionId(sessionId: string): void {
+  if (!sessionId) return;
+  const matches: Array<{ cellId: string; tabId: string }> = [];
+  for (const pane of Object.values(runtimeLayoutStore.panes)) {
+    for (const tab of pane.tabs) {
+      if (tab.sessionId === sessionId) matches.push({ cellId: pane.id, tabId: tab.id });
+    }
+  }
+  for (const match of matches) {
+    const pane = runtimeLayoutStore.panes[match.cellId];
+    if (!pane) continue;
+    if (!pane.tabs.some((tab) => tab.id === match.tabId)) continue;
+    removeCellTab(match.cellId, match.tabId);
+  }
+}
+
+// ---- pending-reset registry (transient; not persisted) --------------------
+//
+// Cmd+R "reset-harness" flips this flag on the old tab BEFORE awaiting the
+// `terminal_kill` for its session. If the tab's spawn was still in flight
+// (oldSessionId undefined), the flag tells `<TerminalPane>`'s post-spawn
+// handler that the resolved session is doomed: kill it instead of plumbing
+// it into the store. Mirrored by `isTabAlive`, which returns false once the
+// tab is gone from `runtimeLayoutStore.panes` — covers the case where
+// `removeCellTab` already pulled the tab.
+
+const pendingResetKeys = new Set<string>();
+
+function tabResetKey(cellId: string, tabId: string): string {
+  return `${cellId}::${tabId}`;
+}
+
+export function markTabPendingReset(cellId: string, tabId: string): void {
+  pendingResetKeys.add(tabResetKey(cellId, tabId));
+}
+
+export function isTabPendingReset(cellId: string, tabId: string): boolean {
+  return pendingResetKeys.has(tabResetKey(cellId, tabId));
+}
+
+export function isTabAlive(cellId: string, tabId: string): boolean {
+  const pane = runtimeLayoutStore.panes[cellId];
+  if (!pane) return false;
+  return pane.tabs.some((t) => t.id === tabId);
 }
 
 /** Set (or clear) the user-chosen label on a tab. Whitespace-only inputs
@@ -740,10 +942,15 @@ export function removeCell(id: string): void {
 
 export function toggleMaximize(paneId: string): void {
   const current = maximizedPaneId();
-  setMaximizedPaneId(current === paneId ? null : paneId);
+  const next = current === paneId ? null : paneId;
+  if (current === next) return;
+  snapMaximizeLayoutOnce();
+  setMaximizedPaneId(next);
 }
 
 export function clearMaximize(): void {
+  if (maximizedPaneId() === null) return;
+  snapMaximizeLayoutOnce();
   setMaximizedPaneId(null);
 }
 
@@ -780,11 +987,17 @@ export function __resetRuntimeLayoutForTests(): void {
     cells: [],
   });
   setMaximizedPaneId(null);
+  setMaximizeLayoutSnap(false);
+  if (maximizeLayoutSnapTimer !== null) {
+    clearTimeout(maximizeLayoutSnapTimer);
+    maximizeLayoutSnapTimer = null;
+  }
   setFocusedPaneId(null);
   setMinimizedPaneIds(new Set<string>());
   setLayoutRev(0);
   idCounter = 0;
   tabIdCounter = 0;
+  pendingResetKeys.clear();
   if (_saveTimer !== null) {
     clearTimeout(_saveTimer);
     _saveTimer = null;

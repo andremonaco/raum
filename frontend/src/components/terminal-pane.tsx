@@ -38,6 +38,7 @@ import "@xterm/xterm/css/xterm.css";
 import type { AgentKind } from "../lib/agentKind";
 import { applyAgentStateToTerminal, isHarnessKind, markOutput } from "../stores/terminalStore";
 import { type AgentState, updateSessionState } from "../stores/agentStore";
+import { isTabAlive, isTabPendingReset } from "../stores/runtimeLayoutStore";
 import {
   registerPane,
   requestWebgl,
@@ -66,6 +67,12 @@ export interface TerminalPaneProps {
   cwd?: string;
   projectSlug?: string;
   worktreeId?: string;
+  /** Layout cell id owning this surface. Set only for layout-bound surfaces
+   *  (orphan surfaces leave it undefined). Used to detect spawns whose owning
+   *  tab was removed mid-flight so we can self-destruct the resolved session. */
+  cellId?: string;
+  /** Layout tab id owning this surface. Pairs with `cellId`. */
+  tabId?: string;
   /** Hex string like `#ff00aa` (§4.6). Prop changes only update the border. */
   borderColor?: string;
   /** Hidden surfaces stay mounted and streaming, but skip renderer promotion and resizes. */
@@ -159,7 +166,7 @@ const COPY_FLASH_MS = 900;
 const MAX_BRIDGE_RECOVERY_ATTEMPTS = 3;
 const BRIDGE_RECOVERY_RETRY_MS = 500;
 
-type TerminalLifecycleEvent = "mount" | "cleanup" | "spawn" | "reattach" | "recover";
+type TerminalLifecycleEvent = "mount" | "cleanup" | "spawn" | "reattach" | "recover" | "self-heal";
 
 const lifecycleCounts: Record<TerminalLifecycleEvent, number> = {
   mount: 0,
@@ -167,6 +174,7 @@ const lifecycleCounts: Record<TerminalLifecycleEvent, number> = {
   spawn: 0,
   reattach: 0,
   recover: 0,
+  "self-heal": 0,
 };
 
 function logLifecycle(
@@ -187,6 +195,12 @@ interface HistoryOverlayState {
   highlightRow: number | null;
 }
 
+interface TerminalSelfHealEventDetail {
+  cellId?: string;
+  tabId?: string;
+  sessionId?: string;
+}
+
 export const TerminalPane: Component<TerminalPaneProps> = (props) => {
   const fallbackPaneId = createUniqueId();
   const paneId = props.surfaceKey ?? fallbackPaneId;
@@ -195,6 +209,17 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
 
   // Exit overlay state: set when the backend reports the process exited naturally.
   const [exitState, setExitState] = createSignal<{ code: number } | null>(null);
+  // Bridge-loss recovery UX. `"reconnecting"` is shown during the
+  // 3-attempt retry window after `terminal:bridge-lost`; `"lost"` is the
+  // persistent banner shown once retries are exhausted, exposing a
+  // manual Reconnect button. Reset to `"idle"` on the first chunk
+  // through the data channel after a successful reattach.
+  const [bridgeRecoveryUiState, setBridgeRecoveryUiState] = createSignal<
+    "idle" | "reconnecting" | "lost"
+  >("idle");
+  // Whether a `terminal_respawn_dead` is in flight from the Recover
+  // button. Disables the button + dims the overlay for visual feedback.
+  const [respawningDead, setRespawningDead] = createSignal<boolean>(false);
   let unlistenProcessExited: UnlistenFn | null = null;
   let unlistenBridgeLost: UnlistenFn | null = null;
 
@@ -237,8 +262,19 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
   let resizePendingFromDrag = false;
   let requestVisibleResize: ((force?: boolean) => void) | null = null;
   let bridgeRecoveryInFlight = false;
-  let bridgeRecoveryAttempts = 0;
+  // Reactive so the "Reconnecting… (N/3)" overlay can show the count
+  // live; underlying mutation still uses the setter from inside the
+  // closure-style retry handlers below.
+  const [bridgeRecoveryAttempts, setBridgeRecoveryAttempts] = createSignal<number>(0);
   let bridgeRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
+  // Refs populated inside `onMount` so the JSX overlay can call into
+  // the recovery handlers (which need closures over `term`, `fit`, and
+  // the data `channel`). The JSX doesn't render the buttons until the
+  // overlay is shown, by which point onMount has run and the refs are
+  // set. Ref-pattern is the smallest change that keeps the existing
+  // closure structure intact.
+  let recoverDeadPaneRef: (() => void) | null = null;
+  let manualReconnectRef: (() => void) | null = null;
 
   const normalBuffer = () => term?.buffer.normal ?? null;
   const hasDetachedHistory = (): boolean => {
@@ -515,8 +551,6 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         pushResize();
       }, delay);
     };
-    requestVisibleResize = scheduleResize;
-
     // §4.1 — gated spawn. Harnesses (Ink-based TUIs) paint their banner at
     // the moment of attach, so the very first PTY frame should land at the
     // real viewport dimensions. Wait until we have fitted dims before the
@@ -531,6 +565,12 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
     // backend returns a structured "not-found" string for that case.
     let hasSpawned = false;
     const persistedSessionId = props.sessionId;
+    let persistedSessionMissing = false;
+
+    const owningTabAlive = (): boolean => {
+      if (!props.cellId || !props.tabId) return true;
+      return isTabAlive(props.cellId, props.tabId) && !isTabPendingReset(props.cellId, props.tabId);
+    };
 
     const reattachSession = (
       targetSessionId: string,
@@ -558,6 +598,7 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       setSessionId(targetSessionId);
       if (options.reason === "recover") {
         bridgeRecoveryInFlight = true;
+        setBridgeRecoveryUiState("reconnecting");
       }
       logLifecycle(options.reason, paneId, targetSessionId);
       void invoke<string>("terminal_reattach", {
@@ -575,7 +616,8 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
           // Success — the output channel is live. Resize will be pushed by
           // the observer's first post-attach tick below.
           bridgeRecoveryInFlight = false;
-          bridgeRecoveryAttempts = 0;
+          setBridgeRecoveryAttempts(0);
+          setBridgeRecoveryUiState("idle");
           setErrorMsg(null);
           setExitState(null);
           props.onSpawned?.(id);
@@ -590,24 +632,38 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         })
         .catch((e) => {
           bridgeRecoveryInFlight = false;
+          const message = String(e);
+          if (message.includes("reattach-in-flight")) {
+            hasSpawned = false;
+            setSessionId(null);
+            return;
+          }
           if (!options.fallbackToSpawn) {
             console.warn("[TerminalPane] bridge recovery reattach failed", e);
-            if (bridgeRecoveryAttempts < MAX_BRIDGE_RECOVERY_ATTEMPTS) {
+            if (bridgeRecoveryAttempts() < MAX_BRIDGE_RECOVERY_ATTEMPTS) {
+              setBridgeRecoveryUiState("reconnecting");
               bridgeRecoveryTimer = setTimeout(() => {
                 bridgeRecoveryTimer = null;
                 recoverBridge(targetSessionId);
               }, BRIDGE_RECOVERY_RETRY_MS);
               return;
             }
-            setExitState({ code: -1 });
+            // Retries exhausted — show the persistent "Connection
+            // lost — Reconnect" banner instead of the dead-process
+            // exit overlay. The bridge died; the inner harness may
+            // still be alive on the tmux server.
+            setBridgeRecoveryUiState("lost");
             return;
           }
           // Either the tmux session is gone (expected after `kill-server`
           // or a long absence past reap_stale) or something transient
           // failed. Either way: release the gate and let `trySpawn` create
-          // a fresh session. The user's scrollback from last time is lost,
-          // but the pane works.
+          // a fresh session only when this surface is still a visible,
+          // layout-owned tab. Hidden stale tabs are removed by the
+          // `terminal-session-removed` event emitted by the backend; spawning
+          // here would recreate the invisible harness the user just closed.
           console.warn("[TerminalPane] terminal_reattach failed — spawning fresh", e);
+          persistedSessionMissing = true;
           hasSpawned = false;
           setSessionId(null);
           // Next ResizeObserver tick will call trySpawn via the dual-mode
@@ -619,18 +675,74 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
 
     const tryReattach = (): void => {
       if (hasSpawned || !persistedSessionId) return;
+      if (persistedSessionMissing) {
+        trySpawn();
+        return;
+      }
       reattachSession(persistedSessionId, { fallbackToSpawn: true, reason: "reattach" });
     };
 
     function recoverBridge(targetSessionId: string): void {
       if (bridgeRecoveryInFlight) return;
       if (!term || !fit) return;
-      bridgeRecoveryAttempts += 1;
+      setBridgeRecoveryAttempts((n) => n + 1);
       reattachSession(targetSessionId, { fallbackToSpawn: false, reason: "recover" });
     }
+    // Surface the closure-bound handlers to the JSX layer below.
+    manualReconnectRef = (): void => {
+      const id = sessionId();
+      if (!id) return;
+      setBridgeRecoveryAttempts(0);
+      setBridgeRecoveryUiState("reconnecting");
+      recoverBridge(id);
+    };
+    recoverDeadPaneRef = (): void => {
+      if (respawningDead()) return;
+      if (!isHarnessKind(props.kind)) return;
+      const id = sessionId();
+      if (!id || !term || !fit) return;
+      try {
+        fit.fit();
+      } catch {
+        return;
+      }
+      const cols = term.cols;
+      const rows = term.rows;
+      if (cols < MIN_REATTACH_COLS || rows < MIN_REATTACH_ROWS) return;
+      setRespawningDead(true);
+      logLifecycle("recover", paneId, id);
+      void invoke<string>("terminal_respawn_dead", {
+        args: {
+          session_id: id,
+          kind: props.kind,
+          project_slug: props.projectSlug,
+          worktree_id: props.worktreeId,
+          cols,
+          rows,
+        },
+        onData: channel,
+      })
+        .then(() => {
+          setRespawningDead(false);
+          setExitState(null);
+          setErrorMsg(null);
+          setBridgeRecoveryAttempts(0);
+          setBridgeRecoveryUiState("idle");
+          if (isHarnessKind(props.kind)) {
+            void hydrateHarnessStateAfterReattach(id, props.kind);
+          }
+        })
+        .catch((e) => {
+          console.warn("[TerminalPane] terminal_respawn_dead failed", e);
+          setRespawningDead(false);
+          setErrorMsg(String(e));
+        });
+    };
 
     const trySpawn = (): void => {
       if (hasSpawned) return;
+      if (props.visible === false) return;
+      if (!owningTabAlive()) return;
       if (!term || !fit) return;
       try {
         fit.fit();
@@ -658,6 +770,21 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         onData: channel,
       })
         .then((id) => {
+          // Cmd+R "reset-harness" can pull the owning tab while this spawn was
+          // still in flight (oldSessionId was undefined when the user fired
+          // Cmd+R). If the tab is gone or flagged for reset, the resolved
+          // session is doomed — kill it instead of plumbing it into the store
+          // as an invisible zombie.
+          if (props.cellId && props.tabId) {
+            const stillAlive = isTabAlive(props.cellId, props.tabId);
+            const flagged = isTabPendingReset(props.cellId, props.tabId);
+            if (!stillAlive || flagged) {
+              void invoke("terminal_kill", { sessionId: id }).catch((e: unknown) => {
+                console.warn("[TerminalPane] post-spawn cleanup kill failed", e);
+              });
+              return;
+            }
+          }
           setSessionId(id);
           props.onSpawned?.(id);
         })
@@ -669,6 +796,90 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         });
     };
 
+    requestVisibleResize = (force = false): void => {
+      scheduleResize(force);
+      if (hasSpawned) return;
+      if (persistedSessionId && !persistedSessionMissing) {
+        tryReattach();
+      } else {
+        trySpawn();
+      }
+    };
+
+    let selfHealInFlight = false;
+    const selfHeal = (): void => {
+      if (selfHealInFlight) return;
+      if (!isHarnessKind(props.kind)) return;
+      const id = sessionId();
+      if (!id || !term || !fit) return;
+      try {
+        fit.fit();
+      } catch {
+        return;
+      }
+      const cols = term.cols;
+      const rows = term.rows;
+      if (cols < MIN_REATTACH_COLS || rows < MIN_REATTACH_ROWS) return;
+
+      selfHealInFlight = true;
+      hasSpawned = true;
+      lastCols = cols;
+      lastRows = rows;
+      setExitState(null);
+      setErrorMsg(null);
+      setBridgeRecoveryAttempts(0);
+      setBridgeRecoveryUiState("reconnecting");
+      try {
+        term.reset();
+      } catch {
+        // A failed local reset should not block the backend repair.
+      }
+
+      logLifecycle("self-heal", paneId, id);
+      void invoke<string>("terminal_self_heal", {
+        args: {
+          session_id: id,
+          kind: props.kind,
+          project_slug: props.projectSlug,
+          worktree_id: props.worktreeId,
+          cols,
+          rows,
+        },
+        onData: channel,
+      })
+        .then((nextId) => {
+          selfHealInFlight = false;
+          setSessionId(nextId);
+          props.onSpawned?.(nextId);
+          updateSessionState(nextId, props.kind, "idle");
+          applyAgentStateToTerminal(nextId, "idle");
+          setBridgeRecoveryAttempts(0);
+          setBridgeRecoveryUiState("idle");
+          requestVisibleResize?.(true);
+        })
+        .catch((e) => {
+          selfHealInFlight = false;
+          console.warn("[TerminalPane] terminal_self_heal failed; spawning fresh", e);
+          void invoke("terminal_kill", { sessionId: id }).catch(() => {
+            /* best-effort cleanup before fallback spawn */
+          });
+          setSessionId(null);
+          setBridgeRecoveryUiState("idle");
+          hasSpawned = false;
+          trySpawn();
+        });
+    };
+
+    function onTerminalSelfHeal(ev: Event): void {
+      const detail = (ev as CustomEvent<TerminalSelfHealEventDetail>).detail;
+      if (!detail) return;
+      if (props.cellId && detail.cellId !== props.cellId) return;
+      if (props.tabId && detail.tabId !== props.tabId) return;
+      if (detail.sessionId && detail.sessionId !== sessionId()) return;
+      selfHeal();
+    }
+    window.addEventListener("raum:terminal-self-heal", onTerminalSelfHeal);
+
     void (async () => {
       unlistenBridgeLost = await listen<{ sessionId: string; exitCode: number }>(
         "terminal:bridge-lost",
@@ -676,7 +887,13 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
           const id = sessionId();
           if (!id || ev.payload.sessionId !== id) return;
           if (exitState()) return;
-          if (bridgeRecoveryAttempts >= MAX_BRIDGE_RECOVERY_ATTEMPTS) return;
+          if (bridgeRecoveryAttempts() >= MAX_BRIDGE_RECOVERY_ATTEMPTS) {
+            // Auto-retries already exhausted — surface the persistent
+            // "Connection lost" banner so the user can manually trigger
+            // another attempt.
+            setBridgeRecoveryUiState("lost");
+            return;
+          }
           recoverBridge(id);
         },
       );
@@ -825,6 +1042,7 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
     onCleanup(() => {
       host?.removeEventListener("mousedown", onMouseDown);
       window.removeEventListener("mouseup", onWindowMouseUp);
+      window.removeEventListener("raum:terminal-self-heal", onTerminalSelfHeal);
     });
 
     // §4.7 — register with the global search registry.
@@ -1021,16 +1239,57 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
           </div>
         )}
       </Show>
-      <Show when={exitState()}>
-        <button
-          type="button"
-          class="absolute inset-0 z-10 flex cursor-pointer items-center justify-center bg-scrim"
-          onClick={() => props.onRequestClose?.()}
-        >
+      <Show when={exitState() && bridgeRecoveryUiState() !== "lost"}>
+        <div class="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-scrim">
           <span class="select-none font-mono text-sm text-muted-foreground">
             exited: {exitState()!.code}
           </span>
-        </button>
+          <div class="flex items-center gap-2">
+            <Show when={isHarnessKind(props.kind)}>
+              <button
+                type="button"
+                class="rounded border border-border bg-surface-2 px-3 py-1 font-mono text-xs text-foreground hover:bg-surface-3 disabled:opacity-50"
+                disabled={respawningDead()}
+                onClick={() => recoverDeadPaneRef?.()}
+              >
+                {respawningDead() ? "Recovering…" : "Recover"}
+              </button>
+            </Show>
+            <button
+              type="button"
+              class="rounded border border-border bg-surface-2 px-3 py-1 font-mono text-xs text-muted-foreground hover:bg-surface-3"
+              onClick={() => props.onRequestClose?.()}
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      </Show>
+      <Show when={bridgeRecoveryUiState() === "reconnecting"}>
+        <div class="pointer-events-none absolute right-2 top-2 z-10 select-none rounded border border-border bg-surface-2/90 px-2 py-1 font-mono text-[11px] text-muted-foreground">
+          Reconnecting… ({bridgeRecoveryAttempts()}/{MAX_BRIDGE_RECOVERY_ATTEMPTS})
+        </div>
+      </Show>
+      <Show when={bridgeRecoveryUiState() === "lost"}>
+        <div class="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-scrim">
+          <span class="select-none font-mono text-sm text-muted-foreground">Connection lost</span>
+          <div class="flex items-center gap-2">
+            <button
+              type="button"
+              class="rounded border border-border bg-surface-2 px-3 py-1 font-mono text-xs text-foreground hover:bg-surface-3"
+              onClick={() => manualReconnectRef?.()}
+            >
+              Reconnect
+            </button>
+            <button
+              type="button"
+              class="rounded border border-border bg-surface-2 px-3 py-1 font-mono text-xs text-muted-foreground hover:bg-surface-3"
+              onClick={() => props.onRequestClose?.()}
+            >
+              Close
+            </button>
+          </div>
+        </div>
       </Show>
     </div>
   );

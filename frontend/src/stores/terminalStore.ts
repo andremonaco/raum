@@ -21,6 +21,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { createStore, reconcile } from "solid-js/store";
 import { agentStore, type AgentKind, type AgentState } from "./agentStore";
+import { removeTabsBySessionId } from "./runtimeLayoutStore";
 
 const TERMINAL_PANE_CONTEXT_CHANGED_EVENT = "terminal-pane-context-changed";
 const PANE_PROMPT_UPDATED_EVENT = "pane:prompt-updated";
@@ -31,6 +32,10 @@ export interface TerminalListItem {
   worktree_id: string | null;
   kind: AgentKind;
   created_unix: number;
+  /** True when the rehydrate path detected this session's tmux pane was
+   *  dead and could not auto-revive it. Backend skips the field on the wire
+   *  when false (see `TerminalListItem` in terminal.rs). */
+  dead?: boolean;
 }
 
 export type TerminalWorkingState = "idle" | "working" | "waiting";
@@ -100,6 +105,7 @@ const [idsByWorktreeId, setIdsByWorktreeId] = createSignal<
 const [lastOutputBySession, setLastOutputBySession] = createSignal<ReadonlyMap<string, number>>(
   new Map(),
 );
+const [closingTerminalIds, setClosingTerminalIds] = createSignal<ReadonlySet<string>>(EMPTY_SET);
 
 export {
   workingIds,
@@ -109,6 +115,7 @@ export {
   idsByProjectSlug,
   idsByWorktreeId,
   lastOutputBySession,
+  closingTerminalIds,
 };
 
 const pendingWorkingStateById: Record<string, TerminalWorkingState> = {};
@@ -123,6 +130,7 @@ function hydrateTerminalRecord(item: TerminalListItem, existing?: TerminalRecord
   const sameLifecycle = existing?.created_unix === item.created_unix;
   return {
     ...item,
+    dead: item.dead ?? false,
     workingState: existing?.workingState ?? pending ?? mapAgentState(agentState),
     paneContext: sameLifecycle ? existing?.paneContext : undefined,
   };
@@ -145,6 +153,7 @@ function shallowEqualRecord(a: TerminalRecord, b: TerminalRecord): boolean {
     a.worktree_id === b.worktree_id &&
     a.kind === b.kind &&
     a.created_unix === b.created_unix &&
+    (a.dead ?? false) === (b.dead ?? false) &&
     a.workingState === b.workingState &&
     a.paneContext === b.paneContext
   );
@@ -325,6 +334,7 @@ function applyTerminalPatch(patch: TerminalPatch): void {
           next.delete(sessionId);
           return next;
         });
+        clearTerminalClosing(sessionId);
         return;
       }
       case "setWorkingState": {
@@ -382,6 +392,25 @@ export function removeTerminal(sessionId: string): void {
   applyTerminalPatch({ op: "remove", sessionId });
   setMru((prev) => (prev.includes(sessionId) ? prev.filter((id) => id !== sessionId) : prev));
   delete pendingWorkingStateById[sessionId];
+  clearTerminalClosing(sessionId);
+}
+
+export function markTerminalClosing(sessionId: string): void {
+  setClosingTerminalIds((prev) => {
+    if (prev.has(sessionId)) return prev;
+    const next = new Set(prev);
+    next.add(sessionId);
+    return next;
+  });
+}
+
+export function clearTerminalClosing(sessionId: string): void {
+  setClosingTerminalIds((prev) => {
+    if (!prev.has(sessionId)) return prev;
+    const next = new Set(prev);
+    next.delete(sessionId);
+    return next.size === 0 ? EMPTY_SET : next;
+  });
 }
 
 /** Feed the terminal store from the agent state-machine. */
@@ -730,6 +759,7 @@ export async function subscribeTerminalEvents(): Promise<UnlistenFn> {
   const unlistenRemoved = await listen<TerminalSessionRemoved>("terminal-session-removed", (ev) => {
     if (!ev.payload.session_id) return;
     removeTerminal(ev.payload.session_id);
+    removeTabsBySessionId(ev.payload.session_id);
   });
   const unlistenPaneContext = await listen<TerminalPaneContextChanged>(
     TERMINAL_PANE_CONTEXT_CHANGED_EVENT,

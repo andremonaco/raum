@@ -1,6 +1,6 @@
 import type { AgentKind } from "./agentKind";
 import type { Rect } from "./layoutTree";
-import type { RuntimeCell } from "../stores/runtimeLayoutStore";
+import type { PaneContent, RuntimeCell } from "../stores/runtimeLayoutStore";
 import type { TerminalRecord } from "../stores/terminalStore";
 
 export type SurfaceSource = "layout" | "orphan";
@@ -22,6 +22,11 @@ export interface TerminalSurfaceDescriptor {
 
 export interface ProjectTerminalSurfacesArgs {
   cells: readonly RuntimeCell[];
+  /** Panes that are registered (in `runtimeLayoutStore.panes`) but not in
+   *  the BSP `tree` — minimized harnesses living in the dock. They produce
+   *  invisible, no-rect surfaces so xterm stays mounted across the
+   *  in-tree → off-tree transition. */
+  offTreePanes?: readonly PaneContent[];
   activeRectMap: ReadonlyMap<string, Rect>;
   minimizedPaneIds: ReadonlySet<string>;
   crossProjectMode: string | null;
@@ -51,6 +56,10 @@ function isAgentKind(kind: RuntimeCell["kind"]): kind is AgentKind {
   return kind !== "empty";
 }
 
+function isPaneAgentKind(kind: PaneContent["kind"]): kind is AgentKind {
+  return kind !== "empty";
+}
+
 function rankSurface(surface: TerminalSurfaceDescriptor, activeTab: boolean): number {
   let rank = 0;
   if (surface.visible) rank += 100;
@@ -71,6 +80,7 @@ export function projectTerminalSurfaces(
 
   const addLayoutSurface = (surface: TerminalSurfaceDescriptor, activeTab: boolean): void => {
     if (!surface.sessionId) {
+      if (!surface.visible) return;
       unsessioned.push(surface);
       return;
     }
@@ -136,11 +146,41 @@ export function projectTerminalSurfaces(
     }
   }
 
+  // Off-tree minimized panes: emit invisible/no-rect descriptors keyed on
+  // `tab.id` so the xterm component stays mounted across the in-tree →
+  // off-tree transition (preserves scrollback). The surface layer hides
+  // them via `visible: false` (no positioning, `display: none`).
+  for (const pane of args.offTreePanes ?? []) {
+    if (!isPaneAgentKind(pane.kind)) continue;
+    for (const tab of pane.tabs) {
+      const projectSlug = tab.projectSlug ?? pane.projectSlug;
+      const worktreeId = tab.worktreeId ?? pane.worktreeId;
+      addLayoutSurface(
+        {
+          key: tab.id,
+          source: "layout",
+          kind: pane.kind,
+          sessionId: tab.sessionId,
+          cellId: pane.id,
+          tabId: tab.id,
+          projectSlug,
+          worktreeId,
+          rect: null,
+          visible: false,
+          active: false,
+          maximized: false,
+        },
+        tab.id === pane.activeTabId,
+      );
+    }
+  }
+
   for (const [sessionId, record] of Object.entries(args.terminalById)) {
     if (ownedSessions.has(sessionId)) continue;
     if (!record || record.kind === "shell") continue;
     const projectedRect = args.projectedRectMap.get(sessionId) ?? null;
     const visible = isCrossProject && projectedRect !== null && projectedIds.has(sessionId);
+    if (!visible) continue;
     sessionOwners.set(sessionId, {
       rank: 0,
       surface: {

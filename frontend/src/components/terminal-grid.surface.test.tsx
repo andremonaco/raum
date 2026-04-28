@@ -171,6 +171,31 @@ describe("TerminalGrid persistent surfaces", () => {
     expect(screen.getByTestId("terminal-surface-tab-beta")).toHaveAttribute("data-visible", "true");
   });
 
+  it("does not mount dock-only orphan sessions in normal project view", () => {
+    setTerminals([
+      {
+        session_id: "session-alpha",
+        project_slug: "alpha",
+        worktree_id: null,
+        kind: "codex",
+        created_unix: 1,
+      },
+      {
+        session_id: "orphan-alpha",
+        project_slug: "alpha",
+        worktree_id: null,
+        kind: "codex",
+        created_unix: 3,
+      },
+    ]);
+
+    render(() => <TerminalGrid />);
+
+    expect(screen.getByTestId("terminal-surface-tab-alpha")).toBeInTheDocument();
+    expect(screen.queryByTestId("terminal-surface-orphan:orphan-alpha")).toBeNull();
+    expect(surfaceMounts).toBe(2);
+  });
+
   it("hides the divider layer while a pane is maximized", () => {
     setRuntimeLayout([
       {
