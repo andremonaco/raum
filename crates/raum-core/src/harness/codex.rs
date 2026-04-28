@@ -719,6 +719,54 @@ pub fn codex_notify_script_body(_event_socket: &Path) -> String {
 set -eu
 SOCK="${RAUM_EVENT_SOCK:-}"
 if [ -z "$SOCK" ]; then exit 0; fi
+PYTHON_BIN=""
+if [ -x /usr/bin/python3 ]; then
+  PYTHON_BIN=/usr/bin/python3
+elif [ -x /opt/homebrew/bin/python3 ]; then
+  PYTHON_BIN=/opt/homebrew/bin/python3
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON_BIN=python3
+fi
+if [ -n "$PYTHON_BIN" ]; then
+  exec "$PYTHON_BIN" -c '
+import json
+import os
+import socket
+import sys
+
+sock_path = os.environ.get("RAUM_EVENT_SOCK") or ""
+if not sock_path:
+    raise SystemExit(0)
+
+payload_raw = sys.argv[1] if len(sys.argv) > 1 else "{}"
+try:
+    payload = json.loads(payload_raw)
+except Exception:
+    payload = {}
+session_id = os.environ.get("RAUM_SESSION") or None
+envelope = {
+    "harness": "codex",
+    "event": "Notification",
+    "source": "notify",
+    "reliability": "event-driven",
+    "session_id": session_id,
+    "payload": payload,
+}
+line = json.dumps(envelope, separators=(",", ":")) + "\n"
+timeout = float(os.environ.get("RAUM_HOOK_SEND_TIMEOUT_SECS", "1"))
+try:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout)
+        sock.connect(sock_path)
+        sock.sendall(line.encode("utf-8"))
+        try:
+            sock.shutdown(socket.SHUT_WR)
+        except Exception:
+            pass
+except Exception:
+    pass
+' "$@"
+fi
 SESSION_ID="${RAUM_SESSION:-}"
 # Codex invokes us with the serialised JSON as argv[1]. Use `${1-}` (no
 # colon) so an empty string is still accepted; the previous form

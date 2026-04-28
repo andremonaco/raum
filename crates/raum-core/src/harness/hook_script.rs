@@ -8,6 +8,16 @@
 //! The script body is pure: it reads `$RAUM_EVENT_SOCK`,
 //! `$RAUM_SESSION`, and `$RAUM_HOOK_TIMEOUT_SECS` at runtime, so no
 //! socket path is baked in at generation time.
+//!
+//! The two harnesses use different invocation contracts and we must
+//! honour each one — sharing a single body wedges Codex (see below):
+//!
+//! - **Claude Code** pipes the hook payload on **stdin** and closes the
+//!   fd, so the dispatcher reads it via `cat`.
+//! - **Codex** passes the payload as the **last argv** (`argv[2]` after
+//!   the event name) and inherits its own stdin into the child without
+//!   closing it. Calling `cat` would block until Codex's 600 s default
+//!   hook timeout fires, freezing every turn.
 
 use crate::agent::AgentKind;
 
@@ -58,37 +68,198 @@ impl TryFrom<AgentKind> for HookDispatcher {
 /// `content` is this body.
 #[must_use]
 pub fn body(dispatcher: HookDispatcher) -> String {
-    let harness = dispatcher.harness_tag();
+    match dispatcher {
+        HookDispatcher::ClaudeCode => body_claude_code(),
+        HookDispatcher::Codex => body_codex(),
+    }
+}
+
+/// Pure-shell `awk` JSON-string escaper for the fallback transport path.
+/// The normal path execs a single Python process and does JSON/socket work
+/// there; if Python is unavailable, this keeps the shell fallback from
+/// spawning Python again just to quote strings.
+///
+/// Handles `\`, `"`, `\t`, `\r`, and embedded `\n` (lines are joined
+/// with `\\n` since awk strips trailing newlines per record). Other
+/// control bytes (< 0x20) are extremely rare in raum-controlled hook
+/// payloads and would only show up wrapped inside a JSON string from
+/// Claude Code itself, where they'd already be escape-sequenced.
+const AWK_JSON_ESCAPE: &str = r#"json_escape_stdin() {
+  awk 'BEGIN{ORS=""; printf "\""}
+       {if (NR > 1) printf "\\n";
+        gsub(/\\/, "\\\\"); gsub(/"/, "\\\"");
+        gsub(/\t/, "\\t"); gsub(/\r/, "\\r");
+        printf "%s", $0}
+       END{printf "\""}'
+}
+"#;
+
+/// Python fast path for Claude Code hooks.
+///
+/// Kept before the shell fallback so the normal path does not fork `cat`,
+/// `awk`, `socat`/`nc`, `head`, `od`, or `tr` for every hook event. This
+/// matters when the OS is close to its per-user process limit: the harness
+/// can launch the hook script successfully, then the script's first internal
+/// fork fails with `Resource temporarily unavailable`.
+const PYTHON_CLAUDE_FAST_PATH: &str = r#"PYTHON_BIN=""
+if [ -x /usr/bin/python3 ]; then
+  PYTHON_BIN=/usr/bin/python3
+elif [ -x /opt/homebrew/bin/python3 ]; then
+  PYTHON_BIN=/opt/homebrew/bin/python3
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON_BIN=python3
+fi
+if [ -n "$PYTHON_BIN" ]; then
+  exec "$PYTHON_BIN" -c '
+import json
+import os
+import socket
+import sys
+import uuid
+
+sock_path = os.environ.get("RAUM_EVENT_SOCK") or ""
+if not sock_path:
+    raise SystemExit(0)
+
+event = sys.argv[1] if len(sys.argv) > 1 else "unknown"
+session_id = os.environ.get("RAUM_SESSION") or None
+payload = sys.stdin.read()
+timeout = float(os.environ.get("RAUM_HOOK_TIMEOUT_SECS", "55"))
+
+def write_socket(envelope, wait_reply=False):
+    line = json.dumps(envelope, separators=(",", ":")) + "\n"
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        if wait_reply:
+            sock.settimeout(timeout)
+        sock.connect(sock_path)
+        sock.sendall(line.encode("utf-8"))
+        if not wait_reply:
+            return ""
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        return (buf.splitlines()[0] if buf else b"").decode("utf-8", errors="replace")
+
+if event == "PermissionRequest":
+    request_id = uuid.uuid4().hex
+    envelope = {
+        "harness": "claude-code",
+        "event": event,
+        "session_id": session_id,
+        "request_id": request_id,
+        "payload": payload,
+    }
+    try:
+        decision = write_socket(envelope, wait_reply=True)
+    except Exception:
+        decision = ""
+
+    if decision == "allow":
+        out = {"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": {"behavior": "allow"}}}
+    elif decision in ("allow-and-remember", "allow_and_remember"):
+        out = {"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": {"behavior": "allow"}, "updatedPermissions": []}}
+    elif decision == "deny":
+        out = {"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": {"behavior": "deny", "message": "raum user denied"}}}
+    else:
+        out = {"hookSpecificOutput": {"hookEventName": "PermissionRequest", "permissionDecision": "ask"}}
+    sys.stdout.write(json.dumps(out, separators=(",", ":")) + "\n")
+else:
+    envelope = {
+        "harness": "claude-code",
+        "event": event,
+        "session_id": session_id,
+        "payload": payload,
+    }
+    try:
+        write_socket(envelope)
+    except Exception:
+        pass
+' "$@"
+fi
+
+"#;
+
+/// Python fast path for Codex hook events. Codex passes the payload as argv,
+/// not stdin, so this path must not read stdin.
+const PYTHON_CODEX_FAST_PATH: &str = r#"PYTHON_BIN=""
+if [ -x /usr/bin/python3 ]; then
+  PYTHON_BIN=/usr/bin/python3
+elif [ -x /opt/homebrew/bin/python3 ]; then
+  PYTHON_BIN=/opt/homebrew/bin/python3
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON_BIN=python3
+fi
+if [ -n "$PYTHON_BIN" ]; then
+  exec "$PYTHON_BIN" -c '
+import json
+import os
+import socket
+import sys
+
+sock_path = os.environ.get("RAUM_EVENT_SOCK") or ""
+if not sock_path:
+    raise SystemExit(0)
+
+event = sys.argv[1] if len(sys.argv) > 1 else "unknown"
+payload_raw = sys.argv[2] if len(sys.argv) > 2 else "{}"
+try:
+    payload = json.loads(payload_raw)
+except Exception:
+    payload = {}
+session_id = os.environ.get("RAUM_SESSION") or None
+envelope = {
+    "harness": "codex",
+    "event": event,
+    "session_id": session_id,
+    "payload": payload,
+}
+line = json.dumps(envelope, separators=(",", ":")) + "\n"
+timeout = float(os.environ.get("RAUM_HOOK_SEND_TIMEOUT_SECS", "1"))
+try:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout)
+        sock.connect(sock_path)
+        sock.sendall(line.encode("utf-8"))
+        try:
+            sock.shutdown(socket.SHUT_WR)
+        except Exception:
+            pass
+except Exception:
+    pass
+' "$@"
+fi
+
+"#;
+
+/// Claude Code dispatcher: stdin payload + blocking `PermissionRequest`.
+///
+/// Claude Code's hook contract pipes the JSON payload on stdin and
+/// expects the script to print a JSON decision document to stdout for
+/// `PermissionRequest`. The fire-and-forget branch covers every other
+/// event (Notification, Stop, etc.).
+fn body_claude_code() -> String {
     let timeout_secs = DEFAULT_PERMISSION_TIMEOUT_SECS;
     format!(
         r#"#!/usr/bin/env sh
 {HEADER}set -eu
 SOCK="${{RAUM_EVENT_SOCK:-}}"
 if [ -z "$SOCK" ]; then exit 0; fi
+{PYTHON_CLAUDE_FAST_PATH}
 EVENT_NAME="${{1:-unknown}}"
 SESSION_ID="${{RAUM_SESSION:-}}"
 TIMEOUT_SECS="${{RAUM_HOOK_TIMEOUT_SECS:-{timeout_secs}}}"
 PAYLOAD="$(cat || true)"
 
-# json_escape stdin → stdout-quoted JSON string. Uses python3 when
-# available; falls back to a best-effort empty "" for hosts that lack it.
-json_escape() {{
-  if command -v python3 >/dev/null 2>&1; then
-    python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'
-  else
-    printf '""'
-  fi
-}}
+{AWK_JSON_ESCAPE}
+QUOTED_PAYLOAD=$(printf '%s' "$PAYLOAD" | json_escape_stdin)
 
-QUOTED_PAYLOAD=$(printf '%s' "$PAYLOAD" | json_escape)
-
-# Build {{"harness":"…","event":"…","session_id":…,"request_id":…?,"payload":…}}.
-# request_id is injected only for PermissionRequest events; other events
-# omit the field to keep the fire-and-forget wire shape unchanged.
 if [ -z "$SESSION_ID" ]; then
   SESSION_JSON="null"
 else
-  SESSION_JSON=$(printf '%s' "$SESSION_ID" | json_escape)
+  SESSION_JSON=$(printf '%s' "$SESSION_ID" | json_escape_stdin)
 fi
 
 send_fire_and_forget() {{
@@ -96,8 +267,8 @@ send_fire_and_forget() {{
   # and re-append it via `printf '%s\n'` below. The server framing is
   # newline-delimited, so we MUST terminate the line or the blocking
   # reader on the other side waits forever.
-  JSON=$(printf '{{"harness":"%s","event":"%s","session_id":%s,"payload":%s}}' \
-    "{harness}" "$EVENT_NAME" "$SESSION_JSON" "$QUOTED_PAYLOAD")
+  JSON=$(printf '{{"harness":"claude-code","event":"%s","session_id":%s,"payload":%s}}' \
+    "$EVENT_NAME" "$SESSION_JSON" "$QUOTED_PAYLOAD")
   if command -v socat >/dev/null 2>&1; then
     # `-u` = unidirectional (stdin → socket). socat exits on stdin EOF
     # instead of waiting for the peer to fully close, which on some
@@ -107,7 +278,6 @@ send_fire_and_forget() {{
   elif command -v nc >/dev/null 2>&1; then
     printf '%s\n' "$JSON" | nc -U "$SOCK" || true
   elif command -v python3 >/dev/null 2>&1; then
-    # python3 fallback — hosts without socat/nc still get delivery.
     printf '%s\n' "$JSON" | python3 -c '
 import os, sys, socket
 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -124,15 +294,9 @@ sock.close()
 # timeout or transport failure, fall through to permissionDecision:"ask"
 # so Claude Code shows its native TUI prompt (graceful degradation).
 handle_permission_request() {{
-  # Generate a short request id. `od -N8 -An -tx1` is POSIX-portable
-  # (works on BusyBox); we collapse the spaces into a single hex string.
   REQ_ID=$(od -N8 -An -tx1 /dev/urandom 2>/dev/null | tr -d ' \n' || date +%s%N)
-  # Build the JSON body *without* its trailing newline — `$(...)` strips
-  # trailing newlines from its capture, so we always append the `\n` at
-  # the sending `printf` instead. The server framing is newline-delimited
-  # and blocks until a complete line arrives.
-  JSON=$(printf '{{"harness":"%s","event":"%s","session_id":%s,"request_id":"%s","payload":%s}}' \
-    "{harness}" "$EVENT_NAME" "$SESSION_JSON" "$REQ_ID" "$QUOTED_PAYLOAD")
+  JSON=$(printf '{{"harness":"claude-code","event":"%s","session_id":%s,"request_id":"%s","payload":%s}}' \
+    "$EVENT_NAME" "$SESSION_JSON" "$REQ_ID" "$QUOTED_PAYLOAD")
   DECISION=""
   if command -v socat >/dev/null 2>&1; then
     DECISION=$(printf '%s\n' "$JSON" | socat -T"$TIMEOUT_SECS" - UNIX-CONNECT:"$SOCK" 2>/dev/null | head -n1 || true)
@@ -177,9 +341,6 @@ finally:
       printf '{{"hookSpecificOutput":{{"hookEventName":"PermissionRequest","decision":{{"behavior":"deny","message":"raum user denied"}}}}}}\n'
       ;;
     ask|"")
-      # Timeout / no-decision fallback: tell Claude to use its native
-      # TUI prompt. Emitting an empty JSON object is also acceptable
-      # per the hooks spec, but `permissionDecision:"ask"` is explicit.
       printf '{{"hookSpecificOutput":{{"hookEventName":"PermissionRequest","permissionDecision":"ask"}}}}\n'
       ;;
     *)
@@ -200,4 +361,144 @@ case "$EVENT_NAME" in
 esac
 "#
     )
+}
+
+/// Codex dispatcher: argv payload, fire-and-forget only.
+///
+/// Codex invokes the script as `codex.sh <event> <json-payload>`. The
+/// payload is already valid JSON, so we embed it verbatim — re-escaping
+/// would corrupt nested strings. `PermissionRequest` is omitted because
+/// Codex doesn't have an equivalent hook event; the JSON shapes returned
+/// by `handle_permission_request` are Claude-Code-specific.
+fn body_codex() -> String {
+    format!(
+        r#"#!/usr/bin/env sh
+{HEADER}set -eu
+SOCK="${{RAUM_EVENT_SOCK:-}}"
+if [ -z "$SOCK" ]; then exit 0; fi
+{PYTHON_CODEX_FAST_PATH}
+EVENT_NAME="${{1:-unknown}}"
+SESSION_ID="${{RAUM_SESSION:-}}"
+# Codex hands the JSON payload as the LAST argv. The explicit if/else
+# is intentional: the natural-looking `${{2-{{}}}}` fails because POSIX
+# brace-matching closes the parameter expansion at the first inner
+# brace, leaking a stray brace into the payload (same trap documented
+# at the top of codex-notify.sh).
+# Reading stdin via `cat` would block until Codex's 600 s hook timeout
+# instead, since Codex inherits its own (open) stdin into the child.
+if [ $# -ge 2 ]; then
+  PAYLOAD="$2"
+else
+  PAYLOAD="{{}}"
+fi
+
+{AWK_JSON_ESCAPE}
+if [ -z "$SESSION_ID" ]; then
+  SESSION_JSON="null"
+else
+  SESSION_JSON=$(printf '%s' "$SESSION_ID" | json_escape_stdin)
+fi
+
+# Embed PAYLOAD verbatim — Codex guarantees it's already valid JSON.
+# `$(...)` strips the trailing newline; the sending `printf '%s\n'`
+# re-adds one so the newline-framed reader on the other end unblocks.
+JSON=$(printf '{{"harness":"codex","event":"%s","session_id":%s,"payload":%s}}' \
+  "$EVENT_NAME" "$SESSION_JSON" "$PAYLOAD")
+
+if command -v socat >/dev/null 2>&1; then
+  printf '%s\n' "$JSON" | socat -u - UNIX-CONNECT:"$SOCK" || true
+elif command -v nc >/dev/null 2>&1; then
+  printf '%s\n' "$JSON" | nc -U "$SOCK" || true
+elif command -v python3 >/dev/null 2>&1; then
+  printf '%s\n' "$JSON" | python3 -c '
+import os, sys, socket
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.connect(os.environ["RAUM_EVENT_SOCK"])
+sock.sendall(sys.stdin.buffer.read())
+sock.close()
+' || true
+fi
+exit 0
+"#
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claude_body_reads_stdin() {
+        let s = body(HookDispatcher::ClaudeCode);
+        assert!(
+            s.contains(r#"exec "$PYTHON_BIN" -c"#),
+            "Claude dispatcher should use the single-process Python fast path when available"
+        );
+        assert!(
+            s.contains(r#"PAYLOAD="$(cat || true)""#),
+            "Claude fallback dispatcher must read stdin payload"
+        );
+        assert!(
+            s.contains("handle_permission_request"),
+            "Claude dispatcher must keep PermissionRequest branch"
+        );
+        assert!(
+            s.contains(r#""harness":"claude-code""#),
+            "Claude envelope must tag harness=claude-code"
+        );
+    }
+
+    #[test]
+    fn codex_body_reads_argv_not_stdin() {
+        let s = body(HookDispatcher::Codex);
+        assert!(
+            s.contains(r#"exec "$PYTHON_BIN" -c"#),
+            "Codex dispatcher should use the single-process Python fast path when available"
+        );
+        // The Codex script must NOT call `cat` to read the payload —
+        // Codex inherits an open stdin and `cat` would hang for 600 s.
+        assert!(
+            !s.contains("cat || true"),
+            "Codex dispatcher must not read stdin via cat (hang risk)"
+        );
+        // It must instead read positional arg 2 (with `{}` fallback).
+        assert!(
+            s.contains(r#"PAYLOAD="$2""#) && s.contains(r#"PAYLOAD="{}""#),
+            "Codex dispatcher must read payload from argv[2] with explicit fallback"
+        );
+        // No PermissionRequest case — Codex has no equivalent event.
+        assert!(
+            !s.contains("handle_permission_request"),
+            "Codex dispatcher should not include PermissionRequest branch"
+        );
+        assert!(
+            s.contains(r#""harness":"codex""#),
+            "Codex envelope must tag harness=codex"
+        );
+        // Payload must be embedded verbatim (no escaping pass).
+        assert!(
+            s.contains(r#""payload":%s"#) && s.contains(r#""$PAYLOAD""#),
+            "Codex dispatcher must embed payload verbatim into envelope"
+        );
+        // No JSON-escaping pipeline applied to the payload.
+        assert!(
+            !s.contains(r#"$PAYLOAD" | json_escape_stdin"#),
+            "Codex dispatcher must not re-escape an already-JSON payload"
+        );
+    }
+
+    #[test]
+    fn neither_body_spawns_python_for_routine_escape() {
+        // python3 may still appear as an absolute-fallback transport,
+        // but it must NOT be the routine JSON escaper — that was the
+        // ~250 ms cold-start tax flagged in the perf review.
+        for d in [HookDispatcher::ClaudeCode, HookDispatcher::Codex] {
+            let s = body(d);
+            assert!(
+                !s.contains("python3 -c 'import json,sys"),
+                "dispatcher {:?} still uses python3 for JSON escaping",
+                d
+            );
+        }
+    }
 }
