@@ -15,6 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use raum_core::config::SessionState;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tracing::warn;
 
 pub const RAUM_TMUX_SOCKET: &str = "raum";
 
@@ -155,27 +156,18 @@ impl TmuxManager {
     /// Idempotent: tmux's `set` clobbers prior values, so calling this on
     /// every launch is safe even when the server is already running.
     pub fn apply_server_options(&self) -> Result<(), TmuxError> {
-        // Disable the prefix key entirely. Without this, Ctrl-B (and any
-        // re-bound prefix) would be swallowed by the attached client instead
-        // of reaching the inner harness.
-        let _ = self
-            .cmd()
-            .args(["set-option", "-g", "prefix", "None"])
-            .status();
-        // Drop every default key binding. Belt-and-suspenders for the prefix
-        // override above — we don't want any tmux command to fire from a
-        // user keystroke.
-        let _ = self.cmd().args(["unbind-key", "-a"]).status();
+        // `set-option -g prefix None` is sufficient on its own: with no prefix
+        // key, no key-table binding can fire from a user keystroke. We
+        // deliberately do NOT follow up with `unbind-key -a` — that deletes
+        // the `prefix` and `root` key-tables entirely, after which any later
+        // tmux op (including ones inside `attach-session`'s key-dispatch
+        // path) that touches a missing table emits `table prefix doesn't
+        // exist` on the parent's stderr.
+        self.run_quiet(&["set-option", "-g", "prefix", "None"]);
         // Zero ESC delay. Ink/Codex/vim depend on fast Esc detection.
-        let _ = self
-            .cmd()
-            .args(["set-option", "-s", "escape-time", "0"])
-            .status();
+        self.run_quiet(&["set-option", "-s", "escape-time", "0"]);
         // Hide the status bar — we don't need it stealing a row of viewport.
-        let _ = self
-            .cmd()
-            .args(["set-option", "-g", "status", "off"])
-            .status();
+        self.run_quiet(&["set-option", "-g", "status", "off"]);
         // Strip smcup/rmcup from the attached client's terminfo. Without this,
         // `tmux attach-session` emits the alt-screen enter sequence into
         // xterm.js on connect, which parks the webview in its alternate
@@ -184,27 +176,46 @@ impl TmuxManager {
         // (attached-client) layer keeps the inner pane's alt-screen handling
         // untouched, so TUIs running inside tmux still get their alt-screen
         // on the pane.
-        let _ = self
-            .cmd()
-            .args([
-                "set-option",
-                "-s",
-                "terminal-overrides",
-                ",xterm-256color:smcup@:rmcup@",
-            ])
-            .status();
+        self.run_quiet(&[
+            "set-option",
+            "-s",
+            "terminal-overrides",
+            ",xterm-256color:smcup@:rmcup@",
+        ]);
         // Don't synthesize focus reporting at the tmux layer. The inner
         // process can request `?1004h` directly if it cares.
-        let _ = self
-            .cmd()
-            .args(["set-option", "-g", "focus-events", "off"])
-            .status();
+        self.run_quiet(&["set-option", "-g", "focus-events", "off"]);
         // Don't emit DECSLRM / xterm title escapes from tmux.
-        let _ = self
-            .cmd()
-            .args(["set-option", "-g", "set-titles", "off"])
-            .status();
+        self.run_quiet(&["set-option", "-g", "set-titles", "off"]);
         Ok(())
+    }
+
+    /// Fire-and-forget tmux invocation used for idempotent option setters.
+    /// Captures stderr and routes any unexpected output through `tracing::warn!`
+    /// keyed by the subcommand, instead of inheriting it onto the parent
+    /// process's stderr (where it would surface in the dev console).
+    /// Cold-socket "no server running" / "error connecting" lines are
+    /// expected during early bootstrap and are swallowed silently.
+    fn run_quiet(&self, args: &[&str]) {
+        let out = match self.cmd().args(args).output() {
+            Ok(o) => o,
+            Err(e) => {
+                warn!(args = ?args, error = %e, "tmux invocation failed to spawn");
+                return;
+            }
+        };
+        if out.status.success() {
+            return;
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let trimmed = stderr.trim();
+        if trimmed.is_empty()
+            || trimmed.contains("no server running")
+            || trimmed.contains("error connecting")
+        {
+            return;
+        }
+        warn!(args = ?args, stderr = %trimmed, "tmux invocation reported error");
     }
 
     pub fn list_sessions(&self) -> Result<Vec<TmuxSession>, TmuxError> {
@@ -352,14 +363,8 @@ impl TmuxManager {
         // exposure. xterm.js's own 10 000-line scrollback is the visible
         // history surface today; keeping tmux's matches it in case we surface
         // copy-mode through a command palette entry later.
-        let _ = self
-            .cmd()
-            .args(["set-option", "-t", id, "history-limit", "10000"])
-            .status();
-        let _ = self
-            .cmd()
-            .args(["set-option", "-t", id, "remain-on-exit", "on"])
-            .status();
+        self.run_quiet(&["set-option", "-t", id, "history-limit", "10000"]);
+        self.run_quiet(&["set-option", "-t", id, "remain-on-exit", "on"]);
         // Pin the window size to whatever raum drives via `resize-window`,
         // regardless of attached-client geometry. tmux's auto modes
         // (`latest`/`largest`/etc.) don't fire reliably on every tmux build
@@ -368,33 +373,24 @@ impl TmuxManager {
         // the difference with its hatched "viewport > pane" pattern. Manual
         // mode plus explicit `tmux resize-window` from the resize command
         // makes our intent the source of truth.
-        let _ = self
-            .cmd()
-            .args(["set-option", "-t", id, "window-size", "manual"])
-            .status();
+        self.run_quiet(&["set-option", "-t", id, "window-size", "manual"]);
         // Hide the status bar on this specific session. `apply_server_options`
         // sets `-g status off`, but that only sticks if the tmux server is
         // alive when it runs — on a clean launch the server may start just to
         // answer the `-g` set and then exit (no sessions yet), discarding the
         // global value. Setting it session-local here is race-free.
-        let _ = self
-            .cmd()
-            .args(["set-option", "-t", id, "status", "off"])
-            .status();
+        self.run_quiet(&["set-option", "-t", id, "status", "off"]);
         // Re-apply the server-wide smcup/rmcup strip now that we know the
         // server is alive (the session we just created is keeping it up).
         // `terminal-overrides` is a server option, so it can't be mirrored
         // per-session the way `status off` is — but setting it with the
         // server guaranteed-alive here avoids the same cold-start race.
-        let _ = self
-            .cmd()
-            .args([
-                "set-option",
-                "-s",
-                "terminal-overrides",
-                ",xterm-256color:smcup@:rmcup@",
-            ])
-            .status();
+        self.run_quiet(&[
+            "set-option",
+            "-s",
+            "terminal-overrides",
+            ",xterm-256color:smcup@:rmcup@",
+        ]);
         Ok(())
     }
 

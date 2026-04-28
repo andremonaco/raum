@@ -32,7 +32,6 @@ tokio = { version = "1", features = [
     "process",
     "macros",
 ] }
-notify = { version = "6", default-features = false, features = ["macos_kqueue"] }
 slug = "0.1"
 once_cell = "1"
 parking_lot = "0.12"
@@ -60,4 +59,4 @@ raum-hooks = { path = "../raum-hooks" }
 
 [package.metadata.cargo-machete]
 # Used via re-exports or macro expansion that machete cannot trace statically.
-ignored = ["directories", "notify", "once_cell", "parking_lot"]
+ignored = ["directories", "once_cell", "parking_lot"]
