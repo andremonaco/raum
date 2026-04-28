@@ -1315,26 +1315,41 @@ pub async fn terminal_reattach<R: Runtime>(
         (Some(dirty_tx), Some(task))
     };
 
-    // Replay the pane snapshot into xterm.js before the live client attaches.
-    // The fresh xterm instance has no local history of its own; without this
-    // replay the user loses both durable shell history and the last visible
-    // TUI frame on every app reload.
-    //
-    // tmux exposes these two surfaces separately:
-    // - the visible pane surface (plain `capture-pane`) which is the active
-    //   alternate-screen frame when one is live
-    // - the underlying durable normal-buffer history (`capture-pane -a`) while
-    //   alternate-screen is active
-    //
-    // We write the normal history first, then switch xterm into alt-screen and
-    // paint the captured live frame when present. The subsequent live attach
-    // overwrites the viewport again but leaves the recovered normal buffer in
-    // place for dedicated history browsing.
+    // Resize tmux before replaying a snapshot. Otherwise a restart into a
+    // larger window first paints the old, smaller tmux surface and only fixes
+    // itself once the live attached client catches up.
+    {
+        let tmux_for_resize = tmux.clone();
+        let id_for_resize = session_id.clone();
+        match tokio::task::spawn_blocking(move || {
+            tmux_for_resize.resize(&id_for_resize, u32::from(cols), u32::from(rows))
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "terminal_reattach: pre-snapshot resize failed"
+            ),
+            Err(e) => tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "terminal_reattach: pre-snapshot resize task failed"
+            ),
+        }
+    }
+
+    // Replay a bounded viewport snapshot into xterm.js before the live client
+    // attaches. This gives the user an immediate frame without forcing every
+    // restart to capture and stream the full 10k-line tmux history for every
+    // pane. Full plain-text history remains available through tmux-backed
+    // search.
     {
         let tmux_for_capture = tmux.clone();
         let id_for_capture = session_id.clone();
         match tokio::task::spawn_blocking(move || {
-            tmux_for_capture.capture_pane_snapshot(&id_for_capture)
+            tmux_for_capture.capture_pane_view_snapshot(&id_for_capture, rows)
         })
         .await
         {

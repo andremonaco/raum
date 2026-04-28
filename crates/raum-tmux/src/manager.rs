@@ -513,6 +513,31 @@ impl TmuxManager {
         })
     }
 
+    /// Capture only the recent visible pane state needed for a fast reattach
+    /// paint. This intentionally avoids walking the full tmux history because
+    /// app restart may reattach many panes at once, and full-history replay
+    /// delays the live PTY bridge.
+    pub fn capture_pane_view_snapshot(
+        &self,
+        id: &str,
+        line_count: u16,
+    ) -> Result<PaneSnapshot, TmuxError> {
+        let line_count = line_count.max(1);
+        let alternate_on = self.is_alternate_on(id)?;
+        if alternate_on {
+            let alternate = self.capture_pane_recent(id, false, line_count)?;
+            return Ok(PaneSnapshot {
+                normal: Vec::new(),
+                alternate: Some(alternate),
+            });
+        }
+
+        Ok(PaneSnapshot {
+            normal: self.capture_pane_recent(id, false, line_count)?,
+            alternate: None,
+        })
+    }
+
     /// Plain-text variant of [`Self::capture_pane_snapshot`] for the global
     /// search panel. Returns the pane's full scrollback (and the alt-screen
     /// frame, if active) as decoded UTF-8 with no ANSI escapes — ready to
@@ -584,6 +609,29 @@ impl TmuxManager {
             cmd.arg("-a");
         }
         cmd.args(["-S", "-", "-E", "-", "-t", id]);
+        let out = cmd.output()?;
+        if !out.status.success() {
+            return Err(TmuxError::NonZero {
+                status: out.status.code().unwrap_or(-1),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            });
+        }
+        Ok(rewrite_lf_to_crlf(out.stdout))
+    }
+
+    fn capture_pane_recent(
+        &self,
+        id: &str,
+        alternate_mode: bool,
+        line_count: u16,
+    ) -> Result<Vec<u8>, TmuxError> {
+        let mut cmd = self.cmd();
+        cmd.args(["capture-pane", "-p", "-e"]);
+        if alternate_mode {
+            cmd.arg("-a");
+        }
+        let start = format!("-{}", line_count.saturating_sub(1));
+        cmd.args(["-S", &start, "-E", "-", "-t", id]);
         let out = cmd.output()?;
         if !out.status.success() {
             return Err(TmuxError::NonZero {
