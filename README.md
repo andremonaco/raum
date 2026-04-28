@@ -14,6 +14,10 @@
     <a href="LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square"></a>
     <img alt="platforms" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey?style=flat-square">
   </p>
+
+  <br>
+
+  <img src="assets/demo.gif" alt="raum demo" width="900">
 </div>
 
 ---
