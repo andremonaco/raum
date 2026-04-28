@@ -691,7 +691,7 @@ const WorktreeRow: Component<WorktreeRowProps> = (rowProps) => {
           the row or set the active worktree. */}
       <button
         type="button"
-        class="absolute right-1 top-1 flex size-5 items-center justify-center rounded text-foreground-dim opacity-0 transition-opacity hover:bg-hover hover:text-destructive focus-visible:opacity-100 group-hover/wt:opacity-100"
+        class="absolute right-1 top-1 flex size-5 items-center justify-center rounded text-foreground-dim opacity-0 transition-all duration-100 hover:bg-hover hover:text-destructive focus-visible:opacity-100 active:scale-90 group-hover/wt:opacity-100"
         title={deleteTitle()}
         aria-label={deleteTitle()}
         onClick={(ev) => {
@@ -1673,7 +1673,7 @@ export const Sidebar: Component = () => {
             />
             <button
               type="button"
-              class="flex h-7 w-7 shrink-0 items-center justify-center rounded bg-selected text-base leading-none text-muted-foreground hover:bg-hover hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+              class="flex h-7 w-7 shrink-0 items-center justify-center rounded bg-selected text-base leading-none text-muted-foreground transition-all duration-100 hover:bg-hover hover:text-foreground active:scale-90 disabled:cursor-not-allowed disabled:opacity-40 disabled:active:scale-100"
               title={activeProjectSlug() ? "New worktree" : "Select a project first"}
               disabled={!activeProjectSlug()}
               onClick={() => setCreateModalSlug(activeProjectSlug() ?? null)}
