@@ -24,11 +24,10 @@ Optional (only required if you want to spawn the matching harness):
 
 Install raum itself:
 
-- **macOS** — `brew install --cask andremonaco/raum/raum`. The cask strips
-  Gatekeeper's quarantine flag so the ad-hoc-signed bundle launches directly;
-  direct `.dmg` downloads from the [latest release][releases] currently
-  require `xattr -dr com.apple.quarantine /Applications/raum.app` once after
-  installing, until Developer ID notarization lands.
+- **macOS** — `brew install --cask andremonaco/raum/raum`, or download the
+  Developer ID-signed and Apple-notarized `.dmg` from the
+  [latest release][releases]. Both paths launch from Finder without Gatekeeper
+  prompts.
 - **Linux** — install the `.deb` (Ubuntu/Debian) or run the `.AppImage`
   (anything with FUSE) from the [latest release][releases].
 

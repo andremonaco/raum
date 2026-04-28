@@ -167,16 +167,6 @@ Use the **Run workflow** button on the `release` action. Both
 release-plz jobs are idempotent — they no-op when there's no pending
 work.
 
-<!-- TODO(§14.6): Publishing the first notarized draft still requires a
-maintainer with the Apple Developer ID certificates and the Tauri updater
-signing key configured as GitHub Actions secrets. Once those are in
-place, the seed tag above kicks the automation into life and subsequent
-releases are hands-off until the publish step. Until then the DMGs are
-ad-hoc signed and the Homebrew cask strips `com.apple.quarantine` in a
-`postflight` block (`packaging/homebrew/Casks/raum.rb`) so brew users
-don't hit the Gatekeeper "cannot verify" dialog; the Apple env vars to
-re-enable are at `.github/workflows/release.yml:107-120`. -->
-
 ## Post-release smoke test (§14.7)
 
 Run the following checklist on a fresh macOS and a fresh Linux VM (no prior
@@ -185,10 +175,10 @@ install-path wiring, recovery, presets, and search.
 
 - [ ] macOS VM: install via `brew install --cask andremonaco/raum/raum` on
       the bumped tap, launch from Finder. Gatekeeper should not complain.
-      (If it does, the cask's `postflight` quarantine strip didn't run — or,
-      once notarization is enabled, the notarization step failed.) Direct
-      `.dmg` downloads still hit Gatekeeper today; that path will clear when
-      Developer ID signing lands.
+      (If it does, the notarization step in `release.yml` failed — re-check
+      the `APPLE_*` secrets and the build job logs.) Repeat with a direct
+      `.dmg` download from the GitHub Release; both paths must launch
+      cleanly.
 - [ ] Linux VM (Ubuntu): install the `.deb` with
       `sudo dpkg -i raum_*_amd64.deb`. Launch from the app grid.
 - [ ] Linux VM (anything with FUSE): run the `.AppImage` directly.

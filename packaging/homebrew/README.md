@@ -19,22 +19,11 @@ identically afterwards.
 
 ## Signing status
 
-The DMGs published on GitHub Releases are **ad-hoc signed**, not signed
-with an Apple Developer ID and not notarized. Launching a quarantined
-ad-hoc bundle via Finder on macOS Sonoma/Sequoia triggers Gatekeeper's
-"cannot verify … Move to Bin" dialog.
-
-The cask works around this with a `postflight` block that removes the
-`com.apple.quarantine` extended attribute from the staged app, so the
-dialog never appears for users installing via `brew install --cask`.
-Users who download the `.dmg` directly from GitHub Releases will still
-hit the dialog and can run `xattr -dr com.apple.quarantine
-/Applications/raum.app` to clear it manually.
-
-Moving to full Developer ID signing + notarization is tracked as a
-follow-up in [`docs/release.md`](../../docs/release.md); the required
-secrets and workflow wiring are already documented there. When that
-lands, the `postflight` block can be removed.
+The DMGs published on GitHub Releases are signed with an Apple
+Developer ID and notarized by Apple. Both `brew install --cask` and
+direct `.dmg` downloads launch from Finder without Gatekeeper
+prompts. The signing + notarization wiring lives in
+[`docs/release.md`](../../docs/release.md).
 
 ## One-time setup (maintainer)
 
