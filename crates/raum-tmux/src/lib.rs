@@ -7,9 +7,11 @@
 
 #![allow(clippy::cast_possible_truncation)]
 
+pub mod coalescer;
 pub mod manager;
 pub mod pty_bridge;
 
+pub use coalescer::{FLUSH_BYTES, FLUSH_MS, StreamCoalescer};
 pub use manager::{
     PaneContext, PaneSnapshot, PaneTextSnapshot, RAUM_TMUX_SOCKET, RecoveryReport, TmuxError,
     TmuxManager, TmuxSession,

@@ -359,10 +359,11 @@ impl TmuxManager {
                 stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             });
         }
-        // §3.8 — retain tmux scrollback as a safety net for future copy-mode
-        // exposure. xterm.js's own 10 000-line scrollback is the visible
-        // history surface today; keeping tmux's matches it in case we surface
-        // copy-mode through a command palette entry later.
+        // §3.8 — retain tmux scrollback as the source of truth for reattach
+        // replay. `terminal_reattach` calls `capture_pane_snapshot`, which
+        // pulls this whole buffer back into xterm.js after restart, so this
+        // value is coupled to `frontend/src/lib/scrollbackConfig.ts`'s
+        // `SCROLLBACK_MAX`. Keep them aligned — the smaller of the two wins.
         self.run_quiet(&["set-option", "-t", id, "history-limit", "10000"]);
         self.run_quiet(&["set-option", "-t", id, "remain-on-exit", "on"]);
         // Pin the window size to whatever raum drives via `resize-window`,
@@ -509,10 +510,15 @@ impl TmuxManager {
         })
     }
 
-    /// Capture only the recent visible pane state needed for a fast reattach
-    /// paint. This intentionally avoids walking the full tmux history because
-    /// app restart may reattach many panes at once, and full-history replay
-    /// delays the live PTY bridge.
+    /// Capture only the recent visible pane state. Required because non-
+    /// alt-screen Ink-style TUIs (Claude Code, OpenCode) do cursor-positioned
+    /// in-place updates: tmux's scrollback faithfully records every
+    /// intermediate redraw frame as rows scroll off, plus mixed widths from
+    /// any pane resize. Replaying that into xterm produces visible
+    /// corruption (overlapping rules, ghost prompts, mismatched widths).
+    /// Capturing only the bottom `line_count` lines yields the latest clean
+    /// frame the user already sees in normal use; the live tmux client
+    /// repaints the visible area immediately on attach.
     pub fn capture_pane_view_snapshot(
         &self,
         id: &str,
@@ -584,7 +590,12 @@ impl TmuxManager {
         Ok(parse_pane_context(&line))
     }
 
-    fn is_alternate_on(&self, id: &str) -> Result<bool, TmuxError> {
+    /// Whether the pane currently has the alternate screen buffer active
+    /// (TUIs like `vim`, `htop`, Codex). Callers need this to choose between
+    /// full-history capture (alt-screen apps cleanly separate the alt frame
+    /// from the underlying normal scrollback) and viewport-only capture
+    /// (non-alt TUIs corrupt scrollback with in-place redraws).
+    pub fn is_alternate_on(&self, id: &str) -> Result<bool, TmuxError> {
         let out = self
             .cmd()
             .args(["display-message", "-p", "-t", id, "#{alternate_on}"])

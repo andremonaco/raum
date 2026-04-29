@@ -207,7 +207,7 @@ pub fn attach_via_pty(
     session_id: &str,
     cols: u16,
     rows: u16,
-    mut on_data: DataSink,
+    on_data: DataSink,
     on_exit: ExitSink,
 ) -> Result<PtyBridgeHandle, PtyBridgeError> {
     let pty_system = native_pty_system();
@@ -258,9 +258,21 @@ pub fn attach_via_pty(
         .take_writer()
         .map_err(|e| PtyBridgeError::TakeWriter(e.to_string()))?;
 
-    // Reader thread: pulls bytes off the master and hands them to `on_data`.
-    // Detached — the reader exits when the master fd is closed (drop) or
-    // when `on_data` returns false (frontend channel gone).
+    // The reader+coalescer pair below splits PTY draining from IPC framing.
+    //
+    // - Reader thread: blocks on the master fd and shovels every read into a
+    //   bounded channel. Stays decoupled from downstream send latency so the
+    //   kernel PTY buffer keeps draining even if the WebView is busy.
+    // - Coalescer thread: owns `on_data` and a `StreamCoalescer`. Batches
+    //   reads into [`FLUSH_BYTES`]-sized (or [`FLUSH_MS`]-aged) frames before
+    //   invoking the callback, so a bursty agent (e.g. Claude Code emitting a
+    //   plan as one ~50 KB write) crosses the IPC as a few large messages
+    //   instead of dozens of ~16 KB ones.
+    //
+    // Both detach. They exit cleanly on master EOF or on `on_data` returning
+    // false. The coalescer force-flushes its tail buffer on shutdown so the
+    // last bytes of a burst aren't dropped.
+    let (data_tx, data_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
     let reader_session = session_id.to_string();
     std::thread::Builder::new()
         .name(format!("raum-pty-reader-{session_id}"))
@@ -270,8 +282,7 @@ pub fn attach_via_pty(
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        let chunk = buf[..n].to_vec();
-                        if !on_data(chunk) {
+                        if data_tx.send(buf[..n].to_vec()).is_err() {
                             break;
                         }
                     }
@@ -292,6 +303,48 @@ pub fn attach_via_pty(
                     }
                 }
             }
+            // Drop `data_tx` so the coalescer thread observes channel close.
+        })
+        .map_err(|e| PtyBridgeError::Spawn(e.to_string()))?;
+
+    let coalescer_session = session_id.to_string();
+    std::thread::Builder::new()
+        .name(format!("raum-pty-coalescer-{session_id}"))
+        .spawn(move || {
+            use std::sync::mpsc::RecvTimeoutError;
+            use std::time::Duration;
+
+            use crate::coalescer::{FLUSH_MS, StreamCoalescer};
+
+            let mut on_data = on_data;
+            let mut sink = move |bytes: Vec<u8>| -> bool { on_data(bytes) };
+            let mut coalescer = StreamCoalescer::new();
+            let timeout = Duration::from_millis(FLUSH_MS);
+            loop {
+                match data_rx.recv_timeout(timeout) {
+                    Ok(chunk) => {
+                        if !coalescer.feed(&chunk, &mut sink) {
+                            break;
+                        }
+                        if !coalescer.flush_if_due(&mut sink) {
+                            break;
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => {
+                        if !coalescer.flush_if_due(&mut sink) {
+                            break;
+                        }
+                    }
+                    Err(RecvTimeoutError::Disconnected) => {
+                        let _ = coalescer.force_flush(&mut sink);
+                        break;
+                    }
+                }
+            }
+            tracing::debug!(
+                session_id = %coalescer_session,
+                "pty bridge: coalescer exited",
+            );
         })
         .map_err(|e| PtyBridgeError::Spawn(e.to_string()))?;
 
