@@ -192,6 +192,8 @@ pub fn run() {
             commands::worktree_branch_merged,
             commands::git_checkout_branch,
             commands::worktree_remove,
+            commands::worktree_merge_preview,
+            commands::worktree_merge,
             commands::worktree_config_write,
             // §9 — sidebar surface (Wave 3C).
             commands::worktree_status,

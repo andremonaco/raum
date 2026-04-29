@@ -70,7 +70,15 @@ import {
   idsByWorktreeId,
   terminalStore,
 } from "../stores/terminalStore";
-import { ActivityIcon, AlertCircleIcon, CheckIcon, LoaderIcon, PlusIcon } from "./icons";
+import {
+  ActivityIcon,
+  AlertCircleIcon,
+  CheckIcon,
+  GitMergeIcon,
+  GridEqualIcon,
+  LoaderIcon,
+  PlusIcon,
+} from "./icons";
 import { CreateWorktreeModal } from "./create-worktree-modal";
 import { Button } from "./ui/button";
 import {
@@ -81,6 +89,7 @@ import {
   DialogPortal,
   DialogTitle,
 } from "./ui/dialog";
+import { Tooltip, TooltipContent, TooltipPortal, TooltipTrigger } from "./ui/tooltip";
 const DiffViewerModal = lazy(() =>
   import("./diff-viewer-modal").then((m) => ({ default: m.DiffViewerModal })),
 );
@@ -89,6 +98,9 @@ const FileEditorModal = lazy(() =>
 );
 const DeleteWorktreeModal = lazy(() =>
   import("./delete-worktree-modal").then((m) => ({ default: m.DeleteWorktreeModal })),
+);
+const MergeWorktreeModal = lazy(() =>
+  import("./merge-worktree-modal").then((m) => ({ default: m.MergeWorktreeModal })),
 );
 const UnlinkProjectModal = lazy(() =>
   import("./unlink-project-modal").then((m) => ({ default: m.UnlinkProjectModal })),
@@ -289,6 +301,11 @@ interface WorktreeRowProps {
   mainBranchFallback: string | null;
   /** Called when the user clicks the row-level delete icon. */
   onRequestDelete: () => void;
+  /**
+   * Called when the user clicks the row-level merge icon.
+   * `null` for main worktrees (no merge target — they ARE the target).
+   */
+  onRequestMerge?: () => void;
 }
 
 /**
@@ -686,58 +703,84 @@ const WorktreeRow: Component<WorktreeRowProps> = (rowProps) => {
         </span>
       </button>
 
-      {/* Row-level delete/unlink button — hover-revealed, top-right.
-          Sits outside the main button so the click doesn't also expand
-          the row or set the active worktree. */}
-      <button
-        type="button"
-        class="absolute right-1 top-1 flex size-5 items-center justify-center rounded text-foreground-dim opacity-0 transition-all duration-100 hover:bg-hover hover:text-destructive focus-visible:opacity-100 active:scale-90 group-hover/wt:opacity-100"
-        title={deleteTitle()}
-        aria-label={deleteTitle()}
-        onClick={(ev) => {
-          ev.stopPropagation();
-          rowProps.onRequestDelete();
-        }}
-      >
-        <Show
-          when={rowProps.isMain}
-          fallback={
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="1.8"
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              class="size-3.5"
-              aria-hidden="true"
+      {/* Row-level action cluster (merge + delete/unlink) — hover-revealed,
+          top-right. Sits outside the main button so a click doesn't also
+          expand the row or set the active worktree. */}
+      <div class="absolute right-1 top-1 flex items-center gap-0.5 opacity-0 transition-opacity duration-100 focus-within:opacity-100 group-hover/wt:opacity-100">
+        <Show when={!rowProps.isMain && rowProps.onRequestMerge}>
+          <Tooltip>
+            <TooltipTrigger
+              as="button"
+              type="button"
+              class="flex size-5 items-center justify-center rounded text-foreground-dim transition-all duration-100 hover:bg-hover hover:text-success active:scale-90"
+              aria-label="Merge worktree into its base branch"
+              onClick={(ev: MouseEvent) => {
+                ev.stopPropagation();
+                rowProps.onRequestMerge?.();
+              }}
             >
-              <polyline points="3 6 5 6 21 6" />
-              <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
-              <path d="M10 11v6" />
-              <path d="M14 11v6" />
-              <path d="M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2" />
-            </svg>
-          }
-        >
-          <svg
-            xmlns="http://www.w3.org/2000/svg"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.8"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            class="size-3.5"
-            aria-hidden="true"
-          >
-            <path d="M18.84 12.25 11 20.09a5.5 5.5 0 0 1-7.78-7.78l1.41-1.41" />
-            <path d="m5.16 11.75 7.84-7.84a5.5 5.5 0 0 1 7.78 7.78l-1.41 1.41" />
-            <line x1="2" y1="2" x2="22" y2="22" />
-          </svg>
+              <GitMergeIcon class="size-3.5" />
+            </TooltipTrigger>
+            <TooltipPortal>
+              <TooltipContent>Merge into base branch</TooltipContent>
+            </TooltipPortal>
+          </Tooltip>
         </Show>
-      </button>
+        <Tooltip>
+          <TooltipTrigger
+            as="button"
+            type="button"
+            class="flex size-5 items-center justify-center rounded text-foreground-dim transition-all duration-100 hover:bg-hover hover:text-destructive active:scale-90"
+            aria-label={deleteTitle()}
+            onClick={(ev: MouseEvent) => {
+              ev.stopPropagation();
+              rowProps.onRequestDelete();
+            }}
+          >
+            <Show
+              when={rowProps.isMain}
+              fallback={
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.8"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  class="size-3.5"
+                  aria-hidden="true"
+                >
+                  <polyline points="3 6 5 6 21 6" />
+                  <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+                  <path d="M10 11v6" />
+                  <path d="M14 11v6" />
+                  <path d="M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2" />
+                </svg>
+              }
+            >
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.8"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                class="size-3.5"
+                aria-hidden="true"
+              >
+                <path d="M18.84 12.25 11 20.09a5.5 5.5 0 0 1-7.78-7.78l1.41-1.41" />
+                <path d="m5.16 11.75 7.84-7.84a5.5 5.5 0 0 1 7.78 7.78l-1.41 1.41" />
+                <line x1="2" y1="2" x2="22" y2="22" />
+              </svg>
+            </Show>
+          </TooltipTrigger>
+          <TooltipPortal>
+            <TooltipContent>{deleteTitle()}</TooltipContent>
+          </TooltipPortal>
+        </Tooltip>
+      </div>
 
       <Show when={diffTarget() !== null}>
         <Suspense>
@@ -1207,9 +1250,7 @@ const AllTerminalsRow: Component<AllTerminalsRowProps> = (rowProps) => {
         onClick={() => setActiveWorktreeAll(rowProps.projectSlug)}
         title="Show terminals across all worktrees; new spawns land in the project root"
       >
-        <span class="mt-0.5 shrink-0 font-mono text-[10px] text-foreground-dim" aria-hidden="true">
-          ∗
-        </span>
+        <GridEqualIcon class="size-3 shrink-0 text-foreground-dim" />
         <span
           class="flex-1 truncate font-mono text-xs"
           classList={{
@@ -1254,6 +1295,11 @@ const ProjectSection: Component<ProjectSectionProps> = (sectionProps) => {
     { kind: "wt"; wt: Worktree } | { kind: "project" } | null
   >(null);
   const closeDeleteTarget = () => setDeleteTarget(null);
+
+  // Merge target — `null` means closed. Opens MergeWorktreeModal for the
+  // selected non-main worktree.
+  const [mergeTarget, setMergeTarget] = createSignal<Worktree | null>(null);
+  const closeMergeTarget = () => setMergeTarget(null);
 
   const items = createMemo(() => {
     const cached = worktreesByProject()[slug()];
@@ -1353,6 +1399,7 @@ const ProjectSection: Component<ProjectSectionProps> = (sectionProps) => {
                     isMain={false}
                     mainBranchFallback={mainWorktree()?.branch ?? null}
                     onRequestDelete={() => setDeleteTarget({ kind: "wt", wt })}
+                    onRequestMerge={() => setMergeTarget(wt)}
                   />
                 )}
               </For>
@@ -1403,6 +1450,23 @@ const ProjectSection: Component<ProjectSectionProps> = (sectionProps) => {
           </Suspense>
         );
       })()}
+
+      <Show when={mergeTarget()}>
+        {(wt) => (
+          <Suspense>
+            <MergeWorktreeModal
+              open={true}
+              projectSlug={slug()}
+              worktree={wt()}
+              onClose={closeMergeTarget}
+              onMerged={() => {
+                clearWorktreeListCache(slug());
+                void refreshWorktreeList(slug());
+              }}
+            />
+          </Suspense>
+        )}
+      </Show>
     </section>
   );
 };
@@ -1582,16 +1646,13 @@ export const Sidebar: Component = () => {
                       title={`All terminals — ${allCounts().active} active · ${allCounts().waiting} waiting · ${allCounts().idle} idle`}
                       onClick={() => setActiveWorktreeAll(project().slug)}
                     >
-                      <span
-                        class="font-mono text-[10px] leading-none"
+                      <GridEqualIcon
+                        class="size-3"
                         classList={{
                           "text-foreground": isAllActiveMini(),
                           "text-foreground-dim": !isAllActiveMini(),
                         }}
-                        aria-hidden="true"
-                      >
-                        ∗
-                      </span>
+                      />
                     </button>
                     <For each={wts()}>
                       {(wt) => {
