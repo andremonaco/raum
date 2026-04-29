@@ -182,8 +182,11 @@ fi
 
 "#;
 
-/// Python fast path for Codex hook events. Codex passes the payload as argv,
-/// not stdin, so this path must not read stdin.
+/// Python fast path for Codex hook events. Codex pipes the JSON payload on
+/// stdin (see https://developers.openai.com/codex/hooks); argv carries the
+/// event name only. The legacy top-level `notify = [...]` script uses the
+/// argv shape — that one lives in `codex.rs::codex_notify_script_body`,
+/// not here.
 const PYTHON_CODEX_FAST_PATH: &str = r#"PYTHON_BIN=""
 if [ -x /usr/bin/python3 ]; then
   PYTHON_BIN=/usr/bin/python3
@@ -204,9 +207,9 @@ if not sock_path:
     raise SystemExit(0)
 
 event = sys.argv[1] if len(sys.argv) > 1 else "unknown"
-payload_raw = sys.argv[2] if len(sys.argv) > 2 else "{}"
+payload_raw = sys.stdin.read()
 try:
-    payload = json.loads(payload_raw)
+    payload = json.loads(payload_raw) if payload_raw.strip() else {}
 except Exception:
     payload = {}
 session_id = os.environ.get("RAUM_SESSION") or None
@@ -363,13 +366,15 @@ esac
     )
 }
 
-/// Codex dispatcher: argv payload, fire-and-forget only.
+/// Codex dispatcher: stdin payload, fire-and-forget only.
 ///
-/// Codex invokes the script as `codex.sh <event> <json-payload>`. The
-/// payload is already valid JSON, so we embed it verbatim — re-escaping
-/// would corrupt nested strings. `PermissionRequest` is omitted because
-/// Codex doesn't have an equivalent hook event; the JSON shapes returned
-/// by `handle_permission_request` are Claude-Code-specific.
+/// Codex's `[hooks]` runtime invokes the script as `codex.sh <event>` and
+/// pipes the JSON payload on stdin (see
+/// https://developers.openai.com/codex/hooks). The payload is already
+/// valid JSON, so we embed it verbatim — re-escaping would corrupt
+/// nested strings. `PermissionRequest` is omitted because Codex doesn't
+/// have an equivalent hook event; the JSON shapes returned by
+/// `handle_permission_request` are Claude-Code-specific.
 fn body_codex() -> String {
     format!(
         r#"#!/usr/bin/env sh
@@ -379,16 +384,10 @@ if [ -z "$SOCK" ]; then exit 0; fi
 {PYTHON_CODEX_FAST_PATH}
 EVENT_NAME="${{1:-unknown}}"
 SESSION_ID="${{RAUM_SESSION:-}}"
-# Codex hands the JSON payload as the LAST argv. The explicit if/else
-# is intentional: the natural-looking `${{2-{{}}}}` fails because POSIX
-# brace-matching closes the parameter expansion at the first inner
-# brace, leaking a stray brace into the payload (same trap documented
-# at the top of codex-notify.sh).
-# Reading stdin via `cat` would block until Codex's 600 s hook timeout
-# instead, since Codex inherits its own (open) stdin into the child.
-if [ $# -ge 2 ]; then
-  PAYLOAD="$2"
-else
+# Codex pipes the JSON payload on stdin. Empty stdin → fall back to
+# `{{}}` so the envelope still parses downstream.
+PAYLOAD="$(cat || true)"
+if [ -z "$PAYLOAD" ]; then
   PAYLOAD="{{}}"
 fi
 
@@ -449,22 +448,31 @@ mod tests {
     }
 
     #[test]
-    fn codex_body_reads_argv_not_stdin() {
+    fn codex_body_reads_stdin_not_argv() {
         let s = body(HookDispatcher::Codex);
         assert!(
             s.contains(r#"exec "$PYTHON_BIN" -c"#),
             "Codex dispatcher should use the single-process Python fast path when available"
         );
-        // The Codex script must NOT call `cat` to read the payload —
-        // Codex inherits an open stdin and `cat` would hang for 600 s.
+        // Codex's `[hooks]` runtime pipes the JSON on stdin, not argv.
+        // The shell fallback must read it via `cat`.
         assert!(
-            !s.contains("cat || true"),
-            "Codex dispatcher must not read stdin via cat (hang risk)"
+            s.contains(r#"PAYLOAD="$(cat || true)""#),
+            "Codex shell fallback must read stdin payload via cat"
         );
-        // It must instead read positional arg 2 (with `{}` fallback).
+        // The Python fast path must read sys.stdin, not sys.argv[2].
         assert!(
-            s.contains(r#"PAYLOAD="$2""#) && s.contains(r#"PAYLOAD="{}""#),
-            "Codex dispatcher must read payload from argv[2] with explicit fallback"
+            s.contains("payload_raw = sys.stdin.read()"),
+            "Codex Python fast path must read payload from stdin"
+        );
+        assert!(
+            !s.contains("payload_raw = sys.argv[2]"),
+            "Codex dispatcher must not read payload from argv[2] (Codex pipes JSON on stdin)"
+        );
+        // Empty-stdin guard so the envelope still parses downstream.
+        assert!(
+            s.contains(r#"PAYLOAD="{}""#),
+            "Codex dispatcher must fall back to an empty JSON object on empty stdin"
         );
         // No PermissionRequest case — Codex has no equivalent event.
         assert!(

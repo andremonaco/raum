@@ -592,22 +592,29 @@ async fn codex_hook_dispatcher_forwards_lifecycle_events_to_event_socket() {
             ),
             other => panic!("unexpected event name {other}"),
         };
-        // Codex hands the payload as the LAST argv (matches
-        // `legacy_notify.rs::command.arg(notify_payload)` upstream),
-        // and inherits its own stdin into the child without closing
-        // it. We mirror both: payload-as-argv + Stdio::null() for stdin.
+        // Codex's `[hooks]` runtime invokes the script as
+        // `<script> <event>` and pipes the JSON payload on stdin (see
+        // https://developers.openai.com/codex/hooks). We mirror that
+        // here: argv carries only the event name, payload is written
+        // to the child's stdin.
         let mut child = Command::new("sh")
             .arg("-x")
             .arg(&script)
             .arg(event_name)
-            .arg(payload)
             .env("RAUM_EVENT_SOCK", &sock_path)
             .env("RAUM_SESSION", "raum-codex-1")
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            stdin.write_all(payload.as_bytes()).await.unwrap();
+            // Drop the handle so the child sees EOF — `cat` returns
+            // and the dispatcher continues.
+            drop(stdin);
+        }
         let mut child_stderr = child.stderr.take();
         let stderr_handle = tokio::spawn(async move {
             let mut buf = Vec::new();
