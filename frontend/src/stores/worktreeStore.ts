@@ -9,6 +9,8 @@ import { createSignal } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
+import { scheduleActiveSave } from "./runtimeLayoutStore";
+
 /** Shape of a worktree as surfaced by `worktree_list`. */
 export interface Worktree {
   branch: string | null;
@@ -83,14 +85,28 @@ export function getWorktreeScope(projectSlug: string): WorktreeScope {
 export function setActiveWorktree(projectSlug: string, worktreePath: string | undefined): void {
   if (worktreePath === undefined) {
     setActiveWorktreeStore("byProject", projectSlug, ALL_WORKTREES_SCOPE);
-    return;
+  } else {
+    setActiveWorktreeStore("byProject", projectSlug, { mode: "worktree", path: worktreePath });
   }
-  setActiveWorktreeStore("byProject", projectSlug, { mode: "worktree", path: worktreePath });
+  scheduleActiveSave();
 }
 
 /** Switch the sidebar selection to the cross-worktree aggregate view. */
 export function setActiveWorktreeAll(projectSlug: string): void {
   setActiveWorktreeStore("byProject", projectSlug, ALL_WORKTREES_SCOPE);
+  scheduleActiveSave();
+}
+
+/** Hydrate the per-project scope map from a saved active-layout snapshot.
+ *  Each entry pins the project's sidebar to the named worktree path; absent
+ *  entries default to the cross-worktree "all" view. Used at startup so the
+ *  view restored on the active project AND every other project (when
+ *  switched into) matches what the user last had open. */
+export function hydrateActiveWorktreeScopes(scopes: Record<string, string>): void {
+  for (const [slug, path] of Object.entries(scopes)) {
+    if (typeof path !== "string" || path.length === 0) continue;
+    setActiveWorktreeStore("byProject", slug, { mode: "worktree", path });
+  }
 }
 
 /** Legacy reader — returns the pinned worktree path, or `undefined` when "all". */

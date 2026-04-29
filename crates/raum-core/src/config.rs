@@ -564,6 +564,12 @@ pub struct ActiveLayoutState {
     pub project_slug: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_id: Option<String>,
+    /// Per-project sidebar scope at the time of save: `slug → worktree path`.
+    /// Missing slugs default to the cross-worktree "all" view on rehydrate.
+    /// Persisted so switching projects after a restart restores whichever
+    /// worktree row was active before the app was last closed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub worktree_scopes: BTreeMap<String, String>,
     #[serde(default, alias = "cell")]
     pub cells: Vec<ActiveLayoutCell>,
 }
@@ -809,10 +815,14 @@ mod tests {
 
     #[test]
     fn active_layout_state_roundtrip() {
+        let mut worktree_scopes = BTreeMap::new();
+        worktree_scopes.insert("acme".into(), "/path/to/wt".into());
+        worktree_scopes.insert("beta".into(), "/path/to/beta-feature".into());
         let state = ActiveLayoutState {
             saved_at: 1_714_000_001,
             project_slug: Some("acme".into()),
             worktree_id: Some("/path/to/wt".into()),
+            worktree_scopes,
             cells: vec![
                 ActiveLayoutCell {
                     id: "cell-1".into(),

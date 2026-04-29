@@ -26,7 +26,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import type { AgentKind } from "../lib/agentKind";
-import { matchesWorktreeScope, type WorktreeScope } from "./worktreeStore";
+import { activeProjectSlug } from "./projectStore";
+import { activeWorktreeStore, matchesWorktreeScope, type WorktreeScope } from "./worktreeStore";
 import {
   buildFromRects,
   compact,
@@ -88,6 +89,11 @@ export interface ActiveLayoutState {
   saved_at: number;
   project_slug?: string;
   worktree_id?: string;
+  /** Per-project sidebar scope: `slug → worktree path`. Missing slugs map to
+   *  the cross-worktree "all" view on rehydrate. Round-tripped so the user's
+   *  per-project worktree pin survives a restart and is reapplied as soon as
+   *  they switch back to that project. */
+  worktree_scopes?: Record<string, string>;
   cells: ActiveLayoutCell[];
 }
 
@@ -388,7 +394,20 @@ export function nextTabId(): string {
 
 let _saveTimer: ReturnType<typeof setTimeout> | null = null;
 
-function scheduleActiveSave(): void {
+/** Snapshot the per-project sidebar scope into a plain `slug → worktree path`
+ *  map suitable for the active-layout TOML. "all" mode is encoded as an
+ *  absent entry so the resulting map matches `BTreeMap::is_empty` on the
+ *  Rust side and we don't bloat the file with default-valued rows. */
+function collectWorktreeScopes(): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [slug, scope] of Object.entries(activeWorktreeStore.byProject)) {
+    if (!scope) continue;
+    if (scope.mode === "worktree") out[slug] = scope.path;
+  }
+  return out;
+}
+
+export function scheduleActiveSave(): void {
   if (_saveTimer !== null) clearTimeout(_saveTimer);
   _saveTimer = setTimeout(() => {
     _saveTimer = null;
@@ -410,8 +429,11 @@ function scheduleActiveSave(): void {
         ...(t.projectSlug ? { project_slug: t.projectSlug } : {}),
         ...(t.worktreeId ? { worktree_id: t.worktreeId } : {}),
       }));
+    const scopes = collectWorktreeScopes();
     const payload: ActiveLayoutState = {
       saved_at: Math.floor(Date.now() / 1000),
+      ...(activeProjectSlug() !== undefined ? { project_slug: activeProjectSlug() } : {}),
+      ...(Object.keys(scopes).length > 0 ? { worktree_scopes: scopes } : {}),
       cells: [
         ...inTreeCells.map((c) => ({
           id: c.id,

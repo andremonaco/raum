@@ -22,7 +22,8 @@ import { initHomeDir } from "./lib/pathDisplay";
 import { installFileDrop } from "./lib/fileDrop";
 import { previewOnboarding, setPreviewOnboarding } from "./lib/devOnboardingPreview";
 import { startShellContextPoller } from "./lib/shellContextPoller";
-import { prewarmAllWorktrees } from "./stores/worktreeStore";
+import { hydrateActiveWorktreeScopes, prewarmAllWorktrees } from "./stores/worktreeStore";
+import { setActiveProjectSlug } from "./stores/projectStore";
 import "overlayscrollbars/overlayscrollbars.css";
 
 interface RaumConfigSnapshot {
@@ -100,6 +101,21 @@ async function scheduleBackgroundUpdateCheck(snapshot: RaumConfigSnapshot): Prom
 async function hydrateActiveLayout(): Promise<void> {
   try {
     const saved = await invoke<ActiveLayoutState>("active_layout_get");
+
+    // Restore the per-project sidebar scope FIRST, before any cell-level
+    // setRuntimeLayout work. The grid's pruning pass keys on
+    // `activeWorktreeStore.byProject`, so hydrating those entries here
+    // means the very first render already shows the worktree-scoped view
+    // the user had open at shutdown — without this, every project would
+    // briefly fall back to the cross-worktree "all" aggregate before the
+    // user clicked into their pinned worktree row again.
+    if (saved.worktree_scopes) hydrateActiveWorktreeScopes(saved.worktree_scopes);
+    // Restore the previously-active project tab. Set this even when the
+    // saved layout has no cells: the user may have closed the app on an
+    // empty project and we still want that project preselected. The
+    // project-list reconcile in `setProjects` keeps this slug set as long
+    // as it still exists on disk.
+    if (saved.project_slug) setActiveProjectSlug(saved.project_slug);
 
     if (!saved.cells || saved.cells.length === 0) return;
 
