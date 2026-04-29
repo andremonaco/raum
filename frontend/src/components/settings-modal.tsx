@@ -1880,6 +1880,12 @@ const releasePageUrl = (version: string) =>
  *  release workflow's `bump-homebrew` job. */
 const BREW_UPGRADE_COMMAND = "brew upgrade --cask raum";
 
+/** GitHub's "latest release" redirector. Used as a manual fallback when the
+ *  in-app updater fails (network/cert/signature issue) so the user always
+ *  has a working escape hatch — they can grab the signed DMG / .deb /
+ *  AppImage directly. Resolves to whichever tag has the `Latest` flag. */
+const LATEST_RELEASE_URL = "https://github.com/andremonaco/raum/releases/latest";
+
 const UpdatesSection: Component = () => {
   const [currentVersion] = createResource<string>(async () => {
     try {
@@ -2016,6 +2022,19 @@ const UpdatesSection: Component = () => {
       await openUrl(releasePageUrl(version));
     } catch (e) {
       console.warn("openUrl release page failed", e);
+    }
+  };
+
+  /** Fallback target for the error state: the user can't always reach
+   *  `latest.json` over the in-app updater path (older bundled clients
+   *  hit reqwest-level failures whose detail Tauri doesn't surface), so
+   *  give them a one-click route to the GitHub releases page where
+   *  signed DMGs/.deb/.AppImage live. */
+  const openLatestRelease = async () => {
+    try {
+      await openUrl(LATEST_RELEASE_URL);
+    } catch (e) {
+      console.warn("openUrl latest release failed", e);
     }
   };
 
@@ -2228,6 +2247,31 @@ const UpdatesSection: Component = () => {
                   disabled={relaunching()}
                 >
                   {relaunching() ? "Relaunching…" : "Relaunch now"}
+                </button>
+              </Show>
+              {/* Error-state escape hatches. The in-app updater can fail
+                  for reqwest reasons we have no way to recover from in
+                  this binary (TLS / proxy / cert quirks baked into the
+                  bundled HTTP client). Always offer the user a direct
+                  path to the signed bundles on GitHub Releases, plus a
+                  copy-able `brew upgrade` command for cask installs. */}
+              <Show when={phase().kind === "error"}>
+                <Show when={installFlavor() === "homebrew"}>
+                  <button
+                    type="button"
+                    class="rounded-md border border-warning/40 bg-warning/10 px-2 py-0.5 text-[10px] text-warning transition-colors hover:bg-warning/20"
+                    onClick={() => void copyBrewCommand()}
+                    title={BREW_UPGRADE_COMMAND}
+                  >
+                    {brewCopied() ? "Copied" : "Copy brew upgrade"}
+                  </button>
+                </Show>
+                <button
+                  type="button"
+                  class="rounded-md border border-border bg-background px-2 py-0.5 text-[10px] text-foreground transition-colors hover:bg-accent"
+                  onClick={() => void openLatestRelease()}
+                >
+                  View latest release
                 </button>
               </Show>
               <button
