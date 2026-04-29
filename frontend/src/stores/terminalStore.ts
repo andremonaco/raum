@@ -22,6 +22,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { createStore, reconcile } from "solid-js/store";
 import { agentStore, type AgentKind, type AgentState } from "./agentStore";
 import { removeTabsBySessionId } from "./runtimeLayoutStore";
+import { clearReviewLinkForSession } from "./reviewLinkStore";
 
 const TERMINAL_PANE_CONTEXT_CHANGED_EVENT = "terminal-pane-context-changed";
 const PANE_PROMPT_UPDATED_EVENT = "pane:prompt-updated";
@@ -760,6 +761,9 @@ export async function subscribeTerminalEvents(): Promise<UnlistenFn> {
     if (!ev.payload.session_id) return;
     removeTerminal(ev.payload.session_id);
     removeTabsBySessionId(ev.payload.session_id);
+    // Cross-harness review: tell the backend to drop any link involving
+    // this session so the linked-pane badge clears on the surviving side.
+    void clearReviewLinkForSession(ev.payload.session_id);
   });
   const unlistenPaneContext = await listen<TerminalPaneContextChanged>(
     TERMINAL_PANE_CONTEXT_CHANGED_EVENT,

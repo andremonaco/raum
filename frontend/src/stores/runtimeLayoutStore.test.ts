@@ -33,6 +33,7 @@ import {
   restorePane,
   setSessionId,
   setSplitRatios,
+  setSplitRatiosByBoundary,
   setTabLabel,
   setTabAutoLabel,
   setTabSessionId,
@@ -452,6 +453,77 @@ describe("runtimeLayoutStore (BSP)", () => {
     const b = runtimeLayoutStore.cells.find((c) => c.id === "b")!;
     expect(a.w).toBeCloseTo(LAYOUT_UNIT / 2, -1);
     expect(b.w).toBeCloseTo(LAYOUT_UNIT / 2, -1);
+  });
+
+  it("setSplitRatiosByBoundary resizes the right runtime split when adjacent visible siblings are not adjacent in runtime", () => {
+    // Runtime tree: row split [a, b, c]. The pruned tree (visible only)
+    // hides `b`, so to the user it looks like row split [a, c]. Dragging
+    // the divider between a and c must end up changing the runtime split's
+    // ratios for a and c, leaving b's runtime ratio untouched.
+    splitPane(pane("a"), null, "right");
+    splitPane(pane("b"), "a", "right");
+    splitPane(pane("c"), "b", "right");
+    // Sequential splitPane rolls slots in halves, so the tree starts at
+    // a=0.5, b=0.25, c=0.25. Sanity-check that before the drag.
+    expect(runtimeLayoutStore.cells.map((c) => c.id).sort()).toEqual(["a", "b", "c"]);
+    const a0 = runtimeLayoutStore.cells.find((c) => c.id === "a")!;
+    const b0 = runtimeLayoutStore.cells.find((c) => c.id === "b")!;
+    const c0 = runtimeLayoutStore.cells.find((c) => c.id === "c")!;
+    expect(a0.w).toBeCloseTo(LAYOUT_UNIT * 0.5, -1);
+    expect(b0.w).toBeCloseTo(LAYOUT_UNIT * 0.25, -1);
+    expect(c0.w).toBeCloseTo(LAYOUT_UNIT * 0.25, -1);
+
+    // Pretend `b` is hidden (the way the pruned tree would present it):
+    // visibleLeafIds = [a, c], leftIds = [a], rightIds = [c]. The
+    // visible siblings' combined runtime share is 0.5 + 0.25 = 0.75,
+    // and the user drags so that pruned [a:c] becomes [0.7, 0.3].
+    setSplitRatiosByBoundary({
+      axis: "row",
+      leftLeafIds: ["a"],
+      rightLeafIds: ["c"],
+      visibleLeafIds: ["a", "c"],
+      prunedLeftRatio: 0.7,
+      prunedRightRatio: 0.3,
+    });
+
+    const a = runtimeLayoutStore.cells.find((c) => c.id === "a")!;
+    const b = runtimeLayoutStore.cells.find((c) => c.id === "b")!;
+    const c = runtimeLayoutStore.cells.find((c) => c.id === "c")!;
+    // b's runtime share is preserved — the user can't see it, so it
+    // shouldn't move under their drag.
+    expect(b.w).toBeCloseTo(LAYOUT_UNIT * 0.25, -1);
+    // a and c divide the remaining 0.75 share in 0.7 : 0.3 proportions.
+    expect(a.w).toBeCloseTo(LAYOUT_UNIT * 0.75 * 0.7, -1);
+    expect(c.w).toBeCloseTo(LAYOUT_UNIT * 0.75 * 0.3, -1);
+  });
+
+  it("setSplitRatiosByBoundary is a no-op when the leaves are missing or the axis disagrees", () => {
+    splitPane(pane("a"), null, "right");
+    splitPane(pane("b"), "a", "right");
+    const before = runtimeLayoutStore.cells.map((c) => c.w);
+
+    // Wrong axis — the only split here is "row", asking for "col" must
+    // not corrupt the tree.
+    setSplitRatiosByBoundary({
+      axis: "col",
+      leftLeafIds: ["a"],
+      rightLeafIds: ["b"],
+      visibleLeafIds: ["a", "b"],
+      prunedLeftRatio: 0.9,
+      prunedRightRatio: 0.1,
+    });
+    expect(runtimeLayoutStore.cells.map((c) => c.w)).toEqual(before);
+
+    // Unknown leaves — same: don't touch the tree.
+    setSplitRatiosByBoundary({
+      axis: "row",
+      leftLeafIds: ["ghost"],
+      rightLeafIds: ["b"],
+      visibleLeafIds: ["a", "b"],
+      prunedLeftRatio: 0.9,
+      prunedRightRatio: 0.1,
+    });
+    expect(runtimeLayoutStore.cells.map((c) => c.w)).toEqual(before);
   });
 
   it("equalizeAllRatios is a safe no-op on a single-leaf tree", () => {

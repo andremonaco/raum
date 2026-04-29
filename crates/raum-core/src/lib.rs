@@ -10,6 +10,7 @@ pub mod logging;
 pub mod paths;
 pub mod prereqs;
 pub mod project;
+pub mod review;
 pub mod sigil;
 pub mod store;
 

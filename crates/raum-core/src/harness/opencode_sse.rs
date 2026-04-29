@@ -35,7 +35,7 @@
 //! handles both the canonical framing and multi-line `data:` (joined
 //! with `\n`) to stay robust against future server changes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -86,6 +86,59 @@ pub fn new_pending_map() -> PendingRequestMap {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
+/// Bounded FIFO of OpenCode message ids that we have seen as
+/// **user-role** messages on the SSE bus. Used to correlate later
+/// `message.part.updated` events (whose payload carries `messageID` but
+/// not `role`) back to a user message so we can extract the typed
+/// prompt text.
+///
+/// Why a tracker is necessary: OpenCode's `message.updated` payload
+/// carries the message `info` (which has `role`) but no parts, while
+/// `message.part.updated` carries the part text but no role. Stateless
+/// extraction is therefore impossible; we have to remember which
+/// message ids belong to user turns.
+///
+/// Capacity is intentionally small — we only need enough headroom to
+/// cover the gap between a user `message.updated` and its first
+/// `message.part.updated`, which is typically milliseconds.
+pub const USER_MESSAGE_TRACKER_CAPACITY: usize = 64;
+
+#[derive(Debug, Default)]
+pub struct UserMessageTracker {
+    /// FIFO of message ids in insertion order (oldest first).
+    order: VecDeque<String>,
+    /// Membership index for O(1) lookup.
+    index: HashSet<String>,
+}
+
+impl UserMessageTracker {
+    fn remember(&mut self, message_id: String) {
+        if self.index.contains(&message_id) {
+            return;
+        }
+        if self.order.len() >= USER_MESSAGE_TRACKER_CAPACITY
+            && let Some(evicted) = self.order.pop_front()
+        {
+            self.index.remove(&evicted);
+        }
+        self.index.insert(message_id.clone());
+        self.order.push_back(message_id);
+    }
+
+    fn contains(&self, message_id: &str) -> bool {
+        self.index.contains(message_id)
+    }
+}
+
+/// Shared user-message tracker. Owned by the channel; cloned into the
+/// SSE drive loop and `translate()` calls.
+pub type UserMessageIds = Arc<Mutex<UserMessageTracker>>;
+
+#[must_use]
+pub fn new_user_message_tracker() -> UserMessageIds {
+    Arc::new(Mutex::new(UserMessageTracker::default()))
+}
+
 /// SSE channel tuned to the OpenCode server. Owns a `reqwest::Client`
 /// and a shared [`PendingRequestMap`].
 #[allow(missing_debug_implementations)]
@@ -93,6 +146,7 @@ pub struct OpenCodeSseChannel {
     base_url: String,
     client: reqwest::Client,
     pending: PendingRequestMap,
+    user_messages: UserMessageIds,
     /// Fallback session id used when OpenCode emits an event we cannot
     /// scope to a real session (e.g. `server.connected`). The runtime
     /// wires this from the [`SessionSpec`] so the UI's notification
@@ -118,6 +172,7 @@ impl OpenCodeSseChannel {
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             pending,
+            user_messages: new_user_message_tracker(),
             fallback_session,
             health: Arc::new(Mutex::new(ChannelHealth::NotStarted)),
         }
@@ -161,6 +216,7 @@ impl NotificationChannel for OpenCodeSseChannel {
         let base = me.base_url.clone();
         let client = me.client.clone();
         let pending = me.pending.clone();
+        let user_messages = me.user_messages.clone();
         let fallback = me.fallback_session.clone();
         let health = me.health.clone();
 
@@ -196,9 +252,17 @@ impl NotificationChannel for OpenCodeSseChannel {
             // the server closes the stream cleanly and `Err(...)` on an
             // I/O error; either way we fall back through the outer
             // reconnect loop.
-            let outcome = drive_stream(stream, &sink, &pending, &fallback, &cancel, || {
-                delay = INITIAL_RECONNECT_DELAY;
-            })
+            let outcome = drive_stream(
+                stream,
+                &sink,
+                &pending,
+                &user_messages,
+                &fallback,
+                &cancel,
+                || {
+                    delay = INITIAL_RECONNECT_DELAY;
+                },
+            )
             .await;
             if cancel.is_cancelled() {
                 return Ok(());
@@ -245,6 +309,7 @@ async fn drive_stream<S, F>(
     mut stream: S,
     sink: &NotificationSink,
     pending: &PendingRequestMap,
+    user_messages: &UserMessageIds,
     fallback: &SessionId,
     cancel: &CancellationToken,
     mut on_event: F,
@@ -270,7 +335,7 @@ where
                     let Ok(text) = std::str::from_utf8(frame) else { continue };
                     if let Some(data) = parse_data(text) {
                         on_event();
-                        if let Some(ev) = translate(&data, pending, fallback) {
+                        if let Some(ev) = translate(&data, pending, user_messages, fallback) {
                             // `send_timeout` instead of `send` because the
                             // plan's sink is bounded; we'd rather drop an
                             // event than wedge the SSE task on a
@@ -365,6 +430,7 @@ struct Envelope<'a> {
 fn translate(
     data: &str,
     pending: &PendingRequestMap,
+    user_messages: &UserMessageIds,
     fallback: &SessionId,
 ) -> Option<NotificationEvent> {
     let env: Envelope<'_> = match serde_json::from_str(data) {
@@ -483,36 +549,77 @@ fn translate(
                 payload: env.properties,
             })
         }
-        // User message events. OpenCode's SSE bus has shifted the exact
-        // event name between minor releases (`message.updated` vs
-        // `message.part.updated` vs the legacy `message`), and the user-
-        // text payload has moved between `info.parts[*].text` and
-        // top-level `part.text`. Be permissive: accept any of the known
-        // names and probe both locations. Emit a synthetic `TurnStart`
-        // notification so the same drain path that handles Claude/Codex
-        // `UserPromptSubmit` records the prompt and advances the state
-        // machine.
-        "message.updated" | "message.part.updated" | "message" => {
-            let role = env
+        // User message events. OpenCode splits a single user turn across
+        // two SSE events:
+        //
+        //   1. `message.updated` payload `{ sessionID, info }` — the
+        //      `info` carries `role: "user"` (or "assistant") and the
+        //      message id, but **no parts**. Use it to remember which
+        //      message ids are user turns.
+        //   2. `message.part.updated` payload `{ sessionID, part, time }`
+        //      — `part` is a `TextPart` with `messageID, text, ...` but
+        //      **no role**. The text is the user's typed prompt iff the
+        //      `part.messageID` belongs to a previously-recorded user
+        //      message.
+        //
+        // The legacy `message` event name (older OpenCode) used to bundle
+        // both — kept as a fallback that probes the typed-prompt position
+        // both ways. Confirmed against
+        // `packages/opencode/src/session/message-v2.ts` on
+        // `sst/opencode@dev`.
+        "message.updated" | "message" => {
+            let info = env
                 .properties
                 .get("info")
-                .or_else(|| env.properties.get("message"))
-                .and_then(|i| i.get("role"))
-                .and_then(Value::as_str);
+                .or_else(|| env.properties.get("message"))?;
+            let role = info.get("role").and_then(Value::as_str);
+            // Always remember user message ids so a later
+            // `message.part.updated` can be correlated. Then attempt the
+            // legacy embedded-text path before bailing out.
+            if role == Some("user")
+                && let Some(id) = info.get("id").and_then(Value::as_str)
+            {
+                user_messages.lock().remember(id.to_string());
+            }
             if role != Some("user") {
                 return None;
             }
-            let session = env
-                .properties
-                .get("info")
-                .or_else(|| env.properties.get("message"))
-                .and_then(|i| i.get("sessionID"))
-                .and_then(Value::as_str)
-                .or_else(|| env.properties.get("sessionID").and_then(Value::as_str))
-                .map_or_else(|| fallback.clone(), SessionId::new);
             let text = extract_user_message_text(&env.properties)?;
             Some(NotificationEvent {
-                session_id: session,
+                session_id: fallback.clone(),
+                harness: AgentKind::OpenCode,
+                kind: NotificationKind::TurnStart,
+                source,
+                reliability: Reliability::Deterministic,
+                request_id: None,
+                payload: serde_json::json!({ "prompt": text }),
+            })
+        }
+        "message.part.updated" => {
+            let part = env.properties.get("part")?;
+            // Only text parts carry a typed prompt. Skip tool/snapshot/
+            // reasoning/etc. Synthetic injections (raum-side or
+            // OpenCode-side framing) must also be filtered.
+            if part.get("type").and_then(Value::as_str) != Some("text") {
+                return None;
+            }
+            if part.get("synthetic").and_then(Value::as_bool) == Some(true) {
+                return None;
+            }
+            let message_id = part.get("messageID").and_then(Value::as_str)?;
+            // Drop if we have not seen a user-role `message.updated`
+            // for this messageID — it belongs to an assistant turn.
+            if !user_messages.lock().contains(message_id) {
+                return None;
+            }
+            let text = part
+                .get("text")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())?
+                .to_string();
+            Some(NotificationEvent {
+                session_id: fallback.clone(),
                 harness: AgentKind::OpenCode,
                 kind: NotificationKind::TurnStart,
                 source,
@@ -640,9 +747,10 @@ mod tests {
     #[test]
     fn translate_permission_asked_populates_pending_map() {
         let pending = new_pending_map();
+        let user_messages = new_user_message_tracker();
         let fallback = SessionId::new("raum-default");
         let data = r#"{"type":"permission.asked","properties":{"id":"perm-1","sessionID":"sess-1","permission":"bash","patterns":["ls *"],"metadata":{},"always":[]}}"#;
-        let ev = translate(data, &pending, &fallback).expect("event");
+        let ev = translate(data, &pending, &user_messages, &fallback).expect("event");
         assert_eq!(ev.kind, NotificationKind::PermissionNeeded);
         assert_eq!(ev.session_id, SessionId::new("sess-1"));
         assert_eq!(
@@ -659,12 +767,13 @@ mod tests {
     #[test]
     fn translate_permission_replied_clears_pending() {
         let pending = new_pending_map();
+        let user_messages = new_user_message_tracker();
         pending
             .lock()
             .insert(PermissionRequestId::new("perm-1"), SessionId::new("sess-1"));
         let fallback = SessionId::new("raum-default");
         let data = r#"{"type":"permission.replied","properties":{"sessionID":"sess-1","requestID":"perm-1","reply":"once"}}"#;
-        let ev = translate(data, &pending, &fallback).expect("event");
+        let ev = translate(data, &pending, &user_messages, &fallback).expect("event");
         assert_eq!(ev.kind, NotificationKind::TurnEnd);
         assert!(pending.lock().is_empty());
     }
@@ -672,9 +781,10 @@ mod tests {
     #[test]
     fn translate_question_asked_is_idle_prompt_needed() {
         let pending = new_pending_map();
+        let user_messages = new_user_message_tracker();
         let fallback = SessionId::new("raum-default");
         let data = r#"{"type":"question.asked","properties":{"id":"q-1","sessionID":"sess-1","questions":[{"question":"Continue?","header":"Confirm","options":[{"label":"Yes","description":"Proceed"}]}]}}"#;
-        let ev = translate(data, &pending, &fallback).expect("event");
+        let ev = translate(data, &pending, &user_messages, &fallback).expect("event");
         assert_eq!(ev.kind, NotificationKind::IdlePromptNeeded);
         assert_eq!(ev.session_id, SessionId::new("sess-1"));
         assert!(ev.request_id.is_none());
@@ -684,9 +794,10 @@ mod tests {
     #[test]
     fn translate_question_replied_is_turn_start() {
         let pending = new_pending_map();
+        let user_messages = new_user_message_tracker();
         let fallback = SessionId::new("raum-default");
         let data = r#"{"type":"question.replied","properties":{"sessionID":"sess-1","requestID":"q-1","answers":[["Yes"]]}}"#;
-        let ev = translate(data, &pending, &fallback).expect("event");
+        let ev = translate(data, &pending, &user_messages, &fallback).expect("event");
         assert_eq!(ev.kind, NotificationKind::TurnStart);
         assert_eq!(ev.session_id, SessionId::new("sess-1"));
     }
@@ -694,10 +805,11 @@ mod tests {
     #[test]
     fn translate_question_rejected_is_turn_start() {
         let pending = new_pending_map();
+        let user_messages = new_user_message_tracker();
         let fallback = SessionId::new("raum-default");
         let data =
             r#"{"type":"question.rejected","properties":{"sessionID":"sess-1","requestID":"q-1"}}"#;
-        let ev = translate(data, &pending, &fallback).expect("event");
+        let ev = translate(data, &pending, &user_messages, &fallback).expect("event");
         assert_eq!(ev.kind, NotificationKind::TurnStart);
         assert_eq!(ev.session_id, SessionId::new("sess-1"));
     }
@@ -705,28 +817,34 @@ mod tests {
     #[test]
     fn translate_session_status_idle_is_turn_end() {
         let pending = new_pending_map();
+        let user_messages = new_user_message_tracker();
         let fallback = SessionId::new("raum-default");
         let data = r#"{"type":"session.status","properties":{"sessionID":"sess-1","status":{"type":"idle"}}}"#;
-        let ev = translate(data, &pending, &fallback).expect("event");
+        let ev = translate(data, &pending, &user_messages, &fallback).expect("event");
         assert_eq!(ev.kind, NotificationKind::TurnEnd);
     }
 
     #[test]
     fn translate_session_status_busy_dropped() {
         let pending = new_pending_map();
+        let user_messages = new_user_message_tracker();
         let fallback = SessionId::new("raum-default");
         let data = r#"{"type":"session.status","properties":{"sessionID":"sess-1","status":{"type":"busy"}}}"#;
-        assert!(translate(data, &pending, &fallback).is_none());
+        assert!(translate(data, &pending, &user_messages, &fallback).is_none());
     }
 
     #[test]
     fn translate_message_updated_user_role_emits_turnstart_with_prompt() {
         let pending = new_pending_map();
+        let user_messages = new_user_message_tracker();
         let fallback = SessionId::new("raum-default");
         let data = r#"{"type":"message.updated","properties":{"info":{"id":"m-1","role":"user","sessionID":"sess-1","parts":[{"type":"text","text":"refactor session.ts"}]}}}"#;
-        let ev = translate(data, &pending, &fallback).expect("event");
+        let ev = translate(data, &pending, &user_messages, &fallback).expect("event");
         assert_eq!(ev.kind, NotificationKind::TurnStart);
-        assert_eq!(ev.session_id, SessionId::new("sess-1"));
+        // Must use raum's fallback session id, not OpenCode's payload
+        // sessionID — `record_user_prompt` keys on the raum id and
+        // would silently drop the update otherwise.
+        assert_eq!(ev.session_id, SessionId::new("raum-default"));
         assert_eq!(
             ev.payload.get("prompt").and_then(Value::as_str),
             Some("refactor session.ts")
@@ -734,12 +852,27 @@ mod tests {
     }
 
     #[test]
-    fn translate_message_part_updated_user_role_emits_turnstart() {
+    fn translate_message_part_updated_after_user_message_emits_turnstart() {
+        // Modern OpenCode schema: `message.part.updated` carries
+        // `{ sessionID, part, time }` — no role on the part. The
+        // user-typed prompt is detectable only after a preceding
+        // `message.updated` registered the messageID as a user turn.
         let pending = new_pending_map();
+        let user_messages = new_user_message_tracker();
         let fallback = SessionId::new("raum-default");
-        let data = r#"{"type":"message.part.updated","properties":{"info":{"id":"m-1","role":"user","sessionID":"sess-1"},"part":{"type":"text","text":"add rate limit"}}}"#;
-        let ev = translate(data, &pending, &fallback).expect("event");
+
+        // 1) `message.updated` for a user message — registers the id,
+        //    yields no NotificationEvent because the modern info has no
+        //    embedded text.
+        let registered = r#"{"type":"message.updated","properties":{"sessionID":"sess-1","info":{"id":"m-1","role":"user","sessionID":"sess-1","time":{"created":1},"agent":"build","model":{"providerID":"anthropic","modelID":"claude"}}}}"#;
+        assert!(translate(registered, &pending, &user_messages, &fallback).is_none());
+
+        // 2) `message.part.updated` for that messageID — emits TurnStart
+        //    with the typed text.
+        let part = r#"{"type":"message.part.updated","properties":{"sessionID":"sess-1","time":2,"part":{"type":"text","id":"p-1","sessionID":"sess-1","messageID":"m-1","text":"add rate limit"}}}"#;
+        let ev = translate(part, &pending, &user_messages, &fallback).expect("event");
         assert_eq!(ev.kind, NotificationKind::TurnStart);
+        assert_eq!(ev.session_id, SessionId::new("raum-default"));
         assert_eq!(
             ev.payload.get("prompt").and_then(Value::as_str),
             Some("add rate limit")
@@ -747,43 +880,75 @@ mod tests {
     }
 
     #[test]
+    fn translate_message_part_updated_assistant_message_dropped() {
+        // No prior user `message.updated` for `m-2` → the part is
+        // assumed assistant and dropped. Without this guard every
+        // assistant text chunk would surface as a "user prompt".
+        let pending = new_pending_map();
+        let user_messages = new_user_message_tracker();
+        let fallback = SessionId::new("raum-default");
+        let part = r#"{"type":"message.part.updated","properties":{"sessionID":"sess-1","time":2,"part":{"type":"text","id":"p-1","sessionID":"sess-1","messageID":"m-2","text":"streaming response"}}}"#;
+        assert!(translate(part, &pending, &user_messages, &fallback).is_none());
+    }
+
+    #[test]
+    fn translate_message_part_updated_synthetic_part_dropped() {
+        // OpenCode injects `synthetic: true` text parts (e.g. shellImpl
+        // tooling framing). Even when their messageID is a user message,
+        // they are not the typed prompt.
+        let pending = new_pending_map();
+        let user_messages = new_user_message_tracker();
+        let fallback = SessionId::new("raum-default");
+        // Register the user message first.
+        let registered = r#"{"type":"message.updated","properties":{"sessionID":"sess-1","info":{"id":"m-1","role":"user","sessionID":"sess-1","time":{"created":1},"agent":"build","model":{"providerID":"anthropic","modelID":"claude"}}}}"#;
+        let _ = translate(registered, &pending, &user_messages, &fallback);
+        let part = r#"{"type":"message.part.updated","properties":{"sessionID":"sess-1","time":2,"part":{"type":"text","id":"p-1","sessionID":"sess-1","messageID":"m-1","synthetic":true,"text":"injected framing"}}}"#;
+        assert!(translate(part, &pending, &user_messages, &fallback).is_none());
+    }
+
+    #[test]
     fn translate_message_updated_assistant_role_dropped() {
         let pending = new_pending_map();
+        let user_messages = new_user_message_tracker();
         let fallback = SessionId::new("raum-default");
         let data = r#"{"type":"message.updated","properties":{"info":{"id":"m-1","role":"assistant","sessionID":"sess-1","parts":[{"type":"text","text":"sure thing"}]}}}"#;
-        assert!(translate(data, &pending, &fallback).is_none());
+        assert!(translate(data, &pending, &user_messages, &fallback).is_none());
     }
 
     #[test]
     fn translate_message_updated_no_text_dropped() {
         let pending = new_pending_map();
+        let user_messages = new_user_message_tracker();
         let fallback = SessionId::new("raum-default");
         let data = r#"{"type":"message.updated","properties":{"info":{"id":"m-1","role":"user","sessionID":"sess-1","parts":[{"type":"tool"}]}}}"#;
-        assert!(translate(data, &pending, &fallback).is_none());
+        assert!(translate(data, &pending, &user_messages, &fallback).is_none());
     }
 
     #[test]
     fn translate_session_idle_deprecated_alias() {
         let pending = new_pending_map();
+        let user_messages = new_user_message_tracker();
         let fallback = SessionId::new("raum-default");
         let data = r#"{"type":"session.idle","properties":{"sessionID":"sess-1"}}"#;
-        let ev = translate(data, &pending, &fallback).expect("event");
+        let ev = translate(data, &pending, &user_messages, &fallback).expect("event");
         assert_eq!(ev.kind, NotificationKind::TurnEnd);
     }
 
     #[test]
     fn translate_unknown_event_dropped() {
         let pending = new_pending_map();
+        let user_messages = new_user_message_tracker();
         let fallback = SessionId::new("raum-default");
         let data = r#"{"type":"server.heartbeat","properties":{}}"#;
-        assert!(translate(data, &pending, &fallback).is_none());
+        assert!(translate(data, &pending, &user_messages, &fallback).is_none());
     }
 
     #[test]
     fn translate_invalid_json_dropped() {
         let pending = new_pending_map();
+        let user_messages = new_user_message_tracker();
         let fallback = SessionId::new("raum-default");
-        assert!(translate("{garbage", &pending, &fallback).is_none());
+        assert!(translate("{garbage", &pending, &user_messages, &fallback).is_none());
     }
 
     /// End-to-end integration test using wiremock. The server returns a
@@ -811,6 +976,9 @@ mod tests {
             .mount(&server)
             .await;
 
+        // The wiremock test only invokes `OpenCodeSseChannel`, which
+        // owns its own user-message tracker internally; no caller-side
+        // tracker is needed here.
         let pending = new_pending_map();
         let fallback = SessionId::new("raum-default");
         let ch = OpenCodeSseChannel::new(server.uri(), pending.clone(), fallback);

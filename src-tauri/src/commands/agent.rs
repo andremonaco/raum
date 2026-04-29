@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 use raum_core::agent::{AgentAdapter, AgentKind, SessionId};
 use raum_core::agent_state::{
     AgentStateChanged, AgentStateMachine, HookEvent as CoreHookEvent, PromptEntry, PromptUpdated,
-    extract_user_prompt,
+    extract_harness_session_id, extract_user_prompt,
 };
 use raum_core::harness::setup::{SetupContext, SetupExecutor};
 use raum_core::harness::traits::SessionSpec;
@@ -460,7 +460,22 @@ pub async fn drive_event_socket<R: Runtime>(
                 event: ev.event.clone(),
             });
         }
-        let (changes, prompt_update): (Vec<AgentStateChanged>, Option<PromptUpdated>) = {
+        // Try to capture the harness's *own* session id from the
+        // payload of *every* hook event, not just UserPromptSubmit.
+        // Both Claude Code and Codex emit `session_id` in every hook
+        // payload, so any activity (state transitions, permission
+        // requests, Stop, etc.) can backfill the id for sessions that
+        // submitted their first prompt before this code shipped.
+        // `update_session_harness_id` is sticky once set, so this is
+        // a cheap idempotent attempt.
+        //
+        // For UserPromptSubmit only: this also produces a
+        // `PromptUpdated` to drive the `pane:prompt-updated` broadcast.
+        let (changes, prompt_update, harness_session_id): (
+            Vec<AgentStateChanged>,
+            Option<PromptUpdated>,
+            Option<(String, String)>,
+        ) = {
             let Ok(mut registry) = state.agents.lock() else {
                 warn!("event-socket drain: agent registry lock poisoned; dropping event");
                 continue;
@@ -469,22 +484,28 @@ pub async fn drive_event_socket<R: Runtime>(
                 Some(sid) => registry.apply_hook_for_session(kind, sid, &core_event),
                 None => registry.apply_hook_to_matching(kind, &core_event),
             };
-            // For UserPromptSubmit, the harness pipes the user's prompt
-            // to the hook script on stdin; the script forwards that
-            // through `json_escape` as a JSON-encoded *string*, so
-            // `ev.payload` is a `Value::String("{...}")` rather than a
-            // parsed object. `decode_payload` unwraps that wrapper. The
-            // `session_id` route is strict — without it, broadcast
-            // routing can't distinguish multiple Claude panes, so we
-            // silently skip the update rather than over-write the wrong
-            // tab's subtitle.
+            // The harness pipes its full hook payload to the script
+            // (Claude on stdin, Codex on argv). The forwarder
+            // JSON-encodes that as a string, so `ev.payload` is a
+            // `Value::String("{...}")` rather than a parsed object.
+            // `decode_payload` unwraps that wrapper.
+            let decoded = decode_payload(&ev.payload);
+            let harness_session_id = ev
+                .session_id
+                .as_deref()
+                .zip(extract_harness_session_id(kind, decoded.as_ref()))
+                .map(|(sid, hid)| (sid.to_string(), hid));
+            // The `session_id` route is strict — without it,
+            // broadcast routing can't distinguish multiple Claude
+            // panes, so we silently skip the prompt update rather
+            // than over-write the wrong tab's subtitle.
             let prompt_update = if ev.event == "UserPromptSubmit" {
-                let decoded = decode_payload(&ev.payload);
                 let extracted = extract_user_prompt(kind, decoded.as_ref());
                 debug!(
                     harness = %ev.harness,
                     session_id = ?ev.session_id,
                     has_prompt = extracted.is_some(),
+                    has_harness_id = harness_session_id.is_some(),
                     payload_kind = if ev.payload.is_string() { "string" } else { "object" },
                     "UserPromptSubmit prompt extraction",
                 );
@@ -500,8 +521,37 @@ pub async fn drive_event_socket<R: Runtime>(
             } else {
                 None
             };
-            (changes, prompt_update)
+            (changes, prompt_update, harness_session_id)
         };
+        // Persist `harness_session_id` BEFORE emitting any prompt
+        // update on the bus. The bridge task that re-emits
+        // `pane:prompt-updated` runs concurrently, so emitting first
+        // races the frontend's fetch against this disk write — the
+        // fetch can land before the id is persisted, fall through to
+        // the directory-newest fallback, and surface the wrong Task.
+        // Strict ordering here makes the fetch deterministic.
+        if let Some((session_id, harness_id)) = harness_session_id {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as u64);
+            match state.config_store.lock() {
+                Ok(store) => {
+                    if let Err(e) =
+                        store.update_session_harness_id(&session_id, kind, &harness_id, now_ms)
+                    {
+                        warn!(
+                            error = %e,
+                            session_id = %session_id,
+                            "persist harness_session_id failed",
+                        );
+                    }
+                }
+                Err(_) => warn!(
+                    session_id = %session_id,
+                    "persist harness_session_id: config_store lock poisoned",
+                ),
+            }
+        }
         for change in changes {
             // Broadcast buffer fills silently when the bridge task is
             // behind; the `ensure_bridge_running` task logs the lag.
@@ -616,6 +666,9 @@ fn persist_last_prompt<R: Runtime>(app: &AppHandle<R>, update: &PromptUpdated) {
     ) {
         warn!(error=%e, session_id=%update.session_id.as_str(), "persist last_prompt failed");
     }
+    // Cross-harness review reads prompts directly from each harness's own
+    // on-disk transcript (see `crates/raum-core/src/review/transcript.rs`)
+    // — raum no longer maintains its own append-only prompt log.
 }
 
 fn seed_session_activity_for_persisted_state(

@@ -496,6 +496,7 @@ mod tests {
             last_state_at_unix_ms: last_state.map(|_| 2_000),
             last_prompt_text: None,
             last_prompt_at_unix_ms: None,
+            harness_session_id: None,
         }
     }
 

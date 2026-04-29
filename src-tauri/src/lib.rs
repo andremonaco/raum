@@ -156,6 +156,11 @@ pub fn run() {
             commands::terminal::terminal_pane_context_batch,
             commands::terminal::terminal_reap_stale,
             commands::terminal::terminal_kill_orphans,
+            // Cross-harness review feature.
+            commands::review::prepare_review,
+            commands::review::record_review_link,
+            commands::review::clear_review_link,
+            commands::review::session_first_prompt,
             commands::agent::agent_list,
             commands::agent::agent_spawn,
             commands::agent::agent_state,
@@ -218,6 +223,7 @@ pub fn run() {
             commands::config_set_harness_flags,
             commands::config_set_worktree_path_pattern,
             commands::config_set_appearance_theme,
+            commands::config_set_appearance_show_prompt_overlay,
             // Global search — file search over a project's root or arbitrary path.
             commands::search::project_find_files,
             commands::search::search_files_in_path,

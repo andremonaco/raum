@@ -40,7 +40,9 @@ pub use event::{
     NotificationEvent, NotificationKind, PermissionRequestId, Reliability, SourceId,
     classify_notification_event, classify_notification_kind, decode_payload,
 };
-pub use launch::{harness_launch_command, parse_opencode_port_arg};
+pub use launch::{
+    harness_launch_command, harness_launch_command_with_prompt, parse_opencode_port_arg,
+};
 pub use opencode::OpenCodeAdapter;
 pub use reply::{Decision, PermissionReplier, ReplyError, ReplyMode};
 pub use setup::{

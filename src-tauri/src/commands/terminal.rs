@@ -25,8 +25,10 @@ use raum_core::AgentKind;
 use raum_core::config::XTERM_SCROLLBACK_LINES;
 use raum_core::harness::codex::{Osc9Parser, classify_osc9_payload};
 use raum_core::harness::{
-    NotificationKind, Reliability, harness_launch_command, parse_opencode_port_arg,
+    NotificationKind, Reliability, harness_launch_command, harness_launch_command_with_prompt,
+    parse_opencode_port_arg,
 };
+use raum_core::review::inject_opencode_brief;
 use raum_tmux::{
     PaneContext, PaneSnapshot, PtyBridgeHandle, TmuxError, TmuxManager, attach_via_pty,
 };
@@ -351,6 +353,11 @@ pub struct SpawnArgs {
     /// spawning the harness so its first paint lands at the real dimensions.
     pub cols: Option<u32>,
     pub rows: Option<u32>,
+    /// Optional initial prompt appended to the harness launch command. Used
+    /// only by the cross-harness review feature today; the frontend never
+    /// passes this for user-driven spawns.
+    #[serde(default)]
+    pub initial_prompt: Option<String>,
 }
 
 /// Clamp webview-supplied dimensions into a sane range so a broken frontend
@@ -715,7 +722,12 @@ pub async fn terminal_spawn<R: Runtime>(
     } else {
         None
     };
-    let harness_cmd = harness_launch_command(args.kind, extra_flags.as_deref(), opencode_port);
+    let harness_cmd = harness_launch_command_with_prompt(
+        args.kind,
+        extra_flags.as_deref(),
+        opencode_port,
+        args.initial_prompt.as_deref(),
+    );
 
     let mgr_for_new = tmux.clone();
     let id_for_new = session_id.clone();
@@ -735,6 +747,7 @@ pub async fn terminal_spawn<R: Runtime>(
         .lock()
         .ok()
         .and_then(|g| g.as_ref().map(|h| h.path.to_string_lossy().into_owned()));
+    let cwd_for_new = cwd.clone();
     tokio::task::spawn_blocking(move || {
         let mut env_pairs: Vec<(&str, &str)> =
             vec![(raum_hooks::RAUM_SESSION_ENV, raum_session_value.as_str())];
@@ -743,7 +756,7 @@ pub async fn terminal_spawn<R: Runtime>(
         }
         mgr_for_new.new_session_with_env(
             &id_for_new,
-            &cwd,
+            &cwd_for_new,
             use_placeholder.then_some("placeholder"),
             initial_size,
             &env_pairs,
@@ -850,6 +863,29 @@ pub async fn terminal_spawn<R: Runtime>(
         }
     }
 
+    // Cross-harness review: when an OpenCode reviewer is spawned with a
+    // brief, deliver it via OpenCode's `/tui/append-prompt` +
+    // `/tui/submit-prompt` HTTP endpoints once the TUI is up. This is
+    // the documented IDE-integration path; the alternative
+    // (`opencode run '<brief>'`) is one-shot non-interactive and would
+    // exit immediately, killing the reviewer pane. Best-effort: every
+    // failure inside `inject_opencode_brief` is logged and swallowed,
+    // leaving the user with a usable interactive TUI.
+    if matches!(args.kind, AgentKind::OpenCode)
+        && let Some(brief) = args
+            .initial_prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        && let Some(port) = opencode_port
+    {
+        let brief = brief.to_string();
+        let cwd_for_inject = cwd.clone();
+        tokio::spawn(async move {
+            inject_opencode_brief("http://127.0.0.1", port, &cwd_for_inject, &brief).await;
+        });
+    }
+
     Ok(session_id)
 }
 
@@ -873,6 +909,8 @@ async fn open_bridge_and_monitor<R: Runtime>(
     pane_context_dirty_tx: Option<tokio::sync::mpsc::Sender<()>>,
 ) -> Result<(PtyBridgeHandle, JoinHandle<()>), String> {
     let channel_for_data = on_data.clone();
+    let data_app = app.clone();
+    let data_session_id_for_lost = session_id.clone();
     let exit_app = app.clone();
     let exit_id = session_id.clone();
     let activity_for_data = session_activity.clone();
@@ -923,9 +961,29 @@ async fn open_bridge_and_monitor<R: Runtime>(
                 if let Some(tx) = pane_context_dirty_for_data.as_ref() {
                     let _ = tx.try_send(());
                 }
-                channel_for_data
-                    .send(InvokeResponseBody::Raw(bytes))
-                    .is_ok()
+                // Fail-loud send: if the WebView's `Channel<Raw>` is gone
+                // (component unmount, page reload, app shutdown), the
+                // previous `.is_ok()` swallowed the byte and ground on
+                // silently — making "lost output" reports impossible to
+                // diagnose. Now we log + emit `terminal:bridge-lost`
+                // (mirroring the on_exit path) and return false so the
+                // PTY bridge tears down cleanly.
+                if let Err(err) = channel_for_data.send(InvokeResponseBody::Raw(bytes)) {
+                    tracing::warn!(
+                        session_id = %data_session_id_for_lost,
+                        error = %err,
+                        "pty bridge: channel send failed, terminating",
+                    );
+                    let _ = data_app.emit(
+                        "terminal:bridge-lost",
+                        serde_json::json!({
+                            "sessionId": &data_session_id_for_lost,
+                            "exitCode": serde_json::Value::Null,
+                        }),
+                    );
+                    return false;
+                }
+                true
             }),
             Box::new(move |exit_code| {
                 // Attached client exited unexpectedly — the bridge wasn't
@@ -1340,16 +1398,45 @@ pub async fn terminal_reattach<R: Runtime>(
         }
     }
 
-    // Replay a bounded viewport snapshot into xterm.js before the live client
-    // attaches. This gives the user an immediate frame without forcing every
-    // restart to capture and stream the full 10k-line tmux history for every
-    // pane. Full plain-text history remains available through tmux-backed
-    // search.
+    // Replay tmux state into xterm.js before the live client attaches.
+    // Sending here (before `open_bridge_and_monitor` opens the live PTY
+    // bridge) preserves ordering on the same `Channel<Raw>`: replay bytes
+    // always land before any live bytes for this reattach.
+    //
+    // The capture mode depends on `kind × is_alternate_on`:
+    //
+    // - Shell panes → full snapshot (capped at `history-limit = 10000`,
+    //   matching `frontend/src/lib/scrollbackConfig.ts SCROLLBACK_MAX`).
+    //   Plain command output makes a clean scrollback record.
+    //
+    // - Alt-screen TUIs (Codex, `vim`, `htop`, …) → full snapshot. The alt
+    //   branch of `capture_pane_snapshot` cleanly separates the alt frame
+    //   from the underlying normal scrollback (which is shell history from
+    //   before the TUI took over).
+    //
+    // - Non-alt-screen Ink-style TUIs (Claude Code, OpenCode rendering
+    //   without alt-screen) → viewport snapshot only (`rows` lines). These
+    //   harnesses do cursor-positioned in-place updates on the normal
+    //   screen, so tmux scrollback accumulates every intermediate redraw
+    //   frame plus any mixed-width rows from prior resizes. Replaying that
+    //   produces visible corruption (overlapping rules, ghost prompts).
+    //   Recovering meaningful conversation history for these TUIs would
+    //   require parsing their session log files — out of scope here.
     {
         let tmux_for_capture = tmux.clone();
         let id_for_capture = session_id.clone();
+        let viewport_rows = rows;
+        let reattach_kind = args.kind;
         match tokio::task::spawn_blocking(move || {
-            tmux_for_capture.capture_pane_view_snapshot(&id_for_capture, rows)
+            let alt_on = tmux_for_capture
+                .is_alternate_on(&id_for_capture)
+                .unwrap_or(false);
+            let prefer_full = matches!(reattach_kind, AgentKind::Shell) || alt_on;
+            if prefer_full {
+                tmux_for_capture.capture_pane_snapshot(&id_for_capture)
+            } else {
+                tmux_for_capture.capture_pane_view_snapshot(&id_for_capture, viewport_rows)
+            }
         })
         .await
         {
@@ -1358,7 +1445,7 @@ pub async fn terminal_reattach<R: Runtime>(
                 if replay.is_empty() {
                     // Nothing to restore.
                 } else if on_data.send(InvokeResponseBody::Raw(replay)).is_err() {
-                    tracing::debug!(
+                    tracing::warn!(
                         session_id = %session_id,
                         "terminal_reattach: snapshot replay dropped (channel closed)"
                     );

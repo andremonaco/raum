@@ -68,6 +68,13 @@ pub struct AppHandleState {
     /// to "why is raum not showing busy state?". Updated by
     /// `commands::agent::drive_event_socket`.
     pub last_hook_at: Arc<Mutex<Option<LastHook>>>,
+    /// Cross-harness review feature: maps each reviewer session id to the
+    /// session id it is reviewing. Populated by `start_review`, consumed by
+    /// the frontend via the `review:linked` / `review:unlinked` Tauri events
+    /// (the events carry the relationship; this map is mostly diagnostic
+    /// and lets us clean up on session teardown). Session-scoped — not
+    /// persisted across raum restarts.
+    pub review_links: Mutex<HashMap<String, String>>,
 }
 
 /// Snapshot of the most recent hook event, surfaced via
@@ -94,6 +101,7 @@ impl Default for AppHandleState {
             channel_event_tx: Mutex::new(None),
             session_activity: Arc::new(Mutex::new(HashMap::new())),
             last_hook_at: Arc::new(Mutex::new(None)),
+            review_links: Mutex::new(HashMap::new()),
         }
     }
 }

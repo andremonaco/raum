@@ -444,13 +444,330 @@ body,
     box-shadow 180ms ease-out;
 }
 
+/* Cross-harness review linked-pane state. The structural signal lives
+   in `<ReviewBracesLayer>` (an oval chip floating at the shared edge of
+   adjacent linked panes); these rules add the supporting "they're one
+   bound unit" cues. Per memory:feedback_tab_styling_restraint — no
+   colored stripes, glows, or accent borders; quiet bg shifts only.
+   The dnd-active guard mirrors `.pane-selected`'s — the drag preview
+   owns the visual while a drop is in flight. */
+[data-dnd-root]:not(.dnd-active)
+  .leaf-frame.pane-review-linked:not(.pane-selected)
+  .pane-drag-handle {
+  background: color-mix(in oklab, var(--foreground) 5%, transparent);
+}
+[data-dnd-root]:not(.dnd-active) .leaf-frame.pane-review-linked .terminal-chrome-body {
+  /* Quiet body tint on every linked pane so the pair reads as one
+     contiguous canvas rather than two adjacent strangers. The
+     `terminal-chrome-body > :first-child` containing xterm sits above
+     this background, so the canvas itself is unaffected. */
+  background: color-mix(in oklab, var(--foreground) 3%, transparent);
+}
+/* Hover any linked pane → every linked pane gets a slightly stronger
+   bg tint so the full set lights up together. With multiple concurrent
+   reviews, all linked panes light up — acceptable for v1 and lets the
+   user spot the linked set without per-pair JS. */
+[data-dnd-root]:has(.leaf-frame[data-review-linked="true"]:hover)
+  .leaf-frame[data-review-linked="true"]:not(.pane-selected)
+  .pane-drag-handle {
+  background: color-mix(in oklab, var(--foreground) 9%, transparent);
+}
+
+/* The Review Tether — the only visual cue for the linked-pair state.
+   A hairline thread spanning the divider seam between the two panes,
+   with a small icon dot at each end (reviewed on the left, reviewer on
+   the right). Calm, structural, state-of-the-art: zero text, zero
+   color accents, zero glows. The two harness icons + the line between
+   them communicate "these two are connected" without competing with
+   the terminal content underneath.
+
+   The `review-tethers-layer` wrapper establishes its own stacking
+   context (`isolation: isolate`) above the surface + chrome layers;
+   without it, painting order varies between browsers and the bare
+   tether divs sometimes end up beneath the xterm canvases. */
+.review-tethers-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 50;
+  isolation: isolate;
+  pointer-events: none;
+}
+.review-tether {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  gap: 0;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  user-select: none;
+  /* Subtle entrance so a fresh link doesn't pop in jarringly. */
+  animation: review-tether-fade-in 220ms ease-out;
+  /* Recede smoothly when the user reaches into either linked pane.
+     Opacity + scale, no filter blur (cheaper, no canvas repaints). */
+  transition:
+    opacity 220ms ease-out,
+    transform 220ms ease-out;
+}
+.review-tether--recede {
+  opacity: 0.18;
+  transform: translate(-50%, -50%) scale(0.85);
+}
+@keyframes review-tether-fade-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(0.92);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+  }
+}
+.review-tether-dot {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.25rem;
+  height: 2.25rem;
+  border-radius: 9999px;
+  /* Strong contrast against either dark terminals or light theme: the
+     dot is a clearly-lifted chip, full foreground border, neutral
+     drop-shadow. Restraint here means "no accent color"; visibility
+     comes from contrast against the pane bg, not luminance.  */
+  background: var(--background);
+  border: 1.5px solid var(--foreground);
+  color: var(--foreground);
+  box-shadow:
+    0 8px 20px -6px rgb(0 0 0 / 0.7),
+    0 2px 6px -2px rgb(0 0 0 / 0.4);
+  flex: 0 0 auto;
+  /* Phased pulse: reviewer (right side) breathes first, reviewed
+     (left side) breathes 1.2 s later — the half-cycle offset reads as
+     a wave moving from reviewer toward reviewed without being
+     mechanically synced. ease-in-out + tiny scale + opacity bump keep
+     it whisper-quiet; the shimmer below carries the obvious motion. */
+  animation: review-tether-dot-pulse 2400ms ease-in-out infinite;
+}
+.review-tether-dot[data-side="reviewer"] {
+  animation-delay: 0ms;
+}
+.review-tether-dot[data-side="reviewed"] {
+  animation-delay: 1200ms;
+}
+@keyframes review-tether-dot-pulse {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 0.92;
+  }
+  50% {
+    transform: scale(1.04);
+    opacity: 1;
+  }
+}
+.review-tether-icon {
+  width: 1.125rem;
+  height: 1.125rem;
+}
+.review-tether-line {
+  position: relative;
+  width: 3.5rem;
+  height: 1.5px;
+  /* Monochrome gradient; the center is at full foreground so the line
+     reads against any pane bg. Endpoints fade so the line "emerges"
+     from each dot rather than butting up. */
+  background: linear-gradient(
+    to right,
+    color-mix(in oklab, var(--foreground) 25%, transparent) 0%,
+    var(--foreground) 50%,
+    color-mix(in oklab, var(--foreground) 25%, transparent) 100%
+  );
+  margin: 0 -2px;
+  /* The shimmer pseudo lives inside the line — clip it so it can't
+     bleed past the line's rounded ends. */
+  border-radius: 9999px;
+  overflow: hidden;
+}
+/* The Shimmer: a narrow asymmetric gleam that travels right → left
+   along the line, indicating direction "reviewer → reviewee". Brighter
+   at the leading (left) edge, fading to a softer tail — reads as a
+   directional comet, not a generic pulse.
+
+   `background-position` animation is composited on the GPU, so this
+   doesn't trigger paint over the xterm canvases. The 35 %-wide stripe
+   crosses the line in a continuous 2.4 s loop. */
+.review-tether-line::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  /* Comet-shaped stripe: bright at the leading (left) edge — the side
+     that enters new territory as the stripe slides right→left — fading
+     to a softer tail on the trailing (right) edge. The asymmetry tells
+     you which direction the shimmer is travelling at any single frame,
+     even when the motion itself is too subtle to register consciously. */
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    color-mix(in oklab, var(--foreground) 95%, transparent) 35%,
+    color-mix(in oklab, var(--foreground) 30%, transparent) 70%,
+    transparent 100%
+  );
+  background-size: 35% 100%;
+  background-repeat: no-repeat;
+  animation: review-tether-shimmer 2400ms linear infinite;
+}
+@keyframes review-tether-shimmer {
+  /* Start fully off-screen on the right (reviewer side). */
+  from {
+    background-position: 140% 0;
+  }
+  /* End fully off-screen on the left (reviewee side). */
+  to {
+    background-position: -40% 0;
+  }
+}
+/* Pause every motion when the user reaches into a linked pane — the
+   tether becomes a still, dimmed peripheral cue while focus is inside.
+   No motion competes with the work. */
+.review-tether--recede .review-tether-dot,
+.review-tether--recede .review-tether-line::before {
+  animation-play-state: paused;
+}
+
+/* Cross-harness review snap state. When the user drags an agent pane's
+   interior onto another agent pane, the magnetic snap engages
+   immediately (paneDnD's `snapped` flag) and the target enters the
+   `pane-review-snap-target` state. Three things happen on the target,
+   together composing the "feelable" snap moment:
+     1. A one-shot pulse animation (scale 1 → 1.025 → 1) draws the eye
+        to the receiving pane — the "click, snapped" beat.
+     2. A hard 3 px foreground outline lights up the target's perimeter
+        — the "hard border where the drag stops" cue.
+     3. The body's xterm canvas blurs, signaling "this content is the
+        review subject, not the live working surface."
+   Plus the `<ReviewSnapOverlay>` (icons + first-prompt preview).
+   On the source side, `.pane-dragging.is-snapped` (below) ghosts the
+   dragged card and hides its xterm pixels so the target's visuals
+   aren't occluded — no "terminal in terminal" overlay. Moving the
+   cursor past the snap's hysteresis bounds unsnaps automatically. */
+.leaf-frame.pane-review-snap-target {
+  outline: 3px solid var(--foreground);
+  outline-offset: -3px;
+  z-index: 50;
+  animation: pane-review-snap-pulse 280ms cubic-bezier(0.2, 0.9, 0.25, 1);
+}
+@keyframes pane-review-snap-pulse {
+  0% {
+    transform: scale(1);
+  }
+  40% {
+    transform: scale(1.025);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+.leaf-frame.pane-review-snap-target .terminal-chrome-body > :first-child {
+  filter: blur(4px) brightness(0.5);
+  transition: filter 140ms ease-out;
+}
+.leaf-frame .terminal-chrome-body > :first-child {
+  /* Reverse transition when unsnapping. */
+  transition: filter 100ms ease-in;
+}
+.terminal-chrome-body {
+  /* Container queries scope the overlay's icon/text sizes to the pane's
+     own width — small panes get readable mini icons, big panes get a
+     poster-sized "reviews" affordance. */
+  container-type: inline-size;
+}
+.pane-review-snap-overlay {
+  background: color-mix(in oklab, var(--background) 78%, transparent);
+  backdrop-filter: blur(2px);
+  animation: pane-review-snap-fade-in 140ms ease-out;
+  /* Spacing scales with pane width (clamped). cqi = 1% of the container's
+     inline (horizontal) size, so a 1200 px-wide pane gets ~24 px gaps
+     while a 320 px-wide pane gets the lower bound. */
+  gap: clamp(0.75rem, 2cqi, 2rem);
+  padding: clamp(1rem, 4cqi, 4rem);
+}
+@keyframes pane-review-snap-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+.pane-review-snap-icons {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* Inline gap scales with pane width; bigger panes get more breathing
+     room between the icons + arrow. */
+  gap: clamp(0.75rem, 3cqi, 3rem);
+  color: var(--foreground);
+}
+.pane-review-snap-icon {
+  /* The icons are the visual centerpiece — they need to be large at a
+     reasonable pane size and grow further on big screens. Square via
+     equal width + height. */
+  width: clamp(2.5rem, 14cqi, 9rem);
+  height: clamp(2.5rem, 14cqi, 9rem);
+  flex: 0 0 auto;
+}
+.pane-review-snap-arrow {
+  font-size: clamp(0.8rem, 2.4cqi, 1.6rem);
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: color-mix(in oklab, var(--foreground) 65%, transparent);
+  white-space: nowrap;
+}
+.pane-review-snap-prompt {
+  font-size: clamp(0.85rem, 1.8cqi, 1.25rem);
+  line-height: 1.45;
+  max-width: 80%;
+  /* 3 lines max so a paragraph-length original prompt doesn't dominate
+     the overlay; ellipsis carries the rest. */
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  color: color-mix(in oklab, var(--foreground) 80%, transparent);
+}
+.pane-review-snap-prompt-empty {
+  color: color-mix(in oklab, var(--foreground) 50%, transparent);
+  font-style: italic;
+}
+
+/* Hint label inside the snap overlay. The magnetic snap commits on
+   release (no dwell), so the hint is a single, steady "Release to
+   review" message — quiet enough not to compete with the icons +
+   prompt above, loud enough to spell out the gesture. */
+.pane-review-snap-hint {
+  margin-top: clamp(0.4rem, 0.8cqi, 0.7rem);
+  font-size: clamp(0.7rem, 1.4cqi, 0.9rem);
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--foreground);
+}
+
 /* While any drag is in flight, every non-dragging pane gets a subtle ring
    so the full set of valid drop targets is visible at a glance. The
    overshoot spring used for normal layout changes reads as "wobbly" on
    every pointermove — swap for a flat ease-out so the live reflow under
    the cursor feels crisp, not bouncy. Keep the spring for non-drag
    mutations (splits, closes, divider drag) where overshoot feels good. */
-[data-dnd-root].dnd-active .leaf-frame:not(.pane-dragging) {
+/* Exclude both the chrome's drag source (.pane-dragging) AND the
+   surface mirror (.surface-dragging-source) from the global transform
+   transition. Otherwise this 4-class selector outranks the surface's
+   intended `transition: transform 0ms` override (2 classes) and the
+   xterm body lags ~220 ms behind the chrome — header and content
+   visibly separate during drag. Both layers must share one timeline. */
+[data-dnd-root].dnd-active .leaf-frame:not(.pane-dragging):not(.surface-dragging-source) {
   box-shadow:
     0 0 0 1px rgba(113, 113, 122, 0.5),
     0 10px 24px -12px rgba(0, 0, 0, 0.7);
@@ -482,6 +799,42 @@ body,
     0 30px 60px -15px rgba(0, 0, 0, 0.75),
     0 12px 30px -6px rgba(var(--accent-split), 0.22);
   will-change: transform;
+}
+
+/* SNAPPED source: the dragged pane has crossed into a sibling pane's
+   interior. Instead of continuing to track the cursor, the source
+   docks magnetically into the centre of the target via `--snap-dx`/
+   `--snap-dy` (delta from the source pane's resting position to the
+   target's centre, computed in `<TerminalGrid>`'s drag effect).
+   Pairing the same 120 ms ease with a target-anchored translate
+   produces a single, unified "click into place" beat — pane shrinks
+   AND slides to the target's centre simultaneously. Drift past the
+   hysteresis ring (or press Escape) toggles `is-snapped` off; the
+   rule stops matching, --snap-dx/dy are removed, and the pane
+   returns to 1:1 cursor tracking, animated by the same easing —
+   feels like releasing a magnet. Tilt drops to 0 so it reads as
+   locked, not floating; colored split-ring becomes a neutral 2 px
+   foreground outline — paired with the target's pulse + hard
+   outline (above), the moment of snap is unmistakable. The surface
+   mirror (.is-snapped on the surface frame, below) reads the same
+   --snap-dx/dy so chrome and live xterm dock together. */
+.leaf-frame.pane-dragging.is-snapped {
+  transform: translate(var(--snap-dx, 0px), var(--snap-dy, 0px)) scale(0.4);
+  transition:
+    transform 120ms cubic-bezier(0.2, 0.9, 0.25, 1),
+    box-shadow 120ms ease;
+  box-shadow:
+    0 0 0 2px var(--foreground),
+    0 30px 60px -15px rgba(0, 0, 0, 0.75);
+  /* When the snap engages, the source thumbnail must read as PARKED
+     UNDER the target's review affordance — the review overlay (icons,
+     prompt, "Release to review") is the foreground message; the docked
+     thumbnail is the contextual backdrop telling the user "this is the
+     pane that will become the reviewer". `.pane-review-snap-target`
+     uses z-index: 50; we drop the source chrome below it so the
+     overlay paints on top. Outside snap state, `.pane-dragging` keeps
+     z-index: 60 so the floating card stays above everything else. */
+  z-index: 40;
 }
 
 /* Maximized pane fills the canvas completely (no gutter). */
@@ -520,11 +873,31 @@ body,
    carries the visible card lift (border, glow, tilt); this rule just keeps
    the terminal pixels glued to it. `transition: transform 0ms` is critical
    — the inherited 220 ms transform easing from `.leaf-frame` would lag the
-   surface a fraction of a second behind the cursor, breaking the ghost. */
+   surface a fraction of a second behind the cursor, breaking the ghost.
+   `z-index: 50` promotes the source surface above its siblings inside
+   `.terminal-surface-layer` so the dragged chrome card always shows the
+   source pane's own xterm content through its transparent body — without
+   it, when the cursor is over another pane the target surface (later in
+   document order) paints over the translated source surface and the
+   dragged thumbnail appears empty inside its border. */
 .terminal-surface-frame.surface-dragging-source {
   transform: translate(var(--drag-dx), var(--drag-dy)) rotate(-0.6deg) scale(1.02);
   transition: transform 0ms;
   will-change: transform;
+  z-index: 50;
+}
+
+/* Surface mirror for the snapped chrome card. Same target-anchored
+   translate + shrink + ease so the live terminal pixels dock into
+   the target's centre alongside the chrome — the user sees the
+   actual terminal contents in the dragged thumbnail, parked over
+   the destination, not a header strip drifting alone. Without this
+   mirror the surface would stay full-size and continue cursor-
+   tracking while the chrome flew to centre, leaving an oversize
+   ghost. */
+.terminal-surface-frame.surface-dragging-source.is-snapped {
+  transform: translate(var(--snap-dx, 0px), var(--snap-dy, 0px)) scale(0.4);
+  transition: transform 120ms cubic-bezier(0.2, 0.9, 0.25, 1);
 }
 
 .terminal-surface-body {

@@ -288,6 +288,10 @@ pub struct AppearanceConfig {
     /// without hijacking the curated picker selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_theme_path: Option<PathBuf>,
+    /// Fade the first and last user prompt over each agent pane as a
+    /// glanceable banner. Hides on any mouse movement. Default: on.
+    #[serde(default = "default_show_prompt_overlay")]
+    pub show_prompt_overlay: bool,
 }
 pub const DEFAULT_THEME_ID: &str = "raum-default-dark";
 
@@ -295,11 +299,16 @@ fn default_theme_id() -> String {
     DEFAULT_THEME_ID.to_string()
 }
 
+fn default_show_prompt_overlay() -> bool {
+    true
+}
+
 impl Default for AppearanceConfig {
     fn default() -> Self {
         Self {
             theme_id: DEFAULT_THEME_ID.to_string(),
             custom_theme_path: None,
+            show_prompt_overlay: true,
         }
     }
 }
@@ -542,6 +551,16 @@ pub struct TrackedSession {
     pub last_prompt_text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_prompt_at_unix_ms: Option<u64>,
+    /// The harness's *own* session id (Claude Code / Codex UUID),
+    /// captured from the hook payload on the first `UserPromptSubmit`
+    /// event. Persisted so post-restart pane overlays can disambiguate
+    /// between multiple sessions sharing one worktree directory:
+    /// without it, the on-disk transcript heuristic ("newest jsonl in
+    /// the worktree") returns the same file for every pane in the
+    /// project. Optional because shell sessions and harnesses with no
+    /// hook flow never set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_session_id: Option<String>,
 }
 
 /// `state/quickfire-history.toml` — bounded ring of recent quick-fire commands.
@@ -785,6 +804,7 @@ mod tests {
         let cfg = AppearanceConfig {
             theme_id: "dracula".into(),
             custom_theme_path: Some(PathBuf::from("/tmp/custom-theme.json")),
+            show_prompt_overlay: false,
         };
         roundtrip(cfg);
     }
@@ -797,6 +817,7 @@ mod tests {
         let parsed: AppearanceConfig = toml::from_str(raw).expect("parse");
         assert_eq!(parsed.theme_id, DEFAULT_THEME_ID);
         assert!(parsed.custom_theme_path.is_none());
+        assert!(parsed.show_prompt_overlay);
     }
 
     #[test]
@@ -897,6 +918,7 @@ mod tests {
                 last_state_at_unix_ms: None,
                 last_prompt_text: None,
                 last_prompt_at_unix_ms: None,
+                harness_session_id: None,
             }],
         };
         roundtrip(st);

@@ -14,6 +14,7 @@ pub mod hotkeys;
 pub mod notifications;
 pub mod permission;
 pub mod project;
+pub mod review;
 pub mod search;
 pub mod terminal;
 pub mod updater;

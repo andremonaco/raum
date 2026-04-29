@@ -57,6 +57,9 @@ import { getXtermOptions } from "../lib/xtermConfig";
 import { getCurrentXtermTheme, subscribeThemeChange } from "../lib/theme/themeController";
 import { FALLBACK_XTERM_THEME } from "../lib/theme/toXtermTheme";
 import { ChevronDownIcon, CopyIcon } from "./icons";
+import PromptOverlay from "./prompt-overlay";
+import { mouseIdle } from "../lib/globalMouseIdle";
+import { showPromptOverlay } from "../lib/appearancePrefs";
 
 export interface TerminalPaneProps {
   /** Stable identity for a persistent surface. Defaults to a component-local id. */
@@ -83,6 +86,10 @@ export interface TerminalPaneProps {
   onSpawned?: (sessionId: string) => void;
   /** Called when the user clicks the exit overlay to dismiss the pane. */
   onRequestClose?: () => void;
+  /** Optional initial prompt forwarded into the harness's launch command on
+   *  first spawn. Used by the cross-harness review feature; ignored when the
+   *  pane is reattaching to an existing session. */
+  initialPrompt?: string;
 }
 
 interface RenderingConfig {
@@ -140,6 +147,9 @@ interface SpawnArgs {
   /** Measured xterm cols/rows so the harness boots at the real size. */
   cols?: number;
   rows?: number;
+  /** Optional initial prompt appended to the harness launch command (cross-
+   *  harness review feature). Backend ignores when undefined. */
+  initial_prompt?: string;
 }
 
 /**
@@ -763,6 +773,7 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         cwd: props.cwd,
         cols,
         rows,
+        initial_prompt: props.initialPrompt,
       };
       logLifecycle("spawn", paneId, sessionId());
       void invoke<string>("terminal_spawn", {
@@ -1152,6 +1163,18 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         }}
         class="min-h-0 min-w-0 flex-1 overflow-hidden"
       />
+      <Show
+        when={
+          showPromptOverlay() &&
+          isHarnessKind(props.kind) &&
+          !props.active &&
+          !exitState() &&
+          bridgeRecoveryUiState() === "idle" &&
+          !historyOverlay()
+        }
+      >
+        <PromptOverlay sessionId={sessionId()} visible={mouseIdle()} />
+      </Show>
       <Show when={hasDetachedHistory()}>
         <button
           type="button"

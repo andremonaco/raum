@@ -29,6 +29,7 @@ import { Dialog as DialogPrimitive } from "@kobalte/core/dialog";
 
 import { cx } from "~/lib/cva";
 import { tildify } from "~/lib/pathDisplay";
+import { setShowPromptOverlay, showPromptOverlay } from "~/lib/appearancePrefs";
 import {
   DEFAULT_THEME_ID,
   THEME_CATALOG,
@@ -546,10 +547,48 @@ const ThemePickerSection: Component = () => {
   );
 };
 
+/**
+ * Toggle for the per-pane prompt overlay (the glanceable banner that
+ * fades the original task and latest direction over each agent
+ * pane). The signal is shared via `appearancePrefs` so live panes
+ * re-render the moment the user flips this switch.
+ */
+const PromptOverlayToggle: Component = () => {
+  const [saving, setSaving] = createSignal(false);
+  const handleChange = async (v: boolean) => {
+    // Update the local signal immediately so every pane reacts on the
+    // next tick; only roll back if the backend write fails.
+    const previous = showPromptOverlay();
+    setShowPromptOverlay(v);
+    setSaving(true);
+    try {
+      await invoke("config_set_appearance_show_prompt_overlay", { enabled: v });
+    } catch (e) {
+      console.warn("config_set_appearance_show_prompt_overlay failed", e);
+      setShowPromptOverlay(previous);
+    } finally {
+      setSaving(false);
+    }
+  };
+  return (
+    <div class="flex flex-col gap-1.5">
+      <h4 class="text-[10px] uppercase tracking-wider text-muted-foreground">Pane overlay</h4>
+      <ToggleRow
+        label="Show task overlay on panes"
+        description="Fades the first and last prompt over each agent pane. Hides on mouse movement."
+        checked={showPromptOverlay()}
+        onChange={(v) => void handleChange(v)}
+        disabled={saving()}
+      />
+    </div>
+  );
+};
+
 const AppearanceSection: Component = () => {
   return (
     <div class="flex flex-col gap-4">
       <ThemePickerSection />
+      <PromptOverlayToggle />
     </div>
   );
 };

@@ -66,6 +66,7 @@ import {
   type TerminalListItem,
 } from "../stores/terminalStore";
 import { subscribePaneActivity } from "../stores/runtimeLayoutStore";
+import { subscribeReviewLinkEvents } from "../stores/reviewLinkStore";
 import { useKeymap } from "../lib/keymapContext";
 import { PROJECT_COLOR_PALETTE } from "../lib/projectColors";
 import { PROJECT_SIGIL_PALETTE, SIGIL_RESET, deriveSigilFromSlug } from "../lib/projectSigils";
@@ -445,6 +446,7 @@ export const TopRow: Component = () => {
     let unlistenBranches: UnlistenFn | undefined;
     let unlistenMenu: UnlistenFn | undefined;
     let unlistenPaneActivity: UnlistenFn | undefined;
+    let unlistenReviewLinks: UnlistenFn | undefined;
 
     listen<string>("menu-action", (ev) => {
       if (ev.payload === "open-settings") {
@@ -475,6 +477,13 @@ export const TopRow: Component = () => {
     subscribeTerminalEvents()
       .then((u) => {
         unlistenTerminal = u;
+      })
+      .catch(() => {
+        /* Tauri context unavailable (tests). */
+      });
+    subscribeReviewLinkEvents()
+      .then((u) => {
+        unlistenReviewLinks = u;
       })
       .catch(() => {
         /* Tauri context unavailable (tests). */
@@ -529,6 +538,7 @@ export const TopRow: Component = () => {
       unlistenBranches?.();
       unlistenMenu?.();
       unlistenPaneActivity?.();
+      unlistenReviewLinks?.();
     });
   });
 

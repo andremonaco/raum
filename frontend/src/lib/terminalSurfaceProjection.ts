@@ -18,6 +18,9 @@ export interface TerminalSurfaceDescriptor {
   visible: boolean;
   active: boolean;
   maximized: boolean;
+  /** Cross-harness review: forwarded into the next `terminal_spawn`. Set on
+   *  the tab by the review-intent drop handler; cleared once consumed. */
+  initialPrompt?: string;
 }
 
 export interface ProjectTerminalSurfacesArgs {
@@ -140,6 +143,7 @@ export function projectTerminalSurfaces(
           visible,
           active: visible && activeTab && args.focusedPaneId === cell.id,
           maximized,
+          initialPrompt: tab.initialPrompt,
         },
         activeTab,
       );

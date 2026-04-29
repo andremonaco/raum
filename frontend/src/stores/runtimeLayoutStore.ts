@@ -32,8 +32,10 @@ import {
   buildFromRects,
   compact,
   equalizeRatios,
+  findBoundaryLCA,
   leaf,
   leafIds as treeLeafIds,
+  MIN_RATIO,
   normalizeRatios,
   pathToLeaf,
   projectToRects,
@@ -42,6 +44,7 @@ import {
   splitAtRoot,
   swapLeaves,
   tileLeaves,
+  type Axis,
   type Direction,
   type LayoutNode,
   type Rect,
@@ -117,6 +120,14 @@ export interface CellTab {
    *  break the pane-pruning filter). */
   projectSlug?: string;
   worktreeId?: string;
+  /** Cross-harness review: when the tab is spawned, this string is forwarded
+   *  to `terminal_spawn` as `initial_prompt`. Cleared after the first
+   *  successful spawn so reattach paths don't see it. Not persisted. */
+  initialPrompt?: string;
+  /** Cross-harness review: when set, the next successful spawn for this tab
+   *  will record a review link with the given session id (= the reviewed
+   *  session) and clear this field. Not persisted. */
+  pendingReviewOf?: string;
 }
 
 /** Everything we track per pane that ISN'T layout geometry. Keyed by pane id
@@ -286,13 +297,32 @@ export function restorePane(paneId: string): void {
   insertExistingPaneFocused(paneId);
 }
 
+/** Mirror `panes[id]` activity metadata into the matching `cells[i]`
+ *  entry without going through `rebuildCells()`. The full rebuild bumps
+ *  `layoutRev`, which downstream layout-derived memos (notably the
+ *  review-tether `positions` memo in `terminal-grid.tsx`) read as a
+ *  signal that pane geometry changed — forcing a `<For>` rebuild that
+ *  visibly remounts the tether DOM and replays its fade-in animation.
+ *  Activity bumps don't change geometry, so we update `cells` surgically
+ *  instead and skip the layout-rev signal. The dock and any consumer
+ *  that subscribes to `cells[i].lastActivityMs` / `lastSnippet` directly
+ *  still sees the new value via fine-grained store reactivity. */
+function applyCellActivityMirror(
+  paneId: string,
+  patch: Partial<Pick<PaneContent, "lastActivityMs" | "lastSnippet">>,
+): void {
+  const idx = runtimeLayoutStore.cells.findIndex((c) => c.id === paneId);
+  if (idx < 0) return;
+  setRuntimeLayoutStore("cells", idx, patch);
+}
+
 export function setLastSnippet(cellId: string, snippet: string, activityMs: number): void {
   if (!runtimeLayoutStore.panes[cellId]) return;
   setRuntimeLayoutStore("panes", cellId, {
     lastSnippet: snippet,
     lastActivityMs: activityMs,
   });
-  rebuildCells();
+  applyCellActivityMirror(cellId, { lastSnippet: snippet, lastActivityMs: activityMs });
   scheduleActiveSave();
 }
 
@@ -303,10 +333,11 @@ export function setLastSnippet(cellId: string, snippet: string, activityMs: numb
  *  ordering. */
 export function touchPaneBySession(sessionId: string): void {
   if (!sessionId) return;
+  const now = Date.now();
   for (const pane of Object.values(runtimeLayoutStore.panes)) {
     if (pane.tabs.some((t) => t.sessionId === sessionId)) {
-      setRuntimeLayoutStore("panes", pane.id, { lastActivityMs: Date.now() });
-      rebuildCells();
+      setRuntimeLayoutStore("panes", pane.id, { lastActivityMs: now });
+      applyCellActivityMirror(pane.id, { lastActivityMs: now });
       return;
     }
   }
@@ -720,6 +751,83 @@ export function setSplitRatios(nodePath: number[], ratios: number[]): void {
   scheduleActiveSave();
 }
 
+/**
+ * Adjust the ratio on whichever runtime split actually owns the visible
+ * boundary between two adjacent groups of leaves. Dividers are computed
+ * against the *pruned* tree (visible panes only), but the runtime tree
+ * may have hidden siblings between the two visible neighbours, so a
+ * pruned-tree path can land on the wrong split — or a leaf — when
+ * applied verbatim. Looking up the matching split by leaf-id on each
+ * side stays correct under any pruning + compaction.
+ *
+ * `prunedLeftRatio` / `prunedRightRatio` are the new shares the user
+ * wants the two visible siblings to occupy *within their pruned
+ * parent*. We rescale them by the runtime parent's visible-share so
+ * hidden siblings keep their absolute ratios (they're invisible to
+ * the user; touching them would surprise the next time the scope
+ * filter changes).
+ */
+export function setSplitRatiosByBoundary(args: {
+  axis: Axis;
+  leftLeafIds: readonly string[];
+  rightLeafIds: readonly string[];
+  visibleLeafIds: readonly string[];
+  prunedLeftRatio: number;
+  prunedRightRatio: number;
+}): void {
+  const tree = currentTree();
+  if (!tree || tree.kind === "leaf") return;
+  const leftSet = new Set(args.leftLeafIds);
+  const rightSet = new Set(args.rightLeafIds);
+  const visibleSet = new Set(args.visibleLeafIds);
+  const lca = findBoundaryLCA(tree, leftSet, rightSet);
+  if (!lca) return;
+  if (lca.node.axis !== args.axis) return;
+
+  // Sum of LCA child-ratios whose subtree currently has any visible leaf.
+  // Pruned ratios are runtime ratios divided by this sum; we invert to map
+  // the user's pruned-space delta back to runtime-space deltas.
+  let visibleSum = 0;
+  for (let i = 0; i < lca.node.children.length; i++) {
+    if (subtreeContainsAny(lca.node.children[i], visibleSet)) {
+      visibleSum += lca.node.ratios[i];
+    }
+  }
+  if (!Number.isFinite(visibleSum) || visibleSum <= 0) return;
+
+  // Floor the requested pruned ratios so a single pane can't be dragged
+  // into oblivion. The downstream `normalizeRatios` would re-floor anyway,
+  // but doing it here keeps the left+right sum stable so hidden siblings
+  // retain their original ratios after the rebuild.
+  const minPruned = MIN_RATIO;
+  let l = Math.max(args.prunedLeftRatio, minPruned);
+  let r = Math.max(args.prunedRightRatio, minPruned);
+  const prunedSum = l + r;
+  if (prunedSum <= 0) return;
+
+  // Original combined share at the LCA, in runtime coords.
+  const oldCombined = lca.node.ratios[lca.leftIdx] + lca.node.ratios[lca.rightIdx];
+  // Distribute that combined share by the new pruned ratio.
+  l = (l / prunedSum) * oldCombined;
+  r = (r / prunedSum) * oldCombined;
+
+  const nextRatios = [...lca.node.ratios];
+  nextRatios[lca.leftIdx] = l;
+  nextRatios[lca.rightIdx] = r;
+  const next = setRatiosAt(tree, lca.path, normalizeRatios(nextRatios));
+  setRuntimeLayoutStore("tree", next);
+  rebuildCells();
+  scheduleActiveSave();
+}
+
+function subtreeContainsAny(node: LayoutNode, ids: ReadonlySet<string>): boolean {
+  if (node.kind === "leaf") return ids.has(node.id);
+  for (const c of node.children) {
+    if (subtreeContainsAny(c, ids)) return true;
+  }
+  return false;
+}
+
 /** Reset every split in the tree to even ratios. Topology preserved; only
  *  divider positions move. No-op when the tree is null or a bare leaf. */
 export function equalizeAllRatios(): void {
@@ -848,6 +956,79 @@ export function removeTabsBySessionId(sessionId: string): void {
     if (!pane.tabs.some((tab) => tab.id === match.tabId)) continue;
     removeCellTab(match.cellId, match.tabId);
   }
+}
+
+/**
+ * Cross-harness review: turn `cellId` into a reviewer pane targeting
+ * `reviewedSessionId`. Replaces the pane's tabs with a single fresh tab
+ * carrying `initialPrompt` and `pendingReviewOf` so `<TerminalPane>` will
+ * spawn a fresh harness with the review brief seeded as its first turn,
+ * and the post-spawn callback can record the link via the backend.
+ *
+ * The pane's `kind`, `projectSlug`, `worktreeId` are updated to the
+ * supplied values (the reviewer runs in the *reviewed pane's* worktree).
+ *
+ * Does not kill the existing session; the caller is responsible for that
+ * via `terminal_kill` so the order is explicit.
+ *
+ * Returns the new tab id, or null if the pane no longer exists.
+ */
+export function replacePaneForReview(
+  cellId: string,
+  args: {
+    kind: CellKind;
+    projectSlug?: string;
+    worktreeId?: string;
+    initialPrompt: string;
+    reviewedSessionId: string;
+  },
+): string | null {
+  const pane = runtimeLayoutStore.panes[cellId];
+  if (!pane) return null;
+  const tabId = nextTabId();
+  const newTab: CellTab = {
+    id: tabId,
+    initialPrompt: args.initialPrompt,
+    pendingReviewOf: args.reviewedSessionId,
+    projectSlug: args.projectSlug,
+    worktreeId: args.worktreeId,
+  };
+  setRuntimeLayoutStore("panes", cellId, {
+    kind: args.kind,
+    projectSlug: args.projectSlug,
+    worktreeId: args.worktreeId,
+    tabs: [newTab],
+    activeTabId: tabId,
+  });
+  rebuildCells();
+  scheduleActiveSave();
+  return tabId;
+}
+
+/**
+ * Clear the cross-harness-review pending fields on a tab once the linked
+ * spawn has resolved. Idempotent — calling it on a tab that has neither
+ * field set is a no-op.
+ */
+export function clearTabReviewPending(cellId: string, tabId: string): void {
+  const pane = runtimeLayoutStore.panes[cellId];
+  if (!pane) return;
+  const tabIdx = pane.tabs.findIndex((t) => t.id === tabId);
+  if (tabIdx === -1) return;
+  const tab = pane.tabs[tabIdx];
+  if (!tab.initialPrompt && !tab.pendingReviewOf) return;
+  setRuntimeLayoutStore("panes", cellId, "tabs", tabIdx, {
+    initialPrompt: undefined,
+    pendingReviewOf: undefined,
+  });
+}
+
+/** Read the pending-review session id for a given tab, if any. */
+export function tabPendingReviewOf(cellId: string, tabId: string): string | undefined {
+  const pane = runtimeLayoutStore.panes[cellId];
+  if (!pane) return undefined;
+  const tab = pane.tabs.find((t) => t.id === tabId);
+  return tab?.pendingReviewOf;
 }
 
 // ---- pending-reset registry (transient; not persisted) --------------------

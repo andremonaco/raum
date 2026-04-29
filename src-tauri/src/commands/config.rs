@@ -171,6 +171,23 @@ pub fn config_set_appearance_theme(
     store.write_config(&cfg).map_err(|e| e.to_string())
 }
 
+/// Persist the per-pane prompt-overlay toggle. The overlay fades the
+/// first and last user prompt over each agent pane as a glanceable
+/// banner; some users find it noisy and want it off.
+#[tauri::command]
+pub fn config_set_appearance_show_prompt_overlay(
+    state: tauri::State<'_, AppHandleState>,
+    enabled: bool,
+) -> Result<(), String> {
+    let store = state.config_store.lock().map_err(|e| e.to_string())?;
+    let mut cfg: Config = store.read_config().map_err(|e| e.to_string())?;
+    if cfg.appearance.show_prompt_overlay == enabled {
+        return Ok(());
+    }
+    cfg.appearance.show_prompt_overlay = enabled;
+    store.write_config(&cfg).map_err(|e| e.to_string())
+}
+
 /// Persist the global worktree `path_pattern`. Called by the Worktrees settings
 /// section when the user picks a preset or edits a custom pattern.
 ///
