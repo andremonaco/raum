@@ -171,6 +171,56 @@ jobs:
           projectPath: src-tauri
           updaterJsonPreferNsis: false
 
+      # tauri-action notarizes and staples the inner .app, but leaves
+      # the DMG wrapper signed-only. macOS Sequoia's Gatekeeper validates
+      # the DMG itself when it carries the `com.apple.quarantine` xattr
+      # (Safari/Chrome attach it to anything downloaded), so an
+      # unnotarized DMG triggers the "Apple konnte nicht überprüfen, ob
+      # raum frei von Schadsoftware ist" dialog even though the .app
+      # inside is fine. Homebrew users dodge this because `brew install
+      # --cask` strips the quarantine xattr before copying the .app —
+      # but direct DMG downloads from the GH release hit the wall.
+      #
+      # Fix: submit the DMG to notarytool, staple the resulting ticket,
+      # and re-upload over the asset tauri-action already attached to
+      # the draft release.
+      - name: notarize + staple DMG
+        if: startsWith(matrix.target.os, 'macos')
+        env:
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          TRIPLE: ${{ matrix.target.triple }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          dmg_dir="src-tauri/target/${TRIPLE}/release/bundle/dmg"
+          if [ ! -d "$dmg_dir" ]; then
+            echo "no DMG output dir at $dmg_dir" >&2
+            exit 1
+          fi
+          shopt -s nullglob
+          dmgs=( "$dmg_dir"/*.dmg )
+          if [ ${#dmgs[@]} -eq 0 ]; then
+            echo "no DMGs in $dmg_dir" >&2
+            exit 1
+          fi
+          for dmg in "${dmgs[@]}"; do
+            echo "::group::notarize $(basename "$dmg")"
+            xcrun notarytool submit "$dmg" \
+              --key "$APPLE_API_KEY_PATH" \
+              --key-id "$APPLE_API_KEY_ID" \
+              --issuer "$APPLE_API_ISSUER" \
+              --wait
+            xcrun stapler staple "$dmg"
+            xcrun stapler validate "$dmg"
+            spctl -a -vvv -t install "$dmg"
+            echo "::endgroup::"
+            echo "re-uploading stapled $(basename "$dmg") to $TAG"
+            gh release upload "$TAG" "$dmg" \
+              --repo "$GITHUB_REPOSITORY" --clobber
+          done
+
   # Flip the GH Release from draft to published once every platform
   # bundle has uploaded successfully. release-plz creates the release
   # as a draft so the build matrix has a window to attach artefacts
