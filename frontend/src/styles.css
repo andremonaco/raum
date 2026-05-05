@@ -1041,9 +1041,20 @@ body,
   transition: filter 120ms ease-out;
 }
 
+/* Container query root for the overlay. The overlay is rendered inside
+   `.leaf-frame` (the chrome wrapper), which has no `container-type` —
+   without this, every `cqi`/`cqb` below would resolve against the
+   viewport, not the pane, and narrow/short panes clipped the content.
+   Declaring the overlay itself as a `size` container scopes all the
+   `cqi`/`cqb` clamps + container queries below to the pane's own box. */
 .terminal-file-drop-overlay {
-  padding: clamp(1rem, 4cqi, 4rem);
-  gap: clamp(0.65rem, 1.7cqi, 1.4rem);
+  container-type: size;
+  container-name: filedrop;
+  overflow: hidden;
+  min-width: 0;
+  min-height: 0;
+  padding: clamp(0.5rem, 4cqi, 4rem);
+  gap: clamp(0.35rem, 1.7cqi, 1.4rem);
   background:
     linear-gradient(
       180deg,
@@ -1066,19 +1077,27 @@ body,
   }
 }
 
+/* Preview stack: fans out four icons across its own width using
+   percentage anchors. Earlier we offset by fixed rem distances from
+   center, which on a 220px-wide pane meant the 4th tile sat ~120px
+   past the right edge (and got clipped by the overlay's overflow).
+   Sizing each tile as a percentage of the stack and pinning their
+   `left:` anchors at 22 / 45 / 68 / 88% keeps the whole fan inside
+   the stack regardless of pane width. */
 .terminal-file-drop-preview-stack {
   position: relative;
-  width: clamp(8.5rem, 28cqi, 20rem);
-  height: clamp(3rem, 8cqi, 5.5rem);
+  width: min(20rem, 78cqi);
+  max-width: 100%;
+  height: clamp(2.2rem, 14cqb, 5.5rem);
+  flex-shrink: 0;
 }
 
 .terminal-file-drop-preview-file {
   position: absolute;
-  left: 50%;
   top: 50%;
   display: grid;
-  width: clamp(2.8rem, 7cqi, 4.6rem);
-  height: clamp(2.8rem, 7cqi, 4.6rem);
+  width: clamp(2rem, 22%, 4.6rem);
+  aspect-ratio: 1;
   place-items: center;
   border: 1px solid color-mix(in oklab, var(--foreground) 22%, transparent);
   border-radius: 8px;
@@ -1089,31 +1108,37 @@ body,
 }
 
 .terminal-file-drop-preview-file:nth-child(1) {
-  transform: translate(calc(-50% - 4.1rem), calc(-50% + 0.45rem)) rotate(-9deg);
+  left: 22%;
+  transform: translate(-50%, calc(-50% + 6%)) rotate(-9deg);
 }
 
 .terminal-file-drop-preview-file:nth-child(2) {
-  transform: translate(-50%, calc(-50% - 0.4rem)) rotate(1deg);
+  left: 45%;
+  z-index: 2;
+  transform: translate(-50%, calc(-50% - 8%)) rotate(1deg);
 }
 
 .terminal-file-drop-preview-file:nth-child(3) {
-  transform: translate(calc(-50% + 4.1rem), calc(-50% + 0.45rem)) rotate(9deg);
+  left: 68%;
+  transform: translate(-50%, calc(-50% + 6%)) rotate(9deg);
 }
 
 .terminal-file-drop-preview-file:nth-child(4) {
-  transform: translate(calc(-50% + 7.6rem), calc(-50% + 1rem)) rotate(14deg) scale(0.86);
+  left: 88%;
+  transform: translate(-50%, calc(-50% + 14%)) rotate(14deg) scale(0.86);
   opacity: 0.82;
 }
 
 .terminal-file-drop-preview-icon {
-  width: clamp(1.6rem, 4cqi, 2.25rem);
-  height: clamp(1.6rem, 4cqi, 2.25rem);
+  width: clamp(1.1rem, 55%, 2.25rem);
+  height: clamp(1.1rem, 55%, 2.25rem);
 }
 
 .terminal-file-drop-target-icon {
   display: grid;
-  width: clamp(3.7rem, 12cqi, 7.5rem);
-  height: clamp(3.7rem, 12cqi, 7.5rem);
+  width: clamp(2.6rem, 16cqi, 7.5rem);
+  aspect-ratio: 1;
+  max-height: 28cqb;
   place-items: center;
   border: 1px solid color-mix(in oklab, var(--foreground) 28%, transparent);
   border-radius: 8px;
@@ -1121,33 +1146,36 @@ body,
   box-shadow:
     0 18px 42px -20px rgba(0, 0, 0, 0.9),
     0 0 0 5px color-mix(in oklab, var(--project-accent, var(--foreground)) 16%, transparent);
+  flex-shrink: 0;
 }
 
 .terminal-file-drop-harness-icon {
-  width: clamp(2.4rem, 8cqi, 5.2rem);
-  height: clamp(2.4rem, 8cqi, 5.2rem);
+  width: 70%;
+  height: 70%;
 }
 
 .terminal-file-drop-title {
-  max-width: min(90%, 34rem);
-  font-size: clamp(0.95rem, 2.3cqi, 1.55rem);
+  max-width: 100%;
+  font-size: clamp(0.78rem, 2.3cqi, 1.55rem);
   font-weight: 650;
   line-height: 1.15;
   color: var(--foreground);
+  overflow-wrap: anywhere;
 }
 
 .terminal-file-drop-files {
   display: flex;
-  max-width: min(92%, 42rem);
+  max-width: 100%;
   flex-wrap: wrap;
   justify-content: center;
   gap: 0.45rem;
+  min-width: 0;
 }
 
 .terminal-file-drop-chip {
   display: inline-flex;
   min-width: 0;
-  max-width: min(18rem, 42cqi);
+  max-width: min(18rem, 80cqi);
   align-items: center;
   gap: 0.45rem;
   border: 1px solid color-mix(in oklab, var(--foreground) 16%, transparent);
@@ -1155,9 +1183,43 @@ body,
   background: color-mix(in oklab, var(--surface-raised) 86%, transparent);
   padding: 0.42rem 0.58rem;
   color: color-mix(in oklab, var(--foreground) 84%, transparent);
-  font-size: clamp(0.7rem, 1.4cqi, 0.9rem);
+  font-size: clamp(0.65rem, 1.4cqi, 0.9rem);
   line-height: 1;
   box-shadow: inset 0 1px 0 color-mix(in oklab, var(--foreground) 10%, transparent);
+}
+
+/* Progressive degradation as the pane shrinks. Drop the decorative
+   preview-stack first (it's the largest non-essential element); then
+   the chip list (the title + harness icon already convey the action);
+   then the harness icon when even the title is starved for room. */
+@container filedrop (max-width: 22rem) {
+  .terminal-file-drop-preview-stack {
+    display: none;
+  }
+}
+
+@container filedrop (max-height: 13rem) {
+  .terminal-file-drop-preview-stack {
+    display: none;
+  }
+}
+
+@container filedrop (max-width: 16rem) {
+  .terminal-file-drop-files {
+    display: none;
+  }
+}
+
+@container filedrop (max-height: 9rem) {
+  .terminal-file-drop-target-icon {
+    display: none;
+  }
+}
+
+@container filedrop (max-height: 6rem) {
+  .terminal-file-drop-files {
+    display: none;
+  }
 }
 
 .terminal-file-drop-chip span {
