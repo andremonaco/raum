@@ -574,8 +574,9 @@ const WorktreeRow: Component<WorktreeRowProps> = (rowProps) => {
         type="button"
         class="flex w-full items-start gap-1.5 rounded px-1.5 py-1.5 text-left hover:bg-hover"
         classList={{
-          "bg-selected": rowProps.isActive,
+          "sidebar-row-active": rowProps.isActive,
         }}
+        aria-current={rowProps.isActive ? "true" : undefined}
         aria-expanded={expanded()}
         onClick={() => {
           setExpanded((v) => !v);
@@ -1246,7 +1247,8 @@ const AllTerminalsRow: Component<AllTerminalsRowProps> = (rowProps) => {
       <button
         type="button"
         class="flex w-full items-center gap-1.5 rounded px-1.5 py-1.5 text-left hover:bg-hover"
-        classList={{ "bg-selected": rowProps.isActive }}
+        classList={{ "sidebar-row-active": rowProps.isActive }}
+        aria-current={rowProps.isActive ? "true" : undefined}
         onClick={() => setActiveWorktreeAll(rowProps.projectSlug)}
         title="Show terminals across all worktrees; new spawns land in the project root"
       >
@@ -1642,7 +1644,8 @@ export const Sidebar: Component = () => {
                     <button
                       type="button"
                       class="flex w-full items-center justify-center gap-0.5 rounded px-0.5 py-1.5 hover:bg-hover"
-                      classList={{ "bg-selected": isAllActiveMini() }}
+                      classList={{ "sidebar-row-active": isAllActiveMini() }}
+                      aria-current={isAllActiveMini() ? "true" : undefined}
                       title={`All terminals — ${allCounts().active} active · ${allCounts().waiting} waiting · ${allCounts().idle} idle`}
                       onClick={() => setActiveWorktreeAll(project().slug)}
                     >
@@ -1673,7 +1676,8 @@ export const Sidebar: Component = () => {
                           <button
                             type="button"
                             class="flex w-full items-center justify-center gap-0.5 rounded px-0.5 py-1.5 hover:bg-hover"
-                            classList={{ "bg-selected": isActiveWt() }}
+                            classList={{ "sidebar-row-active": isActiveWt() }}
+                            aria-current={isActiveWt() ? "true" : undefined}
                             title={`${wtName()} — ${counts().active} active · ${counts().waiting} waiting · ${counts().idle} idle`}
                             onClick={() => setActiveWorktree(project().slug, wt.path)}
                           >

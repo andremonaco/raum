@@ -2,26 +2,11 @@
  * §8 — Top row navigation.
  *
  * Layout (left → right):
- *   [raum brand] [project tabs… +] | [Active | Needs input · N | Recent]
- *                                     [spawn: shell|claude|codex|opencode]
- *                                     [global-search]
+ *   [raum brand] [project tabs… +] [search] [working · awaiting · completed]
  *
- * Responsibilities per §8.1–§8.6:
- *   • §8.1 horizontal tab strip with colored project tabs + three fixed
- *     filter tabs; color is read live from `projectStore`.
- *   • §8.2 spawn buttons (shell, Claude Code, Codex, OpenCode) with the
- *     hotkey hint pulled from `keymap_get_effective` via the keymap ctx.
- *   • §8.3 filter-tab selection mutates `selectedFilter`; the grid
- *     (Wave 3A) reads this signal directly.
- *   • §8.4 count badge on `Needs input` reflects `waitingCount()` from
- *     `terminalStore`.
- *   • §8.5 keyboard shortcuts for cycle-tab-next/prev, select-project-N,
- *     and the three filter tabs are registered with the keymap context
- *     (Wave 3E owns OS-level capture; we register handlers so cheat-sheet
- *     + manual dispatch work today).
- *   • §8.6 global-search affordance — Wave 3A already parks one here, so
- *     we keep theirs (including the `⌘⇧F` keydown capture) rather than
- *     adding a duplicate.
+ * The working / awaiting / completed counters on the right double as
+ * cross-project view toggles: clicking one paints every matching pane across
+ * projects; clicking again returns to the active project's grid.
  */
 
 import {
@@ -76,7 +61,6 @@ import { closeSpotlight, setTopBarQuery, spotlightOpen } from "../lib/spotlightS
 import { AddProjectModal } from "./add-project-modal";
 import { KeymapSettingsModal } from "./keymap-settings-modal";
 import { SettingsModal } from "./settings-modal";
-import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
 import {
   Dialog,
@@ -95,7 +79,6 @@ import {
   ActivityIcon,
   AlertCircleIcon,
   CheckIcon,
-  ClockIcon,
   GitBranchIcon,
   HARNESS_ICONS,
   type HarnessIconKind,
@@ -119,12 +102,12 @@ export { selectedFilter, setSelectedFilter };
 
 /**
  * Cross-project "spotlight" view. When non-null, raum paints only the panes
- * matching this mode (awaiting / recent / working) across every project and
+ * matching this mode (awaiting / completed / working) across every project and
  * each pane's header glows with its owning project's color. `null` = normal
  * single-project grid. Mutually exclusive with `selectedFilter`, which stays
  * project-scoped.
  */
-export type CrossProjectViewMode = "awaiting" | "recent" | "working";
+export type CrossProjectViewMode = "awaiting" | "completed" | "working";
 const [crossProjectViewMode, setCrossProjectViewMode] = createSignal<CrossProjectViewMode | null>(
   null,
 );
@@ -416,7 +399,6 @@ export const TopRow: Component = () => {
   let headerRef: HTMLElement | undefined;
   let leftSectionRef: HTMLDivElement | undefined;
   let rightSectionRef: HTMLDivElement | undefined;
-  let filterNavRef: HTMLElement | undefined;
   // Remember tabs' natural full-mode width so we can evaluate whether full mode
   // would still fit even while we're currently rendering in compact mode.
   let lastFullTabsWidth = 0;
@@ -561,7 +543,7 @@ export const TopRow: Component = () => {
   };
 
   const evaluateCompact = () => {
-    if (!headerRef || !leftSectionRef || !rightSectionRef || !filterNavRef || !tabsScrollRef) {
+    if (!headerRef || !leftSectionRef || !rightSectionRef || !tabsScrollRef) {
       return;
     }
     const tabCount = projectStore.items.length;
@@ -569,7 +551,6 @@ export const TopRow: Component = () => {
     const headerWidth = headerRef.clientWidth;
     const leftWidth = leftSectionRef.scrollWidth;
     const rightWidth = rightSectionRef.scrollWidth;
-    const filterWidth = filterNavRef.scrollWidth;
     // If currently rendering full mode, the tabs' scrollWidth IS the natural
     // full width — capture it. In compact mode fall back to the last captured
     // value, or to a size-based estimate when we've never seen full mode.
@@ -580,9 +561,9 @@ export const TopRow: Component = () => {
     } else {
       tabsWidth = lastFullTabsWidth > 0 ? lastFullTabsWidth : estimateFullTabsWidth();
     }
-    // grid gap-2 between 3 columns = 16px, center gap-1 between tabs+filters = 4px
-    const GAPS = 20;
-    const requiredForFull = leftWidth + tabsWidth + filterWidth + rightWidth + GAPS;
+    // grid gap-2 between header columns = 16px.
+    const GAPS = 16;
+    const requiredForFull = leftWidth + tabsWidth + rightWidth + GAPS;
     if (!compactTabs() && requiredForFull > headerWidth) {
       setCompactTabs(true);
     } else if (compactTabs() && requiredForFull + 40 <= headerWidth) {
@@ -700,27 +681,12 @@ export const TopRow: Component = () => {
     }
   }
 
-  interface FilterDef {
-    mode: CrossProjectViewMode;
-    label: string;
-    icon: typeof AlertCircleIcon;
-  }
-  // Header filters open a cross-project spotlight view — mapping awaiting /
-  // recent / working to the agent-state buckets. The project-scoped
-  // `selectedFilter` is a separate concern, kept for keymap back-compat.
-  const filters = createMemo<FilterDef[]>(() => [
-    { mode: "awaiting", label: "Awaiting across projects", icon: AlertCircleIcon },
-    { mode: "recent", label: "Recent across projects", icon: ClockIcon },
-    { mode: "working", label: "Working across projects", icon: LoaderIcon },
-  ]);
-
-  // Badge value rendered on each filter button. `waitingCount` and
-  // `activeCount` are already cross-project totals from terminalStore; the
-  // recent view is always capped at 9 and doesn't warrant a count pill.
-  function crossProjectBadgeCount(mode: CrossProjectViewMode): number {
-    if (mode === "awaiting") return waitingCount();
-    if (mode === "working") return activeCount();
-    return 0;
+  // Toggle a cross-project view from a clickable counter on the right side of
+  // the header. Re-clicking the active mode returns to the single-project grid.
+  function toggleCrossProjectView(mode: CrossProjectViewMode) {
+    const next = crossProjectViewMode() === mode ? null : mode;
+    if (next) markStart(`filter-click:${next}`);
+    setCrossProjectViewMode(next);
   }
 
   return (
@@ -798,7 +764,21 @@ export const TopRow: Component = () => {
               </button>
             </div>
           </Show>
-          <RaumLogo class="mr-1 size-5 shrink-0" />
+          <RaumLogo
+            class="mr-1 size-5 shrink-0 cursor-default"
+            onContextMenu={(e) => {
+              // Right-click the brand logo to open the WebView devtools.
+              // Global contextmenu suppressor still owns regular right-clicks
+              // everywhere else; this stays reachable because the handler
+              // bypasses preventDefault by invoking explicitly, and the
+              // suppressor never stops propagation.
+              e.preventDefault();
+              e.stopPropagation();
+              void invoke("open_devtools").catch((err) => {
+                console.warn("open_devtools invoke failed", err);
+              });
+            }}
+          />
           <button
             type="button"
             aria-label="Open settings"
@@ -910,113 +890,54 @@ export const TopRow: Component = () => {
           </For>
         </div>
 
-        {/* CENTER — project tabs (scrollable) + view filter icons (not
-            scrollable, so the badge overhang on the filter buttons is not
-            clipped by `overflow: hidden` on the scroll axis).
-            `min-w-0` on the grid column + the inner flex wrapper lets the
-            tabs column shrink below its natural content width, at which point
-            the `Scrollable` host caps at `max-w-full` and scrolls inside. */}
-        <div
-          data-tauri-drag-region
-          class="grid min-w-0 flex-1 grid-cols-[1fr_auto_1fr] items-center gap-1"
-        >
-          <div data-tauri-drag-region aria-hidden="true" />
-
-          <div data-tauri-drag-region class="flex min-w-0 items-center justify-center">
-            <Scrollable axis="x" class="max-w-full">
-              <nav
-                data-tauri-drag-region
-                ref={(el) => (tabsScrollRef = el)}
-                class="flex flex-none items-stretch gap-0.5"
-                aria-label="Projects"
-                data-testid="project-tabs"
-              >
-                <For each={projectStore.items}>
-                  {(project) => (
-                    <ProjectTab
-                      project={project}
-                      active={activeProjectSlug() === project.slug}
-                      compact={compactTabs()}
-                      onSelect={() => {
-                        markStart("project-switch:active");
-                        setActiveProjectSlug(project.slug);
-                        setSelectedFilter("active");
-                        setCrossProjectViewMode(null);
-                      }}
-                      onRemove={() => setConfirmRemove(project)}
-                    />
-                  )}
-                </For>
-                <Tooltip>
-                  <TooltipTrigger
-                    as={Button}
-                    type="button"
-                    variant="ghost"
-                    size="icon-sm"
-                    class="h-7 w-7 text-muted-foreground hover:text-foreground"
-                    onClick={() => setModalOpen(true)}
-                    aria-label="Add project"
-                    data-testid="add-project-button"
-                  >
-                    <PlusIcon class="size-3.5" />
-                  </TooltipTrigger>
-                  <TooltipPortal>
-                    <TooltipContent>Add project</TooltipContent>
-                  </TooltipPortal>
-                </Tooltip>
-              </nav>
-            </Scrollable>
-          </div>
-
-          <nav
-            data-tauri-drag-region
-            ref={(el) => (filterNavRef = el)}
-            class="relative z-10 flex shrink-0 items-stretch justify-self-end gap-0.5"
-            aria-label="Cross-project views"
-            data-testid="filter-tabs"
-          >
-            <For each={filters()}>
-              {(filter) => {
-                const Icon = filter.icon;
-                const badge = () => crossProjectBadgeCount(filter.mode);
-                const active = () => crossProjectViewMode() === filter.mode;
-                return (
-                  <Tooltip>
-                    <TooltipTrigger
-                      as="button"
-                      type="button"
-                      class="relative flex h-7 w-7 items-center justify-center rounded"
-                      classList={{
-                        "bg-selected text-foreground": active(),
-                        "text-muted-foreground hover:text-foreground": !active(),
-                      }}
-                      onClick={() => {
-                        const nextMode = active() ? null : filter.mode;
-                        if (nextMode) markStart(`filter-click:${nextMode}`);
-                        setCrossProjectViewMode(nextMode);
-                      }}
-                      aria-label={filter.label}
-                      aria-pressed={active()}
-                      data-testid={`filter-${filter.mode}`}
-                    >
-                      <Icon class="size-3.5" />
-                      <Show when={badge() > 0}>
-                        <Badge
-                          class="absolute -top-1 -right-1 h-3.5 min-w-3.5 justify-center rounded-full border border-background bg-warning px-0.5 text-[9px] font-semibold text-background hover:bg-warning"
-                          data-testid={`cross-project-count-${filter.mode}`}
-                        >
-                          {badge()}
-                        </Badge>
-                      </Show>
-                    </TooltipTrigger>
-                    <TooltipPortal>
-                      <TooltipContent>{filter.label}</TooltipContent>
-                    </TooltipPortal>
-                  </Tooltip>
-                );
-              }}
-            </For>
-          </nav>
+        {/* CENTER — project tabs (scrollable). The inner flex wrapper +
+            `min-w-0` lets the tabs column shrink below its natural content
+            width, at which point the `Scrollable` host caps at `max-w-full`
+            and scrolls inside. */}
+        <div data-tauri-drag-region class="flex min-w-0 items-center justify-center">
+          <Scrollable axis="x" class="max-w-full" hideScrollbar>
+            <nav
+              data-tauri-drag-region
+              ref={(el) => (tabsScrollRef = el)}
+              class="flex flex-none items-stretch gap-0.5"
+              aria-label="Projects"
+              data-testid="project-tabs"
+            >
+              <For each={projectStore.items}>
+                {(project) => (
+                  <ProjectTab
+                    project={project}
+                    active={activeProjectSlug() === project.slug}
+                    compact={compactTabs()}
+                    onSelect={() => {
+                      markStart("project-switch:active");
+                      setActiveProjectSlug(project.slug);
+                      setSelectedFilter("active");
+                      setCrossProjectViewMode(null);
+                    }}
+                    onRemove={() => setConfirmRemove(project)}
+                  />
+                )}
+              </For>
+              <Tooltip>
+                <TooltipTrigger
+                  as={Button}
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  class="h-7 w-7 text-muted-foreground hover:text-foreground"
+                  onClick={() => setModalOpen(true)}
+                  aria-label="Add project"
+                  data-testid="add-project-button"
+                >
+                  <PlusIcon class="size-3.5" />
+                </TooltipTrigger>
+                <TooltipPortal>
+                  <TooltipContent>Add project</TooltipContent>
+                </TooltipPortal>
+              </Tooltip>
+            </nav>
+          </Scrollable>
         </div>
 
         {/* RIGHT — search input + status counters */}
@@ -1063,151 +984,184 @@ export const TopRow: Component = () => {
             class="flex items-center gap-0.5 rounded-md px-1 py-0.5 text-[10px]"
             data-testid="harness-counters"
           >
-            <Tooltip>
-              <TooltipTrigger
-                as="span"
-                class="inline-flex items-center gap-1 rounded px-1 py-0.5 font-mono"
-                classList={{
-                  "text-success": activeCount() > 0,
-                  "text-muted-foreground": activeCount() === 0,
-                }}
-                data-testid="active-count"
-              >
-                <Show when={activeCount() > 0} fallback={<ActivityIcon class="size-3" />}>
-                  <LoaderIcon class="size-3 animate-spin" />
-                </Show>
-                {activeCount()}
-              </TooltipTrigger>
-              <TooltipPortal>
-                <TooltipContent>
-                  {activeCount()} active harness{activeCount() === 1 ? "" : "es"}
-                </TooltipContent>
-              </TooltipPortal>
-            </Tooltip>
-            <Show when={waitingCount() > 0}>
-              <HoverCard>
-                <HoverCardTrigger
-                  as="button"
-                  type="button"
-                  class="inline-flex cursor-pointer items-center gap-1 rounded-md bg-warning/15 px-1.5 py-0.5 text-[10px] font-medium text-warning animate-pulse"
-                  data-testid="waiting-count"
-                  onClick={() => {
-                    const first = waitingTerminals()[0];
-                    if (!first?.session_id) return;
-                    window.dispatchEvent(
-                      new CustomEvent("terminal-focus-requested", {
-                        detail: { sessionId: first.session_id },
-                      }),
-                    );
-                  }}
-                >
-                  <AlertCircleIcon class="size-3.5 shrink-0" />
-                  {waitingCount()} need input
-                </HoverCardTrigger>
-                <HoverCardPortal>
-                  <HoverCardContent class="w-80 p-1" data-testid="waiting-list">
-                    <div class="flex flex-col">
-                      <For each={waitingTerminals()}>
-                        {(t) => {
-                          const project = () =>
-                            t.project_slug ? (projectBySlug().get(t.project_slug) ?? null) : null;
-                          const Icon =
-                            HARNESS_ICONS[t.kind as HarnessIconKind] ??
-                            HARNESS_ICONS["shell" as HarnessIconKind];
-                          return (
-                            <button
-                              type="button"
-                              class="group flex items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs hover:bg-hover focus:bg-hover focus:outline-none"
-                              onClick={() => {
-                                window.dispatchEvent(
-                                  new CustomEvent("terminal-focus-requested", {
-                                    detail: { sessionId: t.session_id },
-                                  }),
-                                );
-                              }}
-                            >
-                              <Icon class="size-3.5 shrink-0 text-warning" />
-                              <span class="flex-1 truncate text-foreground/90">
-                                {resolveSessionTabLabel(t.session_id)}
-                              </span>
-                              <Show when={project()}>
-                                {(p) => (
-                                  <span class="flex shrink-0 items-center gap-1 text-[10px] text-muted-foreground/70">
-                                    <Show when={p().sigil}>
-                                      <span class="font-mono text-muted-foreground/60">
-                                        {p().sigil}
-                                      </span>
-                                    </Show>
-                                    <span class="truncate">{p().name}</span>
+            {/* Working — toggles the cross-project working view */}
+            {(() => {
+              const active = () => crossProjectViewMode() === "working";
+              return (
+                <Tooltip>
+                  <TooltipTrigger
+                    as="button"
+                    type="button"
+                    class="inline-flex items-center gap-1 rounded px-1 py-0.5 font-mono transition-colors"
+                    classList={{
+                      "bg-selected text-foreground": active(),
+                      "text-success": !active() && activeCount() > 0,
+                      "text-muted-foreground hover:text-foreground":
+                        !active() && activeCount() === 0,
+                    }}
+                    onClick={() => toggleCrossProjectView("working")}
+                    aria-pressed={active()}
+                    aria-label="Show working across projects"
+                    data-testid="active-count"
+                  >
+                    <Show when={activeCount() > 0} fallback={<ActivityIcon class="size-3" />}>
+                      <LoaderIcon class="size-3 animate-spin" />
+                    </Show>
+                    {activeCount()}
+                  </TooltipTrigger>
+                  <TooltipPortal>
+                    <TooltipContent>
+                      {active() ? "Hide" : "Show"} {activeCount()} working harness
+                      {activeCount() === 1 ? "" : "es"} across projects
+                    </TooltipContent>
+                  </TooltipPortal>
+                </Tooltip>
+              );
+            })()}
+
+            {/* Awaiting — toggles the cross-project awaiting view; hover-card
+                still previews the list of waiting harnesses. */}
+            {(() => {
+              const active = () => crossProjectViewMode() === "awaiting";
+              const has = () => waitingCount() > 0;
+              return (
+                <HoverCard>
+                  <HoverCardTrigger
+                    as="button"
+                    type="button"
+                    class="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] font-medium transition-colors"
+                    classList={{
+                      "bg-selected text-foreground": active(),
+                      "bg-warning/15 text-warning animate-pulse": !active() && has(),
+                      "text-muted-foreground hover:text-foreground font-mono": !active() && !has(),
+                    }}
+                    onClick={() => toggleCrossProjectView("awaiting")}
+                    aria-pressed={active()}
+                    aria-label="Show awaiting across projects"
+                    data-testid="waiting-count"
+                  >
+                    <AlertCircleIcon class={has() ? "size-3.5 shrink-0" : "size-3 shrink-0"} />
+                    <Show when={has()} fallback={<>0</>}>
+                      {waitingCount()} need input
+                    </Show>
+                  </HoverCardTrigger>
+                  <Show when={has()}>
+                    <HoverCardPortal>
+                      <HoverCardContent class="w-80 p-1" data-testid="waiting-list">
+                        <div class="flex flex-col">
+                          <For each={waitingTerminals()}>
+                            {(t) => {
+                              const project = () =>
+                                t.project_slug
+                                  ? (projectBySlug().get(t.project_slug) ?? null)
+                                  : null;
+                              const Icon =
+                                HARNESS_ICONS[t.kind as HarnessIconKind] ??
+                                HARNESS_ICONS["shell" as HarnessIconKind];
+                              return (
+                                <button
+                                  type="button"
+                                  class="group flex items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs hover:bg-hover focus:bg-hover focus:outline-none"
+                                  onClick={() => {
+                                    window.dispatchEvent(
+                                      new CustomEvent("terminal-focus-requested", {
+                                        detail: { sessionId: t.session_id },
+                                      }),
+                                    );
+                                  }}
+                                >
+                                  <Icon class="size-3.5 shrink-0 text-warning" />
+                                  <span class="flex-1 truncate text-foreground/90">
+                                    {resolveSessionTabLabel(t.session_id)}
                                   </span>
-                                )}
-                              </Show>
-                            </button>
-                          );
-                        }}
-                      </For>
-                    </div>
-                  </HoverCardContent>
-                </HoverCardPortal>
-              </HoverCard>
-            </Show>
-            <Show when={waitingCount() === 0}>
-              <span
-                class="inline-flex items-center gap-1 rounded px-1 py-0.5 font-mono text-muted-foreground"
-                data-testid="waiting-count"
-              >
-                <AlertCircleIcon class="size-3" />0
-              </span>
-            </Show>
-            <HoverCard>
-              <HoverCardTrigger
-                as="span"
-                class="inline-flex items-center gap-1 rounded px-1 py-0.5 font-mono text-muted-foreground"
-                data-testid="done-count"
-              >
-                <CheckIcon class="size-3" />
-                {idleCount()}
-              </HoverCardTrigger>
-              <HoverCardPortal>
-                <HoverCardContent class="w-64 p-2 text-xs">
-                  <div class="text-foreground/90">
-                    {idleCount()} idle harness{idleCount() === 1 ? "" : "es"}
-                  </div>
-                  <Show when={idleCount() > 0}>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      class="mt-2 h-7 w-full justify-start text-[11px]"
-                      onClick={() => {
-                        void (async () => {
-                          try {
-                            const killed = await invoke<string[]>("terminal_kill_orphans");
-                            setOrphanSweepResult({
-                              count: killed.length,
-                              ids: killed,
-                            });
-                          } catch (e) {
-                            console.error("[top-row] terminal_kill_orphans failed", e);
-                            setOrphanSweepResult({
-                              count: 0,
-                              error: String(e),
-                            });
-                          }
-                        })();
-                      }}
-                    >
-                      Sweep orphan tmux sessions
-                    </Button>
-                    <p class="mt-1 text-[10px] leading-snug text-muted-foreground">
-                      Kills tmux sessions on the raum socket that aren&apos;t tracked by the app.
-                      Safety floor: ignores sessions newer than 30 s so it can&apos;t race a fresh
-                      spawn.
-                    </p>
+                                  <Show when={project()}>
+                                    {(p) => (
+                                      <span class="flex shrink-0 items-center gap-1 text-[10px] text-muted-foreground/70">
+                                        <Show when={p().sigil}>
+                                          <span class="font-mono text-muted-foreground/60">
+                                            {p().sigil}
+                                          </span>
+                                        </Show>
+                                        <span class="truncate">{p().name}</span>
+                                      </span>
+                                    )}
+                                  </Show>
+                                </button>
+                              );
+                            }}
+                          </For>
+                        </div>
+                      </HoverCardContent>
+                    </HoverCardPortal>
                   </Show>
-                </HoverCardContent>
-              </HoverCardPortal>
-            </HoverCard>
+                </HoverCard>
+              );
+            })()}
+
+            {/* Completed — toggles the cross-project completed view; hover-card
+                hosts the orphan-sweep tooling. */}
+            {(() => {
+              const active = () => crossProjectViewMode() === "completed";
+              return (
+                <HoverCard>
+                  <HoverCardTrigger
+                    as="button"
+                    type="button"
+                    class="inline-flex items-center gap-1 rounded px-1 py-0.5 font-mono transition-colors"
+                    classList={{
+                      "bg-selected text-foreground": active(),
+                      "text-muted-foreground hover:text-foreground": !active(),
+                    }}
+                    onClick={() => toggleCrossProjectView("completed")}
+                    aria-pressed={active()}
+                    aria-label="Show completed across projects"
+                    data-testid="done-count"
+                  >
+                    <CheckIcon class="size-3" />
+                    {idleCount()}
+                  </HoverCardTrigger>
+                  <HoverCardPortal>
+                    <HoverCardContent class="w-64 p-2 text-xs">
+                      <div class="text-foreground/90">
+                        {idleCount()} completed harness{idleCount() === 1 ? "" : "es"}
+                      </div>
+                      <Show when={idleCount() > 0}>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="sm"
+                          class="mt-2 h-7 w-full justify-start text-[11px]"
+                          onClick={() => {
+                            void (async () => {
+                              try {
+                                const killed = await invoke<string[]>("terminal_kill_orphans");
+                                setOrphanSweepResult({
+                                  count: killed.length,
+                                  ids: killed,
+                                });
+                              } catch (e) {
+                                console.error("[top-row] terminal_kill_orphans failed", e);
+                                setOrphanSweepResult({
+                                  count: 0,
+                                  error: String(e),
+                                });
+                              }
+                            })();
+                          }}
+                        >
+                          Sweep orphan tmux sessions
+                        </Button>
+                        <p class="mt-1 text-[10px] leading-snug text-muted-foreground">
+                          Kills tmux sessions on the raum socket that aren&apos;t tracked by the
+                          app. Safety floor: ignores sessions newer than 30 s so it can&apos;t race
+                          a fresh spawn.
+                        </p>
+                      </Show>
+                    </HoverCardContent>
+                  </HoverCardPortal>
+                </HoverCard>
+              );
+            })()}
           </div>
         </div>
       </header>

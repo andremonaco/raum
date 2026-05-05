@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   __setDragStateForTests,
@@ -113,15 +113,19 @@ describe("magnetic snap via beginDrag", () => {
     { id: "tgt", x: 5000, y: 0, w: 5000, h: 10000 },
   ];
 
+  interface DropResult {
+    sourceId: string;
+    targetId: string | null;
+    zone: string | null;
+    snapped: boolean;
+    armed: boolean;
+  }
+
   function start(opts?: {
     canSnapTo?: (id: string) => boolean;
-    onDrop?: (r: {
-      sourceId: string;
-      targetId: string | null;
-      zone: string | null;
-      snapped: boolean;
-    }) => void;
+    onDrop?: (r: DropResult) => void;
     cells?: typeof LEFT_RIGHT_CELLS;
+    armDelayMs?: number;
   }): void {
     const event = new PointerEvent("pointerdown", { clientX: 100, clientY: 500 });
     beginDrag({
@@ -133,6 +137,7 @@ describe("magnetic snap via beginDrag", () => {
       cells: opts?.cells ?? LEFT_RIGHT_CELLS,
       layoutUnit: 10000,
       canSnapTo: opts?.canSnapTo,
+      armDelayMs: opts?.armDelayMs,
       onDrop:
         opts?.onDrop ??
         (() => {
@@ -340,24 +345,26 @@ describe("magnetic snap via beginDrag", () => {
   });
 
   it("commits the review on pointerup while snapped", () => {
-    const drops: Array<{ snapped: boolean; targetId: string | null }> = [];
+    const drops: DropResult[] = [];
     start({
       onDrop: (r) => {
-        drops.push({ snapped: r.snapped, targetId: r.targetId });
+        drops.push(r);
       },
     });
     move(750, 500);
     document.dispatchEvent(new PointerEvent("pointerup", { clientX: 750, clientY: 500 }));
     expect(drops).toHaveLength(1);
     expect(drops[0].snapped).toBe(true);
+    // armDelayMs defaults to 0 → snap arms instantly → release commits.
+    expect(drops[0].armed).toBe(true);
     expect(drops[0].targetId).toBe("tgt");
   });
 
   it("does not commit when released outside any snap or edge zone", () => {
-    const drops: Array<{ snapped: boolean; targetId: string | null }> = [];
+    const drops: DropResult[] = [];
     start({
       onDrop: (r) => {
-        drops.push({ snapped: r.snapped, targetId: r.targetId });
+        drops.push(r);
       },
     });
     // Hover into target then drag clearly past hysteresis, then release in
@@ -367,6 +374,7 @@ describe("magnetic snap via beginDrag", () => {
     document.dispatchEvent(new PointerEvent("pointerup", { clientX: 100, clientY: 500 }));
     expect(drops).toHaveLength(1);
     expect(drops[0].snapped).toBe(false);
+    expect(drops[0].armed).toBe(false);
   });
 
   it("edge zones still classify when the cursor is in the (capped) edge band", () => {
@@ -385,5 +393,215 @@ describe("magnetic snap via beginDrag", () => {
 
   it("ROOT_TARGET sentinel is unchanged", () => {
     expect(ROOT_TARGET).toBe("__root__");
+  });
+
+  // ---- dwell-to-arm gate -------------------------------------------------
+  //
+  // The visual snap engages immediately on entry, but a destructive
+  // commit (review = kill source pane's session) is gated on the
+  // separate `armed` flag. With armDelayMs > 0 the cursor must remain
+  // snapped on the same target for that long before `armed` flips
+  // true. Below tests cover the gate's transitions: instant arm on 0,
+  // delayed arm with timer, retarget reset, release-while-snapped-but-
+  // unarmed, and timer cancellation on Escape / leave-hysteresis.
+
+  describe("armDelayMs dwell gate", () => {
+    beforeEach(() => {
+      // Scope vi's fake timers to JUST setTimeout / clearTimeout / Date.
+      // The default `useFakeTimers()` also fakes requestAnimationFrame,
+      // which clobbers the outer beforeEach's rAF override (the one that
+      // populates `rafCallbacks` for `flushRaf()` to drain). Without this
+      // scope, `move()` would queue its rAF in vi's fake queue, our
+      // `flushRaf()` would no-op, and `dragState()` would never update.
+      vi.useFakeTimers({
+        toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"],
+      });
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("with armDelayMs=0, snap engages and arms in the same frame", () => {
+      start({ armDelayMs: 0 });
+      move(750, 500);
+      expect(dragState()?.snapped).toBe(true);
+      expect(dragState()?.armed).toBe(true);
+      expect(dragState()?.armStartedAtMs).toBeNull(); // no dwell stamp when instant
+    });
+
+    it("with armDelayMs>0, snap engages without arming (dwell pending)", () => {
+      start({ armDelayMs: 600 });
+      move(750, 500);
+      expect(dragState()?.snapped).toBe(true);
+      expect(dragState()?.armed).toBe(false);
+      expect(dragState()?.armStartedAtMs).toBeGreaterThan(0);
+    });
+
+    it("with armDelayMs=600, armed flips to true after dwell elapses while snapped", () => {
+      start({ armDelayMs: 600 });
+      move(750, 500);
+      expect(dragState()?.armed).toBe(false);
+      // Just before the timer fires → still unarmed.
+      vi.advanceTimersByTime(599);
+      expect(dragState()?.armed).toBe(false);
+      // Crossing the threshold → armed flips true.
+      vi.advanceTimersByTime(2);
+      expect(dragState()?.armed).toBe(true);
+    });
+
+    it("hold-after-arm: pointermove inside the hysteresis ring keeps armed=true", () => {
+      start({ armDelayMs: 600 });
+      move(750, 500);
+      vi.advanceTimersByTime(601);
+      expect(dragState()?.armed).toBe(true);
+      // Drift inside the snap interior — must not reset armed.
+      move(760, 500);
+      expect(dragState()?.armed).toBe(true);
+      expect(dragState()?.snapped).toBe(true);
+    });
+
+    it("release before dwell elapses yields snapped=true, armed=false (no commit)", () => {
+      const drops: DropResult[] = [];
+      start({ armDelayMs: 600, onDrop: (r) => drops.push(r) });
+      move(750, 500);
+      vi.advanceTimersByTime(200);
+      // Release while snapped but before the dwell completes.
+      document.dispatchEvent(new PointerEvent("pointerup", { clientX: 750, clientY: 500 }));
+      expect(drops).toHaveLength(1);
+      expect(drops[0].snapped).toBe(true);
+      expect(drops[0].armed).toBe(false); // commit gate is closed
+    });
+
+    it("release after dwell elapses yields snapped=true, armed=true (commits)", () => {
+      const drops: DropResult[] = [];
+      start({ armDelayMs: 600, onDrop: (r) => drops.push(r) });
+      move(750, 500);
+      vi.advanceTimersByTime(601);
+      document.dispatchEvent(new PointerEvent("pointerup", { clientX: 750, clientY: 500 }));
+      expect(drops).toHaveLength(1);
+      expect(drops[0].snapped).toBe(true);
+      expect(drops[0].armed).toBe(true);
+    });
+
+    it("retargeting onto a different pane restarts the dwell from 0", () => {
+      start({
+        armDelayMs: 600,
+        cells: [
+          { id: "src", x: 0, y: 0, w: 3333, h: 10000 },
+          { id: "mid", x: 3333, y: 0, w: 3334, h: 10000 },
+          { id: "rgt", x: 6667, y: 0, w: 3333, h: 10000 },
+        ],
+      });
+      // Engage on mid (interior x ~ 500).
+      move(500, 500);
+      expect(dragState()?.targetId).toBe("mid");
+      const midStart = dragState()?.armStartedAtMs;
+      // Almost-armed on mid…
+      vi.advanceTimersByTime(550);
+      expect(dragState()?.armed).toBe(false);
+      // …then slide into rgt's interior. FRESH ENGAGE on rgt → dwell
+      // restarts from 0; even though we'd accumulated 550 ms on mid,
+      // rgt now needs another full 600 ms to arm.
+      move(800, 500);
+      expect(dragState()?.targetId).toBe("rgt");
+      expect(dragState()?.armed).toBe(false);
+      const rgtStart = dragState()?.armStartedAtMs;
+      expect(rgtStart).toBeGreaterThanOrEqual(midStart ?? 0);
+      // 100 ms further → still unarmed (only 100 ms on rgt).
+      vi.advanceTimersByTime(100);
+      expect(dragState()?.armed).toBe(false);
+      // 600 ms total on rgt → armed.
+      vi.advanceTimersByTime(501);
+      expect(dragState()?.armed).toBe(true);
+      expect(dragState()?.targetId).toBe("rgt");
+    });
+
+    it("leaving the hysteresis ring during dwell cancels the timer + un-arms", () => {
+      start({ armDelayMs: 600 });
+      move(750, 500); // engage on tgt
+      vi.advanceTimersByTime(300);
+      expect(dragState()?.armed).toBe(false);
+      // Drag clearly past the ring (back into src's territory).
+      move(100, 500);
+      expect(dragState()?.snapped).toBe(false);
+      expect(dragState()?.armed).toBe(false);
+      // Run out the original timer's would-be deadline. The cancelled
+      // timer must NOT resurrect armed=true on a non-snapped state.
+      vi.advanceTimersByTime(1000);
+      expect(dragState()?.armed).toBe(false);
+      expect(dragState()?.snapped).toBe(false);
+    });
+
+    it("Escape during dwell cancels the timer (no late arm)", () => {
+      start({ armDelayMs: 600 });
+      move(750, 500);
+      vi.advanceTimersByTime(300);
+      // Press Escape mid-dwell.
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      expect(dragState()?.snapped).toBe(false);
+      expect(dragState()?.armed).toBe(false);
+      // Past the original deadline → still unarmed (timer was cancelled).
+      vi.advanceTimersByTime(1000);
+      expect(dragState()?.armed).toBe(false);
+    });
+
+    it("re-entering the same target after leaving restarts the dwell from 0", () => {
+      start({
+        armDelayMs: 600,
+        cells: [
+          { id: "src", x: 0, y: 0, w: 3333, h: 10000 },
+          { id: "tgt", x: 3333, y: 0, w: 3334, h: 10000 },
+          { id: "far", x: 6667, y: 0, w: 3333, h: 10000 },
+        ],
+      });
+      move(500, 500); // engage on tgt
+      vi.advanceTimersByTime(400); // 400 / 600 ms accumulated
+      // Hop out of tgt into far's interior → dwell on tgt cancels.
+      move(800, 500);
+      expect(dragState()?.targetId).toBe("far");
+      expect(dragState()?.armed).toBe(false);
+      // Hop back into tgt → fresh dwell starts from 0.
+      move(500, 500);
+      expect(dragState()?.targetId).toBe("tgt");
+      expect(dragState()?.armed).toBe(false);
+      // 200 ms on the new dwell → still unarmed (would have been
+      // armed if accumulator had carried).
+      vi.advanceTimersByTime(200);
+      expect(dragState()?.armed).toBe(false);
+      // Past 600 ms on the second dwell → armed.
+      vi.advanceTimersByTime(401);
+      expect(dragState()?.armed).toBe(true);
+    });
+
+    it("hysteresis-only HOLD (no eligible interior hit) preserves armed", () => {
+      // Cursor sat just inside the snap ring on the target (not in
+      // its interior — `eligible` would return false, so this exercises
+      // the HOLD branch). Without the wasSnappedSameTarget guard, this
+      // pointermove would reset armed to false even though the user
+      // hasn't actually left the snap.
+      start({ armDelayMs: 600 });
+      move(750, 500); // engage on tgt centre
+      vi.advanceTimersByTime(601);
+      expect(dragState()?.armed).toBe(true);
+      // Drift to just-outside-tgt-interior but inside the inflated
+      // hysteresis ring (tgt left edge x=500, ring starts at
+      // 500 - SNAP_HYST_PX). Sit inside the ring → HOLD branch.
+      move(500 - Math.floor(SNAP_HYST_PX / 2), 500);
+      expect(dragState()?.snapped).toBe(true);
+      expect(dragState()?.armed).toBe(true); // armed survives the HOLD
+    });
+
+    it("ROOT_TARGET drops never arm regardless of armDelayMs", () => {
+      // Root-edge gestures bypass the snap entirely — they're for
+      // splits / wrapping the layout, not reviews. armed must stay
+      // false even after a long hold near a root edge.
+      start({ armDelayMs: 600 });
+      // Approach the right edge of the root (within ROOT_ENTER_MARGIN).
+      move(995, 500);
+      expect(dragState()?.targetId).toBe(ROOT_TARGET);
+      expect(dragState()?.snapped).toBe(false);
+      vi.advanceTimersByTime(2000);
+      expect(dragState()?.armed).toBe(false);
+    });
   });
 });

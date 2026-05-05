@@ -224,10 +224,9 @@ impl ConfigStore {
     /// pane overlays can disambiguate between multiple sessions sharing
     /// one worktree directory.
     ///
-    /// Sticky once set — Claude/Codex session ids are stable for the
-    /// lifetime of the harness process, so subsequent calls are
-    /// no-ops. This prevents a malformed or out-of-order payload from
-    /// clobbering a known-good id mid-session.
+    /// Updated when a later hook reports a different value. Older raum builds
+    /// briefly guessed ids from cwd-newest transcript discovery; a real hook
+    /// payload must be allowed to repair that bad persisted value.
     ///
     /// Inserts a row when one doesn't yet exist, mirroring
     /// `update_session_last_state`. The first hook event for a fresh
@@ -243,7 +242,7 @@ impl ConfigStore {
     ) -> Result<(), StoreError> {
         let mut st = self.read_sessions().unwrap_or_default();
         if let Some(row) = st.sessions.iter_mut().find(|s| s.session_id == session_id) {
-            if row.harness_session_id.is_some() {
+            if row.harness_session_id.as_deref() == Some(harness_session_id) {
                 return Ok(());
             }
             row.harness_session_id = Some(harness_session_id.to_string());
@@ -769,11 +768,11 @@ mod tests {
     }
 
     #[test]
-    fn update_session_harness_id_inserts_then_is_sticky() {
+    fn update_session_harness_id_inserts_then_repairs_changed_id() {
         // The first hook event for a fresh session arrives before the
         // agent-event bridge has had a chance to register the row, so
-        // the helper must upsert. Subsequent calls must not clobber an
-        // already-set id.
+        // the helper must upsert. Later real hook payloads may repair an
+        // earlier bad persisted id.
         let dir = tempdir().unwrap();
         let store = ConfigStore::new(dir.path());
         store.ensure_layout().unwrap();
@@ -795,10 +794,8 @@ mod tests {
         assert_eq!(row.kind, AgentKind::ClaudeCode);
         assert_eq!(row.created_at_unix_ms, 100);
 
-        // Subsequent calls with a different id must not overwrite —
-        // Claude/Codex session ids are stable, and an unexpected
-        // change is more likely a malformed payload than a real
-        // re-id, so we keep the first one we saw.
+        // Subsequent calls with a different id overwrite. This lets a real
+        // hook payload repair an id guessed by older cwd-newest fallback code.
         store
             .update_session_harness_id(
                 "raum-abc",
@@ -809,7 +806,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             store.last_session_harness_id("raum-abc").as_deref(),
-            Some("claude-uuid-1"),
+            Some("claude-uuid-DIFFERENT"),
         );
     }
 

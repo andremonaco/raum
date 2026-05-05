@@ -107,16 +107,21 @@ interface RaumConfig {
  *  live `agent-state-changed` stream. Populates both the agent store and
  *  the terminal store's `workingState` so top-row counters and per-pane
  *  indicators render the correct state on app reload. */
-async function hydrateHarnessStateAfterReattach(sessionId: string, kind: AgentKind): Promise<void> {
+async function hydrateHarnessStateAfterReattach(
+  sessionId: string,
+  kind: AgentKind,
+): Promise<AgentState | null> {
   try {
     const state = await invoke<AgentState | null>("agent_state", {
       sessionId,
     });
-    if (!state) return;
+    if (!state) return null;
     updateSessionState(sessionId, kind, state);
     applyAgentStateToTerminal(sessionId, state);
+    return state;
   } catch (e) {
     console.warn("[TerminalPane] agent_state hydrate failed", e);
+    return null;
   }
 }
 
@@ -175,6 +180,8 @@ const COPY_FLASH_MS = 900;
 
 const MAX_BRIDGE_RECOVERY_ATTEMPTS = 3;
 const BRIDGE_RECOVERY_RETRY_MS = 500;
+const REATTACH_IN_FLIGHT_RETRY_MS = 250;
+const MAX_REATTACH_IN_FLIGHT_RETRIES = 20;
 
 type TerminalLifecycleEvent = "mount" | "cleanup" | "spawn" | "reattach" | "recover" | "self-heal";
 
@@ -211,6 +218,29 @@ interface TerminalSelfHealEventDetail {
   sessionId?: string;
 }
 
+interface AgentStateChangedPayload {
+  session_id: string | Record<string, unknown>;
+  to: AgentState;
+}
+
+type ReconnectHistoryStatus =
+  | "live-bridge"
+  | "provider-replay"
+  | "deferred-provider-replay"
+  | "unavailable";
+
+interface ReconnectResult {
+  sessionId: string;
+  historyStatus: ReconnectHistoryStatus;
+  message?: string;
+}
+
+function sessionIdFromAgentPayload(id: AgentStateChangedPayload["session_id"]): string {
+  if (typeof id === "string") return id;
+  const inner = id["0"];
+  return typeof inner === "string" ? inner : "";
+}
+
 export const TerminalPane: Component<TerminalPaneProps> = (props) => {
   const fallbackPaneId = createUniqueId();
   const paneId = props.surfaceKey ?? fallbackPaneId;
@@ -232,6 +262,7 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
   const [respawningDead, setRespawningDead] = createSignal<boolean>(false);
   let unlistenProcessExited: UnlistenFn | null = null;
   let unlistenBridgeLost: UnlistenFn | null = null;
+  let unlistenAgentState: UnlistenFn | null = null;
 
   // §4.6 — Solid signal for the border so prop changes don't re-init xterm.
   // The effect below keeps the signal in sync with `props.borderColor`; the
@@ -285,6 +316,7 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
   // closure structure intact.
   let recoverDeadPaneRef: (() => void) | null = null;
   let manualReconnectRef: (() => void) | null = null;
+  let reattachInFlightTimer: ReturnType<typeof setTimeout> | null = null;
 
   const normalBuffer = () => term?.buffer.normal ?? null;
   const hasDetachedHistory = (): boolean => {
@@ -383,17 +415,36 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       term.loadAddon(fit);
       term.loadAddon(search);
 
-      // Shift+Enter → ESC+CR (Alt/Option+Enter convention). xterm.js by
-      // default sends a bare `\r` for both Enter and Shift+Enter, so the
-      // harness can't distinguish them. `\x1b\r` is the sequence iTerm2's
-      // built-in Shift+Enter binding emits and that Claude Code, Codex,
-      // and OpenCode all interpret as "insert newline without submit."
+      // Shift+Enter newline. xterm.js sends a bare `\r` for both Enter and
+      // Shift+Enter, so without re-encoding the harness can't tell them
+      // apart and the prompt gets submitted. The byte sequence we send
+      // depends on which harness the pane is attached to:
+      //
+      //   * Codex (Rust + crossterm) → `\x1b[13;2u`. The kitty CSI-u form
+      //     for Shift+Enter — codepoint 13 (Enter), modifier 2 (Shift).
+      //     crossterm always parses CSI-u regardless of whether kitty
+      //     enhancement was negotiated, and the resulting `KeyEvent { code:
+      //     Enter, modifiers: SHIFT }` matches Codex's canonical
+      //     `shift(KeyCode::Enter)` insert_newline binding. The legacy
+      //     ESC+CR (Alt+Enter alias) used to work via codex's
+      //     `alt(KeyCode::Enter)` alias but regressed on some versions
+      //     (codex-rs#20580); the CSI-u form is the binding Codex actually
+      //     considers primary.
+      //   * Claude Code / OpenCode (Node TUIs without CSI-u parsers) →
+      //     `\x1b\r`. ESC+CR is iTerm2's default Shift+Enter sequence and
+      //     the one those harnesses match against.
+      //
+      // We don't intercept Shift+Tab. xterm.js sends `\x1b[Z` (back-tab),
+      // which crossterm decodes to `KeyCode::BackTab` — exactly what Codex
+      // binds for plan-mode toggle. Codex does not bind Shift+Tab to
+      // newline, so re-encoding it would not produce a newline either way.
       term.attachCustomKeyEventHandler((ev) => {
         if (ev.type !== "keydown") return true;
         if (ev.key === "Enter" && ev.shiftKey && !ev.ctrlKey && !ev.metaKey && !ev.altKey) {
           const id = sessionId();
           if (id) {
-            void invoke("terminal_send_keys", { sessionId: id, keys: "\x1b\r" }).catch((e) => {
+            const keys = props.kind === "codex" ? "\x1b[13;2u" : "\x1b\r";
+            void invoke("terminal_send_keys", { sessionId: id, keys }).catch((e) => {
               console.error("[TerminalPane] terminal_send_keys (shift+enter) failed", e);
             });
           }
@@ -456,36 +507,62 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       );
     })();
 
-    // §4.1 — raw byte channel. Kept outside the spawn gate so reattach paths
-    // can hand it to `terminal_spawn` too; today reattach uses `props.sessionId`
-    // and skips the spawn but the channel is harmless when unused.
+    // §4.1 — raw byte channel. Each backend bridge gets its own Tauri Channel.
+    // Reusing one Channel across bridge lifetimes looks convenient, but it
+    // leaves reconnect/self-heal paths vulnerable to stale callbacks and
+    // WebView-side channel bookkeeping after the old tmux client is torn down.
+    // A generation check lets late bytes from an older bridge fall on the
+    // floor without corrupting the freshly reattached xterm.
     //
     // NB: Tauri v2 delivers `InvokeResponseBody::Raw` to the webview as an
     // `ArrayBuffer` (small payloads via eval of `new Uint8Array(...).buffer`,
     // large payloads via fetch → `Response.arrayBuffer()`). xterm.js `write`
     // accepts `string | Uint8Array`, not ArrayBuffer, so we always wrap here.
-    const channel = new Channel<ArrayBuffer | Uint8Array | number[]>();
-    channel.onmessage = (data) => {
-      try {
-        let bytes: Uint8Array;
-        if (data instanceof Uint8Array) {
-          bytes = data;
-        } else if (data instanceof ArrayBuffer) {
-          bytes = new Uint8Array(data);
-        } else if (Array.isArray(data)) {
-          bytes = Uint8Array.from(data);
-        } else {
-          // Tauri's large-payload fetch path hands back a Response-like object
-          // whose body needs to be read. Guard anyway so we don't silently drop.
-          console.warn("[TerminalPane] unexpected channel payload", data);
-          return;
+    let outputGeneration = 0;
+    let resetOnFirstOutputGeneration: number | null = null;
+    const makeOutputChannel = (
+      generation: number,
+    ): Channel<ArrayBuffer | Uint8Array | number[]> => {
+      const next = new Channel<ArrayBuffer | Uint8Array | number[]>();
+      next.onmessage = (data) => {
+        if (generation !== outputGeneration) return;
+        try {
+          let bytes: Uint8Array;
+          if (data instanceof Uint8Array) {
+            bytes = data;
+          } else if (data instanceof ArrayBuffer) {
+            bytes = new Uint8Array(data);
+          } else if (Array.isArray(data)) {
+            bytes = Uint8Array.from(data);
+          } else {
+            // Tauri's large-payload fetch path hands back a Response-like object
+            // whose body needs to be read. Guard anyway so we don't silently drop.
+            console.warn("[TerminalPane] unexpected channel payload", data);
+            return;
+          }
+          if (resetOnFirstOutputGeneration === generation) {
+            resetOnFirstOutputGeneration = null;
+            try {
+              term?.reset();
+            } catch {
+              // A failed local reset should not block the replacement frame.
+            }
+          }
+          term?.write(bytes);
+          const id = sessionId();
+          if (id) markOutput(id);
+        } catch (err) {
+          console.error("[TerminalPane] write failed", err);
         }
-        term?.write(bytes);
-        const id = sessionId();
-        if (id) markOutput(id);
-      } catch (err) {
-        console.error("[TerminalPane] write failed", err);
-      }
+      };
+      return next;
+    };
+    let channel = makeOutputChannel(outputGeneration);
+    const rotateOutputChannel = (resetOnFirstOutput: boolean): typeof channel => {
+      outputGeneration += 1;
+      resetOnFirstOutputGeneration = resetOnFirstOutput ? outputGeneration : null;
+      channel = makeOutputChannel(outputGeneration);
+      return channel;
     };
 
     // §4.4 — throttled resize plumbing. ResizeObserver ticks can arrive at
@@ -576,10 +653,80 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
     let hasSpawned = false;
     const persistedSessionId = props.sessionId;
     let persistedSessionMissing = false;
+    let pendingProviderReplaySessionId: string | null = null;
+    let providerReplayInFlight = false;
+    let reattachInFlightRetries = 0;
 
     const owningTabAlive = (): boolean => {
       if (!props.cellId || !props.tabId) return true;
       return isTabAlive(props.cellId, props.tabId) && !isTabPendingReset(props.cellId, props.tabId);
+    };
+
+    const invokeProviderReplay = (
+      targetSessionId: string,
+      reason: "startup" | "deferred",
+    ): void => {
+      if (providerReplayInFlight) return;
+      if (!isHarnessKind(props.kind)) return;
+      if (!term || !fit) return;
+      try {
+        fit.fit();
+      } catch {
+        return;
+      }
+      const cols = term.cols;
+      const rows = term.rows;
+      if (cols < MIN_REATTACH_COLS || rows < MIN_REATTACH_ROWS) return;
+
+      providerReplayInFlight = true;
+      pendingProviderReplaySessionId = null;
+      lastCols = cols;
+      lastRows = rows;
+      const replayChannel = rotateOutputChannel(true);
+      logLifecycle(reason === "deferred" ? "recover" : "reattach", paneId, targetSessionId);
+      void invoke<ReconnectResult>("terminal_provider_replay", {
+        args: {
+          session_id: targetSessionId,
+          kind: props.kind,
+          project_slug: props.projectSlug,
+          worktree_id: props.worktreeId,
+          cols,
+          rows,
+        },
+        onData: replayChannel,
+      })
+        .then((result) => {
+          providerReplayInFlight = false;
+          setSessionId(result.sessionId);
+          props.onSpawned?.(result.sessionId);
+          if (result.historyStatus === "unavailable") {
+            if (reason === "startup" || reason === "deferred") return;
+            setErrorMsg(result.message ?? "Provider replay is unavailable for this pane");
+            return;
+          }
+          setErrorMsg(null);
+          setExitState(null);
+          setBridgeRecoveryAttempts(0);
+          setBridgeRecoveryUiState("idle");
+        })
+        .catch((e) => {
+          providerReplayInFlight = false;
+          console.warn("[TerminalPane] terminal_provider_replay failed", e);
+          if (reason === "startup" || reason === "deferred") return;
+          setErrorMsg(String(e));
+        });
+    };
+
+    const maybeProviderReplayAfterBridge = (
+      targetSessionId: string,
+      state: AgentState | null,
+    ): void => {
+      if (!isHarnessKind(props.kind)) return;
+      if (state === "working" || state === "waiting") {
+        pendingProviderReplaySessionId = targetSessionId;
+        return;
+      }
+      invokeProviderReplay(targetSessionId, "startup");
     };
 
     const reattachSession = (
@@ -610,8 +757,9 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         bridgeRecoveryInFlight = true;
         setBridgeRecoveryUiState("reconnecting");
       }
+      const attachChannel = options.reason === "recover" ? rotateOutputChannel(true) : channel;
       logLifecycle(options.reason, paneId, targetSessionId);
-      void invoke<string>("terminal_reattach", {
+      void invoke<ReconnectResult>("terminal_reattach", {
         args: {
           session_id: targetSessionId,
           kind: props.kind,
@@ -620,9 +768,11 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
           cols,
           rows,
         },
-        onData: channel,
+        onData: attachChannel,
       })
-        .then((id) => {
+        .then((result) => {
+          const id = result.sessionId;
+          reattachInFlightRetries = 0;
           // Success — the output channel is live. Resize will be pushed by
           // the observer's first post-attach tick below.
           bridgeRecoveryInFlight = false;
@@ -631,13 +781,21 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
           setErrorMsg(null);
           setExitState(null);
           props.onSpawned?.(id);
+          if (result.historyStatus === "unavailable") {
+            setErrorMsg(result.message ?? "History recovery is unavailable for this pane");
+            return;
+          }
           // Pull the harness state the backend seeded from `sessions.toml`.
           // Runs once per reattach; the live `agent-state-changed` stream
           // takes over afterwards. Without this pull the reloaded pane
           // would render as idle until the first real hook fired, masking
           // any waiting-for-input harness across the restart.
           if (isHarnessKind(props.kind)) {
-            void hydrateHarnessStateAfterReattach(id, props.kind);
+            void hydrateHarnessStateAfterReattach(id, props.kind).then((state) => {
+              if (options.reason === "reattach" && result.historyStatus === "live-bridge") {
+                maybeProviderReplayAfterBridge(id, state);
+              }
+            });
           }
         })
         .catch((e) => {
@@ -645,7 +803,17 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
           const message = String(e);
           if (message.includes("reattach-in-flight")) {
             hasSpawned = false;
-            setSessionId(null);
+            setSessionId(targetSessionId);
+            if (reattachInFlightRetries >= MAX_REATTACH_IN_FLIGHT_RETRIES) {
+              setErrorMsg("Reattach is still busy; try reconnecting this pane again.");
+              return;
+            }
+            reattachInFlightRetries += 1;
+            if (reattachInFlightTimer !== null) clearTimeout(reattachInFlightTimer);
+            reattachInFlightTimer = setTimeout(() => {
+              reattachInFlightTimer = null;
+              reattachSession(targetSessionId, options);
+            }, REATTACH_IN_FLIGHT_RETRY_MS);
             return;
           }
           if (!options.fallbackToSpawn) {
@@ -665,21 +833,9 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
             setBridgeRecoveryUiState("lost");
             return;
           }
-          // Either the tmux session is gone (expected after `kill-server`
-          // or a long absence past reap_stale) or something transient
-          // failed. Either way: release the gate and let `trySpawn` create
-          // a fresh session only when this surface is still a visible,
-          // layout-owned tab. Hidden stale tabs are removed by the
-          // `terminal-session-removed` event emitted by the backend; spawning
-          // here would recreate the invisible harness the user just closed.
-          console.warn("[TerminalPane] terminal_reattach failed — spawning fresh", e);
+          console.warn("[TerminalPane] terminal_reattach failed", e);
           persistedSessionMissing = true;
-          hasSpawned = false;
-          setSessionId(null);
-          // Next ResizeObserver tick will call trySpawn via the dual-mode
-          // observer below; also kick one inline in case the pane was
-          // already fully measured.
-          trySpawn();
+          setErrorMsg(String(e));
         });
     };
 
@@ -720,8 +876,9 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       const rows = term.rows;
       if (cols < MIN_REATTACH_COLS || rows < MIN_REATTACH_ROWS) return;
       setRespawningDead(true);
+      const respawnChannel = rotateOutputChannel(true);
       logLifecycle("recover", paneId, id);
-      void invoke<string>("terminal_respawn_dead", {
+      void invoke<ReconnectResult>("terminal_respawn_dead", {
         args: {
           session_id: id,
           kind: props.kind,
@@ -730,10 +887,15 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
           cols,
           rows,
         },
-        onData: channel,
+        onData: respawnChannel,
       })
-        .then(() => {
+        .then((result) => {
           setRespawningDead(false);
+          if (result.historyStatus === "unavailable") {
+            setErrorMsg(result.message ?? "Provider recovery is unavailable for this pane");
+            return;
+          }
+          setSessionId(result.sessionId);
           setExitState(null);
           setErrorMsg(null);
           setBridgeRecoveryAttempts(0);
@@ -840,14 +1002,10 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       setErrorMsg(null);
       setBridgeRecoveryAttempts(0);
       setBridgeRecoveryUiState("reconnecting");
-      try {
-        term.reset();
-      } catch {
-        // A failed local reset should not block the backend repair.
-      }
+      const selfHealChannel = rotateOutputChannel(true);
 
       logLifecycle("self-heal", paneId, id);
-      void invoke<string>("terminal_self_heal", {
+      void invoke<ReconnectResult>("terminal_self_heal", {
         args: {
           session_id: id,
           kind: props.kind,
@@ -855,11 +1013,18 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
           worktree_id: props.worktreeId,
           cols,
           rows,
+          replay_before_resume: false,
         },
-        onData: channel,
+        onData: selfHealChannel,
       })
-        .then((nextId) => {
+        .then((result) => {
           selfHealInFlight = false;
+          if (result.historyStatus === "unavailable") {
+            setErrorMsg(result.message ?? "Provider recovery is unavailable for this pane");
+            setBridgeRecoveryUiState("idle");
+            return;
+          }
+          const nextId = result.sessionId;
           setSessionId(nextId);
           props.onSpawned?.(nextId);
           updateSessionState(nextId, props.kind, "idle");
@@ -870,14 +1035,9 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         })
         .catch((e) => {
           selfHealInFlight = false;
-          console.warn("[TerminalPane] terminal_self_heal failed; spawning fresh", e);
-          void invoke("terminal_kill", { sessionId: id }).catch(() => {
-            /* best-effort cleanup before fallback spawn */
-          });
-          setSessionId(null);
+          console.warn("[TerminalPane] terminal_self_heal failed", e);
           setBridgeRecoveryUiState("idle");
-          hasSpawned = false;
-          trySpawn();
+          setErrorMsg(String(e));
         });
     };
 
@@ -908,6 +1068,17 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
           recoverBridge(id);
         },
       );
+    })();
+
+    void (async () => {
+      unlistenAgentState = await listen<AgentStateChangedPayload>("agent-state-changed", (ev) => {
+        const pending = pendingProviderReplaySessionId;
+        if (!pending) return;
+        const changedSessionId = sessionIdFromAgentPayload(ev.payload.session_id);
+        if (changedSessionId !== pending) return;
+        if (ev.payload.to !== "idle" && ev.payload.to !== "completed") return;
+        invokeProviderReplay(pending, "deferred");
+      });
     })();
 
     // §4.4 — dual-mode observer: pre-spawn it triggers trySpawn; post-spawn
@@ -1093,6 +1264,7 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
     requestVisibleResize = null;
     unlistenProcessExited?.();
     unlistenBridgeLost?.();
+    unlistenAgentState?.();
     unsubscribeTheme?.();
     unsubscribeTheme = null;
     unregisterTerminal(paneId);
@@ -1108,6 +1280,10 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
     if (bridgeRecoveryTimer !== null) {
       clearTimeout(bridgeRecoveryTimer);
       bridgeRecoveryTimer = null;
+    }
+    if (reattachInFlightTimer !== null) {
+      clearTimeout(reattachInFlightTimer);
+      reattachInFlightTimer = null;
     }
     clearResizeRepin();
     try {

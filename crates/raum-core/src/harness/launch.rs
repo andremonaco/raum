@@ -79,10 +79,10 @@ pub fn harness_launch_command_with_prompt(
             Some(f) => format!("claude {f}{prompt_suffix}"),
             None => format!("claude{prompt_suffix}"),
         }),
-        AgentKind::Codex => Some(match flags {
-            Some(f) => format!("codex {f}{prompt_suffix}"),
-            None => format!("codex{prompt_suffix}"),
-        }),
+        AgentKind::Codex => {
+            let codex_flags = codex_flags_for_scrollback(flags);
+            Some(format!("codex {codex_flags}{prompt_suffix}"))
+        }
         AgentKind::OpenCode => {
             // OpenCode is always launched as the interactive TUI. Any
             // `prompt` is intentionally ignored here — see the doc-comment
@@ -98,6 +98,72 @@ pub fn harness_launch_command_with_prompt(
                 (Some(f), None, None) => format!("opencode {f}"),
                 (None, _, Some(port)) => format!("opencode --port {port}"),
                 (None, _, None) => "opencode".to_string(),
+            })
+        }
+        AgentKind::Shell => None,
+    }
+}
+
+/// Render the shell command that resumes an existing harness session inside
+/// a tmux pane. Used by the dead-pane recovery path so the harness — not
+/// raum — owns the rehydration of conversation state.
+///
+/// The harness loads its own JSONL/SQLite state by id and renders a clean
+/// frame from scratch, sidestepping every problem with replaying tmux
+/// scrollback for in-place-redraw TUIs.
+///
+/// Per-harness syntax:
+///
+/// * Claude Code: `claude --resume <id> [extra_flags]`
+/// * Codex: `codex resume --no-alt-screen [extra_flags] <id>` (subcommand, not a flag)
+/// * OpenCode: `opencode --session <id> [--port <port>] [extra_flags]`
+/// * Shell: `None` — shells have no session concept.
+///
+/// Returns `None` if the kind has no resume form (Shell) or
+/// `harness_session_id` is empty after trimming.
+///
+/// **Critical safety property:** This must only be invoked when the prior
+/// harness process is gone. Two processes resuming the same session id
+/// race on the underlying state file (Claude's JSONL has documented
+/// concurrent-write corruption; Codex's rollout is append-only; OpenCode's
+/// SQLite serialises but is not designed for multi-writer agent flows).
+/// The caller is responsible for verifying via `tmux check_pane_dead`.
+#[must_use]
+pub fn harness_resume_command(
+    kind: AgentKind,
+    extra_flags: Option<&str>,
+    opencode_port: Option<u16>,
+    harness_session_id: &str,
+) -> Option<String> {
+    let id = harness_session_id.trim();
+    if id.is_empty() {
+        return None;
+    }
+    let id_quoted = shell_single_quote(id);
+    let flags = extra_flags.map(str::trim).filter(|s| !s.is_empty());
+
+    match kind {
+        AgentKind::ClaudeCode => Some(match flags {
+            Some(f) => format!("claude --resume {id_quoted} {f}"),
+            None => format!("claude --resume {id_quoted}"),
+        }),
+        AgentKind::Codex => {
+            let codex_flags = codex_flags_for_scrollback(flags);
+            Some(format!("codex resume {codex_flags} {id_quoted}"))
+        }
+        AgentKind::OpenCode => {
+            // Same port-handling rules as the launch path: caller-pinned
+            // `--port` in extra_flags wins; otherwise inject the chosen
+            // port. The session id goes through `--session <id>`.
+            let explicit_port = flags.and_then(parse_opencode_port_arg);
+            Some(match (flags, explicit_port, opencode_port) {
+                (Some(f), Some(_), _) => format!("opencode --session {id_quoted} {f}"),
+                (Some(f), None, Some(port)) => {
+                    format!("opencode --session {id_quoted} --port {port} {f}")
+                }
+                (Some(f), None, None) => format!("opencode --session {id_quoted} {f}"),
+                (None, _, Some(port)) => format!("opencode --session {id_quoted} --port {port}"),
+                (None, _, None) => format!("opencode --session {id_quoted}"),
             })
         }
         AgentKind::Shell => None,
@@ -120,6 +186,20 @@ fn shell_single_quote(s: &str) -> String {
     }
     out.push('\'');
     out
+}
+
+/// Codex defaults to alternate-screen rendering, which is correct in a
+/// normal terminal but gives xterm.js no durable scrollback for the chat
+/// repaint after `codex resume`. raum keeps panes inside tmux and already
+/// owns scrollback, so force inline rendering unless the user explicitly
+/// supplied the flag.
+fn codex_flags_for_scrollback(flags: Option<&str>) -> String {
+    const NO_ALT_SCREEN: &str = "--no-alt-screen";
+    match flags {
+        Some(f) if f.split_whitespace().any(|part| part == NO_ALT_SCREEN) => f.to_string(),
+        Some(f) => format!("{f} {NO_ALT_SCREEN}"),
+        None => NO_ALT_SCREEN.to_string(),
+    }
 }
 
 /// Extract `--port <n>` / `--port=<n>` from a whitespace-separated
@@ -185,7 +265,20 @@ mod tests {
     fn codex_with_flags() {
         assert_eq!(
             harness_launch_command(AgentKind::Codex, Some("--model gpt-5"), None).as_deref(),
-            Some("codex --model gpt-5"),
+            Some("codex --model gpt-5 --no-alt-screen"),
+        );
+    }
+
+    #[test]
+    fn codex_no_alt_screen_is_not_duplicated() {
+        assert_eq!(
+            harness_launch_command(
+                AgentKind::Codex,
+                Some("--no-alt-screen --model gpt-5"),
+                None
+            )
+            .as_deref(),
+            Some("codex --no-alt-screen --model gpt-5"),
         );
     }
 
@@ -254,7 +347,7 @@ mod tests {
     fn codex_with_prompt() {
         let cmd = harness_launch_command_with_prompt(AgentKind::Codex, None, None, Some("review"))
             .unwrap();
-        assert_eq!(cmd, "codex 'review'");
+        assert_eq!(cmd, "codex --no-alt-screen 'review'");
     }
 
     #[test]
@@ -338,7 +431,7 @@ mod tests {
             harness_launch_command_with_prompt(AgentKind::Codex, None, None, Some(prompt)).unwrap();
         assert_eq!(
             cmd,
-            "codex 'line1\nline2 `backtick` $VAR \"quoted\" back\\slash'"
+            "codex --no-alt-screen 'line1\nline2 `backtick` $VAR \"quoted\" back\\slash'"
         );
     }
 
@@ -349,6 +442,123 @@ mod tests {
         assert_eq!(shell_single_quote("a'b"), r"'a'\''b'");
         assert_eq!(shell_single_quote("'leading"), r"''\''leading'");
         assert_eq!(shell_single_quote("trailing'"), r"'trailing'\'''");
+    }
+
+    // ---- resume command builder -------------------------------------
+
+    #[test]
+    fn resume_shell_returns_none() {
+        assert_eq!(
+            harness_resume_command(AgentKind::Shell, None, None, "anything"),
+            None,
+        );
+    }
+
+    #[test]
+    fn resume_empty_session_id_returns_none() {
+        assert_eq!(
+            harness_resume_command(AgentKind::ClaudeCode, None, None, ""),
+            None,
+        );
+        assert_eq!(
+            harness_resume_command(AgentKind::ClaudeCode, None, None, "   "),
+            None,
+        );
+    }
+
+    #[test]
+    fn resume_claude_no_flags() {
+        let cmd = harness_resume_command(AgentKind::ClaudeCode, None, None, "abc-uuid").unwrap();
+        assert_eq!(cmd, "claude --resume 'abc-uuid'");
+    }
+
+    #[test]
+    fn resume_claude_with_flags() {
+        let cmd =
+            harness_resume_command(AgentKind::ClaudeCode, Some("--verbose"), None, "abc-uuid")
+                .unwrap();
+        assert_eq!(cmd, "claude --resume 'abc-uuid' --verbose");
+    }
+
+    #[test]
+    fn resume_codex_uses_subcommand_form() {
+        // Codex's resume is a subcommand (`codex resume <id>`), not a flag.
+        let cmd = harness_resume_command(AgentKind::Codex, None, None, "rollout-uuid").unwrap();
+        assert_eq!(cmd, "codex resume --no-alt-screen 'rollout-uuid'");
+    }
+
+    #[test]
+    fn resume_codex_with_flags() {
+        let cmd = harness_resume_command(
+            AgentKind::Codex,
+            Some("--model gpt-5"),
+            None,
+            "rollout-uuid",
+        )
+        .unwrap();
+        assert_eq!(
+            cmd,
+            "codex resume --model gpt-5 --no-alt-screen 'rollout-uuid'"
+        );
+    }
+
+    #[test]
+    fn resume_codex_no_alt_screen_is_not_duplicated() {
+        let cmd = harness_resume_command(
+            AgentKind::Codex,
+            Some("--no-alt-screen --model gpt-5"),
+            None,
+            "rollout-uuid",
+        )
+        .unwrap();
+        assert_eq!(
+            cmd,
+            "codex resume --no-alt-screen --model gpt-5 'rollout-uuid'"
+        );
+    }
+
+    #[test]
+    fn resume_opencode_no_port_no_flags() {
+        let cmd = harness_resume_command(AgentKind::OpenCode, None, None, "ulid-x").unwrap();
+        assert_eq!(cmd, "opencode --session 'ulid-x'");
+    }
+
+    #[test]
+    fn resume_opencode_caller_supplied_port() {
+        let cmd = harness_resume_command(AgentKind::OpenCode, None, Some(45123), "ulid-x").unwrap();
+        assert_eq!(cmd, "opencode --session 'ulid-x' --port 45123");
+    }
+
+    #[test]
+    fn resume_opencode_user_pinned_port_wins() {
+        let cmd = harness_resume_command(
+            AgentKind::OpenCode,
+            Some("--port 9000"),
+            Some(45123),
+            "ulid-x",
+        )
+        .unwrap();
+        assert_eq!(cmd, "opencode --session 'ulid-x' --port 9000");
+    }
+
+    #[test]
+    fn resume_opencode_flags_without_port_get_our_port() {
+        let cmd = harness_resume_command(
+            AgentKind::OpenCode,
+            Some("--verbose"),
+            Some(45123),
+            "ulid-x",
+        )
+        .unwrap();
+        assert_eq!(cmd, "opencode --session 'ulid-x' --port 45123 --verbose");
+    }
+
+    #[test]
+    fn resume_session_id_with_quote_is_safely_escaped() {
+        // Defensive — the harnesses generate UUIDs/ULIDs without quotes,
+        // but we shell-quote the id anyway to keep the contract uniform.
+        let cmd = harness_resume_command(AgentKind::ClaudeCode, None, None, "weird'id").unwrap();
+        assert_eq!(cmd, r"claude --resume 'weird'\''id'");
     }
 
     // ---- preexisting tests below ------------------------------------

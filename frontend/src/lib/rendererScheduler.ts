@@ -78,6 +78,12 @@ function findLruWebgl(excludePaneId: string): PaneEntry | null {
 }
 
 function installCanvas(entry: PaneEntry): void {
+  if (import.meta.env.DEV) {
+    console.log(
+      `%c[flicker-debug] installCanvas pane=${entry.paneId} from=${entry.renderer}`,
+      "color:#c70",
+    );
+  }
   try {
     entry.addon?.dispose();
   } catch {
@@ -97,6 +103,12 @@ function installCanvas(entry: PaneEntry): void {
 
 async function installWebgl(entry: PaneEntry): Promise<boolean> {
   if (entry.forbidWebgl) return false;
+  if (import.meta.env.DEV) {
+    console.log(
+      `%c[flicker-debug] installWebgl pane=${entry.paneId} from=${entry.renderer}`,
+      "color:#0a7",
+    );
+  }
   try {
     entry.addon?.dispose();
   } catch {
@@ -164,6 +176,12 @@ export function unregisterPane(paneId: string): void {
 export function setPaneVisibility(paneId: string, visible: boolean): void {
   const entry = panes.get(paneId);
   if (!entry) return;
+  if (import.meta.env.DEV && entry.visible !== visible) {
+    console.log(
+      `%c[flicker-debug] setPaneVisibility pane=${paneId} ${entry.visible} -> ${visible} renderer=${entry.renderer}`,
+      "color:#a4a",
+    );
+  }
   entry.visible = visible;
   if (!visible && entry.renderer === "webgl") {
     installCanvas(entry);

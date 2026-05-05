@@ -286,15 +286,26 @@ pub fn clear_review_link<R: Runtime>(
 }
 
 /// Return the *first* user prompt of the harness session running in the
-/// given pane, or `None` if it can't be read. Used by the cross-harness
-/// review snap overlay to show the original task the session was asked to
-/// perform — not whatever the user typed most recently.
+/// given pane, or `None` if it can't be read. Used by the prompt-overlay
+/// banner (Task + Latest) and the cross-harness review snap overlay to
+/// show the original task the session was asked to perform — not whatever
+/// the user typed most recently.
 ///
-/// Reads directly from the harness's own on-disk transcript via
-/// [`read_session_user_prompts`] — raum no longer maintains a parallel
-/// prompt log. Sessions whose harness writes a format raum doesn't yet
-/// parse (Codex, OpenCode today) return `None`; the frontend falls back
-/// to a "no prompts available" hint.
+/// Resolution order:
+///
+///   1. **Targeted lookup by harness session id** (Claude Code, Codex).
+///      When raum has captured the harness's own UUID from a hook payload
+///      (`update_session_harness_id`), we open exactly that transcript file
+///      — deterministic across multi-pane worktrees.
+///   2. **cwd-newest fallback**. When no harness id is captured (legacy
+///      sessions from before that field shipped) or the by-id reader has no
+///      branch for this kind (OpenCode — there's no on-disk file keyed by
+///      session id; it lives behind the local HTTP API), fall through to
+///      [`read_session_user_prompts`], which picks the newest jsonl in the
+///      worktree (Claude / Codex) or queries the local HTTP server
+///      (OpenCode). Safe in practice because the frontend defers this fetch
+///      until our own `UserPromptSubmit` hook has fired, which makes our
+///      transcript the most-recently-modified file in the worktree.
 #[tauri::command]
 pub async fn session_first_prompt<R: Runtime>(
     _app: AppHandle<R>,
@@ -328,11 +339,10 @@ pub async fn session_first_prompt<R: Runtime>(
         return Ok(None);
     }
     let home_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
-    // Prefer the targeted lookup when raum has captured the harness
-    // session id from a UserPromptSubmit hook. Without it, every pane
-    // sharing this worktree would resolve to the same "newest jsonl"
-    // and the overlay would show the same Task across every harness
-    // in the project after a restart.
+
+    // 1) Try the deterministic by-id reader when raum has captured the
+    //    harness UUID. This is the only branch that's bullet-proof when
+    //    several panes share a worktree.
     let harness_session_id = {
         let store = state
             .config_store
@@ -340,17 +350,24 @@ pub async fn session_first_prompt<R: Runtime>(
             .map_err(|e| format!("config_store lock: {e}"))?;
         store.last_session_harness_id(&args.session_id)
     };
-    // Strict policy: only return a first prompt when we can identify
-    // the session's *own* transcript file via `harness_session_id`.
-    // Without it, the fallback (newest jsonl in the worktree) would
-    // return another session's prompts whenever multiple panes share
-    // a worktree — exactly the bug this codepath exists to prevent.
-    // Returning `None` instead lets the frontend fall back to the live
-    // `lastPrompt` event for the banner.
-    let Some(id) = harness_session_id else {
-        return Ok(None);
-    };
-    let prompts = read_session_user_prompts_for_id(kind, &cwd, &home_dir, &id, opencode_port);
+    if let Some(id) = harness_session_id.as_deref() {
+        let prompts = read_session_user_prompts_for_id(kind, &cwd, &home_dir, id, opencode_port);
+        if let Some(first) = prompts.into_iter().next() {
+            return Ok(Some(first));
+        }
+        // Fall through: by-id reader returned empty. Two cases hit this
+        // path — OpenCode (which has no on-disk file keyed by session
+        // id; the by-id reader is a stub there) and a captured id whose
+        // transcript file the harness hasn't flushed yet.
+    }
+
+    // 2) cwd-newest fallback. Picks the newest jsonl in the worktree
+    //    (Claude / Codex) or queries the local HTTP server (OpenCode).
+    //    The frontend gates this fetch on `lastPrompt()` so by the time
+    //    we land here our hook has fired and our transcript is the
+    //    most-recently-modified — the multi-pane race the strict
+    //    policy used to guard against is effectively closed.
+    let prompts = read_session_user_prompts(kind, &cwd, &home_dir, opencode_port).await;
     Ok(prompts.into_iter().next())
 }
 

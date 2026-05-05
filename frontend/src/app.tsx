@@ -89,8 +89,9 @@ async function scheduleBackgroundUpdateCheck(snapshot: RaumConfigSnapshot): Prom
 /** Rehydrate the runtime grid from the last-saved `active-layout.toml`.
  *
  *  Persisted `session_id`s are passed through verbatim — `TerminalPane`
- *  attempts `terminal_reattach(session_id, …)` on mount and falls back to
- *  `terminal_spawn` if the tmux session no longer exists. The previous
+ *  attempts `terminal_reattach(session_id, …)` on mount and surfaces an
+ *  explicit recovery error if neither tmux nor provider replay is available.
+ *  The previous
  *  implementation cross-referenced `terminal_list()` here to strip dead
  *  ids, but that registry is EMPTY on fresh app boot (no panes have
  *  spawned yet), so it filtered out EVERY persisted id and forced every
@@ -162,9 +163,23 @@ const App: Component = () => {
     installDevtoolsShortcut();
     void loadThemeFromConfig().catch((e) => console.warn("loadThemeFromConfig failed", e));
     void initHomeDir();
-    void installFileDrop().catch((e) => console.warn("installFileDrop failed", e));
+    let disposed = false;
+    let stopFileDrop: (() => void) | undefined;
+    void installFileDrop()
+      .then((unlisten) => {
+        if (disposed) {
+          unlisten();
+          return;
+        }
+        stopFileDrop = unlisten;
+      })
+      .catch((e) => console.warn("installFileDrop failed", e));
     const stopShellContextPoller = startShellContextPoller();
-    onCleanup(stopShellContextPoller);
+    onCleanup(() => {
+      disposed = true;
+      stopFileDrop?.();
+      stopShellContextPoller();
+    });
   });
 
   // §13.2 — mount the onboarding wizard on first launch (config.onboarded =

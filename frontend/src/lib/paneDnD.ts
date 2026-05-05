@@ -55,13 +55,37 @@ export interface DragState {
    *  cursor is over a review-eligible sibling pane's interior, OR when
    *  the snap was previously engaged on `targetId` and the cursor is
    *  still inside the inflated hysteresis bounds (`snapHystRect`).
-   *  Releasing the pointer while `snapped` commits the review. */
+   *  Visual feedback (target outline, source dock, overlay) keys off
+   *  this flag. **Releasing while `snapped` does NOT by itself commit
+   *  the review** — `armed` must also be true. */
   snapped: boolean;
   /** Inflated rect around the snapped target (target rect expanded by
    *  `SNAP_HYST_PX` on every side). The snap stays engaged as long as
    *  the cursor is inside this rect, so micro-jitter doesn't disengage.
    *  Null when not snapped. */
   snapHystRect: DOMRect | null;
+  /** Commit gate for the cross-harness review. Independent of `snapped`
+   *  so the visual snap can be felt immediately while the destructive
+   *  commit (which kills the source pane's session) waits for a
+   *  deliberate dwell. Goes true when:
+   *    • `armDelayMs === 0` — snap engages and arms in the same frame.
+   *      Used when the source pane is empty, so there's no work to lose.
+   *    • A `setTimeout(armDelayMs)` scheduled at engage time fires
+   *      while still snapped on the same target.
+   *  Resets to false on every fresh engagement (initial entry OR
+   *  re-target onto a different pane), on every release, and on
+   *  Escape — so any hesitation that releases the snap forces the
+   *  user to re-enter and re-hold before a commit can fire. */
+  armed: boolean;
+  /** Wall-clock ms (`Date.now()`) at which the active dwell started, or
+   *  null when no dwell is in flight. Set to a fresh stamp on every
+   *  engage / re-target so consumers can render a progress indicator
+   *  whose elapsed time matches the timer that will flip `armed`. */
+  armStartedAtMs: number | null;
+  /** Configured dwell duration for THIS drag, copied from
+   *  `BeginDragOptions.armDelayMs` so the overlay can size its progress
+   *  animation without re-reading the original options. 0 = no dwell. */
+  armDelayMs: number;
   /** Target id whose snap was just released by an Escape keypress. The
    *  snap state machine refuses to re-engage on this target until the
    *  cursor leaves it — without this, releasing snap inside the target
@@ -173,15 +197,26 @@ export interface BeginDragOptions {
    *  shell wires this to "both source and target are review-eligible
    *  agent kinds", so dragging onto a Shell pane never visually snaps. */
   canSnapTo?: (targetId: string) => boolean;
+  /** Dwell time (ms) the cursor must remain snapped on the same target
+   *  before a release counts as a commit. Default `0` arms the snap
+   *  immediately — used when the source pane has no work to lose
+   *  (empty/fresh harness). Pass a positive value (e.g. `600`) when
+   *  the source has history; the visual snap engages on entry but
+   *  releasing before the dwell elapses cancels harmlessly. The dwell
+   *  resets on every fresh engagement (initial entry OR re-target). */
+  armDelayMs?: number;
   /** Called once on pointerup. `zone === null` or `targetId === null`
    *  means the drop was cancelled (outside any target). `snapped` is
-   *  `true` when the magnetic snap was engaged at the moment of release
-   *  — only then should the caller commit a cross-harness review. */
+   *  `true` when the magnetic snap was visually engaged at release;
+   *  `armed` is `true` only after the dwell has elapsed. **The caller
+   *  MUST gate any destructive review action on both `snapped && armed`**
+   *  — `snapped` alone is the visual state, `armed` is the commit gate. */
   onDrop: (result: {
     sourceId: string;
     targetId: string | RootTargetSentinel | null;
     zone: DropZone | null;
     snapped: boolean;
+    armed: boolean;
   }) => void;
 }
 
@@ -193,6 +228,7 @@ export function beginDrag(opts: BeginDragOptions): void {
   cancelDrag();
   const { sourceId, sourceKind, sourceLabel, event, rootEl, cells, layoutUnit, canSnapTo, onDrop } =
     opts;
+  const armDelayMs = Math.max(0, opts.armDelayMs ?? 0);
 
   const startPointerX = event.clientX;
   const startPointerY = event.clientY;
@@ -210,8 +246,51 @@ export function beginDrag(opts: BeginDragOptions): void {
     targetRect: null,
     snapped: false,
     snapHystRect: null,
+    armed: false,
+    armStartedAtMs: null,
+    armDelayMs,
     escapedTargetId: null,
   });
+
+  // Pending dwell timer + the target it was scheduled against. Both must
+  // line up at fire time — if the user has retargeted or unsnapped, the
+  // late callback is a no-op. Tracked outside `dragState` so cancellations
+  // are O(1) and don't churn the reactive signal.
+  let armTimerId: ReturnType<typeof setTimeout> | null = null;
+  let armTimerTargetId: string | null = null;
+
+  function clearArmTimer(): void {
+    if (armTimerId !== null) {
+      clearTimeout(armTimerId);
+      armTimerId = null;
+      armTimerTargetId = null;
+    }
+  }
+
+  function scheduleArmFor(targetId: string): void {
+    clearArmTimer();
+    if (armDelayMs === 0) return; // instant arm path skips the timer
+    armTimerTargetId = targetId;
+    armTimerId = setTimeout(() => {
+      armTimerId = null;
+      const cur = dragState();
+      // Only flip armed=true if the snap is still engaged on the SAME
+      // target the timer was scheduled against. Re-target / release
+      // between scheduling and firing must cancel the arm — the late
+      // callback would otherwise commit a destructive review against a
+      // pane the user is no longer hovering.
+      if (
+        cur &&
+        cur.snapped &&
+        cur.targetId === armTimerTargetId &&
+        cur.targetId !== ROOT_TARGET &&
+        !cur.armed
+      ) {
+        setDragState({ ...cur, armed: true });
+      }
+      armTimerTargetId = null;
+    }, armDelayMs);
+  }
 
   // rAF throttle for pointermove. Trackpads fire pointermove at 120+ Hz;
   // updating dragState that often causes the preview reflow to retarget
@@ -310,6 +389,50 @@ export function beginDrag(opts: BeginDragOptions): void {
       nextEscapedTargetId = null;
     }
 
+    // Dwell-to-arm state machine. Three transitions matter:
+    //   • RELEASE      (snap was on, now off)               → cancel
+    //                                                         timer,
+    //                                                         armed=false.
+    //   • FRESH ENGAGE (snap was off OR target changed)     → cancel
+    //                                                         old timer,
+    //                                                         schedule
+    //                                                         new one
+    //                                                         (or arm
+    //                                                         instantly
+    //                                                         when
+    //                                                         delay=0).
+    //   • HOLD         (snap on same target as last frame)  → keep
+    //                                                         prev.armed
+    //                                                         and the
+    //                                                         already-
+    //                                                         scheduled
+    //                                                         timer.
+    // Carrying `prev.armed` through the HOLD branch is critical: any
+    // pointermove inside the snap interior would otherwise reset armed
+    // to false, defeating the dwell entirely.
+    const wasSnappedSameTarget =
+      prev?.snapped === true && prev?.targetId === outTargetId && outTargetId !== null;
+
+    let armed = false;
+    let armStartedAtMs: number | null = null;
+    if (snapped && outTargetId !== null && outTargetId !== ROOT_TARGET) {
+      if (wasSnappedSameTarget) {
+        armed = prev?.armed ?? false;
+        armStartedAtMs = prev?.armStartedAtMs ?? null;
+      } else {
+        // FRESH ENGAGE: either initial entry, retarget to a different
+        // pane, or re-entry after a release. Restart the dwell from 0.
+        armed = armDelayMs === 0;
+        armStartedAtMs = armDelayMs === 0 ? null : Date.now();
+        scheduleArmFor(outTargetId as string);
+      }
+    } else {
+      // RELEASE (or no snap to begin with). Make sure no timer can
+      // resurrect the arm against a stale target after the user has
+      // moved on.
+      clearArmTimer();
+    }
+
     setDragState({
       sourceId,
       sourceKind,
@@ -323,6 +446,9 @@ export function beginDrag(opts: BeginDragOptions): void {
       targetRect: outRect,
       snapped,
       snapHystRect,
+      armed,
+      armStartedAtMs,
+      armDelayMs,
       escapedTargetId: nextEscapedTargetId,
     });
   }
@@ -355,6 +481,7 @@ export function beginDrag(opts: BeginDragOptions): void {
       targetId: final?.targetId ?? null,
       zone: final?.zone ?? null,
       snapped: final?.snapped ?? false,
+      armed: final?.armed ?? false,
     };
     cleanup();
     onDrop(result);
@@ -362,7 +489,7 @@ export function beginDrag(opts: BeginDragOptions): void {
 
   function onCancel(): void {
     cleanup();
-    onDrop({ sourceId, targetId: null, zone: null, snapped: false });
+    onDrop({ sourceId, targetId: null, zone: null, snapped: false, armed: false });
   }
 
   // Escape mid-drag has two roles depending on whether the magnetic
@@ -387,10 +514,19 @@ export function beginDrag(opts: BeginDragOptions): void {
     if (cur?.snapped && cur.targetId !== null && cur.targetId !== ROOT_TARGET) {
       e.preventDefault();
       e.stopPropagation();
+      // Cancel any in-flight dwell — Escape's whole job here is "I
+      // don't want this snap to commit". Without this, the timer would
+      // continue running and could fire `armed=true` while the user is
+      // still in the snap interior re-evaluating. The snap itself
+      // releases (snapped=false) so on re-entry the FRESH ENGAGE branch
+      // reschedules a new dwell from 0.
+      clearArmTimer();
       setDragState({
         ...cur,
         snapped: false,
         snapHystRect: null,
+        armed: false,
+        armStartedAtMs: null,
         escapedTargetId: cur.targetId as string,
       });
       return;
@@ -406,6 +542,7 @@ export function beginDrag(opts: BeginDragOptions): void {
       rafId = 0;
       latestMoveEvent = null;
     }
+    clearArmTimer();
     document.removeEventListener("pointermove", onMove);
     document.removeEventListener("pointerup", onUp);
     document.removeEventListener("pointercancel", onCancel);

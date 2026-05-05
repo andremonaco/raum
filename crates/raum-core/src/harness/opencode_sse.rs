@@ -75,8 +75,10 @@ const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 /// the session id in the URL — it is kept here anyway because the
 /// [`NotificationEvent`] wire type already carries a `SessionId`, and
 /// consumers (the Tauri state machine, the dock UI) key their rendering
-/// off it. Keeping a map lets the replier log/validate the lookup
-/// without an extra round trip.
+/// off it. This stores raum's pane session id, while OpenCode's own
+/// resumable `sessionID` stays in the event payload for persistence.
+/// Keeping a map lets the replier log/validate the lookup without an
+/// extra round trip.
 pub type PendingRequestMap = Arc<Mutex<HashMap<PermissionRequestId, SessionId>>>;
 
 /// Create an empty pending-request map. Both the channel and the HTTP
@@ -147,10 +149,10 @@ pub struct OpenCodeSseChannel {
     client: reqwest::Client,
     pending: PendingRequestMap,
     user_messages: UserMessageIds,
-    /// Fallback session id used when OpenCode emits an event we cannot
-    /// scope to a real session (e.g. `server.connected`). The runtime
-    /// wires this from the [`SessionSpec`] so the UI's notification
-    /// cards map onto the right tile.
+    /// Raum pane session id used for event routing. OpenCode's payload
+    /// `sessionID` is the resumable harness id; using it as the event
+    /// `session_id` would route state changes away from the terminal
+    /// pane that owns this SSE channel.
     fallback_session: SessionId,
     health: Arc<Mutex<ChannelHealth>>,
 }
@@ -452,11 +454,7 @@ fn translate(
                 .get("id")
                 .and_then(Value::as_str)?
                 .to_string();
-            let session = env
-                .properties
-                .get("sessionID")
-                .and_then(Value::as_str)
-                .map_or_else(|| fallback.clone(), SessionId::new);
+            let session = fallback.clone();
             let req_id = PermissionRequestId::new(id);
             pending.lock().insert(req_id.clone(), session.clone());
             Some(NotificationEvent {
@@ -476,11 +474,7 @@ fn translate(
                 .get("requestID")
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            let session = env
-                .properties
-                .get("sessionID")
-                .and_then(Value::as_str)
-                .map_or_else(|| fallback.clone(), SessionId::new);
+            let session = fallback.clone();
             if let Some(ref r) = req_raw {
                 pending.lock().remove(&PermissionRequestId::new(r.clone()));
             }
@@ -497,11 +491,7 @@ fn translate(
         "question.asked" => {
             // Schema (confirmed against anomalyco/opencode @ dev):
             //   { id: string, sessionID: string, questions: [...], tool?: ... }
-            let session = env
-                .properties
-                .get("sessionID")
-                .and_then(Value::as_str)
-                .map_or_else(|| fallback.clone(), SessionId::new);
+            let session = fallback.clone();
             Some(NotificationEvent {
                 session_id: session,
                 harness: AgentKind::OpenCode,
@@ -513,11 +503,7 @@ fn translate(
             })
         }
         "question.replied" | "question.rejected" => {
-            let session = env
-                .properties
-                .get("sessionID")
-                .and_then(Value::as_str)
-                .map_or_else(|| fallback.clone(), SessionId::new);
+            let session = fallback.clone();
             Some(NotificationEvent {
                 session_id: session,
                 harness: AgentKind::OpenCode,
@@ -534,11 +520,7 @@ fn translate(
             // a session transitions into the `idle` state. We surface
             // it as `TurnEnd` so the agent-state machine leaves
             // `Working`.
-            let session = env
-                .properties
-                .get("sessionID")
-                .and_then(Value::as_str)
-                .map_or_else(|| fallback.clone(), SessionId::new);
+            let session = fallback.clone();
             Some(NotificationEvent {
                 session_id: session,
                 harness: AgentKind::OpenCode,
@@ -585,6 +567,15 @@ fn translate(
                 return None;
             }
             let text = extract_user_message_text(&env.properties)?;
+            let mut payload = serde_json::json!({ "prompt": text });
+            if let Some(session_id) = opencode_session_id(&env.properties)
+                && let Some(obj) = payload.as_object_mut()
+            {
+                obj.insert(
+                    "sessionID".to_string(),
+                    Value::String(session_id.to_string()),
+                );
+            }
             Some(NotificationEvent {
                 session_id: fallback.clone(),
                 harness: AgentKind::OpenCode,
@@ -592,7 +583,7 @@ fn translate(
                 source,
                 reliability: Reliability::Deterministic,
                 request_id: None,
-                payload: serde_json::json!({ "prompt": text }),
+                payload,
             })
         }
         "message.part.updated" => {
@@ -618,6 +609,15 @@ fn translate(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())?
                 .to_string();
+            let mut payload = serde_json::json!({ "prompt": text });
+            if let Some(session_id) = opencode_session_id(&env.properties)
+                && let Some(obj) = payload.as_object_mut()
+            {
+                obj.insert(
+                    "sessionID".to_string(),
+                    Value::String(session_id.to_string()),
+                );
+            }
             Some(NotificationEvent {
                 session_id: fallback.clone(),
                 harness: AgentKind::OpenCode,
@@ -625,7 +625,7 @@ fn translate(
                 source,
                 reliability: Reliability::Deterministic,
                 request_id: None,
-                payload: serde_json::json!({ "prompt": text }),
+                payload,
             })
         }
         "session.status" => {
@@ -641,13 +641,8 @@ fn translate(
             if !idle {
                 return None;
             }
-            let session = env
-                .properties
-                .get("sessionID")
-                .and_then(Value::as_str)
-                .map_or_else(|| fallback.clone(), SessionId::new);
             Some(NotificationEvent {
-                session_id: session,
+                session_id: fallback.clone(),
                 harness: AgentKind::OpenCode,
                 kind: NotificationKind::TurnEnd,
                 source,
@@ -658,6 +653,30 @@ fn translate(
         }
         _ => None,
     }
+}
+
+fn opencode_session_id(properties: &Value) -> Option<&str> {
+    properties
+        .get("sessionID")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            properties
+                .get("info")
+                .and_then(|info| info.get("sessionID"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            properties
+                .get("message")
+                .and_then(|message| message.get("sessionID"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            properties
+                .get("part")
+                .and_then(|part| part.get("sessionID"))
+                .and_then(Value::as_str)
+        })
 }
 
 /// Pull the user's submitted prompt text out of an OpenCode message event
@@ -752,7 +771,11 @@ mod tests {
         let data = r#"{"type":"permission.asked","properties":{"id":"perm-1","sessionID":"sess-1","permission":"bash","patterns":["ls *"],"metadata":{},"always":[]}}"#;
         let ev = translate(data, &pending, &user_messages, &fallback).expect("event");
         assert_eq!(ev.kind, NotificationKind::PermissionNeeded);
-        assert_eq!(ev.session_id, SessionId::new("sess-1"));
+        assert_eq!(ev.session_id, SessionId::new("raum-default"));
+        assert_eq!(
+            ev.payload.get("sessionID").and_then(Value::as_str),
+            Some("sess-1")
+        );
         assert_eq!(
             ev.request_id.as_ref().unwrap(),
             &PermissionRequestId::new("perm-1")
@@ -760,7 +783,7 @@ mod tests {
         let map = pending.lock();
         assert_eq!(
             map.get(&PermissionRequestId::new("perm-1")).cloned(),
-            Some(SessionId::new("sess-1"))
+            Some(SessionId::new("raum-default"))
         );
     }
 
@@ -786,7 +809,11 @@ mod tests {
         let data = r#"{"type":"question.asked","properties":{"id":"q-1","sessionID":"sess-1","questions":[{"question":"Continue?","header":"Confirm","options":[{"label":"Yes","description":"Proceed"}]}]}}"#;
         let ev = translate(data, &pending, &user_messages, &fallback).expect("event");
         assert_eq!(ev.kind, NotificationKind::IdlePromptNeeded);
-        assert_eq!(ev.session_id, SessionId::new("sess-1"));
+        assert_eq!(ev.session_id, SessionId::new("raum-default"));
+        assert_eq!(
+            ev.payload.get("sessionID").and_then(Value::as_str),
+            Some("sess-1")
+        );
         assert!(ev.request_id.is_none());
         assert!(pending.lock().is_empty());
     }
@@ -799,7 +826,7 @@ mod tests {
         let data = r#"{"type":"question.replied","properties":{"sessionID":"sess-1","requestID":"q-1","answers":[["Yes"]]}}"#;
         let ev = translate(data, &pending, &user_messages, &fallback).expect("event");
         assert_eq!(ev.kind, NotificationKind::TurnStart);
-        assert_eq!(ev.session_id, SessionId::new("sess-1"));
+        assert_eq!(ev.session_id, SessionId::new("raum-default"));
     }
 
     #[test]
@@ -811,7 +838,7 @@ mod tests {
             r#"{"type":"question.rejected","properties":{"sessionID":"sess-1","requestID":"q-1"}}"#;
         let ev = translate(data, &pending, &user_messages, &fallback).expect("event");
         assert_eq!(ev.kind, NotificationKind::TurnStart);
-        assert_eq!(ev.session_id, SessionId::new("sess-1"));
+        assert_eq!(ev.session_id, SessionId::new("raum-default"));
     }
 
     #[test]
@@ -822,6 +849,11 @@ mod tests {
         let data = r#"{"type":"session.status","properties":{"sessionID":"sess-1","status":{"type":"idle"}}}"#;
         let ev = translate(data, &pending, &user_messages, &fallback).expect("event");
         assert_eq!(ev.kind, NotificationKind::TurnEnd);
+        assert_eq!(ev.session_id, SessionId::new("raum-default"));
+        assert_eq!(
+            ev.payload.get("sessionID").and_then(Value::as_str),
+            Some("sess-1")
+        );
     }
 
     #[test]
@@ -848,6 +880,10 @@ mod tests {
         assert_eq!(
             ev.payload.get("prompt").and_then(Value::as_str),
             Some("refactor session.ts")
+        );
+        assert_eq!(
+            ev.payload.get("sessionID").and_then(Value::as_str),
+            Some("sess-1")
         );
     }
 
@@ -876,6 +912,10 @@ mod tests {
         assert_eq!(
             ev.payload.get("prompt").and_then(Value::as_str),
             Some("add rate limit")
+        );
+        assert_eq!(
+            ev.payload.get("sessionID").and_then(Value::as_str),
+            Some("sess-1")
         );
     }
 
@@ -932,6 +972,7 @@ mod tests {
         let data = r#"{"type":"session.idle","properties":{"sessionID":"sess-1"}}"#;
         let ev = translate(data, &pending, &user_messages, &fallback).expect("event");
         assert_eq!(ev.kind, NotificationKind::TurnEnd);
+        assert_eq!(ev.session_id, SessionId::new("raum-default"));
     }
 
     #[test]

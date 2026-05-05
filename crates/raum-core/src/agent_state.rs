@@ -138,8 +138,8 @@ pub fn extract_user_prompt(harness: AgentKind, payload: &serde_json::Value) -> O
     Some(text.to_string())
 }
 
-/// Pull the *harness's own* session id out of a `UserPromptSubmit`
-/// payload — the Claude Code / Codex UUID, distinct from raum's
+/// Pull the *harness's own* session id out of a hook / notification
+/// payload — the Claude Code / Codex / OpenCode id, distinct from raum's
 /// internal `session_id` (which lives at envelope level). Returns
 /// `None` for harnesses that don't expose one or when the field is
 /// missing.
@@ -155,16 +155,21 @@ pub fn extract_user_prompt(harness: AgentKind, payload: &serde_json::Value) -> O
 ///   (UUID) whose value matches its on-disk jsonl basename.
 /// * Codex's hook payload exposes the rollout's own `session_id`,
 ///   which matches the `session_meta.id` field of the rollout file.
-/// * OpenCode's prompts arrive over SSE without a hook payload that
-///   reaches this helper, so it returns None.
+/// * OpenCode's SSE payloads expose its own resumable `sessionID`.
 #[must_use]
 pub fn extract_harness_session_id(
     harness: AgentKind,
     payload: &serde_json::Value,
 ) -> Option<String> {
     let candidate = match harness {
-        AgentKind::ClaudeCode | AgentKind::Codex => payload.get("session_id"),
-        AgentKind::OpenCode | AgentKind::Shell => None,
+        AgentKind::ClaudeCode | AgentKind::Codex => payload
+            .get("session_id")
+            .or_else(|| payload.get("sessionId"))
+            .or_else(|| payload.get("sessionID")),
+        AgentKind::OpenCode => payload
+            .get("sessionID")
+            .or_else(|| payload.get("session_id")),
+        AgentKind::Shell => None,
     };
     candidate
         .and_then(|v| v.as_str())
@@ -481,6 +486,43 @@ mod tests {
             reliability: None,
             payload: serde_json::Value::Null,
         }
+    }
+
+    #[test]
+    fn extract_opencode_harness_session_id_from_sse_payload() {
+        let payload = serde_json::json!({
+            "sessionID": "ses_221ff2438ffeIaMVCqC4Rv4yo4",
+            "prompt": "keep working"
+        });
+
+        assert_eq!(
+            extract_harness_session_id(AgentKind::OpenCode, &payload).as_deref(),
+            Some("ses_221ff2438ffeIaMVCqC4Rv4yo4")
+        );
+    }
+
+    #[test]
+    fn extract_opencode_harness_session_id_trims_and_skips_empty() {
+        let payload = serde_json::json!({ "sessionID": "   " });
+        assert_eq!(
+            extract_harness_session_id(AgentKind::OpenCode, &payload),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_claude_harness_session_id_accepts_camel_case_aliases() {
+        let payload = serde_json::json!({ "sessionId": "claude-session-1" });
+        assert_eq!(
+            extract_harness_session_id(AgentKind::ClaudeCode, &payload).as_deref(),
+            Some("claude-session-1")
+        );
+
+        let payload = serde_json::json!({ "sessionID": "claude-session-2" });
+        assert_eq!(
+            extract_harness_session_id(AgentKind::ClaudeCode, &payload).as_deref(),
+            Some("claude-session-2")
+        );
     }
 
     #[test]

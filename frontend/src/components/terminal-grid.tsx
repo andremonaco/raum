@@ -121,6 +121,8 @@ import { allReviewLinks, isReviewLinked } from "../stores/reviewLinkStore";
 import { ensureFirstPromptLoaded, firstPromptForSession } from "../lib/firstPromptCache";
 import { crossProjectViewMode, setCrossProjectViewMode } from "./top-row";
 import { Tooltip, TooltipContent, TooltipPortal, TooltipTrigger } from "./ui/tooltip";
+import { FileTypeIcon } from "../lib/fileTypeIcon";
+import { dropPreviewPaths, dropTargetPaneId } from "../lib/fileDrop";
 
 function getScopedProjection(
   rev: number,
@@ -173,6 +175,19 @@ function requestTerminalKill(sessionId: string | undefined, context: string): vo
 }
 
 // ---- cross-harness review -------------------------------------------------
+
+/** Hold-to-commit dwell for the cross-harness review snap, in ms. The
+ *  user must keep the cursor docked over the target for this long
+ *  before releasing actually triggers the review (which kills the
+ *  source pane's session). Skipped when the source is empty/fresh —
+ *  there's no work to lose, so the gesture stays one motion.
+ *
+ *  600 ms balances "deliberate" (well past the ~150–200 ms threshold
+ *  where a gesture reads as accidental) and "responsive" (under the
+ *  ~750 ms threshold where holding starts to feel laggy). Matches the
+ *  long-press / press-and-hold idiom users already know from system
+ *  UIs (touch context menus, drag-to-confirm). */
+const REVIEW_COMMIT_DWELL_MS = 600;
 
 interface ReviewSpawnPayload {
   initialPrompt: string;
@@ -745,25 +760,25 @@ export const TerminalGrid: Component = () => {
                 <For each={activeCells()}>
                   {(cell) => {
                     const effective = createMemo<RuntimeCell>(() => {
-                      if (dragState()?.sourceId === cell.id) return cell;
-                      const preview = previewCellMap()?.get(cell.id);
-                      if (preview) {
-                        return {
-                          ...cell,
-                          x: preview.x,
-                          y: preview.y,
-                          w: preview.w,
-                          h: preview.h,
-                        };
-                      }
-                      const active = activeRectMap().get(cell.id);
-                      if (!active) return cell;
+                      // Drag source: stay anchored to its committed scoped rect
+                      // (the same one the surface uses) so chrome and xterm
+                      // share the resting frame the `--drag-dx/--drag-dy`
+                      // transform translates from. Skipping this and using the
+                      // raw cell rect (global tree) would jump the chrome to a
+                      // different slot than the surface the moment the drag
+                      // starts — visible as the top-bar detaching from its
+                      // terminal body, especially under an active worktree
+                      // scope where global vs. scoped rects diverge.
+                      const isSource = dragState()?.sourceId === cell.id;
+                      const preview = !isSource ? (previewCellMap()?.get(cell.id) ?? null) : null;
+                      const rect = preview ?? activeRectMap().get(cell.id) ?? null;
+                      if (!rect) return cell;
                       return {
                         ...cell,
-                        x: active.x,
-                        y: active.y,
-                        w: active.w,
-                        h: active.h,
+                        x: rect.x,
+                        y: rect.y,
+                        w: rect.w,
+                        h: rect.h,
                       };
                     });
                     return (
@@ -926,6 +941,17 @@ const TerminalSurfaceLayer: Component<{ surfaces: TerminalSurfaceDescriptor[] }>
 };
 
 const TerminalSurfaceHost: Component<{ surface: TerminalSurfaceDescriptor }> = (props) => {
+  if (import.meta.env.DEV) {
+    const k = props.surface.key;
+    const sid = props.surface.sessionId ?? "—";
+    console.log(`%c[flicker-debug] TerminalSurfaceHost MOUNT key=${k} sid=${sid}`, "color:#08c");
+    onCleanup(() => {
+      console.log(
+        `%c[flicker-debug] TerminalSurfaceHost CLEANUP key=${k} sid=${sid}`,
+        "color:#c30",
+      );
+    });
+  }
   const [lastRect, setLastRect] = createSignal<Rect | null>(null);
   createEffect(() => {
     const rect = props.surface.rect;
@@ -950,6 +976,9 @@ const TerminalSurfaceHost: Component<{ surface: TerminalSurfaceDescriptor }> = (
     const s = dragState();
     return s?.snapped === true && s.targetId !== null && s.targetId !== ROOT_TARGET;
   });
+  const fileDropActive = createMemo(
+    () => props.surface.kind !== "shell" && dropTargetPaneId() === props.surface.key,
+  );
   const style = createMemo<Record<string, string>>(() => {
     const r = rect() ?? { id: props.surface.key, x: 0, y: 0, w: LAYOUT_UNIT, h: LAYOUT_UNIT };
     return {
@@ -993,8 +1022,10 @@ const TerminalSurfaceHost: Component<{ surface: TerminalSurfaceDescriptor }> = (
         "pane-maximized": props.surface.maximized,
         "surface-dragging-source": isDragSource(),
         "is-snapped": isSnappedSource(),
+        "file-drop-target": fileDropActive(),
       }}
       data-surface-key={props.surface.key}
+      data-pane-id={props.surface.key}
       data-cell-id={props.surface.cellId}
       data-session-id={props.surface.sessionId ?? ""}
       data-dragging={isDragSource() ? "true" : "false"}
@@ -1044,6 +1075,74 @@ const TerminalSurfaceHost: Component<{ surface: TerminalSurfaceDescriptor }> = (
   );
 };
 
+const pathBasename = (path: string): string => {
+  const normalized = path.replace(/\\/g, "/");
+  return normalized.split("/").filter(Boolean).pop() ?? path;
+};
+
+const FileDropOverlay: Component<{ active: boolean; kind: AgentKind; paths: string[] }> = (
+  props,
+) => {
+  const visiblePaths = createMemo(() => props.paths.slice(0, 4));
+  const extraCount = createMemo(() => Math.max(0, props.paths.length - visiblePaths().length));
+  const TargetIcon = createMemo(() => HARNESS_ICONS[props.kind as keyof typeof HARNESS_ICONS]);
+
+  return (
+    <Show when={props.active && props.paths.length > 0}>
+      <div
+        class="terminal-file-drop-overlay pointer-events-none absolute inset-0 z-40 flex flex-col items-center justify-center text-center"
+        data-testid="terminal-file-drop-overlay"
+      >
+        <div class="terminal-file-drop-preview-stack" aria-hidden="true">
+          <For each={visiblePaths()}>
+            {(path, index) => (
+              <div class="terminal-file-drop-preview-file" style={{ "--file-index": `${index()}` }}>
+                <FileTypeIcon
+                  name={pathBasename(path)}
+                  class="terminal-file-drop-preview-icon"
+                  width={28}
+                  height={28}
+                />
+              </div>
+            )}
+          </For>
+        </div>
+        <div class="terminal-file-drop-target-icon">
+          {(() => {
+            const Icon = TargetIcon();
+            return Icon ? <Icon class="terminal-file-drop-harness-icon" /> : null;
+          })()}
+        </div>
+        <div class="terminal-file-drop-title">
+          {props.paths.length === 1
+            ? "Release to attach file"
+            : `Release to attach ${props.paths.length} files`}
+        </div>
+        <div class="terminal-file-drop-files">
+          <For each={visiblePaths()}>
+            {(path) => (
+              <div class="terminal-file-drop-chip">
+                <FileTypeIcon
+                  name={pathBasename(path)}
+                  class="terminal-file-drop-chip-icon"
+                  width={18}
+                  height={18}
+                />
+                <span>{pathBasename(path)}</span>
+              </div>
+            )}
+          </For>
+          <Show when={extraCount() > 0}>
+            <div class="terminal-file-drop-chip terminal-file-drop-chip-more">
+              +{extraCount()} more
+            </div>
+          </Show>
+        </div>
+      </div>
+    </Show>
+  );
+};
+
 // ---- LeafFrame: absolute-positioned pane ----------------------------------
 
 /**
@@ -1080,6 +1179,9 @@ const ReviewSnapOverlay: Component<ReviewSnapOverlayProps> = (props) => {
   const dragData = createMemo<{
     sourceKind: AgentKind;
     sourceLabel: string;
+    armDelayMs: number;
+    armed: boolean;
+    armStartedAtMs: number | null;
   } | null>(() => {
     const s = dragState();
     if (!s) return null;
@@ -1090,6 +1192,9 @@ const ReviewSnapOverlay: Component<ReviewSnapOverlayProps> = (props) => {
     return {
       sourceKind: s.sourceKind as AgentKind,
       sourceLabel: s.sourceLabel,
+      armDelayMs: s.armDelayMs,
+      armed: s.armed,
+      armStartedAtMs: s.armStartedAtMs,
     };
   });
 
@@ -1111,9 +1216,17 @@ const ReviewSnapOverlay: Component<ReviewSnapOverlayProps> = (props) => {
       {(data) => {
         const ReviewerIcon = HARNESS_ICONS[data().sourceKind as keyof typeof HARNESS_ICONS];
         const ReviewedIcon = HARNESS_ICONS[props.cellKind as keyof typeof HARNESS_ICONS];
+        // Dwell progress key: the CSS animation is restarted from 0
+        // every time `armStartedAtMs` changes — initial engagement,
+        // OR re-targeting from another pane onto this one within the
+        // same drag. Solid's `<Show keyed>` rebuilds the DOM subtree
+        // when the keyed value identity changes, which restarts the
+        // bar's CSS @keyframes from frame 0.
+        const dwellKey = createMemo(() => (data().armDelayMs > 0 ? data().armStartedAtMs : null));
         return (
           <div
             class="pane-review-snap-overlay pointer-events-none absolute inset-0 z-30 flex flex-col items-center justify-center text-center"
+            classList={{ "is-armed": data().armed, "is-dwelling": !data().armed }}
             data-testid="review-snap-overlay"
           >
             <div class="pane-review-snap-icons">
@@ -1133,7 +1246,28 @@ const ReviewSnapOverlay: Component<ReviewSnapOverlayProps> = (props) => {
             >
               {(text) => <div class="pane-review-snap-prompt">{text()}</div>}
             </Show>
-            <div class="pane-review-snap-hint">Release to review</div>
+            {/* Dwell progress bar. Hidden when armDelayMs===0 (empty
+                source: instant arm, no dwell). For non-empty sources,
+                a thin foreground line fills left→right over the dwell
+                duration; once full the user can release to commit.
+                The `keyed` value is the dwell start timestamp — when
+                it changes (retargeting onto this pane mid-drag, or
+                re-engaging after Escape), Solid remounts the subtree
+                which restarts the CSS @keyframes from frame 0. */}
+            <Show when={dwellKey()} keyed>
+              {(_stamp: number) => (
+                <div
+                  class="pane-review-snap-progress"
+                  style={{ "--review-dwell-ms": `${data().armDelayMs}ms` }}
+                  data-testid="review-snap-progress"
+                >
+                  <div class="pane-review-snap-progress-fill" />
+                </div>
+              )}
+            </Show>
+            <div class="pane-review-snap-hint" data-testid="review-snap-hint">
+              {data().armDelayMs === 0 || data().armed ? "Release to review" : "Hold to review…"}
+            </div>
           </div>
         );
       }}
@@ -1564,6 +1698,12 @@ const LeafFrame: Component<{ cell: RuntimeCell; maximizedPaneId: string | null }
     const s = dragState();
     return s?.snapped === true && s.targetId !== null && s.targetId !== ROOT_TARGET;
   });
+  const isFileDropTarget = createMemo(
+    () =>
+      props.cell.kind !== "empty" &&
+      props.cell.kind !== "shell" &&
+      props.cell.activeTabId === dropTargetPaneId(),
+  );
 
   return (
     <div
@@ -1571,7 +1711,9 @@ const LeafFrame: Component<{ cell: RuntimeCell; maximizedPaneId: string | null }
         cellRef = el;
       }}
       data-dnd-target-pane-id={props.cell.id}
+      data-pane-id={props.cell.activeTabId ?? ""}
       data-cell-id={props.cell.id}
+      data-session-id={activeSession() ?? ""}
       data-review-linked={isLinked() ? "true" : undefined}
       class="leaf-frame terminal-chrome-frame flex min-h-0 min-w-0 flex-col"
       classList={{
@@ -1581,6 +1723,7 @@ const LeafFrame: Component<{ cell: RuntimeCell; maximizedPaneId: string | null }
         "pane-maximized": isMaximized(),
         "pane-review-linked": isLinked(),
         "pane-review-snap-target": isReviewSnapTarget(),
+        "file-drop-target": isFileDropTarget(),
         hidden: anyMaximized() && !isMaximized(),
       }}
       style={style()}
@@ -1612,6 +1755,13 @@ const LeafFrame: Component<{ cell: RuntimeCell; maximizedPaneId: string | null }
           targetSessionId={activeSession()}
         />
       </div>
+      <Show when={props.cell.kind !== "empty" && props.cell.kind !== "shell"}>
+        <FileDropOverlay
+          active={isFileDropTarget()}
+          kind={props.cell.kind as AgentKind}
+          paths={dropPreviewPaths()}
+        />
+      </Show>
     </div>
   );
 };
@@ -1688,6 +1838,22 @@ const PaneHeader: Component<PaneHeaderProps> = (props) => {
         const r = projected.rects.get(c.id);
         return r ? [{ id: c.id, x: r.x, y: r.y, w: r.w, h: r.h }] : [];
       });
+      // Dwell-to-arm gate. The source pane will be **destroyed** when a
+      // review commits (its session is killed and the slot is reused for
+      // the reviewer harness), so the commit must be intentional. Two
+      // cases:
+      //   • Empty source — no submitted prompt → no transcript to lose.
+      //     Arm instantly so the natural "spawn fresh reviewer" gesture
+      //     stays one motion.
+      //   • Source has history — require a deliberate hold over the
+      //     target before the snap commits on release. The visual snap
+      //     still engages on entry so the user gets feedback that the
+      //     gesture is recognised; only the destructive commit waits.
+      const sourceSession = activeSessionForCell(props.cellId);
+      const sourceHasHistory =
+        sourceSession !== undefined && terminalStore.byId[sourceSession]?.lastPrompt !== undefined;
+      const armDelayMs = sourceHasHistory ? REVIEW_COMMIT_DWELL_MS : 0;
+
       beginDrag({
         sourceId: props.cellId,
         sourceKind: props.kind,
@@ -1696,6 +1862,7 @@ const PaneHeader: Component<PaneHeaderProps> = (props) => {
         rootEl,
         cells: cellsSnapshot,
         layoutUnit: LAYOUT_UNIT,
+        armDelayMs,
         // Magnetic snap eligibility: only engage when both source and
         // target are review-eligible harnesses. Shell/empty panes never
         // snap — dragging onto a Shell pane just falls through to normal
@@ -1706,18 +1873,20 @@ const PaneHeader: Component<PaneHeaderProps> = (props) => {
           if (!target) return false;
           return target.kind !== "shell" && target.kind !== "empty";
         },
-        onDrop: ({ sourceId, targetId, zone, snapped }) => {
+        onDrop: ({ sourceId, targetId, zone, snapped, armed }) => {
           if (!targetId || !zone || sourceId === targetId) return;
           if (zone === "center") {
             // Center drop on a sibling pane = start a cross-harness review.
             // Center drop on the root sentinel = no-op (no target to review).
             if (targetId === ROOT_TARGET) return;
-            // **Magnetic snap gate.** A review kills the source pane's
-            // session and respawns a new harness, so we never commit
-            // unless the snap was visibly engaged at release. An
-            // unsnapped center release is treated as "changed mind" —
-            // silently cancelled, no toast spam.
-            if (!snapped) return;
+            // **Two-gate commit.** `snapped` is the visual state — the
+            // magnet was engaged at release. `armed` is the dwell gate —
+            // the cursor sat on the target long enough (or the source
+            // was empty, in which case `armDelayMs === 0` arms instantly).
+            // A review kills the source pane's session, so we require
+            // both. An unsnapped or unarmed release is treated as
+            // "changed mind" — silently cancelled, no toast spam.
+            if (!snapped || !armed) return;
             void startReviewFromDrop(sourceId, targetId);
             return;
           }

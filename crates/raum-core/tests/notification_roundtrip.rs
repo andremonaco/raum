@@ -786,7 +786,7 @@ async fn opencode_sse_emits_permission_and_reply_then_http_replier_posts_allow()
 
     let pending = new_pending_map();
     let fallback = SessionId::new("raum-default");
-    let channel = OpenCodeSseChannel::new(server.uri(), pending.clone(), fallback);
+    let channel = OpenCodeSseChannel::new(server.uri(), pending.clone(), fallback.clone());
 
     let (tx, mut rx) = mpsc::channel(8);
     let cancel = CancellationToken::new();
@@ -805,7 +805,13 @@ async fn opencode_sse_emits_permission_and_reply_then_http_replier_posts_allow()
         ev.request_id.as_ref().map(|r| r.as_str().to_string()),
         Some("perm-42".to_string())
     );
-    assert_eq!(ev.session_id, SessionId::new("sess-42"));
+    assert_eq!(ev.session_id, fallback);
+    assert_eq!(
+        ev.payload
+            .get("sessionID")
+            .and_then(serde_json::Value::as_str),
+        Some("sess-42")
+    );
 
     // 2. permission.replied → TurnEnd.
     let ev = timeout(STEP_TIMEOUT, rx.recv())
@@ -855,7 +861,7 @@ async fn opencode_sse_emits_question_waiting_and_resume_events() {
 
     let pending = new_pending_map();
     let fallback = SessionId::new("raum-default");
-    let channel = OpenCodeSseChannel::new(server.uri(), pending, fallback);
+    let channel = OpenCodeSseChannel::new(server.uri(), pending, fallback.clone());
 
     let (tx, mut rx) = mpsc::channel(8);
     let cancel = CancellationToken::new();
@@ -869,7 +875,13 @@ async fn opencode_sse_emits_question_waiting_and_resume_events() {
     assert_eq!(ev.kind, NotificationKind::IdlePromptNeeded);
     assert_eq!(ev.harness, AgentKind::OpenCode);
     assert_eq!(ev.reliability, Reliability::Deterministic);
-    assert_eq!(ev.session_id, SessionId::new("sess-42"));
+    assert_eq!(ev.session_id, fallback);
+    assert_eq!(
+        ev.payload
+            .get("sessionID")
+            .and_then(serde_json::Value::as_str),
+        Some("sess-42")
+    );
     assert!(ev.request_id.is_none());
 
     let ev = timeout(STEP_TIMEOUT, rx.recv())
@@ -877,14 +889,14 @@ async fn opencode_sse_emits_question_waiting_and_resume_events() {
         .expect("sse stream stalled waiting for question.replied")
         .expect("sink closed");
     assert_eq!(ev.kind, NotificationKind::TurnStart);
-    assert_eq!(ev.session_id, SessionId::new("sess-42"));
+    assert_eq!(ev.session_id, SessionId::new("raum-default"));
 
     let ev = timeout(STEP_TIMEOUT, rx.recv())
         .await
         .expect("sse stream stalled waiting for question.rejected")
         .expect("sink closed");
     assert_eq!(ev.kind, NotificationKind::TurnStart);
-    assert_eq!(ev.session_id, SessionId::new("sess-42"));
+    assert_eq!(ev.session_id, SessionId::new("raum-default"));
 
     cancel.cancel();
     let _ = task.await;

@@ -161,7 +161,7 @@ describe("TerminalGrid persistent surfaces", () => {
     );
     expect(screen.getByTestId("terminal-surface-tab-beta")).toHaveAttribute("data-visible", "true");
 
-    setCrossProjectViewMode("recent");
+    setCrossProjectViewMode("completed");
     expect(surfaceMounts).toBe(2);
     expect(surfaceCleanups).toBe(0);
     expect(screen.getByTestId("terminal-surface-tab-alpha")).toHaveAttribute(
@@ -312,6 +312,9 @@ describe("TerminalGrid persistent surfaces", () => {
       targetRect: null,
       snapped: false,
       snapHystRect: null,
+      armed: false,
+      armStartedAtMs: null,
+      armDelayMs: 0,
       escapedTargetId: null,
     });
 
@@ -415,6 +418,9 @@ describe("TerminalGrid persistent surfaces", () => {
       targetRect: new DOMRect(500, 0, 500, 1000),
       snapped: true,
       snapHystRect: new DOMRect(452, -48, 596, 1096),
+      armed: true,
+      armStartedAtMs: null,
+      armDelayMs: 0,
       escapedTargetId: null,
     });
 
@@ -437,6 +443,9 @@ describe("TerminalGrid persistent surfaces", () => {
       targetRect: null,
       snapped: false,
       snapHystRect: null,
+      armed: false,
+      armStartedAtMs: null,
+      armDelayMs: 0,
       escapedTargetId: null,
     });
 

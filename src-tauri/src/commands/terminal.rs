@@ -10,7 +10,7 @@
 //!
 //! Pane I/O runs through a Rust-owned PTY that hosts a child
 //! `tmux attach-session`; xterm.js receives the attached client's rendered
-//! viewport bytes verbatim. xterm.js on the webview side keeps a 10 000-line
+//! viewport bytes verbatim. xterm.js on the webview side keeps a 100 000-line
 //! scrollback (§3.8); the underlying tmux `history-limit` is set to match for
 //! future copy-mode exposure. The scrollback cap is exported as
 //! [`raum_core::config::XTERM_SCROLLBACK_LINES`] and consumed by the frontend.
@@ -18,6 +18,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::TcpListener;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -26,9 +27,11 @@ use raum_core::config::XTERM_SCROLLBACK_LINES;
 use raum_core::harness::codex::{Osc9Parser, classify_osc9_payload};
 use raum_core::harness::{
     NotificationKind, Reliability, harness_launch_command, harness_launch_command_with_prompt,
-    parse_opencode_port_arg,
+    harness_resume_command, parse_opencode_port_arg,
 };
-use raum_core::review::inject_opencode_brief;
+use raum_core::review::{
+    discover_session_id_by_prompt, harness_session_id_matches_cwd, inject_opencode_brief,
+};
 use raum_tmux::{
     PaneContext, PaneSnapshot, PtyBridgeHandle, TmuxError, TmuxManager, attach_via_pty,
 };
@@ -168,6 +171,17 @@ impl TerminalRegistry {
         }
     }
 
+    fn set_monitor_task(&mut self, session_id: &str, monitor_task: JoinHandle<()>) -> bool {
+        let Some(entry) = self.entries.get_mut(session_id) else {
+            monitor_task.abort();
+            return false;
+        };
+        if let Some(existing) = entry.monitor_task.replace(monitor_task) {
+            existing.abort();
+        }
+        true
+    }
+
     /// Tear down the stale bridge + monitor on an existing entry without
     /// removing the entry itself. The entry stays visible to
     /// `terminal_list` so the top-row counters don't flash to zero while
@@ -183,6 +197,7 @@ impl TerminalRegistry {
         if let Some(context) = entry.context_task.take() {
             context.abort();
         }
+        entry.bridge_output_cancelled.store(true, Ordering::SeqCst);
         entry.bridge.shutdown_silent();
         true
     }
@@ -191,26 +206,31 @@ impl TerminalRegistry {
     /// columns (`project_slug`, `worktree_id`, `kind`, `created_unix`)
     /// are preserved. Returns `true` iff the entry existed; when it
     /// returns `false` the caller's bridge + monitor are dropped.
-    pub fn replace_bridge(
+    fn replace_bridge(
         &mut self,
         session_id: &str,
-        bridge: PtyBridgeHandle,
-        monitor_task: JoinHandle<()>,
-        context_task: Option<JoinHandle<()>>,
+        runtime: BridgeRuntime,
         cols: u16,
         rows: u16,
     ) -> bool {
         let Some(entry) = self.entries.get_mut(session_id) else {
-            monitor_task.abort();
-            if let Some(context) = context_task {
+            if let Some(monitor) = runtime.monitor_task {
+                monitor.abort();
+            }
+            if let Some(context) = runtime.context_task {
                 context.abort();
             }
-            bridge.shutdown_silent();
+            runtime
+                .bridge_output_cancelled
+                .store(true, Ordering::SeqCst);
+            runtime.bridge.shutdown_silent();
             return false;
         };
-        entry.bridge = bridge;
-        entry.monitor_task = Some(monitor_task);
-        entry.context_task = context_task;
+        entry.bridge_output_cancelled.store(true, Ordering::SeqCst);
+        entry.bridge = runtime.bridge;
+        entry.bridge_output_cancelled = runtime.bridge_output_cancelled;
+        entry.monitor_task = runtime.monitor_task;
+        entry.context_task = runtime.context_task;
         entry.last_cols = cols;
         entry.last_rows = rows;
         true
@@ -301,6 +321,10 @@ pub struct TerminalEntry {
     /// PTY-wrapped `tmux attach-session` client. Cloning the handle is cheap
     /// (Arc bump); the bridge tears down when the last clone drops.
     pub bridge: PtyBridgeHandle,
+    /// Set before intentionally tearing down/replacing this PTY bridge.
+    /// Reader/coalescer threads may still flush a short tail after
+    /// `shutdown_silent`; this drops stale bytes before they hit xterm.
+    pub bridge_output_cancelled: Arc<AtomicBool>,
     /// Polls `pane_dead` every 300 ms and emits `terminal:process-exited` when
     /// the shell/harness exits naturally (Ctrl-D / Ctrl-C). Aborted by
     /// `terminal_kill` so a manual close never fires a spurious overlay event.
@@ -316,6 +340,13 @@ pub struct TerminalEntry {
     /// tmux's hatched "|..." pattern.
     pub last_cols: u16,
     pub last_rows: u16,
+}
+
+struct BridgeRuntime {
+    bridge: PtyBridgeHandle,
+    bridge_output_cancelled: Arc<AtomicBool>,
+    monitor_task: Option<JoinHandle<()>>,
+    context_task: Option<JoinHandle<()>>,
 }
 
 impl TerminalEntry {
@@ -409,6 +440,12 @@ fn now_unix_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
+}
+
+fn now_unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 fn contains_submit_input(keys: &str) -> bool {
@@ -509,6 +546,7 @@ fn shutdown_removed_entry(mut entry: TerminalEntry, abort_monitor: bool) {
     if let Some(context) = entry.context_task.take() {
         context.abort();
     }
+    entry.bridge_output_cancelled.store(true, Ordering::SeqCst);
     entry.bridge.shutdown_silent();
 }
 
@@ -618,6 +656,39 @@ fn resolve_spawn_cwd(
         return project_dir;
     }
     std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from)
+}
+
+/// Resolve the directory to pass to `tmux respawn-pane -c` for harness
+/// resume/recovery. Prefer tmux's foreground process cwd because harnesses
+/// like Claude key their local session storage by cwd; fall back to the
+/// tracked project root if tmux has no usable path.
+async fn resolve_harness_respawn_cwd(
+    tmux: &Arc<TmuxManager>,
+    state: &AppHandleState,
+    session_id: &str,
+) -> Option<String> {
+    let pane_cwd = {
+        let tmux_for_context = tmux.clone();
+        let id_for_context = session_id.to_string();
+        tokio::task::spawn_blocking(move || tmux_for_context.pane_context(&id_for_context))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .map(|ctx| ctx.current_path)
+            .map(|path| path.trim().to_string())
+            .filter(|path| !path.is_empty())
+            .filter(|path| std::path::Path::new(path).is_dir())
+    };
+    if pane_cwd.is_some() {
+        return pane_cwd;
+    }
+
+    let (project_slug, worktree_id) = tracked_session_context(state, session_id);
+    let project_dir = resolve_project_dir(state, project_slug.as_deref(), worktree_id.as_deref());
+    if project_dir.as_os_str().is_empty() || !project_dir.is_dir() {
+        return None;
+    }
+    Some(project_dir.to_string_lossy().into_owned())
 }
 
 fn generate_session_id(kind: AgentKind) -> String {
@@ -823,6 +894,7 @@ pub async fn terminal_spawn<R: Runtime>(
         on_data,
         cols,
         rows,
+        harness_cmd.is_none(),
     )
     .await
     {
@@ -860,6 +932,10 @@ pub async fn terminal_spawn<R: Runtime>(
             emit_terminal_session_removed(&app, &session_id);
             emit_agent_session_removed(&app, &session_id);
             return Err(err);
+        }
+        let monitor = spawn_pane_death_monitor(app.clone(), tmux.clone(), session_id.clone());
+        if let Ok(mut reg) = state.terminals.lock() {
+            let _ = reg.set_monitor_task(&session_id, monitor);
         }
     }
 
@@ -907,7 +983,9 @@ async fn open_bridge_and_monitor<R: Runtime>(
     session_activity: Arc<Mutex<HashMap<String, Instant>>>,
     channel_event_tx: Option<mpsc::Sender<raum_hooks::HookEvent>>,
     pane_context_dirty_tx: Option<tokio::sync::mpsc::Sender<()>>,
-) -> Result<(PtyBridgeHandle, JoinHandle<()>), String> {
+) -> Result<(PtyBridgeHandle, Arc<AtomicBool>), String> {
+    let bridge_output_cancelled = Arc::new(AtomicBool::new(false));
+    let output_cancel_for_data = bridge_output_cancelled.clone();
     let channel_for_data = on_data.clone();
     let data_app = app.clone();
     let data_session_id_for_lost = session_id.clone();
@@ -943,6 +1021,9 @@ async fn open_bridge_and_monitor<R: Runtime>(
             cols,
             rows,
             Box::new(move |bytes| {
+                if output_cancel_for_data.load(Ordering::SeqCst) {
+                    return false;
+                }
                 if let (Some(parser), Some(tx)) = (osc9_parser.as_mut(), channel_event_tx.as_ref())
                 {
                     for payload in parser.feed(&bytes) {
@@ -1003,33 +1084,39 @@ async fn open_bridge_and_monitor<R: Runtime>(
     .map_err(|e| format!("spawn_blocking join: {e}"))?
     .map_err(|e| format!("pty attach: {e}"))?;
 
-    // Pane-death monitor: polls tmux every 300 ms for natural process exit so
-    // we can emit `terminal:process-exited` even when the attached client is
-    // still happily rendering an empty pane (remain-on-exit). Aborted by
-    // `terminal_kill` so an explicit close never fires a spurious overlay.
-    let monitor_tmux = tmux.clone();
-    let monitor_id = session_id.clone();
-    let monitor_app = app.clone();
-    let monitor_handle = tokio::spawn(async move {
+    Ok((bridge, bridge_output_cancelled))
+}
+
+/// Pane-death monitor: polls tmux every 300 ms for natural process exit so we
+/// can emit `terminal:process-exited` even when the attached client is still
+/// happily rendering an empty pane (remain-on-exit). Aborted by `terminal_kill`
+/// so an explicit close never fires a spurious overlay.
+fn spawn_pane_death_monitor<R: Runtime>(
+    app: AppHandle<R>,
+    tmux: Arc<TmuxManager>,
+    session_id: String,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_millis(300)).await;
-            let id = monitor_id.clone();
-            let tmux = monitor_tmux.clone();
-            match tokio::task::spawn_blocking(move || tmux.check_pane_dead(&id)).await {
+            let id = session_id.clone();
+            let tmux_for_check = tmux.clone();
+            match tokio::task::spawn_blocking(move || tmux_for_check.check_pane_dead(&id)).await {
                 Ok(Ok(Some(exit_code))) => {
-                    let _ = monitor_app.emit(
+                    let _ = app.emit(
                         "terminal:process-exited",
-                        serde_json::json!({ "sessionId": &monitor_id, "exitCode": exit_code }),
+                        serde_json::json!({ "sessionId": &session_id, "exitCode": exit_code }),
                     );
-                    let id2 = monitor_id.clone();
-                    let tmux2 = monitor_tmux.clone();
-                    let _ = tokio::task::spawn_blocking(move || tmux2.kill_session(&id2)).await;
-                    let state: tauri::State<'_, AppHandleState> = monitor_app.state();
+                    let id2 = session_id.clone();
+                    let tmux_for_kill = tmux.clone();
+                    let _ =
+                        tokio::task::spawn_blocking(move || tmux_for_kill.kill_session(&id2)).await;
+                    let state: tauri::State<'_, AppHandleState> = app.state();
                     let removed = match state.terminals.lock() {
-                        Ok(mut reg) => reg.remove(&monitor_id),
+                        Ok(mut reg) => reg.remove(&session_id),
                         Err(e) => {
                             tracing::warn!(
-                                session_id = %monitor_id,
+                                session_id = %session_id,
                                 error = %e,
                                 "terminal monitor: terminals lock poisoned during cleanup"
                             );
@@ -1039,18 +1126,16 @@ async fn open_bridge_and_monitor<R: Runtime>(
                     if let Some(entry) = removed {
                         shutdown_removed_entry(entry, false);
                     }
-                    cleanup_harness_session(&state, &monitor_id);
-                    emit_terminal_session_removed(&monitor_app, &monitor_id);
-                    emit_agent_session_removed(&monitor_app, &monitor_id);
+                    cleanup_harness_session(&state, &session_id);
+                    emit_terminal_session_removed(&app, &session_id);
+                    emit_agent_session_removed(&app, &session_id);
                     break;
                 }
                 Ok(Ok(None)) => { /* pane still alive — keep polling */ }
                 _ => break, // session killed externally (terminal_kill) or I/O error
             }
         }
-    });
-
-    Ok((bridge, monitor_handle))
+    })
 }
 
 /// `terminal_spawn` path: open a bridge + monitor and insert a fresh
@@ -1068,6 +1153,7 @@ async fn attach_pipeline<R: Runtime>(
     on_data: Channel<InvokeResponseBody>,
     cols: u16,
     rows: u16,
+    start_monitor: bool,
 ) -> Result<(), String> {
     let app_handle = app.clone();
     let (pane_context_dirty_tx, context_task) = if matches!(kind, AgentKind::Shell) {
@@ -1077,9 +1163,9 @@ async fn attach_pipeline<R: Runtime>(
             spawn_pane_context_monitor(app.clone(), tmux.clone(), session_id.clone());
         (Some(dirty_tx), Some(task))
     };
-    let (bridge, monitor_handle) = open_bridge_and_monitor(
+    let (bridge, bridge_output_cancelled) = open_bridge_and_monitor(
         app,
-        tmux,
+        tmux.clone(),
         session_id.clone(),
         kind,
         on_data,
@@ -1096,6 +1182,8 @@ async fn attach_pipeline<R: Runtime>(
         }
     })?;
 
+    let monitor_task = start_monitor
+        .then(|| spawn_pane_death_monitor(app_handle.clone(), tmux, session_id.clone()));
     let entry = TerminalEntry {
         session_id: session_id.clone(),
         project_slug,
@@ -1103,7 +1191,8 @@ async fn attach_pipeline<R: Runtime>(
         kind,
         created_unix: now_unix_secs(),
         bridge,
-        monitor_task: Some(monitor_handle),
+        bridge_output_cancelled,
+        monitor_task,
         context_task,
         last_cols: cols,
         last_rows: rows,
@@ -1129,7 +1218,7 @@ async fn attach_pipeline<R: Runtime>(
     Ok(())
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ReattachArgs {
     pub session_id: String,
     pub kind: AgentKind,
@@ -1141,6 +1230,71 @@ pub struct ReattachArgs {
     /// cascade.
     pub cols: Option<u32>,
     pub rows: Option<u32>,
+    /// Compatibility-only repair mode. Public frontend reattach calls leave
+    /// this false so `terminal_reattach` is bridge-only; recovery wrappers set
+    /// it while routing through the shared attach-then-provider-replay path.
+    #[serde(default)]
+    pub resume_after_attach: bool,
+    /// Optional override for resume-after-attach snapshot replay. `None`
+    /// means use the backend's per-harness default. Cmd+R sets this false
+    /// because the current xterm instance already owns the best scrollback;
+    /// startup Codex reattach leaves it unset so tmux scrollback is replayed
+    /// into the new xterm before `codex resume` starts.
+    #[serde(default)]
+    pub replay_before_resume: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[allow(dead_code)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReconnectHistoryStatus {
+    LiveBridge,
+    ProviderReplay,
+    DeferredProviderReplay,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconnectResult {
+    pub session_id: String,
+    pub history_status: ReconnectHistoryStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+impl ReconnectResult {
+    fn live_bridge(session_id: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            history_status: ReconnectHistoryStatus::LiveBridge,
+            message: None,
+        }
+    }
+
+    fn provider_replay(session_id: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            history_status: ReconnectHistoryStatus::ProviderReplay,
+            message: None,
+        }
+    }
+
+    fn unavailable(session_id: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            history_status: ReconnectHistoryStatus::Unavailable,
+            message: Some(message.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ResumeTarget {
+    command: String,
+    cwd: Option<String>,
+    harness_session_id: String,
+    opencode_port: Option<u16>,
 }
 
 fn preferred_context_value(values: [Option<&str>; 4]) -> Option<String> {
@@ -1182,6 +1336,123 @@ fn tracked_session_context(
         .map_or((None, None), |row| (row.project_slug, row.worktree_id))
 }
 
+fn tracked_session_harness_id(state: &AppHandleState, session_id: &str) -> Option<String> {
+    state
+        .config_store
+        .lock()
+        .ok()
+        .and_then(|store| store.last_session_harness_id(session_id))
+}
+
+fn tracked_session_last_prompt(state: &AppHandleState, session_id: &str) -> Option<String> {
+    state
+        .config_store
+        .lock()
+        .ok()
+        .and_then(|store| store.last_session_prompt(session_id))
+        .map(|(prompt, _)| prompt)
+}
+
+fn resolve_harness_extra_flags(state: &AppHandleState, kind: AgentKind) -> Option<String> {
+    let store = state.config_store.lock().expect("config store poisoned");
+    store
+        .read_config()
+        .ok()
+        .and_then(|cfg| match kind {
+            AgentKind::ClaudeCode => cfg.harnesses.claude_code.extra_flags,
+            AgentKind::Codex => cfg.harnesses.codex.extra_flags,
+            AgentKind::OpenCode => cfg.harnesses.opencode.extra_flags,
+            AgentKind::Shell => None,
+        })
+        .filter(|s| !s.trim().is_empty())
+}
+
+async fn resolve_resume_target(
+    state: &AppHandleState,
+    tmux: &Arc<TmuxManager>,
+    session_id: &str,
+    kind: AgentKind,
+    extra_flags: Option<&str>,
+) -> Result<ResumeTarget, String> {
+    if matches!(kind, AgentKind::Shell) {
+        return Err("shell panes do not support provider resume".to_string());
+    }
+
+    let persisted_port = tracked_session_opencode_port(state, session_id);
+    let opencode_port: Option<u16> = if matches!(kind, AgentKind::OpenCode) {
+        Some(match extra_flags.and_then(parse_opencode_port_arg) {
+            Some(explicit) => explicit,
+            None => persisted_port.unwrap_or(reserve_localhost_port()?),
+        })
+    } else {
+        None
+    };
+
+    let respawn_cwd = resolve_harness_respawn_cwd(tmux, state, session_id).await;
+    let resume_id = match tracked_session_harness_id(state, session_id) {
+        Some(id) => id,
+        None => {
+            let cwd = respawn_cwd
+                .as_deref()
+                .map(PathBuf::from)
+                .ok_or_else(|| format!("no provider resume id persisted for {kind:?}"))?;
+            let prompt = tracked_session_last_prompt(state, session_id)
+                .ok_or_else(|| format!("no provider resume id or prompt persisted for {kind:?}"))?;
+            let home_dir = dirs::home_dir()
+                .ok_or_else(|| "cannot discover provider resume id without HOME".to_string())?;
+            let discovered = discover_session_id_by_prompt(kind, &cwd, &home_dir, &prompt)
+                .ok_or_else(|| {
+                    format!(
+                        "no provider resume id persisted for {kind:?}, and no transcript matched this pane's last prompt"
+                    )
+                })?;
+            if let Ok(store) = state.config_store.lock()
+                && let Err(e) = store.update_session_harness_id(
+                    session_id,
+                    kind,
+                    &discovered,
+                    now_unix_millis(),
+                )
+            {
+                tracing::warn!(
+                    session_id = %session_id,
+                    kind = ?kind,
+                    error = %e,
+                    "resolve_resume_target: failed to persist discovered provider resume id",
+                );
+            }
+            tracing::info!(
+                session_id = %session_id,
+                kind = ?kind,
+                harness_session_id = %discovered,
+                cwd = %cwd.display(),
+                "resolve_resume_target: discovered provider resume id from last prompt",
+            );
+            discovered
+        }
+    };
+    if matches!(kind, AgentKind::ClaudeCode | AgentKind::Codex)
+        && let Some(cwd) = respawn_cwd.as_deref().map(PathBuf::from)
+        && let Some(home_dir) = dirs::home_dir()
+        && !harness_session_id_matches_cwd(kind, &cwd, &home_dir, &resume_id)
+    {
+        return Err(format!(
+            "persisted provider resume id for {kind:?} does not match this pane cwd {}; refusing to resume the wrong session",
+            cwd.display()
+        ));
+    }
+
+    let command = harness_resume_command(kind, extra_flags, opencode_port, &resume_id)
+        .ok_or_else(|| format!("no provider resume command available for {kind:?}"))?;
+
+    Ok(ResumeTarget {
+        command,
+        cwd: respawn_cwd,
+        harness_session_id: resume_id,
+        opencode_port,
+    })
+}
+
 struct ReattachInFlightGuard<'a> {
     terminals: &'a Mutex<TerminalRegistry>,
     session_id: String,
@@ -1210,7 +1481,7 @@ pub async fn terminal_reattach<R: Runtime>(
     state: tauri::State<'_, AppHandleState>,
     args: ReattachArgs,
     on_data: Channel<InvokeResponseBody>,
-) -> Result<String, String> {
+) -> Result<ReconnectResult, String> {
     let tmux: Arc<TmuxManager> = state.tmux.clone();
     let session_id = args.session_id.clone();
     let app_handle = app.clone();
@@ -1233,23 +1504,102 @@ pub async fn terminal_reattach<R: Runtime>(
         .map_err(|e| format!("tmux list-sessions: {e}"))?
     };
     if !exists {
-        // Reap any stale registry entry that still references this
-        // session (reattach across a `tmux kill-server`, or across a
-        // stale-reap window).
-        let stale = {
-            let mut reg = state
-                .terminals
-                .lock()
-                .map_err(|e| format!("terminals lock: {e}"))?;
-            reg.remove(&session_id)
-        };
-        if let Some(entry) = stale {
-            shutdown_removed_entry(entry, true);
+        if !args.resume_after_attach {
+            return Ok(ReconnectResult::unavailable(
+                session_id,
+                "tmux session is missing; no provider replay was requested",
+            ));
         }
-        cleanup_harness_session(&state, &session_id);
-        emit_terminal_session_removed(&app_handle, &session_id);
-        emit_agent_session_removed(&app_handle, &session_id);
-        return Err("not-found".to_string());
+        if matches!(args.kind, AgentKind::Shell) {
+            return Ok(ReconnectResult::unavailable(
+                session_id,
+                "shell history is unavailable because the tmux session is missing",
+            ));
+        }
+
+        let extra_flags = resolve_harness_extra_flags(&state, args.kind);
+        if let Err(err) = resolve_resume_target(
+            &state,
+            &tmux,
+            &session_id,
+            args.kind,
+            extra_flags.as_deref(),
+        )
+        .await
+        {
+            return Ok(ReconnectResult::unavailable(session_id, err));
+        }
+
+        let (tracked_project_slug, tracked_worktree_id) =
+            tracked_session_context(&state, &session_id);
+        let (spawn_project_slug, spawn_worktree_id) = resolve_reattach_context(
+            (args.project_slug.as_deref(), args.worktree_id.as_deref()),
+            (None, None),
+            (None, None),
+            (
+                tracked_project_slug.as_deref(),
+                tracked_worktree_id.as_deref(),
+            ),
+        );
+        let cwd = resolve_spawn_cwd(
+            &state,
+            None,
+            spawn_project_slug.as_deref(),
+            spawn_worktree_id.as_deref(),
+        );
+        let initial_size = sanitize_initial_size(args.cols, args.rows);
+        let raum_session_value = session_id.clone();
+        let raum_event_sock_value: Option<String> = state
+            .event_socket
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|h| h.path.to_string_lossy().into_owned()));
+        let tmux_for_new = tmux.clone();
+        let id_for_new = session_id.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut env_pairs: Vec<(&str, &str)> =
+                vec![(raum_hooks::RAUM_SESSION_ENV, raum_session_value.as_str())];
+            if let Some(p) = raum_event_sock_value.as_deref() {
+                env_pairs.push((raum_hooks::RAUM_EVENT_SOCK_ENV, p));
+            }
+            tmux_for_new.new_session_with_env(
+                &id_for_new,
+                &cwd,
+                Some("placeholder"),
+                initial_size,
+                &env_pairs,
+            )
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking join: {e}"))?
+        .map_err(|e| format!("tmux new-session: {e}"))?;
+    }
+
+    let provider_replay_requested =
+        args.resume_after_attach && !matches!(args.kind, AgentKind::Shell);
+    if provider_replay_requested {
+        let extra_flags = resolve_harness_extra_flags(&state, args.kind);
+        if let Err(err) = resolve_resume_target(
+            &state,
+            &tmux,
+            &session_id,
+            args.kind,
+            extra_flags.as_deref(),
+        )
+        .await
+        {
+            return Ok(ReconnectResult::unavailable(session_id, err));
+        }
+    }
+
+    {
+        let tmux_for_history = tmux.clone();
+        let id_for_history = session_id.clone();
+        tokio::task::spawn_blocking(move || {
+            tmux_for_history.set_history_limit(&id_for_history, XTERM_SCROLLBACK_LINES);
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking join: {e}"))?;
     }
 
     let _reattach_guard = {
@@ -1273,7 +1623,7 @@ pub async fn terminal_reattach<R: Runtime>(
     // Shut down the stale bridge on the existing registry entry WITHOUT
     // removing it. The entry stays visible to `terminal_list` for the
     // duration of the reattach, so the top-row counters don't flash to
-    // zero on Cmd+R. Webview-reload path: Rust survives; the old reader
+    // zero during webview reload. Webview-reload path: Rust survives; the old reader
     // thread is still pumping bytes into an orphaned channel and must
     // be torn down before we wire the new one. Full-restart path: no
     // prior entry exists, `had_entry == false` tells us to insert
@@ -1333,6 +1683,7 @@ pub async fn terminal_reattach<R: Runtime>(
         effective_project_slug.as_deref(),
         effective_worktree_id.as_deref(),
     );
+    let resume_after_attach = provider_replay_requested;
 
     if !matches!(args.kind, AgentKind::Shell) {
         crate::commands::agent::ensure_bridge_running(&app, &state.agent_events);
@@ -1398,6 +1749,26 @@ pub async fn terminal_reattach<R: Runtime>(
         }
     }
 
+    if resume_after_attach {
+        let cmd = match respawn_harness_pane_in_place(&tmux, &state, &session_id, args.kind, true)
+            .await
+        {
+            Ok(cmd) => cmd,
+            Err(err) => {
+                if let Some(task) = context_task.as_ref() {
+                    task.abort();
+                }
+                return Err(err);
+            }
+        };
+        tracing::info!(
+            session_id = %session_id,
+            kind = ?args.kind,
+            cmd = %cmd,
+            "terminal_reattach: resumed harness before bridge attach",
+        );
+    }
+
     // Replay tmux state into xterm.js before the live client attaches.
     // Sending here (before `open_bridge_and_monitor` opens the live PTY
     // bridge) preserves ordering on the same `Channel<Raw>`: replay bytes
@@ -1405,23 +1776,27 @@ pub async fn terminal_reattach<R: Runtime>(
     //
     // The capture mode depends on `kind × is_alternate_on`:
     //
-    // - Shell panes → full snapshot (capped at `history-limit = 10000`,
+    // - Shell panes → full snapshot (capped at `history-limit`, currently
     //   matching `frontend/src/lib/scrollbackConfig.ts SCROLLBACK_MAX`).
     //   Plain command output makes a clean scrollback record.
     //
-    // - Alt-screen TUIs (Codex, `vim`, `htop`, …) → full snapshot. The alt
-    //   branch of `capture_pane_snapshot` cleanly separates the alt frame
-    //   from the underlying normal scrollback (which is shell history from
-    //   before the TUI took over).
+    // - Codex and alt-screen TUIs (`vim`, `htop`, …) → full snapshot. Codex
+    //   runs with `--no-alt-screen` under raum specifically so its chat can
+    //   live in normal scrollback; replaying only the viewport would discard
+    //   the history Cmd+R/startup are trying to preserve. For true alt-screen
+    //   panes, `capture_pane_snapshot` cleanly separates the visible alt frame
+    //   from underlying normal scrollback.
     //
-    // - Non-alt-screen Ink-style TUIs (Claude Code, OpenCode rendering
-    //   without alt-screen) → viewport snapshot only (`rows` lines). These
-    //   harnesses do cursor-positioned in-place updates on the normal
-    //   screen, so tmux scrollback accumulates every intermediate redraw
-    //   frame plus any mixed-width rows from prior resizes. Replaying that
-    //   produces visible corruption (overlapping rules, ghost prompts).
-    //   Recovering meaningful conversation history for these TUIs would
-    //   require parsing their session log files — out of scope here.
+    // - Provider replay (`resume_after_attach`) → full snapshot. The harness
+    //   has just rendered its provider-owned transcript into tmux while no
+    //   xterm bridge was attached, so this capture becomes the deterministic
+    //   first frame for xterm scrollback before the live client attaches.
+    //
+    // - Non-alt-screen Ink-style TUIs during bridge-only attach (Claude Code,
+    //   OpenCode rendering without alt-screen) → viewport snapshot. Provider
+    //   replay is the only supported full-history path for these harnesses, but
+    //   a fresh xterm still needs the current tmux frame immediately after app
+    //   restart; otherwise the pane stays blank until the TUI happens to redraw.
     {
         let tmux_for_capture = tmux.clone();
         let id_for_capture = session_id.clone();
@@ -1431,7 +1806,9 @@ pub async fn terminal_reattach<R: Runtime>(
             let alt_on = tmux_for_capture
                 .is_alternate_on(&id_for_capture)
                 .unwrap_or(false);
-            let prefer_full = matches!(reattach_kind, AgentKind::Shell) || alt_on;
+            let prefer_full = resume_after_attach
+                || matches!(reattach_kind, AgentKind::Shell | AgentKind::Codex)
+                || alt_on;
             if prefer_full {
                 tmux_for_capture.capture_pane_snapshot(&id_for_capture)
             } else {
@@ -1470,9 +1847,9 @@ pub async fn terminal_reattach<R: Runtime>(
 
     // Open the fresh PTY bridge + monitor. This is the only long-running
     // work, and we hold no registry lock across it.
-    let (bridge, monitor_handle) = match open_bridge_and_monitor(
+    let (bridge, bridge_output_cancelled) = match open_bridge_and_monitor(
         app,
-        tmux,
+        tmux.clone(),
         session_id.clone(),
         args.kind,
         on_data,
@@ -1501,9 +1878,14 @@ pub async fn terminal_reattach<R: Runtime>(
             return Err(err);
         }
     };
+    let monitor_task = Some(spawn_pane_death_monitor(
+        app_handle.clone(),
+        tmux.clone(),
+        session_id.clone(),
+    ));
 
-    // Land the fresh handles: replace on the existing entry (Cmd+R /
-    // webview reload) or insert a brand-new one (full app restart — the
+    // Land the fresh handles: replace on the existing entry (webview reload)
+    // or insert a brand-new one (full app restart — the
     // backend started empty so `detach_bridge` returned false).
     let item = {
         let mut reg = state
@@ -1511,14 +1893,13 @@ pub async fn terminal_reattach<R: Runtime>(
             .lock()
             .map_err(|e| format!("terminals lock: {e}"))?;
         if had_entry {
-            if !reg.replace_bridge(
-                &session_id,
+            let runtime = BridgeRuntime {
                 bridge,
-                monitor_handle,
+                bridge_output_cancelled,
+                monitor_task,
                 context_task,
-                cols,
-                rows,
-            ) {
+            };
+            if !reg.replace_bridge(&session_id, runtime, cols, rows) {
                 // The entry was removed concurrently (a `terminal_kill`
                 // raced the reattach). The bridge and monitor we just
                 // built are dropped here — the pane will stay blank
@@ -1547,7 +1928,8 @@ pub async fn terminal_reattach<R: Runtime>(
                 kind: args.kind,
                 created_unix,
                 bridge,
-                monitor_task: Some(monitor_handle),
+                bridge_output_cancelled,
+                monitor_task,
                 context_task,
                 last_cols: cols,
                 last_rows: rows,
@@ -1567,7 +1949,214 @@ pub async fn terminal_reattach<R: Runtime>(
         "terminal_reattach: pty bridge ready"
     );
 
-    Ok(session_id)
+    if resume_after_attach {
+        Ok(ReconnectResult::provider_replay(session_id))
+    } else {
+        Ok(ReconnectResult::live_bridge(session_id))
+    }
+}
+
+/// Build the launch command for a harness respawn and run
+/// `tmux respawn-pane -k` against the pane. Caller MUST have already
+/// confirmed the pane is dead (or actively wants to kill what's there —
+/// only `terminal_self_heal` does that).
+///
+/// When `prefer_resume` is true and a `harness_session_id` is persisted,
+/// we first try `<harness> --resume <id>` so the harness rehydrates its
+/// own conversation state from the on-disk session log. After the
+/// `respawn-pane -k` returns, we wait briefly and verify the new pane
+/// is still alive — if `--resume` exits during the grace window (stale id,
+/// auto-update prompt, MCP server failure, version mismatch, etc.), we
+/// return an explicit error and keep the pane identity for retry. We only use
+/// the fresh-launch branch when the caller did not request provider resume.
+///
+/// Returns the command that was actually used, for logging.
+async fn respawn_harness_pane_in_place(
+    tmux: &Arc<TmuxManager>,
+    state: &tauri::State<'_, AppHandleState>,
+    session_id: &str,
+    kind: AgentKind,
+    prefer_resume: bool,
+) -> Result<String, String> {
+    let extra_flags = resolve_harness_extra_flags(state, kind);
+    let fresh_cmd = harness_launch_command(kind, extra_flags.as_deref(), None)
+        .ok_or_else(|| "no launch command derivable for this kind".to_string())?;
+    let resume_target = if prefer_resume {
+        Some(resolve_resume_target(state, tmux, session_id, kind, extra_flags.as_deref()).await?)
+    } else {
+        None
+    };
+
+    // Try --resume first if available; verify the pane survives a brief
+    // grace window. If it doesn't, return an explicit error. We do not
+    // silently substitute a fresh harness because that creates an empty chat
+    // under the same raum pane identity and hides the history failure.
+    if let Some(target) = resume_target {
+        let cmd = target.command.clone();
+        tracing::info!(
+            session_id = %session_id,
+            kind = ?kind,
+            cmd = %cmd,
+            cwd = target.cwd.as_deref().unwrap_or("<tmux-default>"),
+            harness_session_id = %target.harness_session_id,
+            opencode_port = ?target.opencode_port,
+            "respawn_harness_pane_in_place: attempting --resume",
+        );
+        let tmux_for_respawn = tmux.clone();
+        let id_for_respawn = session_id.to_string();
+        let cmd_for_respawn = cmd.clone();
+        let cwd_for_respawn = target.cwd.clone();
+        tokio::task::spawn_blocking(move || {
+            tmux_for_respawn.respawn_with_cwd(
+                &id_for_respawn,
+                &cmd_for_respawn,
+                cwd_for_respawn.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking join: {e}"))?
+        .map_err(|e| format!("tmux respawn-pane: {e}"))?;
+
+        // Grace window. The new harness needs a moment to parse args,
+        // fork its MCP children, open its session log, etc. Anything
+        // that exits during this window is almost certainly a startup
+        // failure (stale id, version mismatch, auto-update prompt,
+        // missing config) — bail out and try fresh instead of leaving
+        // the user with a `[lost tty]` corpse.
+        //
+        // We poll every 100 ms up to 1500 ms total: detects a quick
+        // exit within ~100 ms while still committing fast for a
+        // healthy --resume that took longer than expected to settle.
+        const GRACE_TOTAL_MS: u64 = 1500;
+        const GRACE_POLL_MS: u64 = 100;
+        let grace_start = std::time::Instant::now();
+        let grace_total = std::time::Duration::from_millis(GRACE_TOTAL_MS);
+        let grace_poll = std::time::Duration::from_millis(GRACE_POLL_MS);
+        let resume_died: Option<i32>;
+        loop {
+            let dead = {
+                let tmux_for_check = tmux.clone();
+                let id_for_check = session_id.to_string();
+                tokio::task::spawn_blocking(move || tmux_for_check.check_pane_dead(&id_for_check))
+                    .await
+                    .map_err(|e| format!("spawn_blocking join: {e}"))?
+            };
+            match dead {
+                Ok(Some(exit_code)) => {
+                    resume_died = Some(exit_code);
+                    break;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        error = %e,
+                        "respawn_harness_pane_in_place: pane-dead probe failed during --resume grace, assuming alive",
+                    );
+                    return Ok(cmd);
+                }
+            }
+            if grace_start.elapsed() >= grace_total {
+                // Survived the full window — commit.
+                tracing::info!(
+                    session_id = %session_id,
+                    kind = ?kind,
+                    elapsed_ms = grace_start.elapsed().as_millis() as u64,
+                    "respawn_harness_pane_in_place: --resume pane alive after grace, committing",
+                );
+                return Ok(cmd);
+            }
+            tokio::time::sleep(grace_poll).await;
+        }
+        if let Some(exit_code) = resume_died {
+            tracing::error!(
+                session_id = %session_id,
+                kind = ?kind,
+                exit_code,
+                cmd = %cmd,
+                elapsed_ms = grace_start.elapsed().as_millis() as u64,
+                "respawn_harness_pane_in_place: --resume exited during grace window",
+            );
+            return Err(format!(
+                "provider resume exited early (code {exit_code}); pane kept on the same session for retry"
+            ));
+        }
+    }
+
+    let respawn_cwd = resolve_harness_respawn_cwd(tmux, state, session_id).await;
+    // Fresh-launch path: either no resume id was available, or --resume
+    // failed and we're falling back. Do the respawn-pane -k with the
+    // fresh command and verify the pane survives a brief grace window
+    // — if even fresh launch dies on us (binary missing, malformed
+    // config, etc.), return Err so the caller can surface this through
+    // the dead-pane overlay rather than letting tmux print `[lost tty]`
+    // into the user's xterm.
+    tracing::info!(
+        session_id = %session_id,
+        kind = ?kind,
+        cmd = %fresh_cmd,
+        cwd = respawn_cwd.as_deref().unwrap_or("<tmux-default>"),
+        "respawn_harness_pane_in_place: respawning with fresh launch",
+    );
+    let tmux_for_respawn = tmux.clone();
+    let id_for_respawn = session_id.to_string();
+    let cmd_for_respawn = fresh_cmd.clone();
+    let cwd_for_respawn = respawn_cwd.clone();
+    tokio::task::spawn_blocking(move || {
+        tmux_for_respawn.respawn_with_cwd(
+            &id_for_respawn,
+            &cmd_for_respawn,
+            cwd_for_respawn.as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking join: {e}"))?
+    .map_err(|e| format!("tmux respawn-pane: {e}"))?;
+
+    // Same active poll as the --resume path, shorter window since fresh
+    // launch should come up quickly.
+    const FRESH_GRACE_MS: u64 = 800;
+    const FRESH_POLL_MS: u64 = 100;
+    let grace_start = std::time::Instant::now();
+    let grace_total = std::time::Duration::from_millis(FRESH_GRACE_MS);
+    let grace_poll = std::time::Duration::from_millis(FRESH_POLL_MS);
+    loop {
+        let dead = {
+            let tmux_for_check = tmux.clone();
+            let id_for_check = session_id.to_string();
+            tokio::task::spawn_blocking(move || tmux_for_check.check_pane_dead(&id_for_check))
+                .await
+                .map_err(|e| format!("spawn_blocking join: {e}"))?
+        };
+        match dead {
+            Ok(Some(exit_code)) => {
+                tracing::error!(
+                    session_id = %session_id,
+                    kind = ?kind,
+                    exit_code,
+                    cmd = %fresh_cmd,
+                    "respawn_harness_pane_in_place: fresh launch ALSO exited during grace window — likely missing binary or config issue",
+                );
+                return Err(format!(
+                    "fresh respawn died (code {exit_code}); run `{fresh_cmd}` manually to see why"
+                ));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "respawn_harness_pane_in_place: pane-dead probe failed during fresh grace, assuming alive",
+                );
+                break;
+            }
+        }
+        if grace_start.elapsed() >= grace_total {
+            break;
+        }
+        tokio::time::sleep(grace_poll).await;
+    }
+    Ok(fresh_cmd)
 }
 
 /// Revive a dead tmux pane in place: re-run the harness command in the
@@ -1579,22 +2168,17 @@ pub async fn terminal_reattach<R: Runtime>(
 ///
 /// 1. Verifies the tmux pane really is dead via `check_pane_dead`
 ///    (otherwise the user's still-live harness would be replaced).
-/// 2. Reconstructs the harness launch command from the user's config
-///    (`extra_flags`) and the persisted `opencode_port`, allocating a
-///    fresh port for OpenCode when none is persisted.
-/// 3. Calls `tmux respawn-pane -k` so the same session id now hosts a
-///    fresh harness process.
-/// 4. Hands off to `terminal_reattach` to wire up the PTY bridge and
-///    state machine — same flow the user gets after a normal restart,
-///    minus the "session not found" fallback (we just respawned, so
-///    the session is definitely live).
+/// 2. Hands off to `terminal_reattach` in attach-then-resume mode.
+///    The PTY bridge is opened first, then `tmux respawn-pane -k`
+///    runs the harness resume command so xterm captures the full
+///    history repaint.
 #[tauri::command]
 pub async fn terminal_respawn_dead<R: Runtime>(
     app: AppHandle<R>,
     state: tauri::State<'_, AppHandleState>,
-    args: ReattachArgs,
+    mut args: ReattachArgs,
     on_data: Channel<InvokeResponseBody>,
-) -> Result<String, String> {
+) -> Result<ReconnectResult, String> {
     let tmux: Arc<TmuxManager> = state.tmux.clone();
     let session_id = args.session_id.clone();
 
@@ -1607,7 +2191,20 @@ pub async fn terminal_respawn_dead<R: Runtime>(
         tokio::task::spawn_blocking(move || tmux_for_check.check_pane_dead(&id_for_check))
             .await
             .map_err(|e| format!("spawn_blocking join: {e}"))?
-            .map_err(|e| format!("tmux check pane: {e}"))?
+    };
+    let pane_dead = match pane_dead {
+        Ok(status) => status,
+        Err(e) if !matches!(args.kind, AgentKind::Shell) => {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "terminal_respawn_dead: pane check failed; trying provider replay recovery",
+            );
+            args.resume_after_attach = true;
+            args.replay_before_resume = Some(false);
+            return terminal_reattach(app, state, args, on_data).await;
+        }
+        Err(e) => return Err(format!("tmux check pane: {e}")),
     };
     if pane_dead.is_none() && !matches!(args.kind, AgentKind::Shell) {
         // Pane is alive but the frontend asked us to respawn — pass
@@ -1615,149 +2212,121 @@ pub async fn terminal_respawn_dead<R: Runtime>(
         return terminal_reattach(app, state, args, on_data).await;
     }
 
-    // Step 2 — build the harness command. Shells have no command;
-    // fall through to reattach (kill-respawn won't work without a
-    // command and the reattach path will surface the dead-pane via
-    // the existing exit overlay).
+    // Shells have no command — fall through to reattach so the
+    // existing exit overlay surfaces the dead-pane state.
     if matches!(args.kind, AgentKind::Shell) {
         return terminal_reattach(app, state, args, on_data).await;
     }
-    let extra_flags = {
-        let store = state.config_store.lock().expect("config store poisoned");
-        store
-            .read_config()
-            .ok()
-            .and_then(|cfg| match args.kind {
-                AgentKind::ClaudeCode => cfg.harnesses.claude_code.extra_flags,
-                AgentKind::Codex => cfg.harnesses.codex.extra_flags,
-                AgentKind::OpenCode => cfg.harnesses.opencode.extra_flags,
-                AgentKind::Shell => None,
-            })
-            .filter(|s| !s.trim().is_empty())
-    };
-    // Re-pick OpenCode port: prefer the persisted one (its port is
-    // probably free now that the harness is dead), otherwise reserve
-    // a fresh ephemeral one.
-    let persisted_port = tracked_session_opencode_port(&state, &session_id);
-    let opencode_port: Option<u16> = if matches!(args.kind, AgentKind::OpenCode) {
-        Some(
-            match extra_flags.as_deref().and_then(parse_opencode_port_arg) {
-                Some(explicit) => explicit,
-                None => persisted_port.unwrap_or(reserve_localhost_port()?),
-            },
-        )
-    } else {
-        None
-    };
-    let cmd = match harness_launch_command(args.kind, extra_flags.as_deref(), opencode_port) {
-        Some(c) => c,
-        None => return Err("no launch command derivable for this kind".to_string()),
-    };
 
-    // Step 3 — respawn. tmux's `-k` kills whatever was in the pane
-    // (the dead process record) and starts the new command. If the
-    // pane is genuinely dead this is a no-op kill; if a stale
-    // remain-on-exit record is still hanging around we want it gone.
-    {
-        let tmux_for_respawn = tmux.clone();
-        let id_for_respawn = session_id.clone();
-        let cmd_for_respawn = cmd.clone();
-        tokio::task::spawn_blocking(move || {
-            tmux_for_respawn.respawn_with(&id_for_respawn, &cmd_for_respawn)
-        })
-        .await
-        .map_err(|e| format!("spawn_blocking join: {e}"))?
-        .map_err(|e| format!("tmux respawn-pane: {e}"))?;
-    }
-
-    tracing::info!(
-        session_id = %session_id,
-        kind = ?args.kind,
-        "terminal_respawn_dead: revived pane via respawn",
-    );
-
-    // Step 4 — hand off to the standard reattach path. It clears any
-    // stale ghost/entry, opens a fresh PTY bridge, and registers the
-    // state machine. The persisted `last_state` will get applied as a
-    // seed; that's wrong for a freshly-respawned harness, but the
-    // first hook event from the new process overrides it within a
-    // few hundred ms — close enough to "Idle" for UX purposes.
+    // Step 2 — hand off to the standard reattach path in attach-then-resume
+    // mode. The bridge must be streaming before the resume command starts;
+    // otherwise the harness reconstructs its chat history into tmux while
+    // xterm is not listening, and the frontend only sees the final viewport.
+    args.resume_after_attach = true;
     terminal_reattach(app, state, args, on_data).await
 }
 
-/// Force-repair a live harness pane in place.
+/// Force-repair a live harness pane (the Cmd+R "self-heal" path).
 ///
-/// Unlike `terminal_respawn_dead`, this intentionally uses `respawn-pane -k`
-/// even when the process is still alive. It is the Cmd+R "self-heal" path:
-/// keep the same tmux session id and frontend tab, but replace the process and
-/// open a fresh PTY bridge at the measured xterm size so the new TUI paints
-/// against a clean viewport.
+/// Cmd+R keeps the raum/tmux session id stable. The frontend tab, terminal
+/// store, hook state, and tmux window all use that id as their identity; making
+/// refresh allocate a replacement id leaves too many windows where one layer
+/// has switched while another is still writing to the old channel. The repair
+/// flow is therefore:
+///
+/// 1. Validate the harness can launch in the tracked project context.
+/// 2. Reattach through the standard `terminal_reattach` path in
+///    attach-then-resume mode.
+/// 3. Skip tmux snapshot replay, open a fresh PTY bridge, then run
+///    `respawn-pane -k` with the persisted harness resume id when available.
 #[tauri::command]
 pub async fn terminal_self_heal<R: Runtime>(
     app: AppHandle<R>,
     state: tauri::State<'_, AppHandleState>,
-    args: ReattachArgs,
+    mut args: ReattachArgs,
     on_data: Channel<InvokeResponseBody>,
-) -> Result<String, String> {
+) -> Result<ReconnectResult, String> {
     if matches!(args.kind, AgentKind::Shell) {
         return terminal_reattach(app, state, args, on_data).await;
     }
 
-    let tmux: Arc<TmuxManager> = state.tmux.clone();
     let session_id = args.session_id.clone();
-    let extra_flags = {
-        let store = state.config_store.lock().expect("config store poisoned");
-        store
-            .read_config()
-            .ok()
-            .and_then(|cfg| match args.kind {
-                AgentKind::ClaudeCode => cfg.harnesses.claude_code.extra_flags,
-                AgentKind::Codex => cfg.harnesses.codex.extra_flags,
-                AgentKind::OpenCode => cfg.harnesses.opencode.extra_flags,
-                AgentKind::Shell => None,
-            })
-            .filter(|s| !s.trim().is_empty())
-    };
-    let persisted_port = tracked_session_opencode_port(&state, &session_id);
-    let opencode_port: Option<u16> = if matches!(args.kind, AgentKind::OpenCode) {
-        Some(
-            match extra_flags.as_deref().and_then(parse_opencode_port_arg) {
-                Some(explicit) => explicit,
-                None => persisted_port.unwrap_or(reserve_localhost_port()?),
-            },
-        )
-    } else {
-        None
-    };
-    let cmd = harness_launch_command(args.kind, extra_flags.as_deref(), opencode_port)
-        .ok_or_else(|| "no launch command derivable for this kind".to_string())?;
 
     let (cols, rows) = match args.cols.zip(args.rows) {
         Some((c, r)) => clamp_pty_dims(c, r),
         None => (200, 50),
     };
 
-    {
-        let tmux_for_respawn = tmux.clone();
-        let id_for_respawn = session_id.clone();
-        let cmd_for_respawn = cmd.clone();
-        tokio::task::spawn_blocking(move || {
-            tmux_for_respawn.resize(&id_for_respawn, u32::from(cols), u32::from(rows))?;
-            tmux_for_respawn.respawn_with(&id_for_respawn, &cmd_for_respawn)
-        })
-        .await
-        .map_err(|e| format!("spawn_blocking join: {e}"))?
-        .map_err(|e| format!("tmux self-heal respawn: {e}"))?;
+    let (tracked_project_slug, tracked_worktree_id) = tracked_session_context(&state, &session_id);
+    let (effective_project_slug, effective_worktree_id) = resolve_reattach_context(
+        (args.project_slug.as_deref(), args.worktree_id.as_deref()),
+        (None, None),
+        (None, None),
+        (
+            tracked_project_slug.as_deref(),
+            tracked_worktree_id.as_deref(),
+        ),
+    );
+    let project_dir = resolve_project_dir(
+        &state,
+        effective_project_slug.as_deref(),
+        effective_worktree_id.as_deref(),
+    );
+    if effective_project_slug.is_none() || project_dir.as_os_str().is_empty() {
+        return Err("harness self-heal requires a registered project".to_string());
     }
+
+    let launch_report = prepare_harness_launch_fast(
+        &app,
+        &state,
+        args.kind,
+        effective_project_slug.as_deref(),
+        project_dir.clone(),
+    )?;
+    if launch_report.binary_missing {
+        return Err(format!(
+            "binary `{}` not found on PATH",
+            launch_report.binary
+        ));
+    }
+    spawn_harness_launch_refresh(
+        app.clone(),
+        args.kind,
+        effective_project_slug.clone(),
+        project_dir.clone(),
+    );
 
     tracing::info!(
         session_id = %session_id,
         kind = ?args.kind,
         cols,
         rows,
-        "terminal_self_heal: respawned pane in place",
+        "terminal_self_heal: reattaching bridge before harness resume",
     );
 
+    args.resume_after_attach = true;
+    args.replay_before_resume = Some(false);
+    terminal_reattach(app, state, args, on_data).await
+}
+
+/// Replay provider-owned history for a harness pane without changing its raum
+/// session id. This is the explicit recovery path used after a bridge-only
+/// reconnect once the pane is known not to be Working/Waiting.
+#[tauri::command]
+pub async fn terminal_provider_replay<R: Runtime>(
+    app: AppHandle<R>,
+    state: tauri::State<'_, AppHandleState>,
+    mut args: ReattachArgs,
+    on_data: Channel<InvokeResponseBody>,
+) -> Result<ReconnectResult, String> {
+    if matches!(args.kind, AgentKind::Shell) {
+        return Ok(ReconnectResult::unavailable(
+            args.session_id,
+            "shell panes do not support provider replay",
+        ));
+    }
+    args.resume_after_attach = true;
+    args.replay_before_resume = Some(false);
     terminal_reattach(app, state, args, on_data).await
 }
 

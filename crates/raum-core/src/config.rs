@@ -26,7 +26,7 @@ pub const DEFAULT_COALESCE_BYTES: usize = 16 * 1024;
 /// doesn't get flipped to Idle too early.
 pub const DEFAULT_SILENCE_THRESHOLD_MS: u64 = 10_000;
 pub const DEFAULT_DEBOUNCE_MS: u64 = 500;
-pub const XTERM_SCROLLBACK_LINES: u32 = 10_000;
+pub const XTERM_SCROLLBACK_LINES: u32 = 100_000;
 pub const QUICKFIRE_HISTORY_LIMIT: usize = 100;
 
 /// User-global `config.toml`.

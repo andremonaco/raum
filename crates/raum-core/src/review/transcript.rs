@@ -105,6 +105,91 @@ pub fn discover_transcript_path(kind: AgentKind, cwd: &Path, home_dir: &Path) ->
     }
 }
 
+/// Resolve the Codex session id for the newest rollout launched in
+/// `cwd`. This is the same cwd-scoped discovery used for prompt
+/// extraction, but returns the resumable id Codex expects in
+/// `codex resume <id>`.
+///
+/// Production use case: older raum builds did not always capture
+/// Codex's own session id from hooks, so a recovered pane may have a
+/// tracked raum session but no persisted `harness_session_id`. Codex
+/// writes the id into the rollout's `session_meta` event and embeds it
+/// as the filename suffix; this helper recovers it before falling back
+/// to a fresh launch.
+#[must_use]
+pub fn discover_codex_session_id(cwd: &Path, home_dir: &Path) -> Option<String> {
+    let path = discover_codex_transcript(cwd, home_dir)?;
+    codex_session_id_from_rollout(&path)
+        .or_else(|| codex_session_id_from_filename(&path))
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+}
+
+/// Resolve the Claude Code session id for the newest transcript launched in
+/// `cwd`. Claude stores each session as `<session-id>.jsonl`, so the filename
+/// stem is the value accepted by `claude --resume <id>`.
+#[must_use]
+pub fn discover_claude_session_id(cwd: &Path, home_dir: &Path) -> Option<String> {
+    let path = discover_claude_code_transcript(cwd, home_dir)?;
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+/// Resolve a provider session id by matching a persisted raum prompt against
+/// transcripts in `cwd`.
+///
+/// This is narrower than the cwd-newest helpers above: if several raum panes
+/// share one worktree, the newest transcript may belong to a sibling pane.
+/// Matching the pane's own last prompt gives legacy rows without a captured
+/// `harness_session_id` a recoverable path without silently replaying another
+/// conversation.
+#[must_use]
+pub fn discover_session_id_by_prompt(
+    kind: AgentKind,
+    cwd: &Path,
+    home_dir: &Path,
+    prompt: &str,
+) -> Option<String> {
+    let target = prompt.trim();
+    if target.is_empty() {
+        return None;
+    }
+    match kind {
+        AgentKind::ClaudeCode => discover_claude_session_id_by_prompt(cwd, home_dir, target),
+        AgentKind::Codex => discover_codex_session_id_by_prompt(cwd, home_dir, target),
+        AgentKind::OpenCode | AgentKind::Shell => None,
+    }
+}
+
+/// Validate that a captured provider session id belongs to `cwd`.
+///
+/// Used by reconnect/replay code as a last line of defense against older
+/// cwd-newest fallback bugs: if multiple panes share one worktree, a guessed
+/// id can point at a sibling session. In that case replay must fail visibly
+/// instead of resuming the wrong conversation.
+#[must_use]
+pub fn harness_session_id_matches_cwd(
+    kind: AgentKind,
+    cwd: &Path,
+    home_dir: &Path,
+    harness_session_id: &str,
+) -> bool {
+    match kind {
+        AgentKind::ClaudeCode => {
+            claude_transcript_path_for_id(cwd, home_dir, harness_session_id).is_some()
+        }
+        AgentKind::Codex => codex_transcript_path_for_id(cwd, home_dir, harness_session_id)
+            .is_some_and(|path| {
+                cwd.to_str()
+                    .is_some_and(|cwd| codex_rollout_matches_cwd(&path, cwd))
+            }),
+        AgentKind::OpenCode | AgentKind::Shell => true,
+    }
+}
+
 /// Like [`read_session_user_prompts`] but targets the harness session
 /// whose own session id matches `harness_session_id` instead of
 /// picking the newest jsonl in the worktree directory.
@@ -241,6 +326,44 @@ fn discover_claude_code_transcript(cwd: &Path, home_dir: &Path) -> Option<PathBu
     let encoded = encode_cwd_for_claude(cwd)?;
     let dir = home_dir.join(".claude").join("projects").join(&encoded);
     newest_jsonl_in(&dir)
+}
+
+fn discover_claude_session_id_by_prompt(
+    cwd: &Path,
+    home_dir: &Path,
+    prompt: &str,
+) -> Option<String> {
+    let encoded = encode_cwd_for_claude(cwd)?;
+    let dir = home_dir.join(".claude").join("projects").join(&encoded);
+    let mut best: Option<(String, SystemTime)> = None;
+    let entries = std::fs::read_dir(&dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+            continue;
+        }
+        if !transcript_contains_prompt(parse_claude_user_prompts(&path), prompt) {
+            continue;
+        }
+        let Some(id) = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let modified = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        match &best {
+            Some((_, t)) if *t >= modified => {}
+            _ => best = Some((id, modified)),
+        }
+    }
+    best.map(|(id, _)| id)
 }
 
 /// Claude Code's actual on-disk encoding rule — verified against
@@ -499,6 +622,94 @@ fn discover_codex_transcript(cwd: &Path, home_dir: &Path) -> Option<PathBuf> {
     best.map(|(p, _)| p)
 }
 
+fn discover_codex_session_id_by_prompt(
+    cwd: &Path,
+    home_dir: &Path,
+    prompt: &str,
+) -> Option<String> {
+    let sessions = home_dir.join(".codex").join("sessions");
+    if !sessions.is_dir() {
+        return None;
+    }
+    let cwd_str = cwd.to_str()?;
+    let mut best: Option<(String, SystemTime)> = None;
+    let mut consider = |path: PathBuf| {
+        if !codex_rollout_matches_cwd(&path, cwd_str) {
+            return;
+        }
+        if !transcript_contains_prompt(parse_codex_user_prompts(&path), prompt) {
+            return;
+        }
+        let Some(id) = codex_session_id_from_rollout(&path)
+            .or_else(|| codex_session_id_from_filename(&path))
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+        else {
+            return;
+        };
+        let modified = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        match &best {
+            Some((_, t)) if *t >= modified => {}
+            _ => best = Some((id, modified)),
+        }
+    };
+
+    let Ok(years) = std::fs::read_dir(&sessions) else {
+        return None;
+    };
+    for year in years.flatten() {
+        if !year.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let Ok(months) = std::fs::read_dir(year.path()) else {
+            continue;
+        };
+        for month in months.flatten() {
+            if !month.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let Ok(days) = std::fs::read_dir(month.path()) else {
+                continue;
+            };
+            for day in days.flatten() {
+                if !day.file_type().is_ok_and(|t| t.is_dir()) {
+                    continue;
+                }
+                let Ok(files) = std::fs::read_dir(day.path()) else {
+                    continue;
+                };
+                for entry in files.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+                        continue;
+                    }
+                    let is_rollout = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|s| s.starts_with("rollout-"));
+                    if is_rollout {
+                        consider(path);
+                    }
+                }
+            }
+        }
+    }
+    best.map(|(id, _)| id)
+}
+
+fn transcript_contains_prompt(prompts: Vec<String>, target: &str) -> bool {
+    let target = target.trim();
+    if target.is_empty() {
+        return false;
+    }
+    prompts.into_iter().any(|prompt| {
+        let prompt = prompt.trim();
+        prompt == target || prompt.contains(target) || target.contains(prompt)
+    })
+}
+
 /// Read just the first line of `path` and check whether the
 /// `session_meta` event reports the session was launched in `cwd`. Two
 /// shapes seen across Codex versions: `{payload: {cwd}}` or `{cwd}`.
@@ -523,6 +734,38 @@ fn codex_rollout_matches_cwd(path: &Path, cwd: &str) -> bool {
         .or_else(|| value.pointer("/cwd"))
         .and_then(|v| v.as_str())
         == Some(cwd)
+}
+
+fn codex_session_id_from_rollout(path: &Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = String::new();
+    reader.read_line(&mut line).ok()?;
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let value = serde_json::from_str::<Value>(trimmed).ok()?;
+    value
+        .pointer("/payload/id")
+        .or_else(|| value.pointer("/id"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+fn codex_session_id_from_filename(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    let id = stem.get(stem.len().checked_sub(36)?..)?.trim();
+    if id.len() != 36 {
+        return None;
+    }
+    let is_uuid_like = id.chars().enumerate().all(|(idx, ch)| match idx {
+        8 | 13 | 18 | 23 => ch == '-',
+        _ => ch.is_ascii_hexdigit(),
+    });
+    is_uuid_like.then(|| id.to_string())
 }
 
 /// Parse user prompts from a Codex rollout. Supports two event shapes:
@@ -831,6 +1074,63 @@ mod tests {
 
         let found = discover_transcript_path(AgentKind::ClaudeCode, cwd, home.path());
         assert_eq!(found.as_deref(), Some(newer.as_path()));
+    }
+
+    #[test]
+    fn discover_claude_session_id_uses_newest_jsonl_stem() {
+        let home = tempdir().unwrap();
+        let cwd = Path::new("/Users/foo/myrepo");
+        let proj_dir = home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("-Users-foo-myrepo");
+        fs::create_dir_all(&proj_dir).unwrap();
+
+        fs::write(proj_dir.join("older-session.jsonl"), b"{}").unwrap();
+        sleep(Duration::from_millis(50));
+        fs::write(proj_dir.join("newer-session.jsonl"), b"{}").unwrap();
+
+        assert_eq!(
+            discover_claude_session_id(cwd, home.path()).as_deref(),
+            Some("newer-session")
+        );
+    }
+
+    #[test]
+    fn discover_claude_session_id_by_prompt_disambiguates_shared_cwd() {
+        let home = tempdir().unwrap();
+        let cwd = Path::new("/Users/foo/myrepo");
+        let proj_dir = home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("-Users-foo-myrepo");
+        fs::create_dir_all(&proj_dir).unwrap();
+
+        fs::write(
+            proj_dir.join("older-session.jsonl"),
+            r#"{"type":"user","message":{"role":"user","content":"target prompt"}}
+"#,
+        )
+        .unwrap();
+        sleep(Duration::from_millis(50));
+        fs::write(
+            proj_dir.join("newer-sibling.jsonl"),
+            r#"{"type":"user","message":{"role":"user","content":"different prompt"}}
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            discover_claude_session_id(cwd, home.path()).as_deref(),
+            Some("newer-sibling"),
+        );
+        assert_eq!(
+            discover_session_id_by_prompt(AgentKind::ClaudeCode, cwd, home.path(), "target prompt")
+                .as_deref(),
+            Some("older-session"),
+        );
     }
 
     #[tokio::test]
@@ -1230,6 +1530,131 @@ mod tests {
         let prompts =
             read_session_user_prompts(AgentKind::Codex, Path::new(cwd), home.path(), None).await;
         assert_eq!(prompts, vec!["new"]);
+    }
+
+    #[test]
+    fn codex_session_id_discovery_reads_newest_matching_rollout_meta() {
+        let cwd = "/Users/foo/repo";
+        let home = tempdir().unwrap();
+        let dir = home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("04")
+            .join("29");
+        fs::create_dir_all(&dir).unwrap();
+
+        let older = dir.join("rollout-2026-04-29T10-00-00-old-id.jsonl");
+        fs::write(
+            &older,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"old-id\",\"cwd\":\"{cwd}\"}}}}\n"
+            ),
+        )
+        .unwrap();
+        sleep(Duration::from_millis(50));
+
+        let other = dir.join("rollout-2026-04-29T11-00-00-other-id.jsonl");
+        fs::write(
+            &other,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"other-id\",\"cwd\":\"/elsewhere\"}}\n",
+        )
+        .unwrap();
+        sleep(Duration::from_millis(50));
+
+        let newer = dir.join("rollout-2026-04-29T12-00-00-new-id.jsonl");
+        fs::write(
+            &newer,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"new-id\",\"cwd\":\"{cwd}\"}}}}\n"
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            discover_codex_session_id(Path::new(cwd), home.path()).as_deref(),
+            Some("new-id"),
+        );
+    }
+
+    #[test]
+    fn codex_session_id_discovery_falls_back_to_uuid_filename_suffix() {
+        let cwd = "/Users/foo/repo";
+        let home = tempdir().unwrap();
+        let dir = home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("04")
+            .join("29");
+        fs::create_dir_all(&dir).unwrap();
+
+        let id = "123e4567-e89b-12d3-a456-426614174000";
+        let rollout = dir.join(format!("rollout-2026-04-29T12-00-00-{id}.jsonl"));
+        fs::write(
+            &rollout,
+            format!("{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":\"{cwd}\"}}}}\n"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            discover_codex_session_id(Path::new(cwd), home.path()).as_deref(),
+            Some(id),
+        );
+    }
+
+    #[test]
+    fn discover_codex_session_id_by_prompt_disambiguates_shared_cwd() {
+        let cwd = "/Users/foo/repo";
+        let home = tempdir().unwrap();
+        let dir = home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("04")
+            .join("29");
+        fs::create_dir_all(&dir).unwrap();
+
+        let older_id = "11111111-1111-1111-1111-111111111111";
+        let older = dir.join(format!("rollout-2026-04-29T10-00-00-{older_id}.jsonl"));
+        fs::write(
+            &older,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":\"{cwd}\"}}}}\n\
+{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"user_message\",\"message\":\"target prompt\"}}}}\n"
+            ),
+        )
+        .unwrap();
+        sleep(Duration::from_millis(50));
+
+        let newer_id = "22222222-2222-2222-2222-222222222222";
+        let newer = dir.join(format!("rollout-2026-04-29T11-00-00-{newer_id}.jsonl"));
+        fs::write(
+            &newer,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":\"{cwd}\"}}}}\n\
+{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"user_message\",\"message\":\"different prompt\"}}}}\n"
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            discover_codex_session_id(Path::new(cwd), home.path()).as_deref(),
+            Some(newer_id),
+        );
+        assert_eq!(
+            discover_session_id_by_prompt(
+                AgentKind::Codex,
+                Path::new(cwd),
+                home.path(),
+                "target prompt"
+            )
+            .as_deref(),
+            Some(older_id),
+        );
     }
 
     #[tokio::test]

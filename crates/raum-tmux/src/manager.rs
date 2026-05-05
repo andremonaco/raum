@@ -12,7 +12,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use raum_core::config::SessionState;
+use raum_core::config::{SessionState, XTERM_SCROLLBACK_LINES};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::warn;
@@ -359,12 +359,7 @@ impl TmuxManager {
                 stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             });
         }
-        // §3.8 — retain tmux scrollback as the source of truth for reattach
-        // replay. `terminal_reattach` calls `capture_pane_snapshot`, which
-        // pulls this whole buffer back into xterm.js after restart, so this
-        // value is coupled to `frontend/src/lib/scrollbackConfig.ts`'s
-        // `SCROLLBACK_MAX`. Keep them aligned — the smaller of the two wins.
-        self.run_quiet(&["set-option", "-t", id, "history-limit", "10000"]);
+        self.set_history_limit(id, XTERM_SCROLLBACK_LINES);
         self.run_quiet(&["set-option", "-t", id, "remain-on-exit", "on"]);
         // Pin the window size to whatever raum drives via `resize-window`,
         // regardless of attached-client geometry. tmux's auto modes
@@ -426,10 +421,24 @@ impl TmuxManager {
     /// Used after the PTY bridge attaches so the harness boots into a viewport
     /// the attached client is already rendering.
     pub fn respawn_with(&self, id: &str, command: &str) -> Result<(), TmuxError> {
-        let out = self
-            .cmd()
-            .args(["respawn-pane", "-k", "-t", id, command])
-            .output()?;
+        self.respawn_with_cwd(id, command, None)
+    }
+
+    /// Like [`Self::respawn_with`], but pins the new process to a start
+    /// directory with tmux's `respawn-pane -c`.
+    pub fn respawn_with_cwd(
+        &self,
+        id: &str,
+        command: &str,
+        cwd: Option<&str>,
+    ) -> Result<(), TmuxError> {
+        let mut cmd = self.cmd();
+        cmd.args(["respawn-pane", "-k"]);
+        if let Some(cwd) = cwd.map(str::trim).filter(|s| !s.is_empty()) {
+            cmd.args(["-c", cwd]);
+        }
+        cmd.args(["-t", id, command]);
+        let out = cmd.output()?;
         if !out.status.success() {
             return Err(TmuxError::NonZero {
                 status: out.status.code().unwrap_or(-1),
@@ -437,6 +446,15 @@ impl TmuxManager {
             });
         }
         Ok(())
+    }
+
+    /// Keep tmux's retained pane history aligned with xterm.js. This is called
+    /// for both newly-created sessions and already-existing sessions during
+    /// reattach so old panes stop clipping future Codex resume output at a
+    /// previous smaller limit.
+    pub fn set_history_limit(&self, id: &str, limit: u32) {
+        let limit = limit.to_string();
+        self.run_quiet(&["set-option", "-t", id, "history-limit", &limit]);
     }
 
     pub fn kill_session(&self, id: &str) -> Result<(), TmuxError> {

@@ -672,19 +672,16 @@ export const waitingCount = selectors.waitingCount;
 /** Count of harnesses at rest (state = `idle`). */
 export const idleCount = selectors.idleCount;
 
-export type CrossProjectHarnessMode = "awaiting" | "working" | "recent";
+export type CrossProjectHarnessMode = "awaiting" | "working" | "completed";
 
 export function listCrossProjectHarnessSessions(mode: CrossProjectHarnessMode): TerminalRecord[] {
   if (mode === "awaiting") return waitingTerminals();
   if (mode === "working") return activeTerminals();
 
-  const ids = [...harnessIds()];
+  // "completed" — idle harnesses across every project, sorted by most recent
+  // output (or creation time, when no PTY tick has landed yet).
+  const records = resolveHarnessIds(idleIds());
   const lo = lastOutputBySession();
-  const records: TerminalRecord[] = [];
-  for (const id of ids) {
-    const record = terminalStore.byId[id];
-    if (record) records.push(record);
-  }
   records.sort(
     (left, right) =>
       (lo.get(right.session_id) ?? right.created_unix * 1000) -

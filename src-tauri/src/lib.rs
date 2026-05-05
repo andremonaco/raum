@@ -145,6 +145,7 @@ pub fn run() {
             commands::harnesses_check,
             commands::terminal::terminal_spawn,
             commands::terminal::terminal_reattach,
+            commands::terminal::terminal_provider_replay,
             commands::terminal::terminal_self_heal,
             commands::terminal::terminal_respawn_dead,
             commands::terminal::terminal_kill,
