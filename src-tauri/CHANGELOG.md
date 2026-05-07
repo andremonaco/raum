@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/andremonaco/raum/releases/tag/v0.1.4) - 2026-05-07
+
+### Added
+
+- feat(harness): provider-replay recovery, dwell-armed review snap, file-drop overlay
+- feat(review): cross-harness review via drag-and-drop snap
+- feat(worktree): merge worktree from sidebar with step-progress dialog
+- feat(layout): persist active project + per-project worktree scope across restarts
+
+### Fixed
+
+- fix(tmux): forward focus-events to the inner harness; ignore .raum/
+
+### Other
+
+- test(tmux): assert burst preservation via capture-pane, not PTY bytes
+- test(tmux): widen burst-marker deadline to 20s for slow Linux CI
+- refactor: split mega-modules and add cross-restart terminal snapshots
+- refactor(tmux): extract StreamCoalescer into its own module
+
+
 ## [0.1.3](https://github.com/andremonaco/raum/releases/tag/v0.1.3) - 2026-04-28
 
 ### Added
