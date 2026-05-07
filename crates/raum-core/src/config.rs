@@ -26,7 +26,7 @@ pub const DEFAULT_COALESCE_BYTES: usize = 16 * 1024;
 /// doesn't get flipped to Idle too early.
 pub const DEFAULT_SILENCE_THRESHOLD_MS: u64 = 10_000;
 pub const DEFAULT_DEBOUNCE_MS: u64 = 500;
-pub const XTERM_SCROLLBACK_LINES: u32 = 10_000;
+pub const XTERM_SCROLLBACK_LINES: u32 = 100_000;
 pub const QUICKFIRE_HISTORY_LIMIT: usize = 100;
 
 /// User-global `config.toml`.
@@ -79,9 +79,9 @@ pub struct HarnessesConfig {
     pub shell: HarnessConfig,
     #[serde(
         rename = "claude-code",
-        skip_serializing_if = "HarnessConfig::is_default"
+        skip_serializing_if = "ClaudeCodeConfig::is_default"
     )]
-    pub claude_code: HarnessConfig,
+    pub claude_code: ClaudeCodeConfig,
     #[serde(skip_serializing_if = "HarnessConfig::is_default")]
     pub codex: HarnessConfig,
     #[serde(skip_serializing_if = "HarnessConfig::is_default")]
@@ -100,6 +100,39 @@ pub struct HarnessConfig {
 impl HarnessConfig {
     pub fn is_default(&self) -> bool {
         self.extra_flags.is_none()
+    }
+}
+
+/// Claude Code-specific config. Extends [`HarnessConfig`] with a knob for
+/// fullscreen (alt-screen) rendering: Claude Code 2.1.89+ honours
+/// `CLAUDE_CODE_NO_FLICKER=1` to switch from inline to alt-screen, which
+/// sidesteps Ink's hard-wrap-into-scrollback corruption on resize/reattach.
+/// raum defaults to fullscreen and exposes the inline path as an opt-out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClaudeCodeConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra_flags: Option<String>,
+    /// `true` (default) → inject `CLAUDE_CODE_NO_FLICKER=1` so Claude paints
+    /// the alt-screen and never emits hard-wrapped bytes into scrollback.
+    /// `false` → legacy inline mode; resize/restart will need snapshot replay
+    /// and will exhibit residual Ink hard-wrap artifacts.
+    #[serde(rename = "fullscreen")]
+    pub fullscreen: bool,
+}
+
+impl Default for ClaudeCodeConfig {
+    fn default() -> Self {
+        Self {
+            extra_flags: None,
+            fullscreen: true,
+        }
+    }
+}
+
+impl ClaudeCodeConfig {
+    pub fn is_default(&self) -> bool {
+        self.extra_flags.is_none() && self.fullscreen
     }
 }
 
@@ -288,6 +321,10 @@ pub struct AppearanceConfig {
     /// without hijacking the curated picker selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_theme_path: Option<PathBuf>,
+    /// Fade the first and last user prompt over each agent pane as a
+    /// glanceable banner. Hides on any mouse movement. Default: on.
+    #[serde(default = "default_show_prompt_overlay")]
+    pub show_prompt_overlay: bool,
 }
 pub const DEFAULT_THEME_ID: &str = "raum-default-dark";
 
@@ -295,11 +332,16 @@ fn default_theme_id() -> String {
     DEFAULT_THEME_ID.to_string()
 }
 
+fn default_show_prompt_overlay() -> bool {
+    true
+}
+
 impl Default for AppearanceConfig {
     fn default() -> Self {
         Self {
             theme_id: DEFAULT_THEME_ID.to_string(),
             custom_theme_path: None,
+            show_prompt_overlay: true,
         }
     }
 }
@@ -542,6 +584,16 @@ pub struct TrackedSession {
     pub last_prompt_text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_prompt_at_unix_ms: Option<u64>,
+    /// The harness's *own* session id (Claude Code / Codex UUID),
+    /// captured from the hook payload on the first `UserPromptSubmit`
+    /// event. Persisted so post-restart pane overlays can disambiguate
+    /// between multiple sessions sharing one worktree directory:
+    /// without it, the on-disk transcript heuristic ("newest jsonl in
+    /// the worktree") returns the same file for every pane in the
+    /// project. Optional because shell sessions and harnesses with no
+    /// hook flow never set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_session_id: Option<String>,
 }
 
 /// `state/quickfire-history.toml` — bounded ring of recent quick-fire commands.
@@ -564,6 +616,12 @@ pub struct ActiveLayoutState {
     pub project_slug: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_id: Option<String>,
+    /// Per-project sidebar scope at the time of save: `slug → worktree path`.
+    /// Missing slugs default to the cross-worktree "all" view on rehydrate.
+    /// Persisted so switching projects after a restart restores whichever
+    /// worktree row was active before the app was last closed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub worktree_scopes: BTreeMap<String, String>,
     #[serde(default, alias = "cell")]
     pub cells: Vec<ActiveLayoutCell>,
 }
@@ -779,6 +837,7 @@ mod tests {
         let cfg = AppearanceConfig {
             theme_id: "dracula".into(),
             custom_theme_path: Some(PathBuf::from("/tmp/custom-theme.json")),
+            show_prompt_overlay: false,
         };
         roundtrip(cfg);
     }
@@ -791,6 +850,7 @@ mod tests {
         let parsed: AppearanceConfig = toml::from_str(raw).expect("parse");
         assert_eq!(parsed.theme_id, DEFAULT_THEME_ID);
         assert!(parsed.custom_theme_path.is_none());
+        assert!(parsed.show_prompt_overlay);
     }
 
     #[test]
@@ -809,10 +869,14 @@ mod tests {
 
     #[test]
     fn active_layout_state_roundtrip() {
+        let mut worktree_scopes = BTreeMap::new();
+        worktree_scopes.insert("acme".into(), "/path/to/wt".into());
+        worktree_scopes.insert("beta".into(), "/path/to/beta-feature".into());
         let state = ActiveLayoutState {
             saved_at: 1_714_000_001,
             project_slug: Some("acme".into()),
             worktree_id: Some("/path/to/wt".into()),
+            worktree_scopes,
             cells: vec![
                 ActiveLayoutCell {
                     id: "cell-1".into(),
@@ -887,6 +951,7 @@ mod tests {
                 last_state_at_unix_ms: None,
                 last_prompt_text: None,
                 last_prompt_at_unix_ms: None,
+                harness_session_id: None,
             }],
         };
         roundtrip(st);

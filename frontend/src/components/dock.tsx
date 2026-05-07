@@ -220,7 +220,11 @@ export function selectOrphanRecords(
 }
 
 export const Dock: Component<DockProps> = (props) => {
-  // Tick so relative timestamps re-compute every second.
+  // 1 Hz tick that drives the chips' "Xs ago" relative timestamps.
+  // Scoped narrowly: only `DockChip.timestamp()` reads it. The cell-list
+  // memos below intentionally do NOT depend on `tick` — otherwise the
+  // dock would rebuild its array (and force `<For>` reconciliation) once
+  // a second even when nothing actually changed in the layout.
   const [tick, setTick] = createSignal(0);
   onMount(() => {
     const id = setInterval(() => setTick((n) => n + 1), 1000);
@@ -228,7 +232,6 @@ export const Dock: Component<DockProps> = (props) => {
   });
 
   const minimizedCells = createMemo(() => {
-    void tick(); // refresh timestamps
     const ids = minimizedPaneIds();
     // The caller hands us only the off-tree minimized panes; defensively
     // re-filter here so a stale prop snapshot never resurrects a chip after
@@ -270,7 +273,6 @@ export const Dock: Component<DockProps> = (props) => {
   // don't apply: a live tmux session that fell out of the layout should always
   // stay reachable until the user restores or kills it.
   const orphanRecords = createMemo<TerminalRecord[]>(() => {
-    void tick();
     const slug = activeProjectSlug();
     const mountedLayoutSessionIds = new Set<string>();
     for (const terminal of listTerminals()) {
@@ -451,8 +453,14 @@ const DockChip: Component<DockChipProps> = (props) => {
   const reliability = () => resolvedCellReliability(props.cell);
 
   const snippet = () => props.cell.lastSnippet ?? "";
-  const timestamp = () =>
-    props.cell.lastActivityMs ? relativeTime(props.cell.lastActivityMs) : "";
+  const timestamp = () => {
+    // `props.tick` is the 1 Hz wall-clock pulse from the parent dock.
+    // Reading it here is the *only* way Solid knows to recompute the
+    // "Xs ago" string each second — `relativeTime` returns a fresh value
+    // for the same `lastActivityMs` because it diffs against `Date.now()`.
+    void props.tick;
+    return props.cell.lastActivityMs ? relativeTime(props.cell.lastActivityMs) : "";
+  };
 
   const label = () => props.cell.title ?? props.cell.kind;
 

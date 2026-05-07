@@ -329,6 +329,58 @@ export function setSplitRatios(root: LayoutNode, nodePath: number[], ratios: num
 }
 
 /**
+ * Find the lowest common ancestor split in `root` where every id in
+ * `leftIds` lives in one child subtree and every id in `rightIds` lives in
+ * a different child subtree. Returns the path to that split plus the two
+ * child indices, or null when no such split exists.
+ *
+ * Used by divider-drag: dividers are computed against a *pruned* tree
+ * (visible panes only), but ratio mutations must apply to the *runtime*
+ * tree, which may have hidden siblings between the visible neighbours
+ * after pruning. Looking up the boundary by leaf-id sidesteps the path
+ * mismatch the pruning introduces.
+ */
+export function findBoundaryLCA(
+  root: LayoutNode,
+  leftIds: ReadonlySet<string>,
+  rightIds: ReadonlySet<string>,
+): { path: number[]; leftIdx: number; rightIdx: number; node: Split } | null {
+  if (leftIds.size === 0 || rightIds.size === 0) return null;
+  const search = (node: LayoutNode, path: number[]): ReturnType<typeof findBoundaryLCA> => {
+    if (isLeaf(node)) return null;
+    let leftChildIdx = -1;
+    let rightChildIdx = -1;
+    for (let i = 0; i < node.children.length; i++) {
+      const child = node.children[i];
+      const hasAnyLeft = subtreeContainsAny(child, leftIds);
+      const hasAnyRight = subtreeContainsAny(child, rightIds);
+      if (hasAnyLeft && hasAnyRight) {
+        // Both groups are inside the same child — descend further.
+        return search(child, [...path, i]);
+      }
+      if (hasAnyLeft) {
+        if (leftChildIdx !== -1) return null;
+        leftChildIdx = i;
+      } else if (hasAnyRight) {
+        if (rightChildIdx !== -1) return null;
+        rightChildIdx = i;
+      }
+    }
+    if (leftChildIdx === -1 || rightChildIdx === -1) return null;
+    return { path, leftIdx: leftChildIdx, rightIdx: rightChildIdx, node };
+  };
+  return search(root, []);
+}
+
+function subtreeContainsAny(node: LayoutNode, ids: ReadonlySet<string>): boolean {
+  if (isLeaf(node)) return ids.has(node.id);
+  for (const c of node.children) {
+    if (subtreeContainsAny(c, ids)) return true;
+  }
+  return false;
+}
+
+/**
  * Find the path (sequence of child indices) from root to the leaf with id
  * `targetId`. Returns null if the leaf is not present. Path is empty when
  * the root itself is the target leaf.

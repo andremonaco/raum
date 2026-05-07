@@ -26,13 +26,16 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import type { AgentKind } from "../lib/agentKind";
-import { matchesWorktreeScope, type WorktreeScope } from "./worktreeStore";
+import { activeProjectSlug } from "./projectStore";
+import { activeWorktreeStore, matchesWorktreeScope, type WorktreeScope } from "./worktreeStore";
 import {
   buildFromRects,
   compact,
   equalizeRatios,
+  findBoundaryLCA,
   leaf,
   leafIds as treeLeafIds,
+  MIN_RATIO,
   normalizeRatios,
   pathToLeaf,
   projectToRects,
@@ -41,6 +44,7 @@ import {
   splitAtRoot,
   swapLeaves,
   tileLeaves,
+  type Axis,
   type Direction,
   type LayoutNode,
   type Rect,
@@ -88,6 +92,11 @@ export interface ActiveLayoutState {
   saved_at: number;
   project_slug?: string;
   worktree_id?: string;
+  /** Per-project sidebar scope: `slug → worktree path`. Missing slugs map to
+   *  the cross-worktree "all" view on rehydrate. Round-tripped so the user's
+   *  per-project worktree pin survives a restart and is reapplied as soon as
+   *  they switch back to that project. */
+  worktree_scopes?: Record<string, string>;
   cells: ActiveLayoutCell[];
 }
 
@@ -111,6 +120,19 @@ export interface CellTab {
    *  break the pane-pruning filter). */
   projectSlug?: string;
   worktreeId?: string;
+  /** Cross-harness review: when the tab is spawned, this string is forwarded
+   *  to `terminal_spawn` as `initial_prompt`. Cleared after the first
+   *  successful spawn so reattach paths don't see it. Not persisted. */
+  initialPrompt?: string;
+  /** Cross-harness review: when set, the next successful spawn for this tab
+   *  will record a review link with the given session id (= the reviewed
+   *  session) and clear this field. Not persisted. */
+  pendingReviewOf?: string;
+  /** Cross-harness review: per-spawn model + effort override picked by the
+   *  user in the pre-spawn picker. Forwarded to `terminal_spawn` as
+   *  `modelOverride` on the next spawn and cleared by `clearTabReviewPending`.
+   *  Not persisted. */
+  modelOverride?: { model: string; effort?: string };
 }
 
 /** Everything we track per pane that ISN'T layout geometry. Keyed by pane id
@@ -152,18 +174,36 @@ const [runtimeLayoutStore, setRuntimeLayoutStore] = createStore<RuntimeLayoutSta
 });
 
 const [maximizedPaneId, setMaximizedPaneId] = createSignal<string | null>(null);
-const [maximizeLayoutSnap, setMaximizeLayoutSnap] = createSignal(false);
+// True for the duration of a maximize/restore transition. Drives the
+// `.maximize-anim` class on the grid root, which extends the chrome's
+// position transition to `.terminal-surface-frame` so live xterm pixels
+// grow/shrink in lockstep with the chrome (without polluting the rest
+// of the surface's lifecycle, which intentionally avoids transitions).
+const [maximizeAnim, setMaximizeAnim] = createSignal(false);
+// Pane whose position is currently animating. While maximizing it equals
+// the new `maximizedPaneId`; while restoring it equals the previous one.
+// Used in CSS to keep that pane painted (and every other one
+// `visibility: hidden`) for the full transition window — the chrome layer
+// sits above the surface layer, so without this the headers of the other
+// panes would paint over the maximized terminal during restore.
+const [maxAnimTargetId, setMaxAnimTargetId] = createSignal<string | null>(null);
 const [focusedPaneId, setFocusedPaneId] = createSignal<string | null>(null);
 const [minimizedPaneIds, setMinimizedPaneIds] = createSignal<ReadonlySet<string>>(new Set());
-let maximizeLayoutSnapTimer: ReturnType<typeof setTimeout> | null = null;
+let maximizeAnimTimer: ReturnType<typeof setTimeout> | null = null;
 
-function snapMaximizeLayoutOnce(): void {
-  setMaximizeLayoutSnap(true);
-  if (maximizeLayoutSnapTimer !== null) clearTimeout(maximizeLayoutSnapTimer);
-  maximizeLayoutSnapTimer = setTimeout(() => {
-    maximizeLayoutSnapTimer = null;
-    setMaximizeLayoutSnap(false);
-  }, 50);
+// Slightly longer than the spring transition (180 ms) so the window outlasts
+// the overshoot tail and the surface stays glued to the chrome end-to-end.
+const MAXIMIZE_ANIM_MS = 240;
+
+function pulseMaximizeAnim(targetId: string | null): void {
+  setMaximizeAnim(true);
+  setMaxAnimTargetId(targetId);
+  if (maximizeAnimTimer !== null) clearTimeout(maximizeAnimTimer);
+  maximizeAnimTimer = setTimeout(() => {
+    maximizeAnimTimer = null;
+    setMaximizeAnim(false);
+    setMaxAnimTargetId(null);
+  }, MAXIMIZE_ANIM_MS);
 }
 
 // Monotonic layout revision, bumped inside `rebuildCells()` after every
@@ -176,7 +216,8 @@ const [layoutRev, setLayoutRev] = createSignal(0);
 export {
   runtimeLayoutStore,
   maximizedPaneId,
-  maximizeLayoutSnap,
+  maximizeAnim,
+  maxAnimTargetId,
   focusedPaneId,
   setFocusedPaneId,
   minimizedPaneIds,
@@ -244,7 +285,8 @@ export function minimizePane(paneId: string): void {
     setRuntimeLayoutStore("tree", next);
   }
   if (maximizedPaneId() === paneId) {
-    snapMaximizeLayoutOnce();
+    // Pane is leaving the tree entirely (minimize). No restore animation
+    // possible — the chrome it would have shrunk back into is gone.
     setMaximizedPaneId(null);
   }
   if (focusedPaneId() === paneId) setFocusedPaneId(null);
@@ -280,13 +322,32 @@ export function restorePane(paneId: string): void {
   insertExistingPaneFocused(paneId);
 }
 
+/** Mirror `panes[id]` activity metadata into the matching `cells[i]`
+ *  entry without going through `rebuildCells()`. The full rebuild bumps
+ *  `layoutRev`, which downstream layout-derived memos (notably the
+ *  review-tether `positions` memo in `terminal-grid.tsx`) read as a
+ *  signal that pane geometry changed — forcing a `<For>` rebuild that
+ *  visibly remounts the tether DOM and replays its fade-in animation.
+ *  Activity bumps don't change geometry, so we update `cells` surgically
+ *  instead and skip the layout-rev signal. The dock and any consumer
+ *  that subscribes to `cells[i].lastActivityMs` / `lastSnippet` directly
+ *  still sees the new value via fine-grained store reactivity. */
+function applyCellActivityMirror(
+  paneId: string,
+  patch: Partial<Pick<PaneContent, "lastActivityMs" | "lastSnippet">>,
+): void {
+  const idx = runtimeLayoutStore.cells.findIndex((c) => c.id === paneId);
+  if (idx < 0) return;
+  setRuntimeLayoutStore("cells", idx, patch);
+}
+
 export function setLastSnippet(cellId: string, snippet: string, activityMs: number): void {
   if (!runtimeLayoutStore.panes[cellId]) return;
   setRuntimeLayoutStore("panes", cellId, {
     lastSnippet: snippet,
     lastActivityMs: activityMs,
   });
-  rebuildCells();
+  applyCellActivityMirror(cellId, { lastSnippet: snippet, lastActivityMs: activityMs });
   scheduleActiveSave();
 }
 
@@ -297,10 +358,11 @@ export function setLastSnippet(cellId: string, snippet: string, activityMs: numb
  *  ordering. */
 export function touchPaneBySession(sessionId: string): void {
   if (!sessionId) return;
+  const now = Date.now();
   for (const pane of Object.values(runtimeLayoutStore.panes)) {
     if (pane.tabs.some((t) => t.sessionId === sessionId)) {
-      setRuntimeLayoutStore("panes", pane.id, { lastActivityMs: Date.now() });
-      rebuildCells();
+      setRuntimeLayoutStore("panes", pane.id, { lastActivityMs: now });
+      applyCellActivityMirror(pane.id, { lastActivityMs: now });
       return;
     }
   }
@@ -388,7 +450,47 @@ export function nextTabId(): string {
 
 let _saveTimer: ReturnType<typeof setTimeout> | null = null;
 
-function scheduleActiveSave(): void {
+/** Until `hydrateActiveLayout` finishes (or explicitly opens the gate when
+ *  there is nothing to hydrate), `scheduleActiveSave` will queue saves but
+ *  never actually invoke `active_layout_save`. This prevents a save fired
+ *  by an early `setActiveProjectSlug` (from the project-list refresh that
+ *  races layout hydration on launch) from overwriting the on-disk layout
+ *  with `cells: []` before the saved cells are read back into the store. */
+let _saveGateOpen = false;
+let _savePendingWhileGated = false;
+
+/** Open the save gate. Called by `hydrateActiveLayout` once hydration has
+ *  either restored the saved cells or confirmed there were none. Any save
+ *  request that arrived while the gate was closed is honoured here. */
+export function openActiveLayoutSaveGate(): void {
+  if (_saveGateOpen) return;
+  _saveGateOpen = true;
+  if (_savePendingWhileGated) {
+    _savePendingWhileGated = false;
+    scheduleActiveSave();
+  }
+}
+
+/** Snapshot the per-project sidebar scope into a plain `slug → worktree path`
+ *  map suitable for the active-layout TOML. "all" mode is encoded as an
+ *  absent entry so the resulting map matches `BTreeMap::is_empty` on the
+ *  Rust side and we don't bloat the file with default-valued rows. */
+function collectWorktreeScopes(): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [slug, scope] of Object.entries(activeWorktreeStore.byProject)) {
+    if (!scope) continue;
+    if (scope.mode === "worktree") out[slug] = scope.path;
+  }
+  return out;
+}
+
+export function scheduleActiveSave(): void {
+  if (!_saveGateOpen) {
+    // Hydration hasn't finished yet — record that a save was requested and
+    // bail. The gate-opener will retrigger this once hydration is done.
+    _savePendingWhileGated = true;
+    return;
+  }
   if (_saveTimer !== null) clearTimeout(_saveTimer);
   _saveTimer = setTimeout(() => {
     _saveTimer = null;
@@ -410,8 +512,11 @@ function scheduleActiveSave(): void {
         ...(t.projectSlug ? { project_slug: t.projectSlug } : {}),
         ...(t.worktreeId ? { worktree_id: t.worktreeId } : {}),
       }));
+    const scopes = collectWorktreeScopes();
     const payload: ActiveLayoutState = {
       saved_at: Math.floor(Date.now() / 1000),
+      ...(activeProjectSlug() !== undefined ? { project_slug: activeProjectSlug() } : {}),
+      ...(Object.keys(scopes).length > 0 ? { worktree_scopes: scopes } : {}),
       cells: [
         ...inTreeCells.map((c) => ({
           id: c.id,
@@ -624,9 +729,10 @@ export function removePane(id: string): void {
     setRuntimeLayoutStore("tree", next);
   }
   setRuntimeLayoutStore("panes", id, undefined as unknown as PaneContent);
-  // Clear volatile per-pane state.
+  // Clear volatile per-pane state. The pane is gone — no restore animation
+  // needed (and none possible: the chrome it would shrink back into has
+  // been unmounted).
   if (maximizedPaneId() === id) {
-    snapMaximizeLayoutOnce();
     setMaximizedPaneId(null);
   }
   if (focusedPaneId() === id) setFocusedPaneId(null);
@@ -698,6 +804,83 @@ export function setSplitRatios(nodePath: number[], ratios: number[]): void {
   scheduleActiveSave();
 }
 
+/**
+ * Adjust the ratio on whichever runtime split actually owns the visible
+ * boundary between two adjacent groups of leaves. Dividers are computed
+ * against the *pruned* tree (visible panes only), but the runtime tree
+ * may have hidden siblings between the two visible neighbours, so a
+ * pruned-tree path can land on the wrong split — or a leaf — when
+ * applied verbatim. Looking up the matching split by leaf-id on each
+ * side stays correct under any pruning + compaction.
+ *
+ * `prunedLeftRatio` / `prunedRightRatio` are the new shares the user
+ * wants the two visible siblings to occupy *within their pruned
+ * parent*. We rescale them by the runtime parent's visible-share so
+ * hidden siblings keep their absolute ratios (they're invisible to
+ * the user; touching them would surprise the next time the scope
+ * filter changes).
+ */
+export function setSplitRatiosByBoundary(args: {
+  axis: Axis;
+  leftLeafIds: readonly string[];
+  rightLeafIds: readonly string[];
+  visibleLeafIds: readonly string[];
+  prunedLeftRatio: number;
+  prunedRightRatio: number;
+}): void {
+  const tree = currentTree();
+  if (!tree || tree.kind === "leaf") return;
+  const leftSet = new Set(args.leftLeafIds);
+  const rightSet = new Set(args.rightLeafIds);
+  const visibleSet = new Set(args.visibleLeafIds);
+  const lca = findBoundaryLCA(tree, leftSet, rightSet);
+  if (!lca) return;
+  if (lca.node.axis !== args.axis) return;
+
+  // Sum of LCA child-ratios whose subtree currently has any visible leaf.
+  // Pruned ratios are runtime ratios divided by this sum; we invert to map
+  // the user's pruned-space delta back to runtime-space deltas.
+  let visibleSum = 0;
+  for (let i = 0; i < lca.node.children.length; i++) {
+    if (subtreeContainsAny(lca.node.children[i], visibleSet)) {
+      visibleSum += lca.node.ratios[i];
+    }
+  }
+  if (!Number.isFinite(visibleSum) || visibleSum <= 0) return;
+
+  // Floor the requested pruned ratios so a single pane can't be dragged
+  // into oblivion. The downstream `normalizeRatios` would re-floor anyway,
+  // but doing it here keeps the left+right sum stable so hidden siblings
+  // retain their original ratios after the rebuild.
+  const minPruned = MIN_RATIO;
+  let l = Math.max(args.prunedLeftRatio, minPruned);
+  let r = Math.max(args.prunedRightRatio, minPruned);
+  const prunedSum = l + r;
+  if (prunedSum <= 0) return;
+
+  // Original combined share at the LCA, in runtime coords.
+  const oldCombined = lca.node.ratios[lca.leftIdx] + lca.node.ratios[lca.rightIdx];
+  // Distribute that combined share by the new pruned ratio.
+  l = (l / prunedSum) * oldCombined;
+  r = (r / prunedSum) * oldCombined;
+
+  const nextRatios = [...lca.node.ratios];
+  nextRatios[lca.leftIdx] = l;
+  nextRatios[lca.rightIdx] = r;
+  const next = setRatiosAt(tree, lca.path, normalizeRatios(nextRatios));
+  setRuntimeLayoutStore("tree", next);
+  rebuildCells();
+  scheduleActiveSave();
+}
+
+function subtreeContainsAny(node: LayoutNode, ids: ReadonlySet<string>): boolean {
+  if (node.kind === "leaf") return ids.has(node.id);
+  for (const c of node.children) {
+    if (subtreeContainsAny(c, ids)) return true;
+  }
+  return false;
+}
+
 /** Reset every split in the tree to even ratios. Topology preserved; only
  *  divider positions move. No-op when the tree is null or a bare leaf. */
 export function equalizeAllRatios(): void {
@@ -754,6 +937,27 @@ export function setTabSessionId(cellId: string, tabId: string, sessionId: string
   const tabIdx = pane.tabs.findIndex((t) => t.id === tabId);
   if (tabIdx === -1) return;
   setRuntimeLayoutStore("panes", cellId, "tabs", tabIdx, { sessionId });
+  rebuildCells();
+  scheduleActiveSave();
+}
+
+/** Replace every tab reference to a backend session id.
+ *
+ * Used when restart recovery swaps a stale tmux session for a provider-resumed
+ * replacement. The visual tab remains the same; only its backend identity
+ * changes.
+ */
+export function replaceTabsSessionId(oldSessionId: string, newSessionId: string): void {
+  if (!oldSessionId || !newSessionId || oldSessionId === newSessionId) return;
+  let changed = false;
+  for (const pane of Object.values(runtimeLayoutStore.panes)) {
+    pane.tabs.forEach((tab, idx) => {
+      if (tab.sessionId !== oldSessionId) return;
+      setRuntimeLayoutStore("panes", pane.id, "tabs", idx, { sessionId: newSessionId });
+      changed = true;
+    });
+  }
+  if (!changed) return;
   rebuildCells();
   scheduleActiveSave();
 }
@@ -826,6 +1030,81 @@ export function removeTabsBySessionId(sessionId: string): void {
     if (!pane.tabs.some((tab) => tab.id === match.tabId)) continue;
     removeCellTab(match.cellId, match.tabId);
   }
+}
+
+/**
+ * Cross-harness review: spawn a fresh reviewer pane next to the reviewed
+ * pane. The new pane carries a single tab with `initialPrompt` and
+ * `pendingReviewOf` so `<TerminalPane>` will spawn a fresh harness with
+ * the review brief seeded as its first turn, and the post-spawn callback
+ * can record the link via the backend.
+ *
+ * The reviewer runs in the *reviewed pane's* worktree; the dragged source
+ * pane that triggered the gesture is left untouched — its session keeps
+ * running in its original slot.
+ *
+ * Returns the freshly created pane + tab ids, or null if the target pane
+ * no longer exists.
+ */
+export function spawnReviewerPane(
+  reviewedCellId: string,
+  args: {
+    kind: CellKind;
+    projectSlug?: string;
+    worktreeId?: string;
+    initialPrompt: string;
+    reviewedSessionId: string;
+    modelOverride?: { model: string; effort?: string };
+  },
+): { paneId: string; tabId: string } | null {
+  if (!runtimeLayoutStore.panes[reviewedCellId]) return null;
+  const paneId = nextCellId();
+  const tabId = nextTabId();
+  const tab: CellTab = {
+    id: tabId,
+    initialPrompt: args.initialPrompt,
+    pendingReviewOf: args.reviewedSessionId,
+    projectSlug: args.projectSlug,
+    worktreeId: args.worktreeId,
+    modelOverride: args.modelOverride,
+  };
+  const pane: PaneContent = {
+    id: paneId,
+    kind: args.kind,
+    tabs: [tab],
+    activeTabId: tabId,
+    projectSlug: args.projectSlug,
+    worktreeId: args.worktreeId,
+  };
+  splitPane(pane, reviewedCellId, "right");
+  return { paneId, tabId };
+}
+
+/**
+ * Clear the cross-harness-review pending fields on a tab once the linked
+ * spawn has resolved. Idempotent — calling it on a tab that has neither
+ * field set is a no-op.
+ */
+export function clearTabReviewPending(cellId: string, tabId: string): void {
+  const pane = runtimeLayoutStore.panes[cellId];
+  if (!pane) return;
+  const tabIdx = pane.tabs.findIndex((t) => t.id === tabId);
+  if (tabIdx === -1) return;
+  const tab = pane.tabs[tabIdx];
+  if (!tab.initialPrompt && !tab.pendingReviewOf && !tab.modelOverride) return;
+  setRuntimeLayoutStore("panes", cellId, "tabs", tabIdx, {
+    initialPrompt: undefined,
+    pendingReviewOf: undefined,
+    modelOverride: undefined,
+  });
+}
+
+/** Read the pending-review session id for a given tab, if any. */
+export function tabPendingReviewOf(cellId: string, tabId: string): string | undefined {
+  const pane = runtimeLayoutStore.panes[cellId];
+  if (!pane) return undefined;
+  const tab = pane.tabs.find((t) => t.id === tabId);
+  return tab?.pendingReviewOf;
 }
 
 // ---- pending-reset registry (transient; not persisted) --------------------
@@ -944,13 +1223,16 @@ export function toggleMaximize(paneId: string): void {
   const current = maximizedPaneId();
   const next = current === paneId ? null : paneId;
   if (current === next) return;
-  snapMaximizeLayoutOnce();
+  // Animation target = the pane that's actually moving. On maximize that's
+  // the new max; on restore it's the one that just stopped being max.
+  pulseMaximizeAnim(next ?? current);
   setMaximizedPaneId(next);
 }
 
 export function clearMaximize(): void {
-  if (maximizedPaneId() === null) return;
-  snapMaximizeLayoutOnce();
+  const current = maximizedPaneId();
+  if (current === null) return;
+  pulseMaximizeAnim(current);
   setMaximizedPaneId(null);
 }
 
@@ -987,10 +1269,11 @@ export function __resetRuntimeLayoutForTests(): void {
     cells: [],
   });
   setMaximizedPaneId(null);
-  setMaximizeLayoutSnap(false);
-  if (maximizeLayoutSnapTimer !== null) {
-    clearTimeout(maximizeLayoutSnapTimer);
-    maximizeLayoutSnapTimer = null;
+  setMaximizeAnim(false);
+  setMaxAnimTargetId(null);
+  if (maximizeAnimTimer !== null) {
+    clearTimeout(maximizeAnimTimer);
+    maximizeAnimTimer = null;
   }
   setFocusedPaneId(null);
   setMinimizedPaneIds(new Set<string>());
@@ -998,6 +1281,11 @@ export function __resetRuntimeLayoutForTests(): void {
   idCounter = 0;
   tabIdCounter = 0;
   pendingResetKeys.clear();
+  // Tests run without an `app.tsx` boot so they never call
+  // `openActiveLayoutSaveGate`; default the gate open here so existing
+  // tests that exercise `scheduleActiveSave` keep their previous behaviour.
+  _saveGateOpen = true;
+  _savePendingWhileGated = false;
   if (_saveTimer !== null) {
     clearTimeout(_saveTimer);
     _saveTimer = null;

@@ -9,6 +9,7 @@ import { CompactIcon } from "./compact";
 import { CopyIcon } from "./copy";
 import { FolderIcon } from "./folder";
 import { GitBranchIcon } from "./git-branch";
+import { GitMergeIcon } from "./git-merge";
 import { GridEqualIcon } from "./grid-equal";
 import { GridTileIcon } from "./grid-tile";
 import { KeyboardIcon } from "./keyboard";
@@ -32,6 +33,7 @@ export {
   CopyIcon,
   FolderIcon,
   GitBranchIcon,
+  GitMergeIcon,
   GridEqualIcon,
   GridTileIcon,
   KeyboardIcon,

@@ -51,7 +51,69 @@ export interface DragState {
   /** Pixel rect of the hovered target so the overlay can position itself
    *  without re-querying the DOM. Null when no target. */
   targetRect: DOMRect | null;
+  /** Magnetic-snap gate for cross-harness review. `true` whenever the
+   *  cursor is over a review-eligible sibling pane's interior, OR when
+   *  the snap was previously engaged on `targetId` and the cursor is
+   *  still inside the inflated hysteresis bounds (`snapHystRect`).
+   *  Visual feedback (target outline, source dock, overlay) keys off
+   *  this flag. **Releasing while `snapped` does NOT by itself commit
+   *  the review** — `armed` must also be true. */
+  snapped: boolean;
+  /** Inflated rect around the snapped target (target rect expanded by
+   *  `SNAP_HYST_PX` on every side). The snap stays engaged as long as
+   *  the cursor is inside this rect, so micro-jitter doesn't disengage.
+   *  Null when not snapped. */
+  snapHystRect: DOMRect | null;
+  /** Commit gate for the cross-harness review. Independent of `snapped`
+   *  so the visual snap can be felt immediately while the destructive
+   *  commit (which kills the source pane's session) waits for a
+   *  deliberate dwell. Goes true when:
+   *    • `armDelayMs === 0` — snap engages and arms in the same frame.
+   *      Used when the source pane is empty, so there's no work to lose.
+   *    • A `setTimeout(armDelayMs)` scheduled at engage time fires
+   *      while still snapped on the same target.
+   *  Resets to false on every fresh engagement (initial entry OR
+   *  re-target onto a different pane), on every release, and on
+   *  Escape — so any hesitation that releases the snap forces the
+   *  user to re-enter and re-hold before a commit can fire. */
+  armed: boolean;
+  /** Wall-clock ms (`Date.now()`) at which the active dwell started, or
+   *  null when no dwell is in flight. Set to a fresh stamp on every
+   *  engage / re-target so consumers can render a progress indicator
+   *  whose elapsed time matches the timer that will flip `armed`. */
+  armStartedAtMs: number | null;
+  /** Configured dwell duration for THIS drag, copied from
+   *  `BeginDragOptions.armDelayMs` so the overlay can size its progress
+   *  animation without re-reading the original options. 0 = no dwell. */
+  armDelayMs: number;
+  /** Target id whose snap was just released by an Escape keypress. The
+   *  snap state machine refuses to re-engage on this target until the
+   *  cursor leaves it — without this, releasing snap inside the target
+   *  pane would re-engage immediately on the next pointermove because
+   *  the cursor is still in the same interior. Cleared the first frame
+   *  the cursor is over a different (or no) pane. Null when no escape
+   *  is pending. */
+  escapedTargetId: string | null;
 }
+
+/** How far outside the target's bounds the cursor can drift before the
+ *  snap releases. Bigger = more forgiving but feels "magnetic and
+ *  sticky"; smaller = unsnaps quickly and feels responsive. Tuned down
+ *  from 48 px (which the user reported held the snap too aggressively
+ *  on intentional drag-away gestures) to 16 px — still larger than
+ *  trackpad tremor (~2–4 px) but small enough that any deliberate
+ *  drag-onwards motion releases immediately. */
+export const SNAP_HYST_PX = 16;
+
+/** Hard pixel cap for an edge band's width. Without this cap, the
+ *  fractional 15 % rule shrinks the snap interior to a sliver on small
+ *  panes (the user's specific complaint). With it, edges stay reachable
+ *  for splits but never claim more than 32 px per side, so even on a
+ *  120-px pane the interior dominates. */
+const MAX_EDGE_BAND_PX = 32;
+/** Same cap for the wider hysteresis exit band. 2× MAX_EDGE_BAND_PX
+ *  matches the EDGE_EXIT_FRACTION : EDGE_ENTER_FRACTION ratio. */
+const MAX_EDGE_EXIT_PX = 64;
 
 const [dragState, setDragState] = createSignal<DragState | null>(null);
 export { dragState };
@@ -129,12 +191,32 @@ export interface BeginDragOptions {
   cells: readonly HitTestCell[];
   /** Scale of cell.x/y/w/h. `LAYOUT_UNIT` from the store (typically 10000). */
   layoutUnit: number;
+  /** Optional kind/permission gate: returns `true` if the snap should
+   *  engage when the cursor is over `targetId`'s interior. Default
+   *  (when omitted) is `true` for every non-source pane. The harness
+   *  shell wires this to "both source and target are review-eligible
+   *  agent kinds", so dragging onto a Shell pane never visually snaps. */
+  canSnapTo?: (targetId: string) => boolean;
+  /** Dwell time (ms) the cursor must remain snapped on the same target
+   *  before a release counts as a commit. Default `0` arms the snap
+   *  immediately — used when the source pane has no work to lose
+   *  (empty/fresh harness). Pass a positive value (e.g. `600`) when
+   *  the source has history; the visual snap engages on entry but
+   *  releasing before the dwell elapses cancels harmlessly. The dwell
+   *  resets on every fresh engagement (initial entry OR re-target). */
+  armDelayMs?: number;
   /** Called once on pointerup. `zone === null` or `targetId === null`
-   *  means the drop was cancelled (outside any target). */
+   *  means the drop was cancelled (outside any target). `snapped` is
+   *  `true` when the magnetic snap was visually engaged at release;
+   *  `armed` is `true` only after the dwell has elapsed. **The caller
+   *  MUST gate any destructive review action on both `snapped && armed`**
+   *  — `snapped` alone is the visual state, `armed` is the commit gate. */
   onDrop: (result: {
     sourceId: string;
     targetId: string | RootTargetSentinel | null;
     zone: DropZone | null;
+    snapped: boolean;
+    armed: boolean;
   }) => void;
 }
 
@@ -144,7 +226,9 @@ let activeCleanup: (() => void) | null = null;
  *  calls abort the previous one. */
 export function beginDrag(opts: BeginDragOptions): void {
   cancelDrag();
-  const { sourceId, sourceKind, sourceLabel, event, rootEl, cells, layoutUnit, onDrop } = opts;
+  const { sourceId, sourceKind, sourceLabel, event, rootEl, cells, layoutUnit, canSnapTo, onDrop } =
+    opts;
+  const armDelayMs = Math.max(0, opts.armDelayMs ?? 0);
 
   const startPointerX = event.clientX;
   const startPointerY = event.clientY;
@@ -160,7 +244,53 @@ export function beginDrag(opts: BeginDragOptions): void {
     targetId: null,
     zone: null,
     targetRect: null,
+    snapped: false,
+    snapHystRect: null,
+    armed: false,
+    armStartedAtMs: null,
+    armDelayMs,
+    escapedTargetId: null,
   });
+
+  // Pending dwell timer + the target it was scheduled against. Both must
+  // line up at fire time — if the user has retargeted or unsnapped, the
+  // late callback is a no-op. Tracked outside `dragState` so cancellations
+  // are O(1) and don't churn the reactive signal.
+  let armTimerId: ReturnType<typeof setTimeout> | null = null;
+  let armTimerTargetId: string | null = null;
+
+  function clearArmTimer(): void {
+    if (armTimerId !== null) {
+      clearTimeout(armTimerId);
+      armTimerId = null;
+      armTimerTargetId = null;
+    }
+  }
+
+  function scheduleArmFor(targetId: string): void {
+    clearArmTimer();
+    if (armDelayMs === 0) return; // instant arm path skips the timer
+    armTimerTargetId = targetId;
+    armTimerId = setTimeout(() => {
+      armTimerId = null;
+      const cur = dragState();
+      // Only flip armed=true if the snap is still engaged on the SAME
+      // target the timer was scheduled against. Re-target / release
+      // between scheduling and firing must cancel the arm — the late
+      // callback would otherwise commit a destructive review against a
+      // pane the user is no longer hovering.
+      if (
+        cur &&
+        cur.snapped &&
+        cur.targetId === armTimerTargetId &&
+        cur.targetId !== ROOT_TARGET &&
+        !cur.armed
+      ) {
+        setDragState({ ...cur, armed: true });
+      }
+      armTimerTargetId = null;
+    }, armDelayMs);
+  }
 
   // rAF throttle for pointermove. Trackpads fire pointermove at 120+ Hz;
   // updating dragState that often causes the preview reflow to retarget
@@ -174,6 +304,135 @@ export function beginDrag(opts: BeginDragOptions): void {
       targetId: prev?.targetId ?? null,
       zone: prev?.zone ?? null,
     });
+
+    // Snap state machine. Once engaged the snap is sticky against
+    // tremor: cursor drift inside the inflated hysteresis ring keeps
+    // the magnet engaged. It releases the moment the user signals
+    // intent to do something else — either by (i) pressing Escape,
+    // which sets `escapedTargetId` so we suppress re-engagement until
+    // the cursor leaves the escaped target, (ii) dragging the cursor
+    // into another candidate's interior (atomic re-target), or
+    // (iii) entering an edge zone of any pane, which is reserved for
+    // split drops and must remain reachable even from inside the
+    // hysteresis ring.
+    //
+    // Three outcomes per frame:
+    //  (a) ENGAGE/RE-TARGET: cursor is in a sibling pane's interior,
+    //      consumer's kind check passes, AND the target isn't the one
+    //      the user just escaped from → snap with a fresh hysteresis
+    //      rect.
+    //  (b) HOLD: snap was previously engaged and the cursor is still
+    //      inside the inflated hysteresis rect — UNLESS the cursor has
+    //      crossed into an edge zone of any non-source pane. Edge
+    //      zones are reserved for split drops, so two adjacent
+    //      harnesses can be separated by a "wiggle-room" band where
+    //      the snap releases and the user can drop a normal split
+    //      between them. Without this carve-out the 48 px hysteresis
+    //      ring of pane A overlaps pane B's left-edge band entirely,
+    //      jumping snap-A → snap-B with no neutral interval.
+    //  (c) RELEASE: neither — natural classification flows through and
+    //      downstream (edge-split preview, root-edge magnets) takes
+    //      over.
+    //
+    // (a) beats (b) so re-snapping onto a different candidate is atomic
+    // (no flicker through an intermediate "released" state).
+    const isInteriorHit = zone === "center" && targetId !== null && targetId !== ROOT_TARGET;
+    const escapedFromHere = prev?.escapedTargetId !== null && prev?.escapedTargetId === targetId;
+    const eligible =
+      isInteriorHit &&
+      rect !== null &&
+      !escapedFromHere &&
+      (canSnapTo?.(targetId as string) ?? true);
+    // Cursor is in an edge band of a real (non-source, non-root) pane.
+    // When true, the HOLD branch must yield so the split-drop classifier
+    // owns this region. Engage (a) still wins above when the cursor
+    // reaches a sibling's interior.
+    const cursorInEdgeOfNonSourcePane =
+      targetId !== null &&
+      targetId !== ROOT_TARGET &&
+      targetId !== sourceId &&
+      zone !== null &&
+      zone !== "center";
+
+    let snapped = false;
+    let snapHystRect: DOMRect | null = null;
+    let outTargetId = targetId;
+    let outZone = zone;
+    let outRect = rect;
+
+    if (eligible && rect !== null) {
+      snapped = true;
+      snapHystRect = inflateRect(rect, SNAP_HYST_PX);
+    } else if (
+      prev?.snapped &&
+      prev.snapHystRect &&
+      prev.targetId !== null &&
+      prev.targetRect !== null &&
+      pointerInRect(e.clientX, e.clientY, prev.snapHystRect) &&
+      !cursorInEdgeOfNonSourcePane
+    ) {
+      snapped = true;
+      snapHystRect = prev.snapHystRect;
+      outTargetId = prev.targetId;
+      outZone = "center";
+      outRect = prev.targetRect;
+    }
+
+    // Clear the escape suppression once the cursor has left the
+    // escaped target — re-entering should snap again. Engaging on a
+    // different target also clears it (we've moved on).
+    let nextEscapedTargetId = prev?.escapedTargetId ?? null;
+    if (nextEscapedTargetId !== null && targetId !== nextEscapedTargetId) {
+      nextEscapedTargetId = null;
+    }
+    if (snapped && outTargetId !== nextEscapedTargetId) {
+      nextEscapedTargetId = null;
+    }
+
+    // Dwell-to-arm state machine. Three transitions matter:
+    //   • RELEASE      (snap was on, now off)               → cancel
+    //                                                         timer,
+    //                                                         armed=false.
+    //   • FRESH ENGAGE (snap was off OR target changed)     → cancel
+    //                                                         old timer,
+    //                                                         schedule
+    //                                                         new one
+    //                                                         (or arm
+    //                                                         instantly
+    //                                                         when
+    //                                                         delay=0).
+    //   • HOLD         (snap on same target as last frame)  → keep
+    //                                                         prev.armed
+    //                                                         and the
+    //                                                         already-
+    //                                                         scheduled
+    //                                                         timer.
+    // Carrying `prev.armed` through the HOLD branch is critical: any
+    // pointermove inside the snap interior would otherwise reset armed
+    // to false, defeating the dwell entirely.
+    const wasSnappedSameTarget =
+      prev?.snapped === true && prev?.targetId === outTargetId && outTargetId !== null;
+
+    let armed = false;
+    let armStartedAtMs: number | null = null;
+    if (snapped && outTargetId !== null && outTargetId !== ROOT_TARGET) {
+      if (wasSnappedSameTarget) {
+        armed = prev?.armed ?? false;
+        armStartedAtMs = prev?.armStartedAtMs ?? null;
+      } else {
+        // FRESH ENGAGE: either initial entry, retarget to a different
+        // pane, or re-entry after a release. Restart the dwell from 0.
+        armed = armDelayMs === 0;
+        armStartedAtMs = armDelayMs === 0 ? null : Date.now();
+        scheduleArmFor(outTargetId as string);
+      }
+    } else {
+      // RELEASE (or no snap to begin with). Make sure no timer can
+      // resurrect the arm against a stale target after the user has
+      // moved on.
+      clearArmTimer();
+    }
+
     setDragState({
       sourceId,
       sourceKind,
@@ -182,9 +441,15 @@ export function beginDrag(opts: BeginDragOptions): void {
       startPointerY,
       pointerX: e.clientX,
       pointerY: e.clientY,
-      targetId,
-      zone,
-      targetRect: rect,
+      targetId: outTargetId,
+      zone: outZone,
+      targetRect: outRect,
+      snapped,
+      snapHystRect,
+      armed,
+      armStartedAtMs,
+      armDelayMs,
+      escapedTargetId: nextEscapedTargetId,
     });
   }
 
@@ -200,31 +465,72 @@ export function beginDrag(opts: BeginDragOptions): void {
   }
 
   function onUp(e: PointerEvent): void {
-    // Run the final hit-test synchronously (don't wait on rAF) so the drop
-    // commits against the zone under the cursor at pointerup, not against
-    // a potentially-stale frame's classification.
-    const prev = dragState();
-    const { targetId, zone } = hitTest(e, rootEl, sourceId, cells, layoutUnit, {
-      targetId: prev?.targetId ?? null,
-      zone: prev?.zone ?? null,
-    });
+    // Run the snap state machine one last time synchronously (don't wait
+    // on rAF) so the drop commits against the cursor's exact position at
+    // pointerup, including the hysteresis hold for "released a few px
+    // outside the pane but still inside the hysteresis ring".
+    if (rafId !== 0) {
+      cancelAnimationFrame(rafId);
+      rafId = 0;
+      latestMoveEvent = null;
+    }
+    processMove(e);
+    const final = dragState();
+    const result = {
+      sourceId,
+      targetId: final?.targetId ?? null,
+      zone: final?.zone ?? null,
+      snapped: final?.snapped ?? false,
+      armed: final?.armed ?? false,
+    };
     cleanup();
-    onDrop({ sourceId, targetId, zone });
+    onDrop(result);
   }
 
   function onCancel(): void {
     cleanup();
-    onDrop({ sourceId, targetId: null, zone: null });
+    onDrop({ sourceId, targetId: null, zone: null, snapped: false, armed: false });
   }
 
-  // Escape mid-drag is a hard cancel — the live preview tree clears as
-  // `dragState` becomes null, sibling panes ease back to their committed
-  // rects, and `onDrop` is invoked with no target so no mutation commits.
+  // Escape mid-drag has two roles depending on whether the magnetic
+  // snap is currently engaged:
+  //
+  //   • SNAPPED: release the snap and suppress re-engagement on the
+  //     same target (`escapedTargetId`) until the cursor leaves it.
+  //     The drag continues — the user is back in free-positioning mode
+  //     where edge-split previews and other targets are reachable.
+  //   • NOT SNAPPED: hard-cancel the entire drag (the original
+  //     behavior) — the live preview tree clears as `dragState`
+  //     becomes null, sibling panes ease back to their committed
+  //     rects, and `onDrop` is invoked with no target so no mutation
+  //     commits.
+  //
   // Capture-phase + stopPropagation so the keystroke can't be swallowed
   // upstream (e.g. by the cross-project view's own Escape handler in
   // terminal-grid.tsx) before we get it.
   function onKeyDown(e: KeyboardEvent): void {
     if (e.key !== "Escape") return;
+    const cur = dragState();
+    if (cur?.snapped && cur.targetId !== null && cur.targetId !== ROOT_TARGET) {
+      e.preventDefault();
+      e.stopPropagation();
+      // Cancel any in-flight dwell — Escape's whole job here is "I
+      // don't want this snap to commit". Without this, the timer would
+      // continue running and could fire `armed=true` while the user is
+      // still in the snap interior re-evaluating. The snap itself
+      // releases (snapped=false) so on re-entry the FRESH ENGAGE branch
+      // reschedules a new dwell from 0.
+      clearArmTimer();
+      setDragState({
+        ...cur,
+        snapped: false,
+        snapHystRect: null,
+        armed: false,
+        armStartedAtMs: null,
+        escapedTargetId: cur.targetId as string,
+      });
+      return;
+    }
     e.preventDefault();
     e.stopPropagation();
     onCancel();
@@ -236,6 +542,7 @@ export function beginDrag(opts: BeginDragOptions): void {
       rafId = 0;
       latestMoveEvent = null;
     }
+    clearArmTimer();
     document.removeEventListener("pointermove", onMove);
     document.removeEventListener("pointerup", onUp);
     document.removeEventListener("pointercancel", onCancel);
@@ -349,9 +656,18 @@ function cellToRect(cell: HitTestCell, rootRect: DOMRect, unit: number): DOMRect
 
 /**
  * Classify which 5-zone the pointer is in, relative to a target rect.
+ *
+ * Edge bands are sized as `min(dim × FRACTION, MAX_PX)` per side. The
+ * pixel cap is the magnetic-snap fix for dense layouts: the legacy
+ * fraction-only rule shrank the snap interior to a sliver on small
+ * panes, so the user kept missing the harness they wanted to drop on.
+ * Capping each edge band at 32 px keeps splits reachable but lets the
+ * interior dominate as soon as the pane is wider than ~210 px.
+ *
  * Hysteresis: if `prevZone` is an edge zone on this same target, the
- * classifier sticks with it until the pointer has moved PAST the wider
- * EXIT fraction — no flipping at the enter threshold.
+ * classifier sticks with it until the pointer crosses the wider EXIT
+ * band (also px-capped). Without this dead band, sub-pixel jitter at
+ * the boundary flips the zone every pointermove.
  */
 export function paneZone(
   px: number,
@@ -359,30 +675,65 @@ export function paneZone(
   rect: DOMRect,
   prevZone: DropZone | null = null,
 ): DropZone {
-  const rx = (px - rect.left) / rect.width;
-  const ry = (py - rect.top) / rect.height;
-  // Distance from each edge as a fraction of width/height.
-  const d: Record<Exclude<DropZone, "center">, number> = {
-    left: rx,
-    right: 1 - rx,
-    top: ry,
-    bottom: 1 - ry,
-  };
-  // If we were in an edge zone, stick with it as long as the pointer is
-  // still within EXIT distance of *that* edge. This creates the dead band
-  // that absorbs jitter at the 15% boundary.
-  if (prevZone && prevZone !== "center") {
-    if (d[prevZone] <= EDGE_EXIT_FRACTION) return prevZone;
-    // Moved clearly away from the prev edge — fall through to fresh
-    // classification. We might land on center or another edge.
+  const dLeft = px - rect.left;
+  const dRight = rect.right - px;
+  const dTop = py - rect.top;
+  const dBottom = rect.bottom - py;
+  const enterX = Math.min(rect.width * EDGE_ENTER_FRACTION, MAX_EDGE_BAND_PX);
+  const enterY = Math.min(rect.height * EDGE_ENTER_FRACTION, MAX_EDGE_BAND_PX);
+  const exitX = Math.min(rect.width * EDGE_EXIT_FRACTION, MAX_EDGE_EXIT_PX);
+  const exitY = Math.min(rect.height * EDGE_EXIT_FRACTION, MAX_EDGE_EXIT_PX);
+
+  // Hysteresis: stay on the prev edge until the pointer has moved past
+  // its (px-capped) EXIT band. Falls through to fresh classification
+  // once the cursor is clearly off the prev edge.
+  if (prevZone === "left" && dLeft <= exitX) return "left";
+  if (prevZone === "right" && dRight <= exitX) return "right";
+  if (prevZone === "top" && dTop <= exitY) return "top";
+  if (prevZone === "bottom" && dBottom <= exitY) return "bottom";
+
+  // Fresh classification: the cursor must be inside *some* edge band
+  // for an edge zone to win. If every edge distance is bigger than its
+  // enter threshold, the cursor is in the snap interior.
+  const inLeft = dLeft <= enterX;
+  const inRight = dRight <= enterX;
+  const inTop = dTop <= enterY;
+  const inBottom = dBottom <= enterY;
+  if (!inLeft && !inRight && !inTop && !inBottom) return "center";
+
+  // Pick the closest edge among those whose band the cursor is in.
+  let best: DropZone = "center";
+  let bestDist = Infinity;
+  if (inLeft && dLeft < bestDist) {
+    best = "left";
+    bestDist = dLeft;
   }
-  const minEdge = Math.min(d.left, d.right, d.top, d.bottom);
-  // Fresh classification uses the ENTER fraction (narrower than EXIT).
-  if (minEdge > EDGE_ENTER_FRACTION) return "center";
-  if (d.left === minEdge) return "left";
-  if (d.right === minEdge) return "right";
-  if (d.top === minEdge) return "top";
-  return "bottom";
+  if (inRight && dRight < bestDist) {
+    best = "right";
+    bestDist = dRight;
+  }
+  if (inTop && dTop < bestDist) {
+    best = "top";
+    bestDist = dTop;
+  }
+  if (inBottom && dBottom < bestDist) {
+    best = "bottom";
+    bestDist = dBottom;
+  }
+  return best;
+}
+
+/** Expand a rect by `px` on every side. Used to compute the snap's
+ *  hysteresis bounds: the snap stays engaged as long as the cursor is
+ *  inside the inflated rect. */
+function inflateRect(r: DOMRect, px: number): DOMRect {
+  return new DOMRect(r.left - px, r.top - px, r.width + 2 * px, r.height + 2 * px);
+}
+
+/** Half-open hit-test (right/bottom exclusive) so adjacent rects don't
+ *  both claim a 1-px seam. */
+function pointerInRect(x: number, y: number, r: DOMRect): boolean {
+  return x >= r.left && x < r.right && y >= r.top && y < r.bottom;
 }
 
 /**

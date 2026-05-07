@@ -161,7 +161,7 @@ describe("TerminalGrid persistent surfaces", () => {
     );
     expect(screen.getByTestId("terminal-surface-tab-beta")).toHaveAttribute("data-visible", "true");
 
-    setCrossProjectViewMode("recent");
+    setCrossProjectViewMode("completed");
     expect(surfaceMounts).toBe(2);
     expect(surfaceCleanups).toBe(0);
     expect(screen.getByTestId("terminal-surface-tab-alpha")).toHaveAttribute(
@@ -310,6 +310,12 @@ describe("TerminalGrid persistent surfaces", () => {
       targetId: "cell-sibling",
       zone: "right",
       targetRect: null,
+      snapped: false,
+      snapHystRect: null,
+      armed: false,
+      armStartedAtMs: null,
+      armDelayMs: 0,
+      escapedTargetId: null,
     });
 
     // Source surface marks itself as the ghost (CSS ride-along key).
@@ -330,5 +336,122 @@ describe("TerminalGrid persistent surfaces", () => {
     expect(sourceFrame.dataset.dragging).toBe("false");
     expect(sourceFrame.classList.contains("surface-dragging-source")).toBe(false);
     expect(siblingFrame.style.getPropertyValue("--x-pct")).toBe("50%");
+  });
+
+  it("toggles snap-target and is-snapped chrome classes when the magnetic snap engages", () => {
+    setRuntimeLayout([
+      {
+        id: "cell-source",
+        x: 0,
+        y: 0,
+        w: LAYOUT_UNIT / 2,
+        h: LAYOUT_UNIT,
+        kind: "codex",
+        projectSlug: "alpha",
+        activeTabId: "tab-source",
+        tabs: [{ id: "tab-source", sessionId: "session-source" }],
+      },
+      {
+        id: "cell-sibling",
+        x: LAYOUT_UNIT / 2,
+        y: 0,
+        w: LAYOUT_UNIT / 2,
+        h: LAYOUT_UNIT,
+        kind: "codex",
+        projectSlug: "alpha",
+        activeTabId: "tab-sibling",
+        tabs: [{ id: "tab-sibling", sessionId: "session-sibling" }],
+      },
+    ]);
+    setTerminals([
+      {
+        session_id: "session-source",
+        project_slug: "alpha",
+        worktree_id: null,
+        kind: "codex",
+        created_unix: 1,
+      },
+      {
+        session_id: "session-sibling",
+        project_slug: "alpha",
+        worktree_id: null,
+        kind: "codex",
+        created_unix: 2,
+      },
+    ]);
+
+    const { container } = render(() => <TerminalGrid />);
+
+    // The chrome layer's frame is a `.terminal-chrome-frame` (LeafFrame).
+    // Both chrome and surface frames carry `data-cell-id`, so the selector
+    // must scope to the chrome class to disambiguate.
+    function chromeFrameFor(cellId: string): HTMLElement {
+      const el = container.querySelector(`.terminal-chrome-frame[data-cell-id="${cellId}"]`);
+      if (!el) throw new Error(`no chrome frame for ${cellId}`);
+      return el as HTMLElement;
+    }
+    const sourceChrome = chromeFrameFor("cell-source");
+    const siblingChrome = chromeFrameFor("cell-sibling");
+    const sourceSurface = screen
+      .getByTestId("terminal-surface-tab-source")
+      .closest(".terminal-surface-frame") as HTMLElement;
+
+    // Pre-snap baseline.
+    expect(sourceChrome.classList.contains("is-snapped")).toBe(false);
+    expect(sourceSurface.classList.contains("is-snapped")).toBe(false);
+    expect(siblingChrome.classList.contains("pane-review-snap-target")).toBe(false);
+    expect(screen.queryByTestId("review-snap-overlay")).toBeNull();
+
+    // Drive the snap state: the user has dragged source onto sibling and
+    // the magnetic snap is engaged. The chrome should now mark sibling as
+    // the snap target, source as snapped, and render the overlay.
+    __setDragStateForTests({
+      sourceId: "cell-source",
+      sourceKind: "codex",
+      sourceLabel: "Codex",
+      startPointerX: 0,
+      startPointerY: 0,
+      pointerX: 0,
+      pointerY: 0,
+      targetId: "cell-sibling",
+      zone: "center",
+      targetRect: new DOMRect(500, 0, 500, 1000),
+      snapped: true,
+      snapHystRect: new DOMRect(452, -48, 596, 1096),
+      armed: true,
+      armStartedAtMs: null,
+      armDelayMs: 0,
+      escapedTargetId: null,
+    });
+
+    expect(sourceChrome.classList.contains("is-snapped")).toBe(true);
+    expect(sourceSurface.classList.contains("is-snapped")).toBe(true);
+    expect(siblingChrome.classList.contains("pane-review-snap-target")).toBe(true);
+    expect(screen.getByTestId("review-snap-overlay")).toBeInTheDocument();
+
+    // Releasing the snap (still mid-drag, just unsnapped) clears all three.
+    __setDragStateForTests({
+      sourceId: "cell-source",
+      sourceKind: "codex",
+      sourceLabel: "Codex",
+      startPointerX: 0,
+      startPointerY: 0,
+      pointerX: 0,
+      pointerY: 0,
+      targetId: null,
+      zone: null,
+      targetRect: null,
+      snapped: false,
+      snapHystRect: null,
+      armed: false,
+      armStartedAtMs: null,
+      armDelayMs: 0,
+      escapedTargetId: null,
+    });
+
+    expect(sourceChrome.classList.contains("is-snapped")).toBe(false);
+    expect(sourceSurface.classList.contains("is-snapped")).toBe(false);
+    expect(siblingChrome.classList.contains("pane-review-snap-target")).toBe(false);
+    expect(screen.queryByTestId("review-snap-overlay")).toBeNull();
   });
 });

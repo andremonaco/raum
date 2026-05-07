@@ -120,6 +120,57 @@ pub fn extract_user_prompt(harness: AgentKind, payload: &serde_json::Value) -> O
         AgentKind::OpenCode => payload.get("prompt"),
         AgentKind::Shell => None,
     };
+    let text = candidate
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    // Claude Code fires `UserPromptSubmit` for slash commands too,
+    // wrapping the payload in `<command-name>` / `<local-command-*>`
+    // tags. Treating those as "the user prompt" makes the live banner
+    // surface things like `<command-name>/clear` as the Task on a
+    // freshly-spawned pane that hasn't actually been prompted yet.
+    // The on-disk reader uses the same helper to strip these, so reuse
+    // it here for parity. Returning None when nothing meaningful
+    // remains tells the caller to skip the prompt update entirely.
+    if matches!(harness, AgentKind::ClaudeCode) {
+        return crate::review::transcript::clean_claude_user_text(text);
+    }
+    Some(text.to_string())
+}
+
+/// Pull the *harness's own* session id out of a hook / notification
+/// payload — the Claude Code / Codex / OpenCode id, distinct from raum's
+/// internal `session_id` (which lives at envelope level). Returns
+/// `None` for harnesses that don't expose one or when the field is
+/// missing.
+///
+/// Why we capture this: the cross-harness "first prompt" overlay
+/// resolves a transcript file by walking the worktree's harness-side
+/// directory. Without a per-session disambiguator the lookup picks the
+/// directory's newest jsonl, which is shared across every pane in the
+/// project. Persisting this id (see `ConfigStore::update_session_harness_id`)
+/// lets a post-restart lookup target the right file directly.
+///
+/// * Claude Code's hook payload includes a top-level `session_id`
+///   (UUID) whose value matches its on-disk jsonl basename.
+/// * Codex's hook payload exposes the rollout's own `session_id`,
+///   which matches the `session_meta.id` field of the rollout file.
+/// * OpenCode's SSE payloads expose its own resumable `sessionID`.
+#[must_use]
+pub fn extract_harness_session_id(
+    harness: AgentKind,
+    payload: &serde_json::Value,
+) -> Option<String> {
+    let candidate = match harness {
+        AgentKind::ClaudeCode | AgentKind::Codex => payload
+            .get("session_id")
+            .or_else(|| payload.get("sessionId"))
+            .or_else(|| payload.get("sessionID")),
+        AgentKind::OpenCode => payload
+            .get("sessionID")
+            .or_else(|| payload.get("session_id")),
+        AgentKind::Shell => None,
+    };
     candidate
         .and_then(|v| v.as_str())
         .map(str::trim)
@@ -435,6 +486,43 @@ mod tests {
             reliability: None,
             payload: serde_json::Value::Null,
         }
+    }
+
+    #[test]
+    fn extract_opencode_harness_session_id_from_sse_payload() {
+        let payload = serde_json::json!({
+            "sessionID": "ses_221ff2438ffeIaMVCqC4Rv4yo4",
+            "prompt": "keep working"
+        });
+
+        assert_eq!(
+            extract_harness_session_id(AgentKind::OpenCode, &payload).as_deref(),
+            Some("ses_221ff2438ffeIaMVCqC4Rv4yo4")
+        );
+    }
+
+    #[test]
+    fn extract_opencode_harness_session_id_trims_and_skips_empty() {
+        let payload = serde_json::json!({ "sessionID": "   " });
+        assert_eq!(
+            extract_harness_session_id(AgentKind::OpenCode, &payload),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_claude_harness_session_id_accepts_camel_case_aliases() {
+        let payload = serde_json::json!({ "sessionId": "claude-session-1" });
+        assert_eq!(
+            extract_harness_session_id(AgentKind::ClaudeCode, &payload).as_deref(),
+            Some("claude-session-1")
+        );
+
+        let payload = serde_json::json!({ "sessionID": "claude-session-2" });
+        assert_eq!(
+            extract_harness_session_id(AgentKind::ClaudeCode, &payload).as_deref(),
+            Some("claude-session-2")
+        );
     }
 
     #[test]
@@ -979,6 +1067,32 @@ mod tests {
     fn extract_user_prompt_missing_field_returns_none() {
         let payload = serde_json::json!({ "other": "stuff" });
         assert!(extract_user_prompt(AgentKind::ClaudeCode, &payload).is_none());
+    }
+
+    #[test]
+    fn extract_user_prompt_claude_strips_slash_command_machinery() {
+        // Slash commands trigger UserPromptSubmit too; the prompt is
+        // the wrapper-tag payload, not user-typed text. Without
+        // stripping, the live banner shows `<command-name>/clear` as
+        // the Task on a session that wasn't really prompted.
+        let pure_machinery = serde_json::json!({
+            "session_id": "s",
+            "prompt": "<command-name>/clear</command-name>\n<command-args></command-args>",
+        });
+        assert!(
+            extract_user_prompt(AgentKind::ClaudeCode, &pure_machinery).is_none(),
+            "pure slash-command machinery must not surface as a user prompt",
+        );
+
+        // Caveat block followed by real text → return the real text.
+        let mixed = serde_json::json!({
+            "session_id": "s",
+            "prompt": "<local-command-caveat>noise</local-command-caveat>\nactual prompt",
+        });
+        assert_eq!(
+            extract_user_prompt(AgentKind::ClaudeCode, &mixed).as_deref(),
+            Some("actual prompt"),
+        );
     }
 
     #[test]

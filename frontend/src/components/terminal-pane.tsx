@@ -33,6 +33,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { Terminal, type IDisposable } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
+import { SerializeAddon } from "@xterm/addon-serialize";
 import "@xterm/xterm/css/xterm.css";
 
 import type { AgentKind } from "../lib/agentKind";
@@ -52,11 +53,23 @@ import {
 } from "../lib/terminalRegistry";
 import { dropTargetPaneId } from "../lib/fileDrop";
 import { SCROLLBACK_DEFAULT } from "../lib/scrollbackConfig";
-import { isViewportAtBottom, shouldAutoStickToBottomOnResize } from "../lib/terminalResize";
+import {
+  loadTerminalSnapshotBytes,
+  scheduleTerminalSnapshotPersist,
+} from "../lib/terminalSnapshotPersistence";
+import {
+  isViewportAtBottom,
+  shouldAutoStickToBottomOnResize,
+  terminalResizeScheduleDelay,
+} from "../lib/terminalResize";
+import { createXtermWritePump } from "../lib/xtermWritePump";
 import { getXtermOptions } from "../lib/xtermConfig";
 import { getCurrentXtermTheme, subscribeThemeChange } from "../lib/theme/themeController";
 import { FALLBACK_XTERM_THEME } from "../lib/theme/toXtermTheme";
 import { ChevronDownIcon, CopyIcon } from "./icons";
+import PromptOverlay from "./prompt-overlay";
+import { mouseIdle } from "../lib/globalMouseIdle";
+import { showPromptOverlay } from "../lib/appearancePrefs";
 
 export interface TerminalPaneProps {
   /** Stable identity for a persistent surface. Defaults to a component-local id. */
@@ -83,6 +96,14 @@ export interface TerminalPaneProps {
   onSpawned?: (sessionId: string) => void;
   /** Called when the user clicks the exit overlay to dismiss the pane. */
   onRequestClose?: () => void;
+  /** Optional initial prompt forwarded into the harness's launch command on
+   *  first spawn. Used by the cross-harness review feature; ignored when the
+   *  pane is reattaching to an existing session. */
+  initialPrompt?: string;
+  /** Optional one-shot model + effort override forwarded to `terminal_spawn`
+   *  on first spawn. Used by the cross-harness review picker; ignored on
+   *  reattach. */
+  modelOverride?: { model: string; effort?: string };
 }
 
 interface RenderingConfig {
@@ -100,16 +121,21 @@ interface RaumConfig {
  *  live `agent-state-changed` stream. Populates both the agent store and
  *  the terminal store's `workingState` so top-row counters and per-pane
  *  indicators render the correct state on app reload. */
-async function hydrateHarnessStateAfterReattach(sessionId: string, kind: AgentKind): Promise<void> {
+async function hydrateHarnessStateAfterReattach(
+  sessionId: string,
+  kind: AgentKind,
+): Promise<AgentState | null> {
   try {
     const state = await invoke<AgentState | null>("agent_state", {
       sessionId,
     });
-    if (!state) return;
+    if (!state) return null;
     updateSessionState(sessionId, kind, state);
     applyAgentStateToTerminal(sessionId, state);
+    return state;
   } catch (e) {
     console.warn("[TerminalPane] agent_state hydrate failed", e);
+    return null;
   }
 }
 
@@ -140,15 +166,14 @@ interface SpawnArgs {
   /** Measured xterm cols/rows so the harness boots at the real size. */
   cols?: number;
   rows?: number;
+  /** Optional initial prompt appended to the harness launch command (cross-
+   *  harness review feature). Backend ignores when undefined. */
+  initial_prompt?: string;
+  /** Optional one-shot model + effort override (cross-harness review picker).
+   *  Backend ignores when undefined; user-pinned conflicting flags in
+   *  `extra_flags` win. */
+  model_override?: { model: string; effort?: string };
 }
-
-/**
- * §4.4 — throttle resize pushes. ResizeObserver can fire at display refresh
- * rate while the user drags a divider or previews a pane drop; tmux cannot
- * usefully consume every frame, but it must receive regular updates so TUIs
- * repaint live instead of jumping after the interaction ends.
- */
-const RESIZE_THROTTLE_MS = 32;
 
 /** Spawn gate: below these dims the host isn't laid out yet and fit returns junk. */
 const MIN_SPAWN_COLS = 20;
@@ -160,11 +185,27 @@ const MIN_REATTACH_ROWS = 2;
 /** Upper bound before we give up waiting for `document.fonts.ready`. */
 const FONTS_READY_TIMEOUT_MS = 120;
 
+/**
+ * Initial-spawn stable-size gate. The harness boots at whatever cols/rows
+ * the host element measures at the moment of spawn — and once a TUI like
+ * Ink (Claude Code) emits hard-wrapped text at width N, that text stays at
+ * width N in xterm scrollback forever (xterm cannot reflow hard newlines).
+ * If the user launches the app and then maximises the window inside the
+ * first second, naively spawning on `fontsReady` lands the harness at the
+ * pre-maximise (small) cols. So we delay the first spawn/reattach until
+ * the host has held a constant size for `STABLE_SPAWN_QUIET_MS`, capped at
+ * `STABLE_SPAWN_HARD_CAP_MS` so a never-settling layout can't deadlock.
+ */
+const STABLE_SPAWN_QUIET_MS = 150;
+const STABLE_SPAWN_HARD_CAP_MS = 500;
+
 /** Duration the "Copied" flash stays visible after an auto-copy (ms). */
 const COPY_FLASH_MS = 900;
 
 const MAX_BRIDGE_RECOVERY_ATTEMPTS = 3;
 const BRIDGE_RECOVERY_RETRY_MS = 500;
+const REATTACH_IN_FLIGHT_RETRY_MS = 250;
+const MAX_REATTACH_IN_FLIGHT_RETRIES = 20;
 
 type TerminalLifecycleEvent = "mount" | "cleanup" | "spawn" | "reattach" | "recover" | "self-heal";
 
@@ -199,6 +240,19 @@ interface TerminalSelfHealEventDetail {
   cellId?: string;
   tabId?: string;
   sessionId?: string;
+}
+
+type ReconnectHistoryStatus =
+  | "live-bridge"
+  | "provider-replay"
+  | "deferred-provider-replay"
+  | "unavailable";
+
+interface ReconnectResult {
+  sessionId: string;
+  historyStatus: ReconnectHistoryStatus;
+  replacedSessionId?: string;
+  message?: string;
 }
 
 export const TerminalPane: Component<TerminalPaneProps> = (props) => {
@@ -241,6 +295,7 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
   let term: Terminal | null = null;
   let fit: FitAddon | null = null;
   let search: SearchAddon | null = null;
+  let serializeAddon: SerializeAddon | null = null;
   let resizeObserver: ResizeObserver | null = null;
   let resizeTimer: ReturnType<typeof setTimeout> | null = null;
   let copyFlashTimer: ReturnType<typeof setTimeout> | null = null;
@@ -275,6 +330,7 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
   // closure structure intact.
   let recoverDeadPaneRef: (() => void) | null = null;
   let manualReconnectRef: (() => void) | null = null;
+  let reattachInFlightTimer: ReturnType<typeof setTimeout> | null = null;
 
   const normalBuffer = () => term?.buffer.normal ?? null;
   const hasDetachedHistory = (): boolean => {
@@ -370,20 +426,41 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       );
       fit = new FitAddon();
       search = new SearchAddon();
+      serializeAddon = new SerializeAddon();
       term.loadAddon(fit);
       term.loadAddon(search);
+      term.loadAddon(serializeAddon);
 
-      // Shift+Enter → ESC+CR (Alt/Option+Enter convention). xterm.js by
-      // default sends a bare `\r` for both Enter and Shift+Enter, so the
-      // harness can't distinguish them. `\x1b\r` is the sequence iTerm2's
-      // built-in Shift+Enter binding emits and that Claude Code, Codex,
-      // and OpenCode all interpret as "insert newline without submit."
+      // Shift+Enter newline. xterm.js sends a bare `\r` for both Enter and
+      // Shift+Enter, so without re-encoding the harness can't tell them
+      // apart and the prompt gets submitted. The byte sequence we send
+      // depends on which harness the pane is attached to:
+      //
+      //   * Codex (Rust + crossterm) → `\x1b[13;2u`. The kitty CSI-u form
+      //     for Shift+Enter — codepoint 13 (Enter), modifier 2 (Shift).
+      //     crossterm always parses CSI-u regardless of whether kitty
+      //     enhancement was negotiated, and the resulting `KeyEvent { code:
+      //     Enter, modifiers: SHIFT }` matches Codex's canonical
+      //     `shift(KeyCode::Enter)` insert_newline binding. The legacy
+      //     ESC+CR (Alt+Enter alias) used to work via codex's
+      //     `alt(KeyCode::Enter)` alias but regressed on some versions
+      //     (codex-rs#20580); the CSI-u form is the binding Codex actually
+      //     considers primary.
+      //   * Claude Code / OpenCode (Node TUIs without CSI-u parsers) →
+      //     `\x1b\r`. ESC+CR is iTerm2's default Shift+Enter sequence and
+      //     the one those harnesses match against.
+      //
+      // We don't intercept Shift+Tab. xterm.js sends `\x1b[Z` (back-tab),
+      // which crossterm decodes to `KeyCode::BackTab` — exactly what Codex
+      // binds for plan-mode toggle. Codex does not bind Shift+Tab to
+      // newline, so re-encoding it would not produce a newline either way.
       term.attachCustomKeyEventHandler((ev) => {
         if (ev.type !== "keydown") return true;
         if (ev.key === "Enter" && ev.shiftKey && !ev.ctrlKey && !ev.metaKey && !ev.altKey) {
           const id = sessionId();
           if (id) {
-            void invoke("terminal_send_keys", { sessionId: id, keys: "\x1b\r" }).catch((e) => {
+            const keys = props.kind === "codex" ? "\x1b[13;2u" : "\x1b\r";
+            void invoke("terminal_send_keys", { sessionId: id, keys }).catch((e) => {
               console.error("[TerminalPane] terminal_send_keys (shift+enter) failed", e);
             });
           }
@@ -446,38 +523,92 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       );
     })();
 
-    // §4.1 — raw byte channel. Kept outside the spawn gate so reattach paths
-    // can hand it to `terminal_spawn` too; today reattach uses `props.sessionId`
-    // and skips the spawn but the channel is harmless when unused.
+    // §4.1 — raw byte channel. Each backend bridge gets its own Tauri Channel.
+    // Reusing one Channel across bridge lifetimes looks convenient, but it
+    // leaves reconnect/self-heal paths vulnerable to stale callbacks and
+    // WebView-side channel bookkeeping after the old tmux client is torn down.
+    // A generation check lets late bytes from an older bridge fall on the
+    // floor without corrupting the freshly reattached xterm.
     //
     // NB: Tauri v2 delivers `InvokeResponseBody::Raw` to the webview as an
     // `ArrayBuffer` (small payloads via eval of `new Uint8Array(...).buffer`,
     // large payloads via fetch → `Response.arrayBuffer()`). xterm.js `write`
     // accepts `string | Uint8Array`, not ArrayBuffer, so we always wrap here.
-    const channel = new Channel<ArrayBuffer | Uint8Array | number[]>();
-    channel.onmessage = (data) => {
-      try {
-        let bytes: Uint8Array;
-        if (data instanceof Uint8Array) {
-          bytes = data;
-        } else if (data instanceof ArrayBuffer) {
-          bytes = new Uint8Array(data);
-        } else if (Array.isArray(data)) {
-          bytes = Uint8Array.from(data);
-        } else {
-          // Tauri's large-payload fetch path hands back a Response-like object
-          // whose body needs to be read. Guard anyway so we don't silently drop.
-          console.warn("[TerminalPane] unexpected channel payload", data);
-          return;
-        }
-        term?.write(bytes);
+    const outputPump = createXtermWritePump({
+      getTerminal: () => term,
+      onWriteParsed: () => {
         const id = sessionId();
-        if (id) markOutput(id);
-      } catch (err) {
-        console.error("[TerminalPane] write failed", err);
-      }
-    };
+        const target = term;
+        const addon = serializeAddon;
+        if (!id || !target || !addon) return;
+        markOutput(id);
+        // Skip persistence while the buffer is in alt-screen mode. Alt-screen
+        // TUIs (Codex, OpenCode, fullscreen Claude) repaint from source on
+        // every SIGWINCH, so raum's reattach path uses a SIGWINCH bounce
+        // instead of byte replay — a serialized alt buffer is wasted disk
+        // and would corrupt scrollback if ever replayed into a normal-mode
+        // pane.
+        if (target.buffer.active.type === "alternate") return;
+        scheduleTerminalSnapshotPersist(id, { term: target, addon });
+      },
+      onWarn: (queuedFrames) => {
+        if (!import.meta.env.DEV) return;
+        console.warn("[TerminalPane] output write queue is backing up", {
+          paneId,
+          sessionId: sessionId(),
+          queuedFrames,
+        });
+      },
+    });
 
+    const makeOutputChannel = (
+      generation: number,
+    ): Channel<ArrayBuffer | Uint8Array | number[]> => {
+      const next = new Channel<ArrayBuffer | Uint8Array | number[]>();
+      next.onmessage = (data) => {
+        if (generation !== outputPump.generation()) return;
+        try {
+          let bytes: Uint8Array;
+          if (data instanceof Uint8Array) {
+            bytes = data;
+          } else if (data instanceof ArrayBuffer) {
+            bytes = new Uint8Array(data);
+          } else if (Array.isArray(data)) {
+            bytes = Uint8Array.from(data);
+          } else {
+            // Tauri's large-payload fetch path hands back a Response-like object
+            // whose body needs to be read. Guard anyway so we don't silently drop.
+            console.warn("[TerminalPane] unexpected channel payload", data);
+            return;
+          }
+          outputPump.enqueue(generation, bytes);
+        } catch (err) {
+          console.error("[TerminalPane] channel payload handling failed", err);
+        }
+      };
+      return next;
+    };
+    let channel = makeOutputChannel(outputPump.generation());
+    const rotateOutputChannel = (resetOnFirstOutput: boolean): typeof channel => {
+      const generation = outputPump.rotate(resetOnFirstOutput);
+      channel = makeOutputChannel(generation);
+      return channel;
+    };
+    const writeLocalSnapshotFallback = (targetSessionId: string): void => {
+      void loadTerminalSnapshotBytes(targetSessionId)
+        .then((snapshot) => {
+          if (!snapshot) return;
+          outputPump.enqueue(outputPump.generation(), snapshot);
+        })
+        .catch((err) => {
+          if (import.meta.env.DEV) {
+            console.warn("[TerminalPane] snapshot fallback load failed", {
+              targetSessionId,
+              err,
+            });
+          }
+        });
+    };
     // §4.4 — throttled resize plumbing. ResizeObserver ticks can arrive at
     // display refresh rate while pane geometry is changing; every dispatched
     // resize still runs against the latest measured xterm dimensions, but
@@ -539,12 +670,12 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       if (force) forceNextResize = true;
       resizeQueued = true;
       if (resizeTimer !== null) {
-        if (!force) return;
+        if (!force && !isHarnessKind(props.kind)) return;
         clearTimeout(resizeTimer);
         resizeTimer = null;
       }
       const elapsed = performance.now() - lastResizeDispatchMs;
-      const delay = force ? 0 : Math.max(0, RESIZE_THROTTLE_MS - elapsed);
+      const delay = terminalResizeScheduleDelay(props.kind, force, elapsed);
       resizeTimer = setTimeout(() => {
         resizeTimer = null;
         resizeQueued = false;
@@ -566,6 +697,7 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
     let hasSpawned = false;
     const persistedSessionId = props.sessionId;
     let persistedSessionMissing = false;
+    let reattachInFlightRetries = 0;
 
     const owningTabAlive = (): boolean => {
       if (!props.cellId || !props.tabId) return true;
@@ -600,8 +732,9 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         bridgeRecoveryInFlight = true;
         setBridgeRecoveryUiState("reconnecting");
       }
+      const attachChannel = rotateOutputChannel(options.reason === "recover");
       logLifecycle(options.reason, paneId, targetSessionId);
-      void invoke<string>("terminal_reattach", {
+      void invoke<ReconnectResult>("terminal_reattach", {
         args: {
           session_id: targetSessionId,
           kind: props.kind,
@@ -610,9 +743,11 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
           cols,
           rows,
         },
-        onData: channel,
+        onData: attachChannel,
       })
-        .then((id) => {
+        .then((result) => {
+          const id = result.sessionId;
+          reattachInFlightRetries = 0;
           // Success — the output channel is live. Resize will be pushed by
           // the observer's first post-attach tick below.
           bridgeRecoveryInFlight = false;
@@ -621,6 +756,11 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
           setErrorMsg(null);
           setExitState(null);
           props.onSpawned?.(id);
+          if (result.historyStatus === "unavailable") {
+            writeLocalSnapshotFallback(targetSessionId);
+            setErrorMsg(result.message ?? "History recovery is unavailable for this pane");
+            return;
+          }
           // Pull the harness state the backend seeded from `sessions.toml`.
           // Runs once per reattach; the live `agent-state-changed` stream
           // takes over afterwards. Without this pull the reloaded pane
@@ -635,7 +775,17 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
           const message = String(e);
           if (message.includes("reattach-in-flight")) {
             hasSpawned = false;
-            setSessionId(null);
+            setSessionId(targetSessionId);
+            if (reattachInFlightRetries >= MAX_REATTACH_IN_FLIGHT_RETRIES) {
+              setErrorMsg("Reattach is still busy; try reconnecting this pane again.");
+              return;
+            }
+            reattachInFlightRetries += 1;
+            if (reattachInFlightTimer !== null) clearTimeout(reattachInFlightTimer);
+            reattachInFlightTimer = setTimeout(() => {
+              reattachInFlightTimer = null;
+              reattachSession(targetSessionId, options);
+            }, REATTACH_IN_FLIGHT_RETRY_MS);
             return;
           }
           if (!options.fallbackToSpawn) {
@@ -655,20 +805,11 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
             setBridgeRecoveryUiState("lost");
             return;
           }
-          // Either the tmux session is gone (expected after `kill-server`
-          // or a long absence past reap_stale) or something transient
-          // failed. Either way: release the gate and let `trySpawn` create
-          // a fresh session only when this surface is still a visible,
-          // layout-owned tab. Hidden stale tabs are removed by the
-          // `terminal-session-removed` event emitted by the backend; spawning
-          // here would recreate the invisible harness the user just closed.
-          console.warn("[TerminalPane] terminal_reattach failed — spawning fresh", e);
+          console.warn("[TerminalPane] terminal_reattach failed", e);
           persistedSessionMissing = true;
           hasSpawned = false;
           setSessionId(null);
-          // Next ResizeObserver tick will call trySpawn via the dual-mode
-          // observer below; also kick one inline in case the pane was
-          // already fully measured.
+          setErrorMsg(null);
           trySpawn();
         });
     };
@@ -710,8 +851,9 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       const rows = term.rows;
       if (cols < MIN_REATTACH_COLS || rows < MIN_REATTACH_ROWS) return;
       setRespawningDead(true);
+      const respawnChannel = rotateOutputChannel(true);
       logLifecycle("recover", paneId, id);
-      void invoke<string>("terminal_respawn_dead", {
+      void invoke<ReconnectResult>("terminal_respawn_dead", {
         args: {
           session_id: id,
           kind: props.kind,
@@ -720,10 +862,15 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
           cols,
           rows,
         },
-        onData: channel,
+        onData: respawnChannel,
       })
-        .then(() => {
+        .then((result) => {
           setRespawningDead(false);
+          if (result.historyStatus === "unavailable") {
+            setErrorMsg(result.message ?? "Provider recovery is unavailable for this pane");
+            return;
+          }
+          setSessionId(result.sessionId);
           setExitState(null);
           setErrorMsg(null);
           setBridgeRecoveryAttempts(0);
@@ -763,6 +910,8 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         cwd: props.cwd,
         cols,
         rows,
+        initial_prompt: props.initialPrompt,
+        model_override: props.modelOverride,
       };
       logLifecycle("spawn", paneId, sessionId());
       void invoke<string>("terminal_spawn", {
@@ -829,14 +978,10 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       setErrorMsg(null);
       setBridgeRecoveryAttempts(0);
       setBridgeRecoveryUiState("reconnecting");
-      try {
-        term.reset();
-      } catch {
-        // A failed local reset should not block the backend repair.
-      }
+      const selfHealChannel = rotateOutputChannel(true);
 
       logLifecycle("self-heal", paneId, id);
-      void invoke<string>("terminal_self_heal", {
+      void invoke<ReconnectResult>("terminal_self_heal", {
         args: {
           session_id: id,
           kind: props.kind,
@@ -845,10 +990,16 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
           cols,
           rows,
         },
-        onData: channel,
+        onData: selfHealChannel,
       })
-        .then((nextId) => {
+        .then((result) => {
           selfHealInFlight = false;
+          if (result.historyStatus === "unavailable") {
+            setErrorMsg(result.message ?? "Provider recovery is unavailable for this pane");
+            setBridgeRecoveryUiState("idle");
+            return;
+          }
+          const nextId = result.sessionId;
           setSessionId(nextId);
           props.onSpawned?.(nextId);
           updateSessionState(nextId, props.kind, "idle");
@@ -859,14 +1010,9 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         })
         .catch((e) => {
           selfHealInFlight = false;
-          console.warn("[TerminalPane] terminal_self_heal failed; spawning fresh", e);
-          void invoke("terminal_kill", { sessionId: id }).catch(() => {
-            /* best-effort cleanup before fallback spawn */
-          });
-          setSessionId(null);
+          console.warn("[TerminalPane] terminal_self_heal failed", e);
           setBridgeRecoveryUiState("idle");
-          hasSpawned = false;
-          trySpawn();
+          setErrorMsg(String(e));
         });
     };
 
@@ -913,6 +1059,13 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
     const gridRoot = (host as HTMLElement).closest<HTMLElement>('[data-dnd-root="true"]');
     const isDragging = (): boolean => gridRoot?.classList.contains("is-resizing") ?? false;
 
+    // Pre-spawn retry gate. Once the initial-spawn stable-size gate below
+    // resolves and fires the first spawn attempt, this flag flips. Only then
+    // does the main ResizeObserver retry spawn on subsequent resizes (e.g.
+    // host was below MIN_SPAWN_COLS at gate open and grew later). Without
+    // the gate the observer would race: a transient mid-mount resize could
+    // trigger an early spawn at the wrong width.
+    let initialSpawnGateOpen = false;
     if (typeof ResizeObserver !== "undefined") {
       resizeObserver = new ResizeObserver(() => {
         if (hasSpawned) {
@@ -923,6 +1076,7 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
           scheduleResize();
           return;
         }
+        if (!initialSpawnGateOpen) return;
         if (persistedSessionId) {
           tryReattach();
         } else {
@@ -962,8 +1116,62 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
     const fontsTimeout = new Promise<void>((resolve) =>
       setTimeout(resolve, FONTS_READY_TIMEOUT_MS),
     );
-    void Promise.race([fontsReady, fontsTimeout]).then(() => {
+    const fontsSettled = Promise.race([fontsReady, fontsTimeout]);
+
+    // Wait for the host's measured size to be stable for
+    // STABLE_SPAWN_QUIET_MS, with a hard cap of STABLE_SPAWN_HARD_CAP_MS.
+    // This prevents the harness from booting at a transient mid-launch /
+    // mid-maximise size whose width then becomes permanent for any TUI
+    // hard-wrapped output (Ink, etc. — see docstring on the constants).
+    // Returns immediately if ResizeObserver isn't available.
+    const stableHostSize: Promise<void> = (() => {
+      if (typeof ResizeObserver === "undefined" || !host) {
+        return Promise.resolve();
+      }
+      const target = host;
+      return new Promise<void>((resolve) => {
+        let lastWidth = target.offsetWidth;
+        let lastHeight = target.offsetHeight;
+        let quietTimer: ReturnType<typeof setTimeout> | null = null;
+        let hardCapTimer: ReturnType<typeof setTimeout> | null = null;
+        let observer: ResizeObserver | null = null;
+        let settled = false;
+        const finish = (): void => {
+          if (settled) return;
+          settled = true;
+          if (quietTimer !== null) clearTimeout(quietTimer);
+          if (hardCapTimer !== null) clearTimeout(hardCapTimer);
+          try {
+            observer?.disconnect();
+          } catch {
+            /* best-effort */
+          }
+          resolve();
+        };
+        const armQuiet = (): void => {
+          if (quietTimer !== null) clearTimeout(quietTimer);
+          quietTimer = setTimeout(finish, STABLE_SPAWN_QUIET_MS);
+        };
+        observer = new ResizeObserver(() => {
+          const w = target.offsetWidth;
+          const h = target.offsetHeight;
+          if (w === lastWidth && h === lastHeight) return;
+          lastWidth = w;
+          lastHeight = h;
+          armQuiet();
+        });
+        observer.observe(target);
+        armQuiet();
+        hardCapTimer = setTimeout(finish, STABLE_SPAWN_HARD_CAP_MS);
+      });
+    })();
+
+    void Promise.all([fontsSettled, stableHostSize]).then(() => {
       requestAnimationFrame(() => {
+        // Open the pre-spawn retry gate first. If `trySpawn` / `tryReattach`
+        // bails on a too-small viewport, the main ResizeObserver below will
+        // retry on the next resize.
+        initialSpawnGateOpen = true;
         if (!term) return;
         if (persistedSessionId) {
           // Reattach path: open a new PTY-attached client against an
@@ -1098,6 +1306,10 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       clearTimeout(bridgeRecoveryTimer);
       bridgeRecoveryTimer = null;
     }
+    if (reattachInFlightTimer !== null) {
+      clearTimeout(reattachInFlightTimer);
+      reattachInFlightTimer = null;
+    }
     clearResizeRepin();
     try {
       resizeObserver?.disconnect();
@@ -1152,6 +1364,18 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         }}
         class="min-h-0 min-w-0 flex-1 overflow-hidden"
       />
+      <Show
+        when={
+          showPromptOverlay() &&
+          isHarnessKind(props.kind) &&
+          !props.active &&
+          !exitState() &&
+          bridgeRecoveryUiState() === "idle" &&
+          !historyOverlay()
+        }
+      >
+        <PromptOverlay sessionId={sessionId()} visible={mouseIdle()} />
+      </Show>
       <Show when={hasDetachedHistory()}>
         <button
           type="button"

@@ -10,6 +10,7 @@ import { SpotlightDock } from "./components/spotlight-dock";
 import { Toaster } from "./components/ui/sonner";
 import { KeymapProvider, useKeymapAction } from "./lib/keymapContext";
 import {
+  openActiveLayoutSaveGate,
   setRuntimeLayout,
   type ActiveLayoutState,
   type CellKind,
@@ -22,7 +23,8 @@ import { initHomeDir } from "./lib/pathDisplay";
 import { installFileDrop } from "./lib/fileDrop";
 import { previewOnboarding, setPreviewOnboarding } from "./lib/devOnboardingPreview";
 import { startShellContextPoller } from "./lib/shellContextPoller";
-import { prewarmAllWorktrees } from "./stores/worktreeStore";
+import { hydrateActiveWorktreeScopes, prewarmAllWorktrees } from "./stores/worktreeStore";
+import { setActiveProjectSlug } from "./stores/projectStore";
 import "overlayscrollbars/overlayscrollbars.css";
 
 interface RaumConfigSnapshot {
@@ -88,8 +90,9 @@ async function scheduleBackgroundUpdateCheck(snapshot: RaumConfigSnapshot): Prom
 /** Rehydrate the runtime grid from the last-saved `active-layout.toml`.
  *
  *  Persisted `session_id`s are passed through verbatim — `TerminalPane`
- *  attempts `terminal_reattach(session_id, …)` on mount and falls back to
- *  `terminal_spawn` if the tmux session no longer exists. The previous
+ *  attempts `terminal_reattach(session_id, …)` on mount and surfaces an
+ *  explicit recovery error if neither tmux nor provider replay is available.
+ *  The previous
  *  implementation cross-referenced `terminal_list()` here to strip dead
  *  ids, but that registry is EMPTY on fresh app boot (no panes have
  *  spawned yet), so it filtered out EVERY persisted id and forced every
@@ -100,6 +103,21 @@ async function scheduleBackgroundUpdateCheck(snapshot: RaumConfigSnapshot): Prom
 async function hydrateActiveLayout(): Promise<void> {
   try {
     const saved = await invoke<ActiveLayoutState>("active_layout_get");
+
+    // Restore the per-project sidebar scope FIRST, before any cell-level
+    // setRuntimeLayout work. The grid's pruning pass keys on
+    // `activeWorktreeStore.byProject`, so hydrating those entries here
+    // means the very first render already shows the worktree-scoped view
+    // the user had open at shutdown — without this, every project would
+    // briefly fall back to the cross-worktree "all" aggregate before the
+    // user clicked into their pinned worktree row again.
+    if (saved.worktree_scopes) hydrateActiveWorktreeScopes(saved.worktree_scopes);
+    // Restore the previously-active project tab. Set this even when the
+    // saved layout has no cells: the user may have closed the app on an
+    // empty project and we still want that project preselected. The
+    // project-list reconcile in `setProjects` keeps this slug set as long
+    // as it still exists on disk.
+    if (saved.project_slug) setActiveProjectSlug(saved.project_slug);
 
     if (!saved.cells || saved.cells.length === 0) return;
 
@@ -127,6 +145,15 @@ async function hydrateActiveLayout(): Promise<void> {
     setRuntimeLayout(cells);
   } catch {
     // Non-Tauri environment (browser dev) or missing file — silently skip.
+  } finally {
+    // Open the persistence gate exactly once, after hydration has either
+    // restored cells or confirmed there were none. Any save scheduled by
+    // the project-list refresh that races us at startup has been parked
+    // until now — without this gate, that early save could overwrite the
+    // on-disk layout with `cells: []` before we read it back, leaving the
+    // grid empty on the next launch with every live session adrift in the
+    // dock as an orphan.
+    openActiveLayoutSaveGate();
   }
 }
 
@@ -146,9 +173,23 @@ const App: Component = () => {
     installDevtoolsShortcut();
     void loadThemeFromConfig().catch((e) => console.warn("loadThemeFromConfig failed", e));
     void initHomeDir();
-    void installFileDrop().catch((e) => console.warn("installFileDrop failed", e));
+    let disposed = false;
+    let stopFileDrop: (() => void) | undefined;
+    void installFileDrop()
+      .then((unlisten) => {
+        if (disposed) {
+          unlisten();
+          return;
+        }
+        stopFileDrop = unlisten;
+      })
+      .catch((e) => console.warn("installFileDrop failed", e));
     const stopShellContextPoller = startShellContextPoller();
-    onCleanup(stopShellContextPoller);
+    onCleanup(() => {
+      disposed = true;
+      stopFileDrop?.();
+      stopShellContextPoller();
+    });
   });
 
   // §13.2 — mount the onboarding wizard on first launch (config.onboarded =
@@ -165,6 +206,9 @@ const App: Component = () => {
       void scheduleBackgroundUpdateCheck(c);
       return c;
     } catch {
+      // No Tauri host (browser dev / vitest) — there is no layout to read,
+      // so unblock the save gate so future saves can proceed normally.
+      openActiveLayoutSaveGate();
       return { onboarded: true };
     }
   });

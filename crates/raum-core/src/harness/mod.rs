@@ -26,6 +26,7 @@ pub mod codex;
 pub mod event;
 pub mod hook_script;
 pub mod launch;
+pub mod models;
 pub mod opencode;
 pub mod opencode_reply;
 pub mod opencode_sse;
@@ -40,7 +41,12 @@ pub use event::{
     NotificationEvent, NotificationKind, PermissionRequestId, Reliability, SourceId,
     classify_notification_event, classify_notification_kind, decode_payload,
 };
-pub use launch::{harness_launch_command, parse_opencode_port_arg};
+pub use launch::{
+    ModelOverride, harness_launch_command, harness_launch_command_with_prompt,
+    harness_launch_command_with_prompt_and_override, harness_resume_command,
+    parse_opencode_port_arg,
+};
+pub use models::{HarnessModel, list_models};
 pub use opencode::OpenCodeAdapter;
 pub use reply::{Decision, PermissionReplier, ReplyError, ReplyMode};
 pub use setup::{

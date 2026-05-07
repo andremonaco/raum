@@ -32,7 +32,7 @@ describe("crossProjectProjection cache", () => {
       orderedIds: ["a", "b", "c"],
     });
     const second = getCrossProjectProjection({
-      mode: "recent",
+      mode: "completed",
       orderedIds: ["a", "b", "c"],
     });
     const third = getCrossProjectProjection({

@@ -18,6 +18,12 @@ export interface TerminalSurfaceDescriptor {
   visible: boolean;
   active: boolean;
   maximized: boolean;
+  /** Cross-harness review: forwarded into the next `terminal_spawn`. Set on
+   *  the tab by the review-intent drop handler; cleared once consumed. */
+  initialPrompt?: string;
+  /** Cross-harness review: forwarded into the next `terminal_spawn` as
+   *  `model_override`. Set by the pre-spawn picker; cleared once consumed. */
+  modelOverride?: { model: string; effort?: string };
 }
 
 export interface ProjectTerminalSurfacesArgs {
@@ -102,13 +108,14 @@ export function projectTerminalSurfaces(
         ? (args.previewRectMap.get(cell.id) ?? null)
         : null;
     const activeRect = previewRect ?? committedRect;
-    const blockedByOtherMaximized =
-      args.maximizedPaneId !== null && args.maximizedPaneId !== cell.id;
+    // Siblings of a maximized pane stay rendered at their committed rects so
+    // the maximize/restore animation can grow/shrink the maximized pane over
+    // them without the others snapping in and out. The `.pane-maximized`
+    // rule's z-index lifts the maximized surface above siblings within the
+    // surface layer, so they're visually covered for the duration of the
+    // maximize state without needing to be hidden.
     const normalCellVisible =
-      !isCrossProject &&
-      activeRect !== null &&
-      !args.minimizedPaneIds.has(cell.id) &&
-      !blockedByOtherMaximized;
+      !isCrossProject && activeRect !== null && !args.minimizedPaneIds.has(cell.id);
 
     for (const tab of cell.tabs) {
       const activeTab = tab.id === cell.activeTabId;
@@ -140,6 +147,8 @@ export function projectTerminalSurfaces(
           visible,
           active: visible && activeTab && args.focusedPaneId === cell.id,
           maximized,
+          initialPrompt: tab.initialPrompt,
+          modelOverride: tab.modelOverride,
         },
         activeTab,
       );
