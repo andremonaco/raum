@@ -19,6 +19,8 @@ import { createStore, reconcile } from "solid-js/store";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
+import { scheduleActiveSave } from "./runtimeLayoutStore";
+
 export interface ProjectListItem {
   slug: string;
   name: string;
@@ -48,7 +50,18 @@ const [projectBySlug, setProjectBySlug] = createSignal<ReadonlyMap<string, Proje
 
 export { projectBySlug };
 
-const [activeProjectSlug, setActiveProjectSlug] = createSignal<string | undefined>(undefined);
+const [activeProjectSlug, setActiveProjectSlugInternal] = createSignal<string | undefined>(
+  undefined,
+);
+
+/** Set the currently-active project tab. Persists into the active-layout
+ *  snapshot so the same project is reselected on next launch — without this
+ *  the rehydrated grid renders empty until the user clicks a project tab. */
+function setActiveProjectSlug(slug: string | undefined): void {
+  if (activeProjectSlug() === slug) return;
+  setActiveProjectSlugInternal(slug);
+  scheduleActiveSave();
+}
 
 export { activeProjectSlug, setActiveProjectSlug };
 
@@ -178,5 +191,5 @@ export async function subscribeProjectEvents(): Promise<UnlistenFn> {
 export function __resetProjectStoreForTests(): void {
   setProjectStore({ items: [], loaded: false });
   setProjectBySlug(new Map());
-  setActiveProjectSlug(undefined);
+  setActiveProjectSlugInternal(undefined);
 }

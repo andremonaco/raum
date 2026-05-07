@@ -16,3 +16,19 @@ if (typeof window !== "undefined" && typeof window.matchMedia !== "function") {
       dispatchEvent: () => false,
     }) as unknown as MediaQueryList;
 }
+
+// jsdom doesn't ship `ResizeObserver`. Several components observe size
+// changes on layout roots in `onMount`; the call sites are guarded by
+// `typeof ResizeObserver !== "undefined"` where they could degrade
+// gracefully, but `terminal-grid.tsx` requires the observer to drive
+// drag-preview rect recomputation and isn't conditional. Stub a no-op
+// implementation so component mounts under jsdom don't throw.
+if (typeof globalThis.ResizeObserver === "undefined") {
+  class NoopResizeObserver {
+    observe(): void {}
+    unobserve(): void {}
+    disconnect(): void {}
+  }
+  (globalThis as unknown as { ResizeObserver: typeof NoopResizeObserver }).ResizeObserver =
+    NoopResizeObserver;
+}

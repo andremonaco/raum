@@ -79,7 +79,7 @@ describe("terminalSurfaceProjection", () => {
       cells: [alpha],
       activeRectMap: new Map([["alpha", rect("alpha")]]),
       minimizedPaneIds: new Set(),
-      crossProjectMode: "recent",
+      crossProjectMode: "completed",
       projectedSessionIds: ["session-alpha"],
       projectedRectMap: new Map([["session-alpha", rect("session-alpha", 5000, 0)]]),
       terminalById: { "session-alpha": terminal("session-alpha") },
@@ -145,7 +145,7 @@ describe("terminalSurfaceProjection", () => {
     expect(surfaces.map((surface) => surface.key)).toEqual(["tab-alpha"]);
   });
 
-  it("hides layout surfaces behind another maximized pane", () => {
+  it("keeps siblings of a maximized pane visible at their committed rects so the maximize transition can grow over them", () => {
     const alpha = cell("alpha", "alpha");
     const beta = cell("beta", "alpha");
 
@@ -164,10 +164,13 @@ describe("terminalSurfaceProjection", () => {
       maximizedPaneId: "beta",
     });
 
+    // Sibling stays mounted/visible at its rect — the `.pane-maximized`
+    // z-index lift on `beta` covers it visually. Hiding it here would snap
+    // it out instead of letting the maximize/restore transition grow over
+    // and uncover it.
     expect(surfaces.find((surface) => surface.cellId === "alpha")).toMatchObject({
-      visible: false,
+      visible: true,
       maximized: false,
-      rect: null,
     });
     expect(surfaces.find((surface) => surface.cellId === "beta")).toMatchObject({
       visible: true,
@@ -224,7 +227,7 @@ describe("terminalSurfaceProjection", () => {
       cells: [owner],
       activeRectMap: new Map([["owner", rect("owner")]]),
       minimizedPaneIds: new Set(),
-      crossProjectMode: "recent",
+      crossProjectMode: "completed",
       projectedSessionIds: ["session-owner"],
       projectedRectMap: new Map([["session-owner", projected]]),
       terminalById: { "session-owner": terminal("session-owner") },

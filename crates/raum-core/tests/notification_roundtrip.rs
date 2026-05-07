@@ -592,22 +592,29 @@ async fn codex_hook_dispatcher_forwards_lifecycle_events_to_event_socket() {
             ),
             other => panic!("unexpected event name {other}"),
         };
-        // Codex hands the payload as the LAST argv (matches
-        // `legacy_notify.rs::command.arg(notify_payload)` upstream),
-        // and inherits its own stdin into the child without closing
-        // it. We mirror both: payload-as-argv + Stdio::null() for stdin.
+        // Codex's `[hooks]` runtime invokes the script as
+        // `<script> <event>` and pipes the JSON payload on stdin (see
+        // https://developers.openai.com/codex/hooks). We mirror that
+        // here: argv carries only the event name, payload is written
+        // to the child's stdin.
         let mut child = Command::new("sh")
             .arg("-x")
             .arg(&script)
             .arg(event_name)
-            .arg(payload)
             .env("RAUM_EVENT_SOCK", &sock_path)
             .env("RAUM_SESSION", "raum-codex-1")
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            stdin.write_all(payload.as_bytes()).await.unwrap();
+            // Drop the handle so the child sees EOF — `cat` returns
+            // and the dispatcher continues.
+            drop(stdin);
+        }
         let mut child_stderr = child.stderr.take();
         let stderr_handle = tokio::spawn(async move {
             let mut buf = Vec::new();
@@ -779,7 +786,7 @@ async fn opencode_sse_emits_permission_and_reply_then_http_replier_posts_allow()
 
     let pending = new_pending_map();
     let fallback = SessionId::new("raum-default");
-    let channel = OpenCodeSseChannel::new(server.uri(), pending.clone(), fallback);
+    let channel = OpenCodeSseChannel::new(server.uri(), pending.clone(), fallback.clone());
 
     let (tx, mut rx) = mpsc::channel(8);
     let cancel = CancellationToken::new();
@@ -798,7 +805,13 @@ async fn opencode_sse_emits_permission_and_reply_then_http_replier_posts_allow()
         ev.request_id.as_ref().map(|r| r.as_str().to_string()),
         Some("perm-42".to_string())
     );
-    assert_eq!(ev.session_id, SessionId::new("sess-42"));
+    assert_eq!(ev.session_id, fallback);
+    assert_eq!(
+        ev.payload
+            .get("sessionID")
+            .and_then(serde_json::Value::as_str),
+        Some("sess-42")
+    );
 
     // 2. permission.replied → TurnEnd.
     let ev = timeout(STEP_TIMEOUT, rx.recv())
@@ -848,7 +861,7 @@ async fn opencode_sse_emits_question_waiting_and_resume_events() {
 
     let pending = new_pending_map();
     let fallback = SessionId::new("raum-default");
-    let channel = OpenCodeSseChannel::new(server.uri(), pending, fallback);
+    let channel = OpenCodeSseChannel::new(server.uri(), pending, fallback.clone());
 
     let (tx, mut rx) = mpsc::channel(8);
     let cancel = CancellationToken::new();
@@ -862,7 +875,13 @@ async fn opencode_sse_emits_question_waiting_and_resume_events() {
     assert_eq!(ev.kind, NotificationKind::IdlePromptNeeded);
     assert_eq!(ev.harness, AgentKind::OpenCode);
     assert_eq!(ev.reliability, Reliability::Deterministic);
-    assert_eq!(ev.session_id, SessionId::new("sess-42"));
+    assert_eq!(ev.session_id, fallback);
+    assert_eq!(
+        ev.payload
+            .get("sessionID")
+            .and_then(serde_json::Value::as_str),
+        Some("sess-42")
+    );
     assert!(ev.request_id.is_none());
 
     let ev = timeout(STEP_TIMEOUT, rx.recv())
@@ -870,14 +889,14 @@ async fn opencode_sse_emits_question_waiting_and_resume_events() {
         .expect("sse stream stalled waiting for question.replied")
         .expect("sink closed");
     assert_eq!(ev.kind, NotificationKind::TurnStart);
-    assert_eq!(ev.session_id, SessionId::new("sess-42"));
+    assert_eq!(ev.session_id, SessionId::new("raum-default"));
 
     let ev = timeout(STEP_TIMEOUT, rx.recv())
         .await
         .expect("sse stream stalled waiting for question.rejected")
         .expect("sink closed");
     assert_eq!(ev.kind, NotificationKind::TurnStart);
-    assert_eq!(ev.session_id, SessionId::new("sess-42"));
+    assert_eq!(ev.session_id, SessionId::new("raum-default"));
 
     cancel.cancel();
     let _ = task.await;

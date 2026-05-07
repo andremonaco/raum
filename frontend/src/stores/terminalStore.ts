@@ -21,7 +21,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { createStore, reconcile } from "solid-js/store";
 import { agentStore, type AgentKind, type AgentState } from "./agentStore";
-import { removeTabsBySessionId } from "./runtimeLayoutStore";
+import { removeTabsBySessionId, replaceTabsSessionId } from "./runtimeLayoutStore";
+import { clearReviewLinkForSession } from "./reviewLinkStore";
 
 const TERMINAL_PANE_CONTEXT_CHANGED_EVENT = "terminal-pane-context-changed";
 const PANE_PROMPT_UPDATED_EVENT = "pane:prompt-updated";
@@ -671,19 +672,16 @@ export const waitingCount = selectors.waitingCount;
 /** Count of harnesses at rest (state = `idle`). */
 export const idleCount = selectors.idleCount;
 
-export type CrossProjectHarnessMode = "awaiting" | "working" | "recent";
+export type CrossProjectHarnessMode = "awaiting" | "working" | "completed";
 
 export function listCrossProjectHarnessSessions(mode: CrossProjectHarnessMode): TerminalRecord[] {
   if (mode === "awaiting") return waitingTerminals();
   if (mode === "working") return activeTerminals();
 
-  const ids = [...harnessIds()];
+  // "completed" — idle harnesses across every project, sorted by most recent
+  // output (or creation time, when no PTY tick has landed yet).
+  const records = resolveHarnessIds(idleIds());
   const lo = lastOutputBySession();
-  const records: TerminalRecord[] = [];
-  for (const id of ids) {
-    const record = terminalStore.byId[id];
-    if (record) records.push(record);
-  }
   records.sort(
     (left, right) =>
       (lo.get(right.session_id) ?? right.created_unix * 1000) -
@@ -735,6 +733,11 @@ interface TerminalPaneContextChanged extends TerminalPaneContext {
   sessionId: string;
 }
 
+interface TerminalSessionReplaced {
+  oldSessionId: string;
+  newSessionId: string;
+}
+
 interface PanePromptUpdated {
   session_id: AgentStateChanged["session_id"];
   harness: AgentKind;
@@ -760,7 +763,20 @@ export async function subscribeTerminalEvents(): Promise<UnlistenFn> {
     if (!ev.payload.session_id) return;
     removeTerminal(ev.payload.session_id);
     removeTabsBySessionId(ev.payload.session_id);
+    // Cross-harness review: tell the backend to drop any link involving
+    // this session so the linked-pane badge clears on the surviving side.
+    void clearReviewLinkForSession(ev.payload.session_id);
   });
+  const unlistenReplaced = await listen<TerminalSessionReplaced>(
+    "terminal-session-replaced",
+    (ev) => {
+      const oldId = ev.payload.oldSessionId;
+      const newId = ev.payload.newSessionId;
+      if (!oldId || !newId) return;
+      replaceTabsSessionId(oldId, newId);
+      removeTerminal(oldId);
+    },
+  );
   const unlistenPaneContext = await listen<TerminalPaneContextChanged>(
     TERMINAL_PANE_CONTEXT_CHANGED_EVENT,
     (ev) => {
@@ -789,6 +805,7 @@ export async function subscribeTerminalEvents(): Promise<UnlistenFn> {
   return () => {
     unlistenUpsert();
     unlistenRemoved();
+    unlistenReplaced();
     unlistenPaneContext();
     unlistenAgentState();
     unlistenPrompt();

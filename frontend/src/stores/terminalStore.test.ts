@@ -212,14 +212,18 @@ describe("terminalStore harness counts", () => {
     ]);
   });
 
-  it("lists recent cross-project sessions uncapped and sorted by last output", () => {
+  it("lists completed (idle) cross-project sessions sorted by last output", () => {
     vi.useFakeTimers();
     try {
       setTerminals([
         terminal({ session_id: "older", created_unix: 1 }),
         terminal({ session_id: "middle", project_slug: "beta", kind: "codex", created_unix: 2 }),
         terminal({ session_id: "newer", project_slug: "gamma", kind: "opencode", created_unix: 3 }),
+        terminal({ session_id: "busy", project_slug: "delta", kind: "codex", created_unix: 4 }),
       ]);
+
+      // `busy` is actively working — must NOT show in the completed view.
+      applyAgentStateToTerminal("busy", "working");
 
       vi.setSystemTime(new Date("2026-04-23T10:00:00Z"));
       markOutput("older");
@@ -228,7 +232,7 @@ describe("terminalStore harness counts", () => {
       vi.setSystemTime(new Date("2026-04-23T10:00:02Z"));
       markOutput("newer");
 
-      expect(listCrossProjectHarnessSessions("recent").map((t) => t.session_id)).toEqual([
+      expect(listCrossProjectHarnessSessions("completed").map((t) => t.session_id)).toEqual([
         "newer",
         "middle",
         "older",

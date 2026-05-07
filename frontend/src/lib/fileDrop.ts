@@ -14,11 +14,19 @@
  *      (anthropics/claude-code #16532, #4705).
  *
  * Pane resolution: the Tauri v2 drag-drop event is window-global, so we
- * hit-test the cursor against `[data-session-id]` elements. `position`
- * arrives in physical pixels; we divide by devicePixelRatio before
- * `elementFromPoint`. HTML5 DnD listeners don't work reliably on the
- * xterm.js surface (hidden textarea + shadow DOM), which is why we use
- * the OS-level Tauri path.
+ * hit-test the cursor against the rendered pane shells. Webview/OS pairs
+ * disagree on whether `position` is already in CSS pixels or needs a
+ * devicePixelRatio conversion, so we first try the raw point and only fall
+ * back to DPR-scaled coordinates if raw misses every pane. We iterate the actual
+ * `[data-pane-id][data-session-id]` shells and pick the one whose rect
+ * contains the cursor — `elementFromPoint` + `closest()` is unreliable
+ * here because xterm's canvas/textarea, surface-frame chrome, and
+ * absolutely-positioned overlays (snap, exit dialog, history) often sit
+ * between the cursor and the pane shell, causing the closest-walk to land
+ * on a sibling or an outer frame that lacks `data-pane-id`.
+ *
+ * HTML5 DnD listeners don't work reliably on the xterm.js surface either,
+ * which is why we use the OS-level Tauri path.
  */
 
 import { createSignal } from "solid-js";
@@ -29,7 +37,8 @@ import { terminalStore } from "../stores/terminalStore";
 import type { AgentKind } from "../stores/agentStore";
 
 const [dropTargetPaneId, setDropTargetPaneId] = createSignal<string | null>(null);
-export { dropTargetPaneId };
+const [dropPreviewPaths, setDropPreviewPaths] = createSignal<string[]>([]);
+export { dropTargetPaneId, dropPreviewPaths };
 
 export type PasteMode = "harness" | "shell";
 
@@ -43,21 +52,62 @@ export function pasteModeForKind(kind: AgentKind | undefined): PasteMode {
   return "shell";
 }
 
-interface PaneHit {
+export interface PaneHit {
   paneId: string;
   sessionId: string;
 }
 
-function paneUnderCursor(physicalX: number, physicalY: number): PaneHit | null {
+interface LogicalPoint {
+  x: number;
+  y: number;
+}
+
+function isVisiblePaneShell(shell: HTMLElement): boolean {
+  for (let el: HTMLElement | null = shell; el; el = el.parentElement) {
+    const style = window.getComputedStyle(el);
+    if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") {
+      return false;
+    }
+  }
+  return true;
+}
+
+function paneUnderLogicalCursor(point: LogicalPoint): PaneHit | null {
+  const shells = document.querySelectorAll<HTMLElement>("[data-pane-id][data-session-id]");
+  let hit: PaneHit | null = null;
+  for (const shell of shells) {
+    const sessionId = shell.dataset.sessionId ?? "";
+    const paneId = shell.dataset.paneId ?? "";
+    if (!sessionId || !paneId) continue;
+    if (!isVisiblePaneShell(shell)) continue;
+    const rect = shell.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) continue;
+    if (
+      point.x < rect.left ||
+      point.x >= rect.right ||
+      point.y < rect.top ||
+      point.y >= rect.bottom
+    ) {
+      continue;
+    }
+    hit = { paneId, sessionId };
+  }
+  return hit;
+}
+
+/** Geometric hit-test against pane shells. Iterates every mounted
+ *  `[data-pane-id][data-session-id]` shell and picks the one whose
+ *  bounding rect contains the cursor. If multiple rects overlap (e.g. a
+ *  cross-review snap overlay), the last one in DOM order wins — that
+ *  matches paint order and matches what the user visually sees on top.
+ *  Exported for tests. */
+export function paneUnderCursor(physicalX: number, physicalY: number): PaneHit | null {
+  const raw = paneUnderLogicalCursor({ x: physicalX, y: physicalY });
+  if (raw) return raw;
+
   const dpr = window.devicePixelRatio || 1;
-  const el = document.elementFromPoint(physicalX / dpr, physicalY / dpr);
-  if (!el) return null;
-  const shell = el.closest<HTMLElement>("[data-session-id]");
-  if (!shell) return null;
-  const sessionId = shell.dataset.sessionId ?? "";
-  const paneId = shell.dataset.paneId ?? "";
-  if (!sessionId || !paneId) return null;
-  return { paneId, sessionId };
+  if (dpr === 1) return null;
+  return paneUnderLogicalCursor({ x: physicalX / dpr, y: physicalY / dpr });
 }
 
 /** Install the window-level drag-drop handler. Resolves to an unsubscribe
@@ -73,8 +123,10 @@ export async function installFileDrop(): Promise<() => void> {
         // from a webpage) — nothing to insert, so no highlight either.
         if (payload.paths.length === 0) {
           setDropTargetPaneId(null);
+          setDropPreviewPaths([]);
           return;
         }
+        setDropPreviewPaths(payload.paths);
         const hit = paneUnderCursor(payload.position.x, payload.position.y);
         setDropTargetPaneId(hit?.paneId ?? null);
         return;
@@ -86,15 +138,22 @@ export async function installFileDrop(): Promise<() => void> {
       }
       case "leave": {
         setDropTargetPaneId(null);
+        setDropPreviewPaths([]);
         return;
       }
       case "drop": {
         setDropTargetPaneId(null);
+        setDropPreviewPaths([]);
         if (payload.paths.length === 0) return;
         const hit = paneUnderCursor(payload.position.x, payload.position.y);
         if (!hit) return;
         const kind = terminalStore.byId[hit.sessionId]?.kind;
         const mode = pasteModeForKind(kind);
+        window.dispatchEvent(
+          new CustomEvent("terminal-focus-requested", {
+            detail: { sessionId: hit.sessionId },
+          }),
+        );
         void invoke("terminal_paste_paths", {
           sessionId: hit.sessionId,
           paths: payload.paths,

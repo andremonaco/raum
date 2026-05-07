@@ -6,8 +6,8 @@
  */
 
 export const SCROLLBACK_MIN = 100;
-export const SCROLLBACK_MAX = 10_000;
-export const SCROLLBACK_DEFAULT = 10_000;
+export const SCROLLBACK_MAX = 100_000;
+export const SCROLLBACK_DEFAULT = 100_000;
 
 /**
  * Coerce an arbitrary value into a valid scrollback line count.

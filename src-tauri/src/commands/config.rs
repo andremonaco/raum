@@ -146,6 +146,29 @@ pub fn config_set_harness_flags(
     store.write_config(&cfg).map_err(|e| e.to_string())
 }
 
+/// Toggle Claude Code's fullscreen (alt-screen) rendering. When `enabled`
+/// is `true` (default) raum injects `CLAUDE_CODE_NO_FLICKER=1` into newly
+/// spawned panes so Claude paints the alt-screen and doesn't poison
+/// scrollback with hard-wrapped Ink output on resize. Set `false` to opt
+/// back into the legacy inline mode.
+///
+/// Existing panes continue running with whatever mode they were spawned
+/// under — the env var is consumed at boot. The toggle takes effect for
+/// the next pane spawn / replacement.
+#[tauri::command]
+pub fn config_set_claude_fullscreen(
+    state: tauri::State<'_, AppHandleState>,
+    enabled: bool,
+) -> Result<(), String> {
+    let store = state.config_store.lock().map_err(|e| e.to_string())?;
+    let mut cfg: Config = store.read_config().map_err(|e| e.to_string())?;
+    if cfg.harnesses.claude_code.fullscreen == enabled {
+        return Ok(());
+    }
+    cfg.harnesses.claude_code.fullscreen = enabled;
+    store.write_config(&cfg).map_err(|e| e.to_string())
+}
+
 /// Persist the appearance theme. Pass `theme_id` to switch to a curated
 /// catalog entry (clears any custom path) or `custom_theme_path` to point at
 /// a user-supplied VSCode theme JSON on disk (sets `theme_id` back to the
@@ -168,6 +191,23 @@ pub fn config_set_appearance_theme(
     }
     cfg.appearance.theme_id = next_theme;
     cfg.appearance.custom_theme_path = next_custom;
+    store.write_config(&cfg).map_err(|e| e.to_string())
+}
+
+/// Persist the per-pane prompt-overlay toggle. The overlay fades the
+/// first and last user prompt over each agent pane as a glanceable
+/// banner; some users find it noisy and want it off.
+#[tauri::command]
+pub fn config_set_appearance_show_prompt_overlay(
+    state: tauri::State<'_, AppHandleState>,
+    enabled: bool,
+) -> Result<(), String> {
+    let store = state.config_store.lock().map_err(|e| e.to_string())?;
+    let mut cfg: Config = store.read_config().map_err(|e| e.to_string())?;
+    if cfg.appearance.show_prompt_overlay == enabled {
+        return Ok(());
+    }
+    cfg.appearance.show_prompt_overlay = enabled;
     store.write_config(&cfg).map_err(|e| e.to_string())
 }
 

@@ -53,6 +53,17 @@ pub fn event_socket_path() -> PathBuf {
     state_dir().join("events.sock")
 }
 
+/// Per-pane terminal-snapshot directory. raum persists xterm.js
+/// `SerializeAddon`-encoded VT blobs here for the inline-Claude / shell
+/// reattach paths so cross-restart scrollback survives without abusing the
+/// webview's localStorage (which is capped at ~5 MiB and evictable on
+/// macOS WebKit's 7-day storage policy). Snapshots are deleted when the
+/// owning tmux session is killed; the directory itself is GC'd on raum
+/// startup against the live tmux session list.
+pub fn terminal_snapshots_dir() -> PathBuf {
+    state_dir().join("terminal-snapshots")
+}
+
 fn home_dir() -> PathBuf {
     if let Ok(home) = env::var("HOME") {
         if !home.is_empty() {

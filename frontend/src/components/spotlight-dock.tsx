@@ -317,9 +317,9 @@ export const SpotlightDock: Component = () => {
       return [...recents, ...harnessMatches()];
     }
     return [
+      ...fileHits().map((hit): FileItem => ({ type: "file", hit })),
       ...harnessMatches(),
       ...scrollbackItems(),
-      ...fileHits().map((hit): FileItem => ({ type: "file", hit })),
     ];
   });
 
@@ -517,9 +517,6 @@ export const SpotlightDock: Component = () => {
                 <Show when={!query().trim() && sections().hasHarnesses}>
                   <SectionHeader label="Terminals" />
                 </Show>
-                <Show when={query().trim() && sections().harnessCount > 0}>
-                  <SectionHeader label="Terminals" />
-                </Show>
 
                 <For each={sections().items}>
                   {(item, idx) => {
@@ -528,6 +525,11 @@ export const SpotlightDock: Component = () => {
                         item.type === "file" &&
                         (idx() === 0 || sections().items[idx() - 1]?.type !== "file"),
                     );
+                    const isFirstHarness = createMemo(
+                      () =>
+                        item.type === "harness" &&
+                        (idx() === 0 || sections().items[idx() - 1]?.type !== "harness"),
+                    );
                     const isFirstScrollback = createMemo(
                       () =>
                         item.type === "scrollback" &&
@@ -535,11 +537,14 @@ export const SpotlightDock: Component = () => {
                     );
                     return (
                       <>
-                        <Show when={isFirstScrollback()}>
-                          <SectionHeader label="Scrollback" count={sections().scrollbackCount} />
-                        </Show>
                         <Show when={isFirstFile()}>
                           <SectionHeader label="Files" count={sections().fileCount} />
+                        </Show>
+                        <Show when={query().trim() && isFirstHarness()}>
+                          <SectionHeader label="Terminals" count={sections().harnessCount} />
+                        </Show>
+                        <Show when={isFirstScrollback()}>
+                          <SectionHeader label="Scrollback" count={sections().scrollbackCount} />
                         </Show>
                         <ResultRow
                           selected={selectedIdx() === idx()}

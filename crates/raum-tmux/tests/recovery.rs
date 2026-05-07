@@ -181,6 +181,80 @@ async fn pty_bridge_streams_attached_client_output() {
     let _ = mgr.kill_server();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pty_bridge_preserves_large_burst_markers() {
+    if !tmux_available() {
+        eprintln!("pty bridge burst test: tmux not on PATH, skipping");
+        return;
+    }
+
+    let socket = unique_socket();
+    let session_id = format!("burst-{}", std::process::id());
+
+    let mgr = TmuxManager::with_socket(socket.clone());
+    mgr.new_session(&session_id, &PathBuf::from("/tmp"), None, Some((100, 30)))
+        .expect("new-session");
+    let _ = mgr.apply_server_options();
+
+    let received_bytes: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+    let received_for_sink = received_bytes.clone();
+    let bridge = attach_via_pty(
+        &mgr,
+        &session_id,
+        100,
+        30,
+        Box::new(move |bytes| {
+            *received_for_sink.lock().unwrap() += bytes.len();
+            true
+        }),
+        Box::new(|_| {}),
+    )
+    .expect("attach_via_pty");
+
+    mgr.respawn_with(
+        &session_id,
+        "sh -lc 'printf \"RAUM_BURST_START\\n\"; i=0; while [ \"$i\" -lt 2500 ]; do printf \"RAUM_BURST_LINE_%04d abcdefghijklmnopqrstuvwxyz 0123456789\\n\" \"$i\"; i=$((i + 1)); done; printf \"RAUM_BURST_END\\n\"; sleep 2'",
+    )
+    .expect("respawn_with");
+
+    // Verify the burst landed in tmux's scrollback rather than the live PTY
+    // stream: an attached client paints a rendered terminal, and Linux tmux
+    // collapses rapid 2.5k-line scrolls via cursor-position deltas, so the
+    // literal markers may never appear in the bridge bytes even though they
+    // are preserved in the pane history. capture-pane sees the real buffer.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut captured = String::new();
+    while Instant::now() < deadline {
+        let snapshot = mgr
+            .capture_pane_snapshot(&session_id)
+            .expect("capture_pane_snapshot");
+        captured = String::from_utf8_lossy(&snapshot.normal).into_owned();
+        if captured.contains("RAUM_BURST_START") && captured.contains("RAUM_BURST_END") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    assert!(
+        *received_bytes.lock().unwrap() > 0,
+        "PTY bridge should have forwarded some bytes from the burst"
+    );
+    assert!(
+        captured.contains("RAUM_BURST_START"),
+        "scrollback should retain the start marker; captured {} bytes",
+        captured.len()
+    );
+    assert!(
+        captured.contains("RAUM_BURST_END"),
+        "scrollback should retain the end marker; captured {} bytes",
+        captured.len()
+    );
+
+    drop(bridge);
+    let _ = mgr.kill_session(&session_id);
+    let _ = mgr.kill_server();
+}
+
 #[tokio::test]
 async fn paste_into_pane_round_trips_payload_with_spaces_and_quotes() {
     if !tmux_available() {
@@ -294,6 +368,52 @@ async fn capture_pane_snapshot_returns_normal_buffer_with_crlf() {
     assert!(
         !captured.windows(2).any(|w| w[0] != b'\r' && w[1] == b'\n'),
         "captured history must not contain bare LFs"
+    );
+
+    let _ = mgr.kill_session(&session_id);
+    let _ = mgr.kill_server();
+}
+
+#[tokio::test]
+async fn capture_pane_snapshot_preserves_long_scrollback() {
+    if !tmux_available() {
+        eprintln!("long capture-pane test: tmux not on PATH, skipping");
+        return;
+    }
+
+    let socket = unique_socket();
+    let session_id = format!("longcap-{}", std::process::id());
+
+    start_server_with_pinned_lifetime(&socket);
+    let mgr = TmuxManager::with_socket(socket.clone());
+    mgr.new_session(&session_id, &PathBuf::from("/tmp"), None, Some((100, 24)))
+        .expect("new-session");
+    mgr.respawn_with(
+        &session_id,
+        "sh -c 'i=1; while [ $i -le 5200 ]; do printf \"raum-long-%04d\\n\" \"$i\"; i=$((i + 1)); done; sleep 5'",
+    )
+    .expect("respawn_with");
+
+    let mut captured = String::new();
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let snapshot = mgr
+            .capture_pane_snapshot(&session_id)
+            .expect("capture_pane_snapshot");
+        captured = String::from_utf8_lossy(&snapshot.normal).into_owned();
+        if captured.contains("raum-long-5200") {
+            break;
+        }
+    }
+
+    assert!(
+        captured.contains("raum-long-0001"),
+        "full snapshot should include the oldest retained marker, got prefix: {:?}",
+        &captured.chars().take(200).collect::<String>()
+    );
+    assert!(
+        captured.contains("raum-long-5200"),
+        "full snapshot should include the newest marker"
     );
 
     let _ = mgr.kill_session(&session_id);

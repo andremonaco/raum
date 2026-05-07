@@ -8,6 +8,8 @@ interface ScrollableProps {
   axis?: "x" | "y" | "both";
   /** Hidden by default; "auto" mirrors native `overflow: auto`. */
   style?: JSX.CSSProperties;
+  /** Hide the visible rail while keeping wheel/drag scrolling intact. */
+  hideScrollbar?: boolean;
 }
 
 const AXIS_OPTIONS: Record<
@@ -37,7 +39,7 @@ export const Scrollable: ParentComponent<ScrollableProps> = (props) => {
       style={props.style}
       options={{
         scrollbars: {
-          theme: "os-theme-raum",
+          theme: props.hideScrollbar ? "os-theme-raum os-theme-raum--hidden" : "os-theme-raum",
           /* Always visible when content overflows — the thread is subtle
              enough to read as a quiet rail rather than an interruption. */
           autoHide: "never",

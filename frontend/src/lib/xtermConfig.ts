@@ -51,12 +51,17 @@ export const BASE_TERMINAL_OPTIONS = {
   scrollOnUserInput: false,
   fastScrollSensitivity: 5,
   scrollSensitivity: 1.5,
-  // Default is already false, but set explicitly: ED2 (`\x1b[2J` - erase
-  // entire display) should clear the viewport WITHOUT pushing erased
-  // lines into scrollback. Tmux's composite repaint uses ED2; without
-  // this, every repaint would cram the previous viewport into
-  // scrollback — stacking ghost frames on every resize.
-  scrollOnEraseInDisplay: false,
+  // ED2 (`\x1b[2J` - erase entire display) pushes the cleared viewport
+  // into scrollback before wiping it. Tmux issues ED2 on resize, on
+  // initial attach, and on slow-client catch-up; with `false` those
+  // repaints silently dropped real content during heavy bursts (large
+  // plans, big pastes) — leaving mid-sentence gaps the user couldn't
+  // scroll back to recover. With `true` scrollback occasionally contains
+  // a duplicate snapshot of the viewport at each repaint moment, but it
+  // never loses real output. Codex's alt-screen ED2s are unaffected
+  // because alt-screen is suppressed at the attached-client boundary
+  // (`crates/raum-tmux/src/manager.rs:179-184` strips smcup/rmcup).
+  scrollOnEraseInDisplay: true,
 } satisfies Partial<ITerminalOptions> & { fontLigatures: boolean };
 
 /**

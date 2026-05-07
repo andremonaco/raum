@@ -12,7 +12,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use raum_core::config::SessionState;
+use raum_core::config::{SessionState, XTERM_SCROLLBACK_LINES};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::warn;
@@ -150,8 +150,8 @@ impl TmuxManager {
     /// Apply the server-wide options that make every PTY-attached `tmux
     /// attach-session` client as transparent as possible without flattening
     /// tmux's normal and alternate buffers into one surface. We still disable
-    /// the prefix, status bar, synthetic focus events, and title escapes so
-    /// the attached client behaves like a plain terminal tab.
+    /// the prefix, status bar, and title escapes so the attached client
+    /// behaves like a plain terminal tab.
     ///
     /// Idempotent: tmux's `set` clobbers prior values, so calling this on
     /// every launch is safe even when the server is already running.
@@ -182,9 +182,12 @@ impl TmuxManager {
             "terminal-overrides",
             ",xterm-256color:smcup@:rmcup@",
         ]);
-        // Don't synthesize focus reporting at the tmux layer. The inner
-        // process can request `?1004h` directly if it cares.
-        self.run_quiet(&["set-option", "-g", "focus-events", "off"]);
+        // Forward `\e[I` / `\e[O` from the attached client through to the
+        // inner process when it has requested DECSET 1004. With this off,
+        // tmux silently drops those bytes and harnesses (Claude Code, Codex,
+        // vim's `:set autoread`, etc.) never see focus transitions — and
+        // `claude doctor` flags the misconfiguration.
+        self.run_quiet(&["set-option", "-g", "focus-events", "on"]);
         // Don't emit DECSLRM / xterm title escapes from tmux.
         self.run_quiet(&["set-option", "-g", "set-titles", "off"]);
         Ok(())
@@ -324,9 +327,17 @@ impl TmuxManager {
         let (init_cols, init_rows) = initial_size.unwrap_or((200, 50));
         let init_cols_str = init_cols.to_string();
         let init_rows_str = init_rows.to_string();
+        let history_limit_str = XTERM_SCROLLBACK_LINES.to_string();
 
         let mut cmd = self.cmd();
         cmd.args([
+            "start-server",
+            ";",
+            "set-option",
+            "-g",
+            "history-limit",
+            &history_limit_str,
+            ";",
             "new-session",
             "-d",
             "-s",
@@ -359,11 +370,7 @@ impl TmuxManager {
                 stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             });
         }
-        // §3.8 — retain tmux scrollback as a safety net for future copy-mode
-        // exposure. xterm.js's own 10 000-line scrollback is the visible
-        // history surface today; keeping tmux's matches it in case we surface
-        // copy-mode through a command palette entry later.
-        self.run_quiet(&["set-option", "-t", id, "history-limit", "10000"]);
+        self.set_history_limit(id, XTERM_SCROLLBACK_LINES);
         self.run_quiet(&["set-option", "-t", id, "remain-on-exit", "on"]);
         // Pin the window size to whatever raum drives via `resize-window`,
         // regardless of attached-client geometry. tmux's auto modes
@@ -425,10 +432,24 @@ impl TmuxManager {
     /// Used after the PTY bridge attaches so the harness boots into a viewport
     /// the attached client is already rendering.
     pub fn respawn_with(&self, id: &str, command: &str) -> Result<(), TmuxError> {
-        let out = self
-            .cmd()
-            .args(["respawn-pane", "-k", "-t", id, command])
-            .output()?;
+        self.respawn_with_cwd(id, command, None)
+    }
+
+    /// Like [`Self::respawn_with`], but pins the new process to a start
+    /// directory with tmux's `respawn-pane -c`.
+    pub fn respawn_with_cwd(
+        &self,
+        id: &str,
+        command: &str,
+        cwd: Option<&str>,
+    ) -> Result<(), TmuxError> {
+        let mut cmd = self.cmd();
+        cmd.args(["respawn-pane", "-k"]);
+        if let Some(cwd) = cwd.map(str::trim).filter(|s| !s.is_empty()) {
+            cmd.args(["-c", cwd]);
+        }
+        cmd.args(["-t", id, command]);
+        let out = cmd.output()?;
         if !out.status.success() {
             return Err(TmuxError::NonZero {
                 status: out.status.code().unwrap_or(-1),
@@ -436,6 +457,15 @@ impl TmuxManager {
             });
         }
         Ok(())
+    }
+
+    /// Keep tmux's retained pane history aligned with xterm.js. This is called
+    /// for both newly-created sessions and already-existing sessions during
+    /// reattach so old panes stop clipping future Codex resume output at a
+    /// previous smaller limit.
+    pub fn set_history_limit(&self, id: &str, limit: u32) {
+        let limit = limit.to_string();
+        self.run_quiet(&["set-option", "-w", "-t", id, "history-limit", &limit]);
     }
 
     pub fn kill_session(&self, id: &str) -> Result<(), TmuxError> {
@@ -509,10 +539,15 @@ impl TmuxManager {
         })
     }
 
-    /// Capture only the recent visible pane state needed for a fast reattach
-    /// paint. This intentionally avoids walking the full tmux history because
-    /// app restart may reattach many panes at once, and full-history replay
-    /// delays the live PTY bridge.
+    /// Capture only the recent visible pane state. Required because non-
+    /// alt-screen Ink-style TUIs (Claude Code, OpenCode) do cursor-positioned
+    /// in-place updates: tmux's scrollback faithfully records every
+    /// intermediate redraw frame as rows scroll off, plus mixed widths from
+    /// any pane resize. Replaying that into xterm produces visible
+    /// corruption (overlapping rules, ghost prompts, mismatched widths).
+    /// Capturing only the bottom `line_count` lines yields the latest clean
+    /// frame the user already sees in normal use; the live tmux client
+    /// repaints the visible area immediately on attach.
     pub fn capture_pane_view_snapshot(
         &self,
         id: &str,
@@ -584,7 +619,12 @@ impl TmuxManager {
         Ok(parse_pane_context(&line))
     }
 
-    fn is_alternate_on(&self, id: &str) -> Result<bool, TmuxError> {
+    /// Whether the pane currently has the alternate screen buffer active
+    /// (TUIs like `vim`, `htop`, Codex). Callers need this to choose between
+    /// full-history capture (alt-screen apps cleanly separate the alt frame
+    /// from the underlying normal scrollback) and viewport-only capture
+    /// (non-alt TUIs corrupt scrollback with in-place redraws).
+    pub fn is_alternate_on(&self, id: &str) -> Result<bool, TmuxError> {
         let out = self
             .cmd()
             .args(["display-message", "-p", "-t", id, "#{alternate_on}"])

@@ -191,6 +191,7 @@ impl ConfigStore {
                 last_state_at_unix_ms: Some(at_unix_ms),
                 last_prompt_text: None,
                 last_prompt_at_unix_ms: None,
+                harness_session_id: None,
             });
         }
         self.write_sessions(&st)
@@ -216,6 +217,64 @@ impl ConfigStore {
         row.last_prompt_text = Some(text.to_string());
         row.last_prompt_at_unix_ms = Some(at_unix_ms);
         self.write_sessions(&st)
+    }
+
+    /// Upsert the harness's *own* session id (Claude Code / Codex UUID)
+    /// for `session_id`. Captured from any hook payload so post-restart
+    /// pane overlays can disambiguate between multiple sessions sharing
+    /// one worktree directory.
+    ///
+    /// Updated when a later hook reports a different value. Older raum builds
+    /// briefly guessed ids from cwd-newest transcript discovery; a real hook
+    /// payload must be allowed to repair that bad persisted value.
+    ///
+    /// Inserts a row when one doesn't yet exist, mirroring
+    /// `update_session_last_state`. The first hook event for a fresh
+    /// session arrives before the agent-event bridge has had a chance
+    /// to persist any state, so a "row must already exist" contract
+    /// would lose the very first id.
+    pub fn update_session_harness_id(
+        &self,
+        session_id: &str,
+        harness: AgentKind,
+        harness_session_id: &str,
+        at_unix_ms: u64,
+    ) -> Result<(), StoreError> {
+        let mut st = self.read_sessions().unwrap_or_default();
+        if let Some(row) = st.sessions.iter_mut().find(|s| s.session_id == session_id) {
+            if row.harness_session_id.as_deref() == Some(harness_session_id) {
+                return Ok(());
+            }
+            row.harness_session_id = Some(harness_session_id.to_string());
+        } else {
+            st.sessions.push(TrackedSession {
+                session_id: session_id.to_string(),
+                project_slug: None,
+                worktree_id: None,
+                opencode_port: None,
+                kind: harness,
+                created_at_unix_ms: at_unix_ms,
+                last_state: None,
+                last_state_at_unix_ms: None,
+                last_prompt_text: None,
+                last_prompt_at_unix_ms: None,
+                harness_session_id: Some(harness_session_id.to_string()),
+            });
+        }
+        self.write_sessions(&st)
+    }
+
+    /// Fetch the persisted harness session id for `session_id`. Returns
+    /// `None` if no `UserPromptSubmit` has fired yet (or the session is
+    /// shell-only).
+    #[must_use]
+    pub fn last_session_harness_id(&self, session_id: &str) -> Option<String> {
+        self.read_sessions()
+            .ok()?
+            .sessions
+            .into_iter()
+            .find(|s| s.session_id == session_id)
+            .and_then(|s| s.harness_session_id)
     }
 
     /// Fetch the last persisted prompt + timestamp for `session_id`. Used
@@ -288,6 +347,7 @@ impl ConfigStore {
                 last_state_at_unix_ms: None,
                 last_prompt_text: None,
                 last_prompt_at_unix_ms: None,
+                harness_session_id: None,
             });
         }
         self.write_sessions(&st)
@@ -708,6 +768,49 @@ mod tests {
     }
 
     #[test]
+    fn update_session_harness_id_inserts_then_repairs_changed_id() {
+        // The first hook event for a fresh session arrives before the
+        // agent-event bridge has had a chance to register the row, so
+        // the helper must upsert. Later real hook payloads may repair an
+        // earlier bad persisted id.
+        let dir = tempdir().unwrap();
+        let store = ConfigStore::new(dir.path());
+        store.ensure_layout().unwrap();
+
+        // No row exists yet — first call inserts.
+        store
+            .update_session_harness_id("raum-abc", AgentKind::ClaudeCode, "claude-uuid-1", 100)
+            .unwrap();
+        assert_eq!(
+            store.last_session_harness_id("raum-abc").as_deref(),
+            Some("claude-uuid-1"),
+        );
+        let inserted = store.read_sessions().unwrap();
+        let row = inserted
+            .sessions
+            .iter()
+            .find(|s| s.session_id == "raum-abc")
+            .expect("upsert should have created the row");
+        assert_eq!(row.kind, AgentKind::ClaudeCode);
+        assert_eq!(row.created_at_unix_ms, 100);
+
+        // Subsequent calls with a different id overwrite. This lets a real
+        // hook payload repair an id guessed by older cwd-newest fallback code.
+        store
+            .update_session_harness_id(
+                "raum-abc",
+                AgentKind::ClaudeCode,
+                "claude-uuid-DIFFERENT",
+                200,
+            )
+            .unwrap();
+        assert_eq!(
+            store.last_session_harness_id("raum-abc").as_deref(),
+            Some("claude-uuid-DIFFERENT"),
+        );
+    }
+
+    #[test]
     fn sessions_round_trip() {
         let dir = tempdir().unwrap();
         let store = ConfigStore::new(dir.path());
@@ -724,6 +827,7 @@ mod tests {
                 last_state_at_unix_ms: None,
                 last_prompt_text: None,
                 last_prompt_at_unix_ms: None,
+                harness_session_id: None,
             }],
         };
         store.write_sessions(&st).unwrap();
