@@ -83,3 +83,9 @@ export const BREW_UPGRADE_COMMAND = "brew upgrade --cask raum";
  *  tag convention baked into `release.yml`. */
 export const releasePageUrl = (version: string): string =>
   `https://github.com/andremonaco/raum/releases/tag/v${version}`;
+
+/** GitHub's "latest release" redirector. Fallback target for the in-app
+ *  updater error state — older bundled clients can hit reqwest-level
+ *  TLS/proxy/cert failures we can't recover from inside the binary, so
+ *  the user always has a working route to grab signed DMG/.deb/AppImage. */
+export const LATEST_RELEASE_URL = "https://github.com/andremonaco/raum/releases/latest";

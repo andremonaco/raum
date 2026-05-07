@@ -6,7 +6,7 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { openUrl } from "@tauri-apps/plugin-opener";
 
 import { ToggleRow } from "./shared";
-import { BREW_UPGRADE_COMMAND, releasePageUrl } from "./constants";
+import { BREW_UPGRADE_COMMAND, LATEST_RELEASE_URL, releasePageUrl } from "./constants";
 import type { InstallFlavor, UpdatePhase } from "./types";
 import { copyToClipboard } from "./utils";
 
@@ -146,6 +146,19 @@ export const UpdatesSection: Component = () => {
       await openUrl(releasePageUrl(version));
     } catch (e) {
       console.warn("openUrl release page failed", e);
+    }
+  };
+
+  /** Fallback target for the error state: the in-app updater can hit
+   *  reqwest-level failures (TLS / proxy / cert quirks baked into the
+   *  bundled HTTP client) that we can't recover from inside this binary.
+   *  Send the user to the "latest release" redirector so they always
+   *  have a working route to the signed DMG / .deb / AppImage. */
+  const openLatestRelease = async () => {
+    try {
+      await openUrl(LATEST_RELEASE_URL);
+    } catch (e) {
+      console.warn("openUrl latest release failed", e);
     }
   };
 
@@ -358,6 +371,30 @@ export const UpdatesSection: Component = () => {
                   disabled={relaunching()}
                 >
                   {relaunching() ? "Relaunching…" : "Relaunch now"}
+                </button>
+              </Show>
+              {/* Error-state escape hatches: the in-app updater can fail
+                  for reqwest reasons we have no way to recover from in
+                  this binary, so always offer a direct path to the signed
+                  bundles, plus a copy-able `brew upgrade` command for
+                  cask installs. */}
+              <Show when={phase().kind === "error"}>
+                <Show when={installFlavor() === "homebrew"}>
+                  <button
+                    type="button"
+                    class="rounded-md border border-warning/40 bg-warning/10 px-2 py-0.5 text-[10px] text-warning transition-colors hover:bg-warning/20"
+                    onClick={() => void copyBrewCommand()}
+                    title={BREW_UPGRADE_COMMAND}
+                  >
+                    {brewCopied() ? "Copied" : "Copy brew upgrade"}
+                  </button>
+                </Show>
+                <button
+                  type="button"
+                  class="rounded-md border border-border bg-background px-2 py-0.5 text-[10px] text-foreground transition-colors hover:bg-accent"
+                  onClick={() => void openLatestRelease()}
+                >
+                  View latest release
                 </button>
               </Show>
               <button
