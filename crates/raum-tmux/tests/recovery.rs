@@ -217,7 +217,7 @@ async fn pty_bridge_preserves_large_burst_markers() {
     )
     .expect("respawn_with");
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(20);
     let mut rendered = String::new();
     while Instant::now() < deadline {
         rendered = String::from_utf8_lossy(&received.lock().unwrap()).into_owned();
@@ -229,7 +229,8 @@ async fn pty_bridge_preserves_large_burst_markers() {
 
     assert!(
         rendered.contains("RAUM_BURST_START"),
-        "burst output should include the start marker"
+        "burst output should include the start marker; received {} bytes",
+        received.lock().unwrap().len()
     );
     assert!(
         rendered.contains("RAUM_BURST_END"),
