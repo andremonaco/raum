@@ -215,8 +215,21 @@ jobs:
             printf 'Auto-generated from conventional commits since `%s`. Edit the version in `src-tauri/Cargo.toml` before merging if a narrower bump is desired — the push will reset the branch on next main push.\n' "${LAST_TAG}"
           } > "$body"
 
-          if gh pr view "${branch}" --json number --jq .number >/dev/null 2>&1; then
-            gh pr edit "${branch}" \
+          # `gh pr view` matches the most recent PR for a branch regardless
+          # of state, and `gh pr edit` does not reopen a closed PR — so the
+          # naive view-then-edit path silently updates a stale closed PR
+          # while the new release sits unproposed. Look up by state instead:
+          # reuse an open PR, reopen a closed one, or open a new PR.
+          open_num=$(gh pr list --head "${branch}" --base main --state open --json number --jq '.[0].number // empty')
+          closed_num=$(gh pr list --head "${branch}" --base main --state closed --json number,mergedAt --jq 'map(select(.mergedAt == null)) | .[0].number // empty')
+
+          if [ -n "${open_num}" ]; then
+            gh pr edit "${open_num}" \
+              --title "chore(release): v${NEXT_VERSION}" \
+              --body-file "$body"
+          elif [ -n "${closed_num}" ]; then
+            gh pr reopen "${closed_num}"
+            gh pr edit "${closed_num}" \
               --title "chore(release): v${NEXT_VERSION}" \
               --body-file "$body"
           else
