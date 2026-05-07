@@ -159,7 +159,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          dmg_dir="src-tauri/target/${TRIPLE}/release/bundle/dmg"
+          # tauri-action runs `cargo tauri build` from `projectPath` but
+          # cargo respects the workspace target dir at the repo root, so
+          # the bundle lands in `<root>/target/...`, not `src-tauri/target/...`.
+          dmg_dir="target/${TRIPLE}/release/bundle/dmg"
           if [ ! -d "$dmg_dir" ]; then
             echo "no DMG output dir at $dmg_dir" >&2
             exit 1
