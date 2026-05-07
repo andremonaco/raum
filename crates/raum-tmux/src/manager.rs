@@ -324,9 +324,17 @@ impl TmuxManager {
         let (init_cols, init_rows) = initial_size.unwrap_or((200, 50));
         let init_cols_str = init_cols.to_string();
         let init_rows_str = init_rows.to_string();
+        let history_limit_str = XTERM_SCROLLBACK_LINES.to_string();
 
         let mut cmd = self.cmd();
         cmd.args([
+            "start-server",
+            ";",
+            "set-option",
+            "-g",
+            "history-limit",
+            &history_limit_str,
+            ";",
             "new-session",
             "-d",
             "-s",
@@ -454,7 +462,7 @@ impl TmuxManager {
     /// previous smaller limit.
     pub fn set_history_limit(&self, id: &str, limit: u32) {
         let limit = limit.to_string();
-        self.run_quiet(&["set-option", "-t", id, "history-limit", &limit]);
+        self.run_quiet(&["set-option", "-w", "-t", id, "history-limit", &limit]);
     }
 
     pub fn kill_session(&self, id: &str) -> Result<(), TmuxError> {

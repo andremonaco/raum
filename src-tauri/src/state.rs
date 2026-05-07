@@ -8,7 +8,7 @@ use raum_core::store::ConfigStore;
 use raum_hooks::EventSocketHandle;
 use raum_tmux::TmuxManager;
 
-use crate::commands::agent::{AgentEventBus, AgentRegistry};
+use crate::commands::agent::{AgentEventBus, AgentRegistry, ModelsCache};
 use crate::commands::git_watcher::GitHeadWatcher;
 use crate::commands::harness_runtime::HarnessRuntimeRegistry;
 
@@ -62,6 +62,11 @@ pub struct AppHandleState {
     /// `commands::terminal::open_bridge_and_monitor`; cleared when a
     /// session is killed or reattached away from.
     pub session_activity: Arc<Mutex<HashMap<String, Instant>>>,
+    /// Per-session resize/attach geometry gate. `terminal_resize` and
+    /// `terminal_reattach` both mutate the same tmux window + PTY viewport;
+    /// serialize those operations per session so a live user drag cannot
+    /// interleave with startup/recovery attach geometry.
+    pub terminal_resize_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Wall-clock timestamp (epoch seconds) of the most recent hook
     /// event received over the UDS socket or an SSE channel. `None`
     /// means nothing has ever arrived — the typical diagnostic answer
@@ -75,6 +80,12 @@ pub struct AppHandleState {
     /// and lets us clean up on session teardown). Session-scoped — not
     /// persisted across raum restarts.
     pub review_links: Mutex<HashMap<String, String>>,
+    /// Cross-harness review feature: per-kind cache of available harness
+    /// models, populated by `list_harness_models` and invalidated by
+    /// `list_harness_models_refresh`. Holding the cache here (instead of
+    /// re-spawning `opencode models` or re-reading `models_cache.json` on
+    /// every picker open) keeps the picker snappy during the snap dance.
+    pub models_cache: ModelsCache,
 }
 
 /// Snapshot of the most recent hook event, surfaced via
@@ -100,8 +111,10 @@ impl Default for AppHandleState {
             harness_runtimes: HarnessRuntimeRegistry::new(),
             channel_event_tx: Mutex::new(None),
             session_activity: Arc::new(Mutex::new(HashMap::new())),
+            terminal_resize_locks: Mutex::new(HashMap::new()),
             last_hook_at: Arc::new(Mutex::new(None)),
             review_links: Mutex::new(HashMap::new()),
+            models_cache: ModelsCache::default(),
         }
     }
 }

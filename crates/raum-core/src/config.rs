@@ -79,9 +79,9 @@ pub struct HarnessesConfig {
     pub shell: HarnessConfig,
     #[serde(
         rename = "claude-code",
-        skip_serializing_if = "HarnessConfig::is_default"
+        skip_serializing_if = "ClaudeCodeConfig::is_default"
     )]
-    pub claude_code: HarnessConfig,
+    pub claude_code: ClaudeCodeConfig,
     #[serde(skip_serializing_if = "HarnessConfig::is_default")]
     pub codex: HarnessConfig,
     #[serde(skip_serializing_if = "HarnessConfig::is_default")]
@@ -100,6 +100,39 @@ pub struct HarnessConfig {
 impl HarnessConfig {
     pub fn is_default(&self) -> bool {
         self.extra_flags.is_none()
+    }
+}
+
+/// Claude Code-specific config. Extends [`HarnessConfig`] with a knob for
+/// fullscreen (alt-screen) rendering: Claude Code 2.1.89+ honours
+/// `CLAUDE_CODE_NO_FLICKER=1` to switch from inline to alt-screen, which
+/// sidesteps Ink's hard-wrap-into-scrollback corruption on resize/reattach.
+/// raum defaults to fullscreen and exposes the inline path as an opt-out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClaudeCodeConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra_flags: Option<String>,
+    /// `true` (default) → inject `CLAUDE_CODE_NO_FLICKER=1` so Claude paints
+    /// the alt-screen and never emits hard-wrapped bytes into scrollback.
+    /// `false` → legacy inline mode; resize/restart will need snapshot replay
+    /// and will exhibit residual Ink hard-wrap artifacts.
+    #[serde(rename = "fullscreen")]
+    pub fullscreen: bool,
+}
+
+impl Default for ClaudeCodeConfig {
+    fn default() -> Self {
+        Self {
+            extra_flags: None,
+            fullscreen: true,
+        }
+    }
+}
+
+impl ClaudeCodeConfig {
+    pub fn is_default(&self) -> bool {
+        self.extra_flags.is_none() && self.fullscreen
     }
 }
 

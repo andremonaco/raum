@@ -5,7 +5,46 @@
 //! the same `<harness> [<flags>]` string into `tmux respawn-pane`, so
 //! the logic lives here instead of inline in the Tauri layer.
 
+use std::fmt::Write as _;
+
+use serde::{Deserialize, Serialize};
+
 use crate::agent::AgentKind;
+
+/// Per-spawn model selection layered on top of the user's global
+/// `extra_flags` config. Used by the cross-harness review picker to ship a
+/// one-shot `--model`/`--effort` choice down to `terminal_spawn` without
+/// mutating `config.toml`.
+///
+/// `effort` is harness-specific:
+///
+/// * Claude Code: `--effort low|medium|high|xhigh|max` (session-scoped).
+/// * Codex: applied as `-c model_reasoning_effort=<e>` because Codex reads
+///   reasoning effort from `config.toml`/`-c` overrides, not a top-level flag.
+/// * OpenCode: ignored in v1 — OpenCode reads thinking budgets from
+///   `~/.config/opencode/opencode.json` per `provider/model` and a
+///   per-spawn override would require mutating that JSON. Out of scope here.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelOverride {
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+impl ModelOverride {
+    fn trimmed_model(&self) -> Option<&str> {
+        let m = self.model.trim();
+        if m.is_empty() { None } else { Some(m) }
+    }
+
+    fn trimmed_effort(&self) -> Option<&str> {
+        self.effort
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+}
 
 /// Render the shell command that boots a harness inside a tmux pane.
 ///
@@ -67,6 +106,25 @@ pub fn harness_launch_command_with_prompt(
     opencode_port: Option<u16>,
     prompt: Option<&str>,
 ) -> Option<String> {
+    harness_launch_command_with_prompt_and_override(kind, extra_flags, opencode_port, prompt, None)
+}
+
+/// Like [`harness_launch_command_with_prompt`] but layers a one-shot
+/// [`ModelOverride`] (model id + optional effort) on top of `extra_flags`.
+/// Used by the cross-harness review picker.
+///
+/// Precedence: a user-pinned conflicting flag in `extra_flags` always wins.
+/// We only inject `--model`/`--effort` when the corresponding flag is
+/// **not** already present in `extra_flags`, so a global override the user
+/// committed to `config.toml` is never silently overridden.
+#[must_use]
+pub fn harness_launch_command_with_prompt_and_override(
+    kind: AgentKind,
+    extra_flags: Option<&str>,
+    opencode_port: Option<u16>,
+    prompt: Option<&str>,
+    override_: Option<&ModelOverride>,
+) -> Option<String> {
     let flags = extra_flags.map(str::trim).filter(|s| !s.is_empty());
     let prompt_arg = prompt
         .map(str::trim)
@@ -75,14 +133,8 @@ pub fn harness_launch_command_with_prompt(
     let prompt_suffix = prompt_arg.as_deref().unwrap_or("");
 
     match kind {
-        AgentKind::ClaudeCode => Some(match flags {
-            Some(f) => format!("claude {f}{prompt_suffix}"),
-            None => format!("claude{prompt_suffix}"),
-        }),
-        AgentKind::Codex => {
-            let codex_flags = codex_flags_for_scrollback(flags);
-            Some(format!("codex {codex_flags}{prompt_suffix}"))
-        }
+        AgentKind::ClaudeCode => Some(render_claude(flags, prompt_suffix, override_)),
+        AgentKind::Codex => Some(render_codex(flags, prompt_suffix, override_)),
         AgentKind::OpenCode => {
             // OpenCode is always launched as the interactive TUI. Any
             // `prompt` is intentionally ignored here — see the doc-comment
@@ -91,17 +143,132 @@ pub fn harness_launch_command_with_prompt(
             // is up. If the user pinned `--port` in their own flags,
             // honour it; otherwise inject the port we picked.
             let _ = prompt_suffix; // intentionally unused for OpenCode
-            let explicit_port = flags.and_then(parse_opencode_port_arg);
-            Some(match (flags, explicit_port, opencode_port) {
-                (Some(f), Some(_), _) => format!("opencode {f}"),
-                (Some(f), None, Some(port)) => format!("opencode --port {port} {f}"),
-                (Some(f), None, None) => format!("opencode {f}"),
-                (None, _, Some(port)) => format!("opencode --port {port}"),
-                (None, _, None) => "opencode".to_string(),
-            })
+            Some(render_opencode(flags, opencode_port, override_))
         }
         AgentKind::Shell => None,
     }
+}
+
+fn render_claude(flags: Option<&str>, prompt_suffix: &str, ovr: Option<&ModelOverride>) -> String {
+    let mut prefix = String::new();
+    if let Some(o) = ovr {
+        if let Some(model) = o.trimmed_model()
+            && !flags_contain_token(flags, "--model")
+        {
+            let _ = write!(prefix, "--model {} ", shell_single_quote(model));
+        }
+        if let Some(effort) = o.trimmed_effort()
+            && !flags_contain_token(flags, "--effort")
+        {
+            let _ = write!(prefix, "--effort {} ", shell_single_quote(effort));
+        }
+    }
+    let trimmed_prefix = prefix.trim_end();
+    match (flags, trimmed_prefix.is_empty()) {
+        (Some(f), true) => format!("claude {f}{prompt_suffix}"),
+        (Some(f), false) => format!("claude {trimmed_prefix} {f}{prompt_suffix}"),
+        (None, true) => format!("claude{prompt_suffix}"),
+        (None, false) => format!("claude {trimmed_prefix}{prompt_suffix}"),
+    }
+}
+
+fn render_codex(flags: Option<&str>, prompt_suffix: &str, ovr: Option<&ModelOverride>) -> String {
+    let mut prefix = String::new();
+    let mut suffix = String::new();
+    if let Some(o) = ovr {
+        if let Some(model) = o.trimmed_model()
+            && !flags_contain_any(flags, &["--model", "-m"])
+        {
+            let _ = write!(prefix, "-m {} ", shell_single_quote(model));
+        }
+        if let Some(effort) = o.trimmed_effort()
+            && !flags_contain_effort_override(flags)
+        {
+            // Codex consumes reasoning effort via `-c model_reasoning_effort=<e>`.
+            // Effort values are unquoted-ASCII (low/medium/high/xhigh) so we can
+            // emit them inline without shell quoting.
+            let _ = write!(suffix, " -c model_reasoning_effort={effort}");
+        }
+    }
+    let trimmed_prefix = prefix.trim_end();
+    let base = match (flags, trimmed_prefix.is_empty()) {
+        (Some(f), true) => format!("codex {f}"),
+        (Some(f), false) => format!("codex {trimmed_prefix} {f}"),
+        (None, true) => "codex".to_string(),
+        (None, false) => format!("codex {trimmed_prefix}"),
+    };
+    format!("{base}{suffix}{prompt_suffix}")
+}
+
+fn render_opencode(
+    flags: Option<&str>,
+    opencode_port: Option<u16>,
+    ovr: Option<&ModelOverride>,
+) -> String {
+    let explicit_port = flags.and_then(parse_opencode_port_arg);
+    let mut model_prefix = String::new();
+    if let Some(o) = ovr
+        && let Some(model) = o.trimmed_model()
+        && !flags_contain_token(flags, "--model")
+        && !flags_contain_token(flags, "-m")
+    {
+        let _ = write!(model_prefix, "--model {} ", shell_single_quote(model));
+    }
+    let model_prefix = model_prefix.trim_end();
+    match (flags, explicit_port, opencode_port, model_prefix.is_empty()) {
+        (Some(f), Some(_), _, true) => format!("opencode {f}"),
+        (Some(f), Some(_), _, false) => format!("opencode {model_prefix} {f}"),
+        (Some(f), None, Some(port), true) => format!("opencode --port {port} {f}"),
+        (Some(f), None, Some(port), false) => {
+            format!("opencode --port {port} {model_prefix} {f}")
+        }
+        (Some(f), None, None, true) => format!("opencode {f}"),
+        (Some(f), None, None, false) => format!("opencode {model_prefix} {f}"),
+        (None, _, Some(port), true) => format!("opencode --port {port}"),
+        (None, _, Some(port), false) => format!("opencode --port {port} {model_prefix}"),
+        (None, _, None, true) => "opencode".to_string(),
+        (None, _, None, false) => format!("opencode {model_prefix}"),
+    }
+}
+
+/// Whitespace-aware substring probe: does `flags` already contain `token` as
+/// a standalone argument (possibly followed by `=value`)? Cheap and good
+/// enough for the conflict check — we'd rather skip injection than override
+/// a flag the user pinned globally.
+fn flags_contain_token(flags: Option<&str>, token: &str) -> bool {
+    let Some(f) = flags else {
+        return false;
+    };
+    let eq = format!("{token}=");
+    f.split_whitespace()
+        .any(|part| part == token || part.starts_with(&eq))
+}
+
+fn flags_contain_any(flags: Option<&str>, tokens: &[&str]) -> bool {
+    tokens.iter().any(|t| flags_contain_token(flags, t))
+}
+
+/// Codex puts effort overrides under `-c model_reasoning_effort=<value>`,
+/// usually written as the next whitespace-separated token after `-c`.
+fn flags_contain_effort_override(flags: Option<&str>) -> bool {
+    let Some(f) = flags else {
+        return false;
+    };
+    let mut parts = f.split_whitespace().peekable();
+    while let Some(part) = parts.next() {
+        if part == "-c"
+            && let Some(next) = parts.peek()
+            && next.starts_with("model_reasoning_effort=")
+        {
+            return true;
+        }
+        if let Some(rest) = part.strip_prefix("-c=")
+            && rest.starts_with("model_reasoning_effort=")
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Render the shell command that resumes an existing harness session inside
@@ -115,7 +282,7 @@ pub fn harness_launch_command_with_prompt(
 /// Per-harness syntax:
 ///
 /// * Claude Code: `claude --resume <id> [extra_flags]`
-/// * Codex: `codex resume --no-alt-screen [extra_flags] <id>` (subcommand, not a flag)
+/// * Codex: `codex resume [extra_flags] <id>` (subcommand, not a flag)
 /// * OpenCode: `opencode --session <id> [--port <port>] [extra_flags]`
 /// * Shell: `None` — shells have no session concept.
 ///
@@ -147,10 +314,10 @@ pub fn harness_resume_command(
             Some(f) => format!("claude --resume {id_quoted} {f}"),
             None => format!("claude --resume {id_quoted}"),
         }),
-        AgentKind::Codex => {
-            let codex_flags = codex_flags_for_scrollback(flags);
-            Some(format!("codex resume {codex_flags} {id_quoted}"))
-        }
+        AgentKind::Codex => Some(match flags {
+            Some(f) => format!("codex resume {f} {id_quoted}"),
+            None => format!("codex resume {id_quoted}"),
+        }),
         AgentKind::OpenCode => {
             // Same port-handling rules as the launch path: caller-pinned
             // `--port` in extra_flags wins; otherwise inject the chosen
@@ -186,20 +353,6 @@ fn shell_single_quote(s: &str) -> String {
     }
     out.push('\'');
     out
-}
-
-/// Codex defaults to alternate-screen rendering, which is correct in a
-/// normal terminal but gives xterm.js no durable scrollback for the chat
-/// repaint after `codex resume`. raum keeps panes inside tmux and already
-/// owns scrollback, so force inline rendering unless the user explicitly
-/// supplied the flag.
-fn codex_flags_for_scrollback(flags: Option<&str>) -> String {
-    const NO_ALT_SCREEN: &str = "--no-alt-screen";
-    match flags {
-        Some(f) if f.split_whitespace().any(|part| part == NO_ALT_SCREEN) => f.to_string(),
-        Some(f) => format!("{f} {NO_ALT_SCREEN}"),
-        None => NO_ALT_SCREEN.to_string(),
-    }
 }
 
 /// Extract `--port <n>` / `--port=<n>` from a whitespace-separated
@@ -265,12 +418,12 @@ mod tests {
     fn codex_with_flags() {
         assert_eq!(
             harness_launch_command(AgentKind::Codex, Some("--model gpt-5"), None).as_deref(),
-            Some("codex --model gpt-5 --no-alt-screen"),
+            Some("codex --model gpt-5"),
         );
     }
 
     #[test]
-    fn codex_no_alt_screen_is_not_duplicated() {
+    fn codex_preserves_user_no_alt_screen_flag() {
         assert_eq!(
             harness_launch_command(
                 AgentKind::Codex,
@@ -347,7 +500,7 @@ mod tests {
     fn codex_with_prompt() {
         let cmd = harness_launch_command_with_prompt(AgentKind::Codex, None, None, Some("review"))
             .unwrap();
-        assert_eq!(cmd, "codex --no-alt-screen 'review'");
+        assert_eq!(cmd, "codex 'review'");
     }
 
     #[test]
@@ -431,7 +584,7 @@ mod tests {
             harness_launch_command_with_prompt(AgentKind::Codex, None, None, Some(prompt)).unwrap();
         assert_eq!(
             cmd,
-            "codex --no-alt-screen 'line1\nline2 `backtick` $VAR \"quoted\" back\\slash'"
+            "codex 'line1\nline2 `backtick` $VAR \"quoted\" back\\slash'"
         );
     }
 
@@ -484,7 +637,7 @@ mod tests {
     fn resume_codex_uses_subcommand_form() {
         // Codex's resume is a subcommand (`codex resume <id>`), not a flag.
         let cmd = harness_resume_command(AgentKind::Codex, None, None, "rollout-uuid").unwrap();
-        assert_eq!(cmd, "codex resume --no-alt-screen 'rollout-uuid'");
+        assert_eq!(cmd, "codex resume 'rollout-uuid'");
     }
 
     #[test]
@@ -496,14 +649,11 @@ mod tests {
             "rollout-uuid",
         )
         .unwrap();
-        assert_eq!(
-            cmd,
-            "codex resume --model gpt-5 --no-alt-screen 'rollout-uuid'"
-        );
+        assert_eq!(cmd, "codex resume --model gpt-5 'rollout-uuid'");
     }
 
     #[test]
-    fn resume_codex_no_alt_screen_is_not_duplicated() {
+    fn resume_codex_preserves_user_no_alt_screen_flag() {
         let cmd = harness_resume_command(
             AgentKind::Codex,
             Some("--no-alt-screen --model gpt-5"),
@@ -562,6 +712,183 @@ mod tests {
     }
 
     // ---- preexisting tests below ------------------------------------
+
+    // ---- model overrides --------------------------------------------
+
+    fn override_(model: &str, effort: Option<&str>) -> ModelOverride {
+        ModelOverride {
+            model: model.to_string(),
+            effort: effort.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn claude_override_injects_model_and_effort() {
+        let cmd = harness_launch_command_with_prompt_and_override(
+            AgentKind::ClaudeCode,
+            None,
+            None,
+            Some("review"),
+            Some(&override_("opus", Some("high"))),
+        )
+        .unwrap();
+        assert_eq!(cmd, "claude --model 'opus' --effort 'high' 'review'");
+    }
+
+    #[test]
+    fn claude_override_skips_when_user_pinned_model() {
+        let cmd = harness_launch_command_with_prompt_and_override(
+            AgentKind::ClaudeCode,
+            Some("--model claude-sonnet-4-6"),
+            None,
+            None,
+            Some(&override_("opus", Some("high"))),
+        )
+        .unwrap();
+        // user's --model wins; --effort still injected (no conflict)
+        assert_eq!(cmd, "claude --effort 'high' --model claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn claude_override_skips_when_user_pinned_effort() {
+        let cmd = harness_launch_command_with_prompt_and_override(
+            AgentKind::ClaudeCode,
+            Some("--effort low --verbose"),
+            None,
+            None,
+            Some(&override_("opus", Some("high"))),
+        )
+        .unwrap();
+        assert_eq!(cmd, "claude --model 'opus' --effort low --verbose");
+    }
+
+    #[test]
+    fn claude_override_no_effort_only_model() {
+        let cmd = harness_launch_command_with_prompt_and_override(
+            AgentKind::ClaudeCode,
+            None,
+            None,
+            None,
+            Some(&override_("claude-opus-4-7", None)),
+        )
+        .unwrap();
+        assert_eq!(cmd, "claude --model 'claude-opus-4-7'");
+    }
+
+    #[test]
+    fn codex_override_injects_model_and_effort_via_c_flag() {
+        let cmd = harness_launch_command_with_prompt_and_override(
+            AgentKind::Codex,
+            None,
+            None,
+            Some("brief"),
+            Some(&override_("gpt-5.4", Some("high"))),
+        )
+        .unwrap();
+        // Effort goes through `-c key=value` and lands AFTER the prompt would
+        // be wrong; verify it lands before the prompt arg.
+        assert_eq!(
+            cmd,
+            "codex -m 'gpt-5.4' -c model_reasoning_effort=high 'brief'"
+        );
+    }
+
+    #[test]
+    fn codex_override_skips_when_user_already_pinned_dash_m() {
+        let cmd = harness_launch_command_with_prompt_and_override(
+            AgentKind::Codex,
+            Some("-m gpt-5.3-codex"),
+            None,
+            None,
+            Some(&override_("gpt-5.4", Some("high"))),
+        )
+        .unwrap();
+        assert_eq!(cmd, "codex -m gpt-5.3-codex -c model_reasoning_effort=high");
+    }
+
+    #[test]
+    fn codex_override_skips_when_user_already_pinned_long_model() {
+        let cmd = harness_launch_command_with_prompt_and_override(
+            AgentKind::Codex,
+            Some("--model gpt-5.3-codex"),
+            None,
+            None,
+            Some(&override_("gpt-5.4", None)),
+        )
+        .unwrap();
+        assert_eq!(cmd, "codex --model gpt-5.3-codex");
+    }
+
+    #[test]
+    fn codex_override_skips_when_user_already_set_effort_via_c() {
+        let cmd = harness_launch_command_with_prompt_and_override(
+            AgentKind::Codex,
+            Some("-c model_reasoning_effort=low"),
+            None,
+            None,
+            Some(&override_("gpt-5.4", Some("high"))),
+        )
+        .unwrap();
+        assert_eq!(cmd, "codex -m 'gpt-5.4' -c model_reasoning_effort=low");
+    }
+
+    #[test]
+    fn opencode_override_injects_model_only() {
+        let cmd = harness_launch_command_with_prompt_and_override(
+            AgentKind::OpenCode,
+            None,
+            Some(45123),
+            Some("brief"),
+            Some(&override_("github-copilot/claude-opus-4.7", Some("high"))),
+        )
+        .unwrap();
+        // Effort intentionally ignored for OpenCode in v1.
+        assert_eq!(
+            cmd,
+            "opencode --port 45123 --model 'github-copilot/claude-opus-4.7'"
+        );
+        assert!(!cmd.contains("effort"));
+    }
+
+    #[test]
+    fn opencode_override_skips_when_user_already_pinned() {
+        let cmd = harness_launch_command_with_prompt_and_override(
+            AgentKind::OpenCode,
+            Some("--model openai/gpt-5"),
+            Some(45123),
+            None,
+            Some(&override_("github-copilot/claude-opus-4.7", None)),
+        )
+        .unwrap();
+        assert_eq!(cmd, "opencode --port 45123 --model openai/gpt-5");
+    }
+
+    #[test]
+    fn shell_returns_none_with_override() {
+        let cmd = harness_launch_command_with_prompt_and_override(
+            AgentKind::Shell,
+            None,
+            None,
+            None,
+            Some(&override_("opus", None)),
+        );
+        assert!(cmd.is_none());
+    }
+
+    #[test]
+    fn empty_model_override_no_op() {
+        // Empty/whitespace model id should be treated as "no override" so the
+        // backwards-compatible behaviour matches `harness_launch_command_with_prompt`.
+        let cmd = harness_launch_command_with_prompt_and_override(
+            AgentKind::ClaudeCode,
+            None,
+            None,
+            None,
+            Some(&override_("   ", Some(""))),
+        )
+        .unwrap();
+        assert_eq!(cmd, "claude");
+    }
 
     #[test]
     fn parse_port_short_form() {

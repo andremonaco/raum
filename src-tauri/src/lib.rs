@@ -122,6 +122,14 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        // Persist window position / size / maximized state across launches.
+        // Without this the webview opens at tauri.conf.json's default 1440×900
+        // every time, which forces users with bigger monitors to maximize on
+        // every launch — and any harness pane spawned during the early-mount
+        // window picks up the small intermediate size, leaving narrow content
+        // permanently in xterm scrollback (xterm cannot reflow Ink-style
+        // hard-wrapped lines once written).
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         .menu(build_app_menu)
         .on_menu_event(|app, event| {
             let id = event.id().0.as_str();
@@ -145,6 +153,7 @@ pub fn run() {
             commands::harnesses_check,
             commands::terminal::terminal_spawn,
             commands::terminal::terminal_reattach,
+            commands::terminal::terminal_provider_replace,
             commands::terminal::terminal_provider_replay,
             commands::terminal::terminal_self_heal,
             commands::terminal::terminal_respawn_dead,
@@ -157,6 +166,9 @@ pub fn run() {
             commands::terminal::terminal_pane_context_batch,
             commands::terminal::terminal_reap_stale,
             commands::terminal::terminal_kill_orphans,
+            commands::terminal::terminal_snapshot_persist,
+            commands::terminal::terminal_snapshot_load,
+            commands::terminal::terminal_snapshot_delete,
             // Cross-harness review feature.
             commands::review::prepare_review,
             commands::review::record_review_link,
@@ -165,6 +177,10 @@ pub fn run() {
             commands::agent::agent_list,
             commands::agent::agent_spawn,
             commands::agent::agent_state,
+            // Cross-review picker: enumerate models per harness kind so the
+            // overlay can present a real choice instead of a hardcoded list.
+            commands::agent::list_harness_models,
+            commands::agent::list_harness_models_refresh,
             // Atomic agents + terminals snapshot used by the top-row on
             // mount / cmd+r to seed both stores before any memo runs.
             commands::agent::agent_snapshot,
@@ -222,6 +238,7 @@ pub fn run() {
             commands::notifications::notifications_check_authorization,
             commands::notifications::notifications_open_system_settings,
             commands::config_set_harness_flags,
+            commands::config_set_claude_fullscreen,
             commands::config_set_worktree_path_pattern,
             commands::config_set_appearance_theme,
             commands::config_set_appearance_show_prompt_overlay,
@@ -541,6 +558,32 @@ fn bootstrap_rehydrate_sessions(app: &mut tauri::App) {
                 return;
             }
         };
+
+        // GC orphaned terminal snapshots. A snapshot whose session id is no
+        // longer in `live_ids` belongs to a tmux session killed while raum
+        // was down (or to a one-shot `terminal_kill` we missed during a
+        // crash). Run on the rehydrate task so it overlaps with the rest of
+        // recovery and never blocks the UI.
+        let snapshot_live_ids: Vec<String> = live_ids.iter().cloned().collect();
+        match tokio::task::spawn_blocking(move || {
+            raum_core::snapshot_store::gc_orphans(&snapshot_live_ids)
+        })
+        .await
+        {
+            Ok(Ok(removed)) if removed > 0 => {
+                info!(
+                    count = removed,
+                    "rehydrate: reaped orphan terminal snapshots"
+                );
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                warn!(error = %e, "rehydrate: snapshot gc_orphans failed");
+            }
+            Err(e) => {
+                warn!(error = %e, "rehydrate: snapshot gc_orphans join failed");
+            }
+        }
 
         let tracked = {
             let state: tauri::State<'_, state::AppHandleState> = app_handle.state();

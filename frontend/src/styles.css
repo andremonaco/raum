@@ -907,23 +907,54 @@ body,
   z-index: 40;
 }
 
-/* Maximized pane fills the canvas completely (no gutter). */
+/* Maximized pane fills the canvas completely (no gutter, no border, no
+   radius). The grid canvas itself owns the rounded outer edge — keeping a
+   pane-level border + radius here would draw a hairline rectangle inside
+   the canvas's rounded clip and read as a leftover frame around an
+   otherwise full-bleed terminal. */
 .leaf-frame.pane-maximized {
   left: 0 !important;
   top: 0 !important;
   right: 0 !important;
   bottom: 0 !important;
   z-index: 30;
-  box-shadow:
-    0 0 0 1px rgba(var(--accent-split), 0.3),
-    0 20px 50px -10px rgba(0, 0, 0, 0.85);
+  border-color: transparent;
+  border-radius: 0;
+  box-shadow: none;
 }
 
-/* Maximize/restore is an interaction mode, not a layout rearrangement.
-   Snap that geometry change so the previously full-canvas pane cannot keep
-   hit-testing over other panes while its normal spring transition unwinds. */
-[data-dnd-root].maximize-layout-snap .leaf-frame {
-  transition: none !important;
+/* During a maximize/restore toggle, extend the chrome's spring position
+   transition to the surface frame so the live xterm pixels grow/shrink in
+   lockstep with the chrome card. The base `.terminal-surface-frame` rule
+   below sets `transition: none` (intentional — surfaces normally jump on
+   layout changes to avoid resize lag against xterm's fitted geometry); this
+   class wins by source order while the maximize-anim window is open
+   (~240 ms) and reverts to the no-transition default once it closes. */
+[data-dnd-root].maximize-anim .terminal-surface-frame {
+  transition:
+    left 180ms cubic-bezier(0.34, 1.56, 0.64, 1),
+    right 180ms cubic-bezier(0.34, 1.56, 0.64, 1),
+    top 180ms cubic-bezier(0.34, 1.56, 0.64, 1),
+    bottom 180ms cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+/* Hide every leaf-frame that isn't the maximized one — both while a pane
+   is maximized AND for the duration of the restore animation. The chrome
+   layer (`.terminal-chrome-layer { z-index: 20 }`) sits above the surface
+   layer (`z-index: 1`), so without this the headers + frames of sibling
+   panes would paint on top of the maximized terminal — visible as
+   leftover header bars peeking around the maximized pane. The two
+   selectors cover both phases:
+     • `:has(.pane-maximized)` — steady maximized state + maximize phase.
+     • `.maximize-anim ... :not(.pane-max-anim-target)` — restore phase,
+       where `.pane-maximized` has already been removed from the in-flight
+       pane but its position is still springing back into its slot.
+   `.pane-max-anim-target` is set on the chrome AND surface of the pane
+   actually animating, so both halves of it stay painted while every
+   other pane is hidden. */
+[data-dnd-root]:has(.leaf-frame.pane-maximized) .leaf-frame:not(.pane-maximized),
+[data-dnd-root].maximize-anim .leaf-frame:not(.pane-max-anim-target) {
+  visibility: hidden;
 }
 
 .terminal-surface-layer {
@@ -1237,6 +1268,307 @@ body,
 
 .terminal-file-drop-chip-more {
   color: color-mix(in oklab, var(--foreground) 62%, transparent);
+}
+
+/* ── Review picker overlay (cross-harness review) ───────────────────── */
+/* Same container-query approach as `.terminal-file-drop-overlay`: declares
+   itself as a `size` container so the inner card and its segmented controls
+   can scale to the pane. Sized for v1 to feel like a small focused dialog
+   rather than a full-pane takeover; the backdrop dims the pane chrome.
+
+   `pointer-events: auto` is load-bearing: the ancestor `.terminal-chrome-frame`
+   has `pointer-events: none` (it lets xterm own the body and only the
+   `.pane-drag-handle` re-enables clicks). Without this override, every click
+   on the picker card / backdrop would pass through to the xterm canvas and
+   the dialog would be impossible to dismiss. */
+.review-picker-overlay {
+  container-type: size;
+  container-name: reviewpicker;
+  overflow: hidden;
+  min-width: 0;
+  min-height: 0;
+  padding: clamp(0.5rem, 4cqi, 3rem);
+  background: linear-gradient(
+    180deg,
+    color-mix(in oklab, var(--background) 86%, transparent),
+    color-mix(in oklab, var(--background) 76%, transparent)
+  );
+  backdrop-filter: blur(3px);
+  animation: terminal-file-drop-in 140ms ease-out;
+  pointer-events: auto;
+}
+
+.review-picker-card {
+  display: flex;
+  width: min(28rem, 88cqi);
+  max-height: 92cqb;
+  flex-direction: column;
+  gap: clamp(0.55rem, 1.6cqi, 1rem);
+  padding: clamp(0.7rem, 2.6cqi, 1.4rem);
+  border: 1px solid color-mix(in oklab, var(--foreground) 18%, transparent);
+  border-radius: 12px;
+  background: color-mix(in oklab, var(--surface-raised) 96%, transparent);
+  box-shadow:
+    0 24px 60px -28px rgba(0, 0, 0, 0.85),
+    inset 0 1px 0 color-mix(in oklab, var(--foreground) 14%, transparent);
+  text-align: left;
+  overflow: hidden;
+}
+
+.review-picker-header {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+}
+
+.review-picker-icon {
+  display: grid;
+  width: clamp(2rem, 9cqi, 2.6rem);
+  aspect-ratio: 1;
+  flex-shrink: 0;
+  place-items: center;
+  border: 1px solid color-mix(in oklab, var(--foreground) 22%, transparent);
+  border-radius: 8px;
+  background: color-mix(in oklab, var(--surface-raised) 92%, transparent);
+}
+
+.review-picker-harness-icon {
+  width: 70%;
+  height: 70%;
+}
+
+.review-picker-title {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+}
+
+.review-picker-eyebrow {
+  font-size: 0.72rem;
+  letter-spacing: 0.04em;
+  color: color-mix(in oklab, var(--foreground) 60%, transparent);
+  text-transform: uppercase;
+}
+
+.review-picker-kind {
+  font-size: clamp(0.95rem, 2.6cqi, 1.15rem);
+  font-weight: 650;
+  text-transform: capitalize;
+  color: var(--foreground);
+}
+
+.review-picker-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.review-picker-label {
+  flex-shrink: 0;
+  width: 4.2rem;
+  font-size: 0.78rem;
+  color: color-mix(in oklab, var(--foreground) 70%, transparent);
+}
+
+/* Trigger for the model dropdown. The visual contract is the same as a
+   native select (border + chevron + label) but it's a real button so the
+   menu can be the project's Kobalte `DropdownMenu` (consistent with the
+   settings-modal triggers) instead of an OS-rendered listbox. */
+.review-picker-select {
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+  padding: 0.32rem 0.55rem;
+  border: 1px solid color-mix(in oklab, var(--foreground) 22%, transparent);
+  border-radius: 6px;
+  background: color-mix(in oklab, var(--background) 92%, transparent);
+  color: var(--foreground);
+  font-family: inherit;
+  font-size: 0.85rem;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background 120ms ease,
+    border-color 120ms ease;
+}
+
+.review-picker-select:hover,
+.review-picker-select[data-expanded] {
+  background: color-mix(in oklab, var(--surface-raised) 96%, transparent);
+  border-color: color-mix(in oklab, var(--foreground) 32%, transparent);
+}
+
+.review-picker-select:focus-visible {
+  outline: 2px solid color-mix(in oklab, var(--project-accent, var(--foreground)) 60%, transparent);
+  outline-offset: 1px;
+}
+
+.review-picker-select-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.review-picker-select-chevron {
+  width: 0.85rem;
+  height: 0.85rem;
+  flex-shrink: 0;
+  color: color-mix(in oklab, var(--foreground) 60%, transparent);
+  transition: transform 140ms ease;
+}
+
+.review-picker-select[data-expanded] .review-picker-select-chevron {
+  transform: rotate(180deg);
+}
+
+/* Kobalte `DropdownMenuContent` for the picker. The Content component
+   already ships with its own border / shadow / animation classes; we just
+   constrain its width to the trigger and cap its height for long lists. */
+.review-picker-menu {
+  min-width: var(--kb-popper-anchor-width);
+  max-width: 28rem;
+  max-height: 18rem;
+  font-size: 0.83rem;
+}
+
+.review-picker-menu-item {
+  gap: 0.45rem;
+}
+
+.review-picker-menu-check {
+  width: 0.85rem;
+  height: 0.85rem;
+  flex-shrink: 0;
+  opacity: 0;
+  color: color-mix(in oklab, var(--project-accent, var(--foreground)) 80%, transparent);
+}
+
+.review-picker-menu-check.is-current {
+  opacity: 1;
+}
+
+.review-picker-icon-button {
+  display: grid;
+  width: 1.7rem;
+  height: 1.7rem;
+  flex-shrink: 0;
+  place-items: center;
+  border: 1px solid color-mix(in oklab, var(--foreground) 18%, transparent);
+  border-radius: 6px;
+  background: color-mix(in oklab, var(--background) 92%, transparent);
+  color: color-mix(in oklab, var(--foreground) 75%, transparent);
+  font-size: 0.85rem;
+  cursor: pointer;
+  transition:
+    background 120ms ease,
+    color 120ms ease;
+}
+
+.review-picker-icon-button:hover {
+  background: color-mix(in oklab, var(--surface-raised) 96%, transparent);
+  color: var(--foreground);
+}
+
+.review-picker-segmented {
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
+  gap: 0;
+  border: 1px solid color-mix(in oklab, var(--foreground) 18%, transparent);
+  border-radius: 6px;
+  overflow: hidden;
+  background: color-mix(in oklab, var(--background) 92%, transparent);
+}
+
+.review-picker-segment {
+  flex: 1 1 0;
+  padding: 0.3rem 0.45rem;
+  border: 0;
+  border-right: 1px solid color-mix(in oklab, var(--foreground) 12%, transparent);
+  background: transparent;
+  color: color-mix(in oklab, var(--foreground) 70%, transparent);
+  font-family: inherit;
+  font-size: 0.78rem;
+  text-transform: capitalize;
+  cursor: pointer;
+  transition:
+    background 120ms ease,
+    color 120ms ease;
+}
+
+.review-picker-segment:last-child {
+  border-right: 0;
+}
+
+.review-picker-segment:hover {
+  color: var(--foreground);
+  background: color-mix(in oklab, var(--surface-raised) 80%, transparent);
+}
+
+.review-picker-segment.is-selected {
+  background: color-mix(in oklab, var(--project-accent, var(--foreground)) 22%, transparent);
+  color: var(--foreground);
+  font-weight: 600;
+}
+
+.review-picker-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-top: 0.2rem;
+}
+
+.review-picker-button {
+  padding: 0.4rem 0.85rem;
+  border: 1px solid color-mix(in oklab, var(--foreground) 18%, transparent);
+  border-radius: 6px;
+  background: color-mix(in oklab, var(--background) 92%, transparent);
+  color: var(--foreground);
+  font-family: inherit;
+  font-size: 0.83rem;
+  cursor: pointer;
+  transition:
+    background 120ms ease,
+    border-color 120ms ease;
+}
+
+.review-picker-button:hover {
+  background: color-mix(in oklab, var(--surface-raised) 96%, transparent);
+}
+
+.review-picker-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.review-picker-button.is-ghost {
+  background: transparent;
+}
+
+.review-picker-button.is-primary {
+  border-color: color-mix(in oklab, var(--project-accent, var(--foreground)) 50%, transparent);
+  background: color-mix(in oklab, var(--project-accent, var(--foreground)) 18%, transparent);
+}
+
+.review-picker-button.is-primary:hover {
+  background: color-mix(in oklab, var(--project-accent, var(--foreground)) 28%, transparent);
+}
+
+.review-picker-skeleton,
+.review-picker-empty {
+  padding: 1rem 0.4rem;
+  color: color-mix(in oklab, var(--foreground) 65%, transparent);
+  font-size: 0.83rem;
+  text-align: center;
+}
+
+.review-picker-empty p {
+  margin: 0 0 0.6rem;
 }
 
 /* ── Dividers ──────────────────────────────────────────────────────── */

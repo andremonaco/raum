@@ -12,6 +12,7 @@ pub mod prereqs;
 pub mod project;
 pub mod review;
 pub mod sigil;
+pub mod snapshot_store;
 pub mod store;
 
 pub use harness::{ClaudeCodeAdapter, CodexAdapter, OpenCodeAdapter};

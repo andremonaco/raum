@@ -21,7 +21,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { createStore, reconcile } from "solid-js/store";
 import { agentStore, type AgentKind, type AgentState } from "./agentStore";
-import { removeTabsBySessionId } from "./runtimeLayoutStore";
+import { removeTabsBySessionId, replaceTabsSessionId } from "./runtimeLayoutStore";
 import { clearReviewLinkForSession } from "./reviewLinkStore";
 
 const TERMINAL_PANE_CONTEXT_CHANGED_EVENT = "terminal-pane-context-changed";
@@ -733,6 +733,11 @@ interface TerminalPaneContextChanged extends TerminalPaneContext {
   sessionId: string;
 }
 
+interface TerminalSessionReplaced {
+  oldSessionId: string;
+  newSessionId: string;
+}
+
 interface PanePromptUpdated {
   session_id: AgentStateChanged["session_id"];
   harness: AgentKind;
@@ -762,6 +767,16 @@ export async function subscribeTerminalEvents(): Promise<UnlistenFn> {
     // this session so the linked-pane badge clears on the surviving side.
     void clearReviewLinkForSession(ev.payload.session_id);
   });
+  const unlistenReplaced = await listen<TerminalSessionReplaced>(
+    "terminal-session-replaced",
+    (ev) => {
+      const oldId = ev.payload.oldSessionId;
+      const newId = ev.payload.newSessionId;
+      if (!oldId || !newId) return;
+      replaceTabsSessionId(oldId, newId);
+      removeTerminal(oldId);
+    },
+  );
   const unlistenPaneContext = await listen<TerminalPaneContextChanged>(
     TERMINAL_PANE_CONTEXT_CHANGED_EVENT,
     (ev) => {
@@ -790,6 +805,7 @@ export async function subscribeTerminalEvents(): Promise<UnlistenFn> {
   return () => {
     unlistenUpsert();
     unlistenRemoved();
+    unlistenReplaced();
     unlistenPaneContext();
     unlistenAgentState();
     unlistenPrompt();

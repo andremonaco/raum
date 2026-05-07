@@ -16,7 +16,7 @@ import {
   focusPaneByIndex,
   LAYOUT_UNIT,
   layoutRev,
-  maximizeLayoutSnap,
+  maximizeAnim,
   maximizedPaneId,
   isTabAlive,
   isTabPendingReset,
@@ -382,16 +382,21 @@ describe("runtimeLayoutStore (BSP)", () => {
     expect(maximizedPaneId()).toBeNull();
   });
 
-  it("snaps maximize geometry briefly so restored panes do not block clicks", () => {
+  it("opens a maximize-anim window so chrome and surface position transitions stay in lockstep", () => {
     vi.useFakeTimers();
     splitPane(pane("a"), null, "right");
-    expect(maximizeLayoutSnap()).toBe(false);
+    expect(maximizeAnim()).toBe(false);
 
     toggleMaximize("a");
-    expect(maximizeLayoutSnap()).toBe(true);
+    expect(maximizeAnim()).toBe(true);
 
-    vi.advanceTimersByTime(50);
-    expect(maximizeLayoutSnap()).toBe(false);
+    // Outlasts the 180 ms spring transition so the surface stays glued to the
+    // chrome through the overshoot tail.
+    vi.advanceTimersByTime(180);
+    expect(maximizeAnim()).toBe(true);
+
+    vi.advanceTimersByTime(60);
+    expect(maximizeAnim()).toBe(false);
   });
 
   it("focusPaneByIndex is 1-based over in-order traversal", () => {
