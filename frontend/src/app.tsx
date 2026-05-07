@@ -10,6 +10,7 @@ import { SpotlightDock } from "./components/spotlight-dock";
 import { Toaster } from "./components/ui/sonner";
 import { KeymapProvider, useKeymapAction } from "./lib/keymapContext";
 import {
+  openActiveLayoutSaveGate,
   setRuntimeLayout,
   type ActiveLayoutState,
   type CellKind,
@@ -144,6 +145,15 @@ async function hydrateActiveLayout(): Promise<void> {
     setRuntimeLayout(cells);
   } catch {
     // Non-Tauri environment (browser dev) or missing file — silently skip.
+  } finally {
+    // Open the persistence gate exactly once, after hydration has either
+    // restored cells or confirmed there were none. Any save scheduled by
+    // the project-list refresh that races us at startup has been parked
+    // until now — without this gate, that early save could overwrite the
+    // on-disk layout with `cells: []` before we read it back, leaving the
+    // grid empty on the next launch with every live session adrift in the
+    // dock as an orphan.
+    openActiveLayoutSaveGate();
   }
 }
 
@@ -196,6 +206,9 @@ const App: Component = () => {
       void scheduleBackgroundUpdateCheck(c);
       return c;
     } catch {
+      // No Tauri host (browser dev / vitest) — there is no layout to read,
+      // so unblock the save gate so future saves can proceed normally.
+      openActiveLayoutSaveGate();
       return { onboarded: true };
     }
   });

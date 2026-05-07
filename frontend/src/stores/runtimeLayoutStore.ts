@@ -450,6 +450,27 @@ export function nextTabId(): string {
 
 let _saveTimer: ReturnType<typeof setTimeout> | null = null;
 
+/** Until `hydrateActiveLayout` finishes (or explicitly opens the gate when
+ *  there is nothing to hydrate), `scheduleActiveSave` will queue saves but
+ *  never actually invoke `active_layout_save`. This prevents a save fired
+ *  by an early `setActiveProjectSlug` (from the project-list refresh that
+ *  races layout hydration on launch) from overwriting the on-disk layout
+ *  with `cells: []` before the saved cells are read back into the store. */
+let _saveGateOpen = false;
+let _savePendingWhileGated = false;
+
+/** Open the save gate. Called by `hydrateActiveLayout` once hydration has
+ *  either restored the saved cells or confirmed there were none. Any save
+ *  request that arrived while the gate was closed is honoured here. */
+export function openActiveLayoutSaveGate(): void {
+  if (_saveGateOpen) return;
+  _saveGateOpen = true;
+  if (_savePendingWhileGated) {
+    _savePendingWhileGated = false;
+    scheduleActiveSave();
+  }
+}
+
 /** Snapshot the per-project sidebar scope into a plain `slug → worktree path`
  *  map suitable for the active-layout TOML. "all" mode is encoded as an
  *  absent entry so the resulting map matches `BTreeMap::is_empty` on the
@@ -464,6 +485,12 @@ function collectWorktreeScopes(): Record<string, string> {
 }
 
 export function scheduleActiveSave(): void {
+  if (!_saveGateOpen) {
+    // Hydration hasn't finished yet — record that a save was requested and
+    // bail. The gate-opener will retrigger this once hydration is done.
+    _savePendingWhileGated = true;
+    return;
+  }
   if (_saveTimer !== null) clearTimeout(_saveTimer);
   _saveTimer = setTimeout(() => {
     _saveTimer = null;
@@ -1254,6 +1281,11 @@ export function __resetRuntimeLayoutForTests(): void {
   idCounter = 0;
   tabIdCounter = 0;
   pendingResetKeys.clear();
+  // Tests run without an `app.tsx` boot so they never call
+  // `openActiveLayoutSaveGate`; default the gate open here so existing
+  // tests that exercise `scheduleActiveSave` keep their previous behaviour.
+  _saveGateOpen = true;
+  _savePendingWhileGated = false;
   if (_saveTimer !== null) {
     clearTimeout(_saveTimer);
     _saveTimer = null;
