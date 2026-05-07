@@ -150,8 +150,8 @@ impl TmuxManager {
     /// Apply the server-wide options that make every PTY-attached `tmux
     /// attach-session` client as transparent as possible without flattening
     /// tmux's normal and alternate buffers into one surface. We still disable
-    /// the prefix, status bar, synthetic focus events, and title escapes so
-    /// the attached client behaves like a plain terminal tab.
+    /// the prefix, status bar, and title escapes so the attached client
+    /// behaves like a plain terminal tab.
     ///
     /// Idempotent: tmux's `set` clobbers prior values, so calling this on
     /// every launch is safe even when the server is already running.
@@ -182,9 +182,12 @@ impl TmuxManager {
             "terminal-overrides",
             ",xterm-256color:smcup@:rmcup@",
         ]);
-        // Don't synthesize focus reporting at the tmux layer. The inner
-        // process can request `?1004h` directly if it cares.
-        self.run_quiet(&["set-option", "-g", "focus-events", "off"]);
+        // Forward `\e[I` / `\e[O` from the attached client through to the
+        // inner process when it has requested DECSET 1004. With this off,
+        // tmux silently drops those bytes and harnesses (Claude Code, Codex,
+        // vim's `:set autoread`, etc.) never see focus transitions — and
+        // `claude doctor` flags the misconfiguration.
+        self.run_quiet(&["set-option", "-g", "focus-events", "on"]);
         // Don't emit DECSLRM / xterm title escapes from tmux.
         self.run_quiet(&["set-option", "-g", "set-titles", "off"]);
         Ok(())
