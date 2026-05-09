@@ -54,14 +54,22 @@ pub struct RehydrateSummary {
     pub alive: usize,
     pub dead: usize,
     pub forgotten: usize,
+    /// Sessions whose previous tmux server is gone (typically an OS
+    /// reboot) but whose tracked row carries enough state for the
+    /// frontend to invoke the harness's native `--resume` on first
+    /// pane open. The frontend uses this count for an optional toast.
+    pub recoverable_after_reboot: usize,
 }
 
 /// One classified tracked session. The planner produces these; the
 /// applier consumes them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RehydrateJob {
-    /// The tracked row refers to a tmux session that no longer exists.
-    /// Drop it from `sessions.toml`.
+    /// The tracked row refers to a tmux session that no longer exists
+    /// AND the row carries no state from which the harness can resume
+    /// (Shell sessions, or non-Shell rows with neither
+    /// `harness_session_id` nor `last_prompt_text`). Drop it from
+    /// `sessions.toml`.
     Forget { session_id: String },
     /// The tracked row refers to a live tmux session. Re-register a
     /// state machine seeded with `last_state`, and insert a
@@ -74,6 +82,21 @@ pub enum RehydrateJob {
         worktree_id: Option<String>,
         opencode_port: Option<u16>,
         last_state: Option<AgentState>,
+        created_at_unix_ms: u64,
+    },
+    /// The tracked row refers to a tmux session that is gone (the tmux
+    /// server died with the previous OS session, typically a reboot)
+    /// BUT the harness exposes a native `--resume` command and the row
+    /// carries either a persisted `harness_session_id` or
+    /// `last_prompt_text` we can replay against the on-disk transcript.
+    /// The applier inserts a `dead + recoverable_after_reboot` ghost
+    /// and leaves the tracked row in place; the frontend auto-fires
+    /// `terminal_respawn_dead` on first pane mount.
+    Recover {
+        session_id: String,
+        harness: AgentKind,
+        project_slug: Option<String>,
+        worktree_id: Option<String>,
         created_at_unix_ms: u64,
     },
 }
@@ -93,6 +116,12 @@ pub struct RehydrateReport {
     /// failures, or harnesses with no derivable launch command. The
     /// frontend renders these with the Recover overlay.
     pub dead_skipped: Vec<String>,
+    /// Sessions whose previous tmux server is gone (typically an OS
+    /// reboot) but whose tracked row carries enough state for the
+    /// harness's native `--resume` to rebuild the conversation. Each
+    /// of these had a ghost inserted with
+    /// `recoverable_after_reboot: true`; the row was NOT forgotten.
+    pub recoverable_after_reboot: Vec<String>,
 }
 
 impl RehydrateReport {
@@ -117,6 +146,10 @@ impl RehydrateReport {
         self.dead_skipped.len()
     }
     #[must_use]
+    pub fn count_recoverable_after_reboot(&self) -> usize {
+        self.recoverable_after_reboot.len()
+    }
+    #[must_use]
     pub fn summary(&self) -> RehydrateSummary {
         // Live = rehydrated minus revived (revived sessions also land
         // in `rehydrated` because the register-job path runs after a
@@ -127,18 +160,22 @@ impl RehydrateReport {
             alive,
             dead: self.dead_skipped.len(),
             forgotten: self.forgotten.len(),
+            recoverable_after_reboot: self.recoverable_after_reboot.len(),
         }
     }
 }
 
-/// Pure classifier. For every tracked row: if the tmux session is alive
-/// (id is in `live_ids`), emit a `Register`; otherwise, emit a
-/// `Forget`. `Shell` sessions get a `Register` with `last_state == None`
-/// — the applier uses the kind to skip state-machine registration for
-/// shells while still inserting a ghost so `terminal_list` returns them
-/// (shells don't contribute to the counters because
-/// `isProjectScopedHarnessTerminal` filters them out, but the user
-/// still sees them in the tab row).
+/// Pure classifier. Tristate decision per tracked row:
+///
+/// - `Register` — `session_id` is in `live_ids`; the tmux server
+///   survived the previous run.
+/// - `Recover` — `session_id` is NOT in `live_ids` (tmux server died
+///   between runs, typically OS reboot), the kind is non-`Shell`, and
+///   the row carries either `harness_session_id` or `last_prompt_text`
+///   so the harness's native `--resume` can rebuild the conversation.
+/// - `Forget` — everything else: shell sessions whose tmux is gone,
+///   non-shell rows with neither resume id nor last prompt persisted
+///   (no recovery surface), or duplicate ids.
 ///
 /// Duplicate tracked rows for the same session id are tolerated — we
 /// only emit a job for the first occurrence.
@@ -158,6 +195,16 @@ pub fn rehydrate_plan(tracked: &[TrackedSession], live_ids: &HashSet<String>) ->
                 worktree_id: row.worktree_id.clone(),
                 opencode_port: row.opencode_port,
                 last_state: row.last_state,
+                created_at_unix_ms: row.created_at_unix_ms,
+            });
+        } else if !matches!(row.kind, AgentKind::Shell)
+            && (row.harness_session_id.is_some() || row.last_prompt_text.is_some())
+        {
+            out.push(RehydrateJob::Recover {
+                session_id: row.session_id.clone(),
+                harness: row.kind,
+                project_slug: row.project_slug.clone(),
+                worktree_id: row.worktree_id.clone(),
                 created_at_unix_ms: row.created_at_unix_ms,
             });
         } else {
@@ -233,6 +280,29 @@ pub fn apply_rehydrate_plan<R: Runtime>(
                     }
                 }
             }
+            RehydrateJob::Recover {
+                session_id,
+                harness,
+                project_slug,
+                worktree_id,
+                created_at_unix_ms,
+            } => match apply_recover_job(
+                app,
+                state,
+                &session_id,
+                harness,
+                project_slug.as_deref(),
+                worktree_id.as_deref(),
+                created_at_unix_ms,
+            ) {
+                Ok(()) => {
+                    report.recoverable_after_reboot.push(session_id);
+                }
+                Err(e) => {
+                    warn!(error=%e, session_id=%session_id, "rehydrate: recover-after-reboot failed");
+                    report.errors.push((session_id, e));
+                }
+            },
         }
     }
     info!(
@@ -240,6 +310,7 @@ pub fn apply_rehydrate_plan<R: Runtime>(
         revived = report.count_revived(),
         dead_skipped = report.count_dead_skipped(),
         forgotten = report.count_forgotten(),
+        recoverable_after_reboot = report.count_recoverable_after_reboot(),
         errors = report.count_errors(),
         "rehydrate: plan applied",
     );
@@ -353,6 +424,7 @@ fn apply_register_job<R: Runtime>(
             kind: harness,
             created_unix,
             dead: ghost_dead,
+            recoverable_after_reboot: false,
         });
         drop(reg);
         if inserted {
@@ -363,6 +435,7 @@ fn apply_register_job<R: Runtime>(
                 kind: harness,
                 created_unix,
                 dead: ghost_dead,
+                recoverable_after_reboot: false,
             };
             emit_terminal_session_upserted(app, &item);
         }
@@ -402,6 +475,62 @@ fn apply_register_job<R: Runtime>(
     }
 
     Ok(outcome)
+}
+
+/// Applier for `RehydrateJob::Recover`. The previous tmux server is
+/// gone so there is no pane to probe and no state machine to bind —
+/// we just insert a `dead + recoverable_after_reboot` ghost into
+/// `TerminalRegistry` so `terminal_list` returns the row before any
+/// pane mounts.
+///
+/// Crucially, this path does **not** call `store.forget_session(...)`.
+/// The tracked row stays intact in `state/sessions.toml` so its
+/// `harness_session_id`, `last_prompt_text`, and `opencode_port`
+/// fields survive into the eventual `terminal_respawn_dead` call —
+/// without them, the frontend's auto-fire-on-mount would have nothing
+/// to resume against.
+fn apply_recover_job<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &AppHandleState,
+    session_id: &str,
+    harness: AgentKind,
+    project_slug: Option<&str>,
+    worktree_id: Option<&str>,
+    created_at_unix_ms: u64,
+) -> Result<(), String> {
+    let created_unix = created_at_unix_ms / 1000;
+    let mut reg = state
+        .terminals
+        .lock()
+        .map_err(|_| "terminals lock poisoned".to_string())?;
+    let inserted = reg.upsert_ghost(GhostEntry {
+        session_id: session_id.to_string(),
+        project_slug: project_slug.map(str::to_string),
+        worktree_id: worktree_id.map(str::to_string),
+        kind: harness,
+        created_unix,
+        dead: true,
+        recoverable_after_reboot: true,
+    });
+    drop(reg);
+    if inserted {
+        let item = TerminalListItem {
+            session_id: session_id.to_string(),
+            project_slug: project_slug.map(str::to_string),
+            worktree_id: worktree_id.map(str::to_string),
+            kind: harness,
+            created_unix,
+            dead: true,
+            recoverable_after_reboot: true,
+        };
+        emit_terminal_session_upserted(app, &item);
+    }
+    info!(
+        session_id = %session_id,
+        harness = ?harness,
+        "rehydrate: marked session recoverable-after-reboot",
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -477,7 +606,10 @@ mod tests {
     }
 
     #[test]
-    fn rehydrate_plan_marks_tracked_sessions_not_in_tmux_for_forget() {
+    fn rehydrate_plan_marks_unrecoverable_tracked_sessions_for_forget() {
+        // Both rows lack `harness_session_id` and `last_prompt_text`,
+        // so the dead non-Shell row has no recovery surface and gets
+        // Forget. The alive row is unchanged.
         let tracked_rows = vec![
             tracked("raum-alive", AgentKind::OpenCode, Some("acme"), None, None),
             tracked("raum-dead", AgentKind::Codex, Some("acme"), None, None),
@@ -493,6 +625,53 @@ mod tests {
             &plan[1],
             RehydrateJob::Forget { session_id } if session_id == "raum-dead"
         ));
+    }
+
+    #[test]
+    fn rehydrate_plan_marks_dead_non_shell_with_harness_id_for_recover() {
+        let mut row = tracked("raum-dead", AgentKind::ClaudeCode, Some("acme"), None, None);
+        row.harness_session_id = Some("11111111-2222-3333-4444-555555555555".into());
+        let plan = rehydrate_plan(&[row], &HashSet::new());
+        assert_eq!(plan.len(), 1);
+        assert!(
+            matches!(
+                &plan[0],
+                RehydrateJob::Recover {
+                    session_id,
+                    harness: AgentKind::ClaudeCode,
+                    ..
+                } if session_id == "raum-dead",
+            ),
+            "row with persisted harness_session_id should be Recover, got {:?}",
+            plan[0]
+        );
+    }
+
+    #[test]
+    fn rehydrate_plan_marks_dead_non_shell_with_last_prompt_for_recover() {
+        // No harness_session_id, but last_prompt_text is enough — the
+        // resolve_resume_target fallback walks the transcript dir to
+        // discover the id from the prompt.
+        let mut row = tracked("raum-dead", AgentKind::Codex, Some("acme"), None, None);
+        row.last_prompt_text = Some("review this PR".into());
+        let plan = rehydrate_plan(&[row], &HashSet::new());
+        assert_eq!(plan.len(), 1);
+        assert!(matches!(
+            &plan[0],
+            RehydrateJob::Recover { session_id, .. } if session_id == "raum-dead"
+        ));
+    }
+
+    #[test]
+    fn rehydrate_plan_forgets_dead_shell_even_with_persisted_state() {
+        // Shells have no `--resume`. A Shell row is always Forget when
+        // its tmux session is gone, even if last_prompt_text is set
+        // (which can't happen in practice, but be defensive).
+        let mut row = tracked("raum-dead-shell", AgentKind::Shell, None, None, None);
+        row.last_prompt_text = Some("ignored".into());
+        let plan = rehydrate_plan(&[row], &HashSet::new());
+        assert_eq!(plan.len(), 1);
+        assert!(matches!(&plan[0], RehydrateJob::Forget { .. }));
     }
 
     #[test]
@@ -530,6 +709,55 @@ mod tests {
         assert!(
             plan.iter()
                 .all(|j| matches!(j, RehydrateJob::Forget { .. }))
+        );
+    }
+
+    #[test]
+    fn rehydrate_plan_recovers_all_three_supported_harnesses_after_reboot() {
+        // Simulates the post-OS-reboot state: three rows persisted with
+        // harness_session_id but the live tmux socket is empty (server
+        // died with the OS). Each non-Shell row should become a Recover
+        // job, and none should be Forget'd — preserving the
+        // harness_session_id needed by terminal_respawn_dead.
+        let mut claude_row = tracked(
+            "raum-claude",
+            AgentKind::ClaudeCode,
+            Some("acme"),
+            None,
+            None,
+        );
+        claude_row.harness_session_id = Some("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".into());
+        let mut codex_row = tracked("raum-codex", AgentKind::Codex, Some("acme"), None, None);
+        codex_row.harness_session_id = Some("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".into());
+        let mut opencode_row = tracked(
+            "raum-opencode",
+            AgentKind::OpenCode,
+            Some("acme"),
+            None,
+            None,
+        );
+        opencode_row.harness_session_id = Some("cccccccc-cccc-cccc-cccc-cccccccccccc".into());
+        opencode_row.opencode_port = Some(5123);
+
+        let plan = rehydrate_plan(&[claude_row, codex_row, opencode_row], &HashSet::new());
+
+        assert_eq!(plan.len(), 3);
+        let recover_kinds: Vec<AgentKind> = plan
+            .iter()
+            .filter_map(|j| match j {
+                RehydrateJob::Recover { harness, .. } => Some(*harness),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            recover_kinds,
+            vec![AgentKind::ClaudeCode, AgentKind::Codex, AgentKind::OpenCode],
+            "all three harnesses get a Recover job; none are Forget'd",
+        );
+        assert!(
+            plan.iter()
+                .all(|j| !matches!(j, RehydrateJob::Forget { .. })),
+            "no Forget jobs — recoverable rows must keep their state",
         );
     }
 }

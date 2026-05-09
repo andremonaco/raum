@@ -416,6 +416,55 @@ async fn opencode_unreachable_server_returns_empty() {
     assert!(prompts.is_empty());
 }
 
+#[test]
+fn opencode_cli_session_list_picks_newest_matching_directory() {
+    let cwd = Path::new("/Users/foo/repo");
+    let raw = serde_json::json!([
+        {
+            "id": "ses_old",
+            "directory": "/Users/foo/repo",
+            "time": { "updated": 10 }
+        },
+        {
+            "id": "ses_other",
+            "directory": "/Users/foo/other",
+            "time": { "updated": 999 }
+        },
+        {
+            "id": "ses_new",
+            "directory": "/Users/foo/repo",
+            "time": { "updated": 20 }
+        }
+    ])
+    .to_string();
+
+    let got = super::opencode::session_id_for_directory_from_list_json(&raw, cwd);
+    assert_eq!(got.as_deref(), Some("ses_new"));
+}
+
+#[test]
+fn opencode_cli_session_list_accepts_project_directory_shape() {
+    let cwd = Path::new("/Users/foo/repo");
+    let raw = serde_json::json!([
+        {
+            "id": "ses_nested",
+            "project": { "directory": "/Users/foo/repo" },
+            "time": { "created": 1 }
+        }
+    ])
+    .to_string();
+
+    let got = super::opencode::session_id_for_directory_from_list_json(&raw, cwd);
+    assert_eq!(got.as_deref(), Some("ses_nested"));
+}
+
+#[test]
+fn opencode_cli_session_list_returns_none_for_invalid_json() {
+    let got =
+        super::opencode::session_id_for_directory_from_list_json("not-json", Path::new("/repo"));
+    assert!(got.is_none());
+}
+
 /// Pull `("http://host", port)` out of a `http://127.0.0.1:NNNN` uri
 /// — wiremock doesn't expose port directly. Helper for the OpenCode
 /// HTTP tests.

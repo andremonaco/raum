@@ -45,6 +45,7 @@ mod tests;
 // `crate::review::transcript::clean_claude_user_text` must keep
 // resolving after the split.
 pub(crate) use claude::clean_claude_user_text;
+pub use opencode::discover_opencode_session_id_via_cli;
 
 /// Hard cap on how long any per-harness lookup may take. The snap overlay
 /// blocks on this — anything longer than ~500 ms feels broken.

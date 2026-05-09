@@ -18,7 +18,7 @@ pub mod transcript;
 pub use brief::{BriefInputs, render_review_brief};
 pub use inject::inject_opencode_brief;
 pub use transcript::{
-    discover_claude_session_id, discover_codex_session_id, discover_session_id_by_prompt,
-    discover_transcript_path, harness_session_id_matches_cwd, read_session_user_prompts,
-    read_session_user_prompts_for_id,
+    discover_claude_session_id, discover_codex_session_id, discover_opencode_session_id_via_cli,
+    discover_session_id_by_prompt, discover_transcript_path, harness_session_id_matches_cwd,
+    read_session_user_prompts, read_session_user_prompts_for_id,
 };

@@ -25,6 +25,15 @@ pub struct TerminalListItem {
     /// shape stable for the common case.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dead: bool,
+    /// True when the pane is dead because raum's tmux server was torn
+    /// down between the previous run and now (typically an OS reboot)
+    /// and the row carries a persisted `harness_session_id` (or last
+    /// prompt) that lets the harness's native `--resume` rebuild the
+    /// conversation. The frontend uses this flag to auto-fire
+    /// `terminal_respawn_dead` when the pane mounts, instead of waiting
+    /// for the user to click the Recover overlay.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub recoverable_after_reboot: bool,
 }
 
 /// Identity-only terminal record. Populated by the startup rehydrate
@@ -48,6 +57,12 @@ pub struct GhostEntry {
     /// path couldn't auto-revive (Shell sessions, or harnesses where
     /// `respawn_with` failed).
     pub dead: bool,
+    /// True when this ghost was inserted by the post-reboot recovery
+    /// path: the previous tmux server is gone, but the tracked row
+    /// carries enough state (`harness_session_id` or `last_prompt_text`)
+    /// for `terminal_respawn_dead` to recreate the tmux session and run
+    /// the harness's native `--resume` command.
+    pub recoverable_after_reboot: bool,
 }
 
 impl GhostEntry {
@@ -60,6 +75,7 @@ impl GhostEntry {
             kind: self.kind,
             created_unix: self.created_unix,
             dead: self.dead,
+            recoverable_after_reboot: self.recoverable_after_reboot,
         }
     }
 }
@@ -204,6 +220,7 @@ impl TerminalRegistry {
                 // Real entries are by definition live — the bridge is
                 // attached. Dead-pane sessions stay as ghosts.
                 dead: false,
+                recoverable_after_reboot: false,
             })
             .collect();
         // Only include ghosts whose id isn't already represented by a
