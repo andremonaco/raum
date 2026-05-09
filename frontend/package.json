@@ -32,7 +32,6 @@
     "@tauri-apps/api": "latest",
     "@tauri-apps/plugin-dialog": "latest",
     "@tauri-apps/plugin-global-shortcut": "latest",
-    "@tauri-apps/plugin-notification": "latest",
     "@tauri-apps/plugin-opener": "latest",
     "@tauri-apps/plugin-process": "latest",
     "@tauri-apps/plugin-updater": "latest",

@@ -86,6 +86,15 @@ pub struct AppHandleState {
     /// re-spawning `opencode models` or re-reading `models_cache.json` on
     /// every picker open) keeps the picker snappy during the snap dance.
     pub models_cache: ModelsCache,
+    /// macOS-only: retained `UNUserNotificationCenterDelegate` instance.
+    /// Stored here because Objective-C will deallocate the delegate the
+    /// moment its `Retained` ref count hits zero, which would silently
+    /// stop click events from reaching the frontend. Set once during
+    /// `.setup`; never cleared.
+    #[cfg(target_os = "macos")]
+    pub notification_delegate: Mutex<
+        Option<objc2::rc::Retained<crate::notifications::delegate::RaumNotificationDelegate>>,
+    >,
 }
 
 /// Snapshot of the most recent hook event, surfaced via
@@ -115,6 +124,8 @@ impl Default for AppHandleState {
             last_hook_at: Arc::new(Mutex::new(None)),
             review_links: Mutex::new(HashMap::new()),
             models_cache: ModelsCache::default(),
+            #[cfg(target_os = "macos")]
+            notification_delegate: Mutex::new(None),
         }
     }
 }

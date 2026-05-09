@@ -104,6 +104,11 @@ export interface TerminalPaneProps {
    *  on first spawn. Used by the cross-harness review picker; ignored on
    *  reattach. */
   modelOverride?: { model: string; effort?: string };
+  /** When true, the previous tmux server died (typically OS reboot) but the
+   *  tracked row carries enough state for the harness's native `--resume` to
+   *  rebuild the conversation. The pane auto-fires `terminal_respawn_dead`
+   *  on first mount instead of waiting for a manual Recover click. */
+  recoverableAfterReboot?: boolean;
 }
 
 interface RenderingConfig {
@@ -837,6 +842,75 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       setBridgeRecoveryUiState("reconnecting");
       recoverBridge(id);
     };
+    // Post-reboot recovery: the previous tmux server is gone but the
+    // backend kept this pane's tracked row (with `harness_session_id`)
+    // alive and tagged the ghost as `recoverable_after_reboot`. Instead
+    // of going through the normal reattach → "not-found" → trySpawn
+    // fallback (which loses the harness session id by creating a fresh
+    // chat), invoke `terminal_respawn_dead` directly so the harness
+    // resumes its own conversation via `--resume <id>`. The Rust path
+    // already creates the missing tmux session lazily when it sees
+    // `resume_after_attach: true` and no live session.
+    const tryRecoverAfterReboot = (targetSessionId: string): void => {
+      if (hasSpawned) return;
+      if (!isHarnessKind(props.kind)) return;
+      if (!term || !fit) return;
+      try {
+        fit.fit();
+      } catch {
+        return;
+      }
+      const cols = term.cols;
+      const rows = term.rows;
+      if (cols < MIN_REATTACH_COLS || rows < MIN_REATTACH_ROWS) return;
+      hasSpawned = true;
+      lastCols = cols;
+      lastRows = rows;
+      setSessionId(targetSessionId);
+      setRespawningDead(true);
+      const respawnChannel = rotateOutputChannel(true);
+      logLifecycle("recover", paneId, targetSessionId);
+      void invoke<ReconnectResult>("terminal_respawn_dead", {
+        args: {
+          session_id: targetSessionId,
+          kind: props.kind,
+          project_slug: props.projectSlug,
+          worktree_id: props.worktreeId,
+          cols,
+          rows,
+        },
+        onData: respawnChannel,
+      })
+        .then((result) => {
+          setRespawningDead(false);
+          if (result.historyStatus === "unavailable") {
+            setErrorMsg(result.message ?? "Provider recovery is unavailable for this pane");
+            // Drop back to the standard reattach/spawn flow so the user
+            // at least gets a working harness, even if the prior
+            // conversation is unrecoverable.
+            hasSpawned = false;
+            persistedSessionMissing = true;
+            return;
+          }
+          setSessionId(result.sessionId);
+          setExitState(null);
+          setErrorMsg(null);
+          setBridgeRecoveryAttempts(0);
+          setBridgeRecoveryUiState("idle");
+          props.onSpawned?.(result.sessionId);
+          if (isHarnessKind(props.kind)) {
+            void hydrateHarnessStateAfterReattach(result.sessionId, props.kind);
+          }
+        })
+        .catch((e) => {
+          console.warn("[TerminalPane] reboot-recover terminal_respawn_dead failed", e);
+          setRespawningDead(false);
+          setErrorMsg(String(e));
+          hasSpawned = false;
+          persistedSessionMissing = true;
+        });
+    };
+
     recoverDeadPaneRef = (): void => {
       if (respawningDead()) return;
       if (!isHarnessKind(props.kind)) return;
@@ -948,7 +1022,14 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
     requestVisibleResize = (force = false): void => {
       scheduleResize(force);
       if (hasSpawned) return;
-      if (persistedSessionId && !persistedSessionMissing) {
+      if (
+        persistedSessionId &&
+        !persistedSessionMissing &&
+        props.recoverableAfterReboot &&
+        isHarnessKind(props.kind)
+      ) {
+        tryRecoverAfterReboot(persistedSessionId);
+      } else if (persistedSessionId && !persistedSessionMissing) {
         tryReattach();
       } else {
         trySpawn();

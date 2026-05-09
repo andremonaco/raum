@@ -16,7 +16,6 @@
     "core:window:allow-show",
     "core:window:allow-set-title",
     "core:webview:allow-create-webview-window",
-    "notification:default",
     "global-shortcut:default",
     "updater:default",
     "process:default",
