@@ -28,6 +28,12 @@ use tauri::{AppHandle, Runtime};
 use crate::notifications;
 use crate::state::AppHandleState;
 
+// The modern UNUserNotificationCenter-based send command lives at
+// `crate::notifications::send::notifications_send` and is registered
+// directly from `lib.rs`. Tauri's `#[command]` macro generates the
+// `__cmd__notifications_send` shim alongside the function definition,
+// which a plain `pub use` does not re-export.
+
 /// §11.3 — `app.set_dock_badge(count)`. A `count` of 0 clears the badge.
 #[tauri::command]
 pub fn set_dock_badge<R: Runtime>(app: AppHandle<R>, count: u32) -> Result<(), String> {
@@ -247,10 +253,10 @@ pub fn notifications_check_authorization<R: Runtime>(
         };
         let note = if is_dev {
             Some(
-                "Dev build: desktop notifications are attributed to Terminal \
-                 (`com.apple.Terminal`), so raum cannot read an authoritative \
-                 permission state here. Build and launch the bundled app \
-                 (`task build`) to verify raum's own macOS authorization."
+                "Dev build: the unbundled binary has no Info.plist, so the \
+                 modern UserNotifications API has no bundle to attach to. \
+                 Build and launch the bundled app (`task build`) to verify \
+                 raum's own macOS authorization end to end."
                     .to_string(),
             )
         } else {

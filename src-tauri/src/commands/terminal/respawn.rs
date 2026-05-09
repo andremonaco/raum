@@ -7,7 +7,10 @@ use std::sync::Arc;
 
 use raum_core::AgentKind;
 use raum_core::harness::{harness_launch_command, harness_resume_command, parse_opencode_port_arg};
-use raum_core::review::{discover_session_id_by_prompt, harness_session_id_matches_cwd};
+use raum_core::review::{
+    discover_opencode_session_id_via_cli, discover_session_id_by_prompt,
+    harness_session_id_matches_cwd,
+};
 use raum_tmux::TmuxManager;
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{AppHandle, Runtime};
@@ -95,16 +98,27 @@ pub(super) async fn resolve_resume_target(
                 .as_deref()
                 .map(PathBuf::from)
                 .ok_or_else(|| format!("no provider resume id persisted for {kind:?}"))?;
-            let prompt = tracked_session_last_prompt(state, session_id)
-                .ok_or_else(|| format!("no provider resume id or prompt persisted for {kind:?}"))?;
-            let home_dir = dirs::home_dir()
-                .ok_or_else(|| "cannot discover provider resume id without HOME".to_string())?;
-            let discovered = discover_session_id_by_prompt(kind, &cwd, &home_dir, &prompt)
-                .ok_or_else(|| {
+            let discovered = if matches!(kind, AgentKind::OpenCode) {
+                discover_opencode_session_id_via_cli(&cwd)
+                    .await
+                    .ok_or_else(|| {
+                        format!(
+                            "no provider resume id persisted for OpenCode, and `opencode session list --format json` found no session for cwd {}",
+                            cwd.display()
+                        )
+                    })?
+            } else {
+                let prompt = tracked_session_last_prompt(state, session_id).ok_or_else(|| {
+                    format!("no provider resume id or prompt persisted for {kind:?}")
+                })?;
+                let home_dir = dirs::home_dir()
+                    .ok_or_else(|| "cannot discover provider resume id without HOME".to_string())?;
+                discover_session_id_by_prompt(kind, &cwd, &home_dir, &prompt).ok_or_else(|| {
                     format!(
                         "no provider resume id persisted for {kind:?}, and no transcript matched this pane's last prompt"
                     )
-                })?;
+                })?
+            };
             if let Ok(store) = state.config_store.lock()
                 && let Err(e) = store.update_session_harness_id(
                     session_id,

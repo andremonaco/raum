@@ -69,16 +69,25 @@ is rendered in the **Harness Health** panel of the Settings modal.
   `notify = ["<path to codex-notify.sh>"]`, enabling
   `tui.notifications = true` and `tui.notification_method = "osc9"`
   unconditionally so approval prompts emit OSC 9, and — only on Codex
-  ≥ 0.119 — flipping `[features] codex_hooks = true`) and
+  ≥ 0.130 — flipping `[features] hooks = true` plus pre-seeding a
+  `[hooks.state."<hooks.json path>:<event>:0:0"].trusted_hash` for
+  each raum hook so they bypass Codex's `/hooks` review queue
+  introduced in [openai/codex#20321][trust-pr]) and
   `<project>/.codex/hooks.json` (managed entries under
   `UserPromptSubmit` and `Stop` only; `SessionStart` is deliberately
   not subscribed to avoid silence-heuristic `Idle → Working`
   promotion on Codex boot).
-- **Version gate**: Codex hooks first shipped in v0.119; older binaries
-  get `notify` + OSC 9 only. The version is probed via `codex --version`
-  at plan time. raum does **not** assume a released `PermissionRequest`
-  hook yet; supported builds derive waiting-state from OSC 9 approval
-  notifications instead.
+- **Version gate**: Codex 0.130 renamed `[features].codex_hooks` →
+  `[features].hooks` ([#20684][rename-pr]) and gated unmanaged hooks
+  behind a `trusted_hash` review ([#20321][trust-pr]); raum's plan
+  emits both the renamed flag and the matching hash, so we require
+  ≥ 0.130. Older binaries get `notify` + OSC 9 only. The version is
+  probed via `codex --version` at plan time. raum does **not** assume
+  a released `PermissionRequest` hook yet; supported builds derive
+  waiting-state from OSC 9 approval notifications instead.
+
+[rename-pr]: https://github.com/openai/codex/pull/20684
+[trust-pr]: https://github.com/openai/codex/pull/20321
 - **OSC 9 scrape**: raum parses the live PTY bytes of the attached Codex pane for
   `\x1b]9;<payload>\x07`; `approval-requested` → `PermissionNeeded`,
   `agent-turn-complete` → `TurnEnd`.
@@ -163,10 +172,13 @@ before spawning the harness.
 
 ### Codex reliability ring stays dotted (below hooks minimum version)
 
-Codex hooks first shipped in v0.119. On older releases raum falls back
-to `notify` + OSC 9 only, which covers turn-end reliably but leaves
-approval prompts on a heuristic signal. Upgrade Codex, then re-bind the
-project so raum re-writes `hooks.json`.
+raum requires Codex ≥ 0.130 for the hooks channel (the rename of
+`[features].codex_hooks` → `[features].hooks` and the `trusted_hash`
+review gate both landed in that release). On older releases raum falls
+back to `notify` + OSC 9 only, which covers turn-end reliably but
+leaves approval prompts on a heuristic signal. Upgrade Codex, then
+re-bind the project so raum re-writes `hooks.json` and refreshes the
+`[hooks.state]` trust entries in `~/.codex/config.toml`.
 
 ### Blocking hook times out and Claude's TUI prompt fires instead
 

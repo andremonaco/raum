@@ -15,6 +15,7 @@ mod ghost_tests {
             kind: AgentKind::ClaudeCode,
             created_unix: 42,
             dead: false,
+            recoverable_after_reboot: false,
         }
     }
 

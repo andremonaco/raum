@@ -24,6 +24,10 @@ export interface TerminalSurfaceDescriptor {
   /** Cross-harness review: forwarded into the next `terminal_spawn` as
    *  `model_override`. Set by the pre-spawn picker; cleared once consumed. */
   modelOverride?: { model: string; effort?: string };
+  /** Mirrors `TerminalRecord.recoverable_after_reboot` for the surface's
+   *  session. Drives `<TerminalPane>`'s auto-fire of `terminal_respawn_dead`
+   *  on first mount when the previous tmux server died across a reboot. */
+  recoverableAfterReboot?: boolean;
 }
 
 export interface ProjectTerminalSurfacesArgs {
@@ -149,6 +153,9 @@ export function projectTerminalSurfaces(
           maximized,
           initialPrompt: tab.initialPrompt,
           modelOverride: tab.modelOverride,
+          recoverableAfterReboot: sessionId
+            ? !!args.terminalById[sessionId]?.recoverable_after_reboot
+            : false,
         },
         activeTab,
       );
@@ -178,6 +185,9 @@ export function projectTerminalSurfaces(
           visible: false,
           active: false,
           maximized: false,
+          recoverableAfterReboot: tab.sessionId
+            ? !!args.terminalById[tab.sessionId]?.recoverable_after_reboot
+            : false,
         },
         tab.id === pane.activeTabId,
       );
@@ -203,6 +213,7 @@ export function projectTerminalSurfaces(
         visible,
         active: false,
         maximized: false,
+        recoverableAfterReboot: !!record.recoverable_after_reboot,
       },
     });
   }

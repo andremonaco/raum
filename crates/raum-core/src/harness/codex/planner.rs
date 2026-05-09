@@ -10,6 +10,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::config_io::managed_json::{MARKER_BEGIN, MARKER_KEY};
 use crate::harness::setup::SetupError;
@@ -20,6 +21,8 @@ pub(super) fn render_codex_toml_managed_body(
     notify_script: &Path,
     enable_hooks: bool,
     trusted_paths: &[PathBuf],
+    hooks_json_path: &Path,
+    hook_script: &Path,
 ) -> String {
     // TOML arrays are top-level; the `[features]` and `[tui]` tables are
     // siblings. We emit them in a single managed block so the whole raum
@@ -33,9 +36,12 @@ pub(super) fn render_codex_toml_managed_body(
     // do need it would otherwise silently stay in `Working` through
     // every approval prompt.
     //
-    // Only `[features] codex_hooks` stays gated — it's the one setting
-    // that triggers real behaviour change on versions that don't know
-    // the feature flag yet.
+    // `[features] hooks` (renamed from `codex_hooks` in Codex 0.130 —
+    // openai/codex#20684) and the `[hooks.state]` trust entries below
+    // are both gated on `enable_hooks`: they only take effect on
+    // versions that know about hooks at all, and the trust entries
+    // pre-approve raum's own hooks.json so Codex's `/hooks` review
+    // queue (openai/codex#20321) doesn't strand them in `Untrusted`.
     //
     // `[projects."<abs-path>"]` tables pre-declare every raum-registered
     // project + worktree as trusted. Codex keys its trust prompt on the
@@ -46,7 +52,26 @@ pub(super) fn render_codex_toml_managed_body(
     let mut body = format!("notify = [{path_json}]\n");
     body.push_str("\n[tui]\nnotifications = true\nnotification_method = \"osc9\"\n");
     if enable_hooks {
-        body.push_str("\n[features]\ncodex_hooks = true\n");
+        body.push_str("\n[features]\nhooks = true\n");
+        // Pre-seed `[hooks.state."<key>"].trusted_hash` so each raum
+        // hook lands as `Trusted` instead of `Untrusted` on first
+        // launch. The key + hash format must mirror Codex's
+        // `hook_key` / `version_for_toml` exactly — see the helpers
+        // below.
+        // Each event raum subscribes to is written as a single
+        // matcher-group with a single handler in `hooks.json`, so the
+        // positional indices Codex hashes into the state key are
+        // always (0, 0).
+        for event in RAUM_CODEX_HOOK_EVENTS {
+            let key = codex_hook_state_key(hooks_json_path, event, 0, 0);
+            let hash = codex_hook_trusted_hash(event, hook_script);
+            let key_json = serde_json::to_string(&key).unwrap_or_else(|_| "\"\"".into());
+            let hash_json = serde_json::to_string(&hash).unwrap_or_else(|_| "\"\"".into());
+            let _ = write!(
+                body,
+                "\n[hooks.state.{key_json}]\ntrusted_hash = {hash_json}\n",
+            );
+        }
     }
     // De-duplicate while preserving insertion order (project root first,
     // worktrees in caller order) so the rendered body is stable across
@@ -102,6 +127,100 @@ pub(super) fn codex_hook_entry(event: &str, hook_script: &Path) -> Value {
             }
         ],
     })
+}
+
+/// Snake-case label for an event, mirroring upstream
+/// `codex-rs/hooks/src/lib.rs::hook_event_key_label`. raum subscribes
+/// to two events today; if `RAUM_CODEX_HOOK_EVENTS` ever grows, extend
+/// this map at the same time. Unknown events fall through to the input
+/// string so a missing arm shows up as a hash/key mismatch in tests
+/// rather than a silent panic at startup.
+fn codex_hook_event_label(event: &str) -> &str {
+    match event {
+        "PreToolUse" => "pre_tool_use",
+        "PermissionRequest" => "permission_request",
+        "PostToolUse" => "post_tool_use",
+        "PreCompact" => "pre_compact",
+        "PostCompact" => "post_compact",
+        "SessionStart" => "session_start",
+        "UserPromptSubmit" => "user_prompt_submit",
+        "Stop" => "stop",
+        other => other,
+    }
+}
+
+/// Build the `[hooks.state."<key>"]` table key Codex uses to look up
+/// per-hook trust state. Mirrors `hook_key` in
+/// `codex-rs/hooks/src/lib.rs`:
+///   `"{source_path}:{event_label}:{group_index}:{handler_index}"`.
+pub(super) fn codex_hook_state_key(
+    hooks_json_path: &Path,
+    event: &str,
+    group_index: usize,
+    handler_index: usize,
+) -> String {
+    format!(
+        "{}:{}:{group_index}:{handler_index}",
+        hooks_json_path.display(),
+        codex_hook_event_label(event),
+    )
+}
+
+/// Compute the `trusted_hash` Codex expects for a raum hook. Mirrors
+/// `command_hook_hash` + `version_for_toml` in
+/// `codex-rs/hooks/src/engine/discovery.rs` and
+/// `codex-rs/config/src/fingerprint.rs`: SHA-256 over a canonical-JSON
+/// serialisation (recursively sorted object keys) of the normalised
+/// `{event_name, matcher, hooks: [Command]}` identity, hex-lowercase,
+/// prefixed `sha256:`. The handler matches what
+/// [`render_codex_hooks_json`] writes after Codex's discovery
+/// normalisation step (timeout `None` → 600, `async` defaulted to
+/// `false`).
+pub(super) fn codex_hook_trusted_hash(event: &str, hook_script: &Path) -> String {
+    let identity = json!({
+        "event_name": codex_hook_event_label(event),
+        "matcher": ".*",
+        "hooks": [
+            {
+                "type": "command",
+                "command": format!("{} {}", hook_script.display(), event),
+                "timeout": 600u64,
+                "async": false,
+                "statusMessage": format!("raum: forwarding {event}"),
+            }
+        ],
+    });
+    let canonical = canonicalize_json(identity);
+    let bytes = serde_json::to_vec(&canonical).unwrap_or_default();
+    let digest = Sha256::digest(&bytes);
+    let mut hex = String::with_capacity(7 + digest.len() * 2);
+    hex.push_str("sha256:");
+    for byte in digest {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+/// Recursively sort object keys so two structurally-equivalent JSON
+/// values produce identical byte-strings. Matches the `canonical_json`
+/// helper inside `codex-rs/config/src/fingerprint.rs`.
+fn canonicalize_json(value: Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut sorted: std::collections::BTreeMap<String, Value> =
+                std::collections::BTreeMap::new();
+            for (k, v) in map {
+                sorted.insert(k, canonicalize_json(v));
+            }
+            let mut out = serde_json::Map::with_capacity(sorted.len());
+            for (k, v) in sorted {
+                out.insert(k, v);
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(items.into_iter().map(canonicalize_json).collect()),
+        other => other,
+    }
 }
 
 /// Body of the `codex-notify.sh` script.

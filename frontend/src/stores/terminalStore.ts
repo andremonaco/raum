@@ -37,6 +37,12 @@ export interface TerminalListItem {
    *  dead and could not auto-revive it. Backend skips the field on the wire
    *  when false (see `TerminalListItem` in terminal.rs). */
   dead?: boolean;
+  /** True when this session's tmux server is gone (typically an OS reboot)
+   *  but the tracked row carries enough state for the harness's native
+   *  `--resume` to rebuild the conversation. The frontend auto-fires
+   *  `terminal_respawn_dead` on first pane mount instead of showing the
+   *  manual Recover overlay. Backend skips the field on the wire when false. */
+  recoverable_after_reboot?: boolean;
 }
 
 export type TerminalWorkingState = "idle" | "working" | "waiting";

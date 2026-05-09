@@ -2,53 +2,24 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 
 // Stub out the Tauri runtime surface the notification center touches.
 // These modules aren't resolvable under vitest/jsdom, and we want every
-// IPC to be a spy so we can assert on the payloads.
+// IPC to be a spy so we can assert on the payloads. Note that
+// `tauri-plugin-notification` is GONE — all OS notification dispatch
+// flows through the Rust `notifications_send` command via `invoke()`,
+// so its calls land in `mockInvoke` like every other backend command.
 const mockInvoke = vi.fn();
-const mockSendNotification = vi.fn();
+const listenHandlers = new Map<string, (ev: { payload: unknown }) => void>();
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: (...args: unknown[]) => mockInvoke(...args),
 }));
 vi.mock("@tauri-apps/api/event", () => ({
-  listen: vi.fn().mockResolvedValue(() => undefined),
-}));
-vi.mock("@tauri-apps/api/window", () => ({
-  getCurrentWindow: () => ({ isFocused: async () => false }),
-}));
-vi.mock("@tauri-apps/plugin-notification", () => ({
-  isPermissionGranted: vi.fn().mockResolvedValue(true),
-  onAction: vi.fn().mockResolvedValue({ unregister: () => undefined }),
-  requestPermission: vi.fn().mockResolvedValue("granted"),
-  sendNotification: (...args: unknown[]) => mockSendNotification(...args),
-}));
-
-// Sonner is mounted via `<Toaster />` in production; tests never render it,
-// so we only need `toast()` to be a spy. The factory is hoisted by vitest,
-// so declare the spies inside it and expose them via `vi.hoisted` so the
-// test bodies can still assert on them.
-const toastMocks = vi.hoisted(() => {
-  const toastFn = vi.fn() as unknown as {
-    (msg: string, data?: unknown): void;
-    success: ReturnType<typeof vi.fn>;
-    error: ReturnType<typeof vi.fn>;
-    warning: ReturnType<typeof vi.fn>;
-    info: ReturnType<typeof vi.fn>;
-  };
-  toastFn.success = vi.fn();
-  toastFn.error = vi.fn();
-  toastFn.warning = vi.fn();
-  toastFn.info = vi.fn();
-  return {
-    toast: toastFn,
-    mockToastFn: toastFn as unknown as ReturnType<typeof vi.fn>,
-    mockToastSuccess: toastFn.success,
-    mockToastError: toastFn.error,
-    mockToastWarning: toastFn.warning,
-  };
-});
-const { mockToastFn, mockToastSuccess, mockToastError, mockToastWarning } = toastMocks;
-vi.mock("solid-sonner", () => ({
-  toast: toastMocks.toast,
-  Toaster: () => null,
+  listen: vi
+    .fn()
+    .mockImplementation(async (event: string, cb: (ev: { payload: unknown }) => void) => {
+      listenHandlers.set(event, cb);
+      return () => {
+        listenHandlers.delete(event);
+      };
+    }),
 }));
 
 import {
@@ -60,6 +31,7 @@ import {
   badgeMode,
   ensureNotificationPermission,
   pendingPermissionCount,
+  startNotificationCenter,
   syncDockBadge,
 } from "./notificationCenter";
 
@@ -71,20 +43,28 @@ function lastDockBadgeCall(): number | undefined {
   return args?.count;
 }
 
-describe("notification center badge modes", () => {
+interface SendArgs {
+  title: string;
+  body: string;
+  sessionId?: string | null;
+}
+
+function sendCalls(): SendArgs[] {
+  return mockInvoke.mock.calls
+    .filter((c) => c[0] === "notifications_send")
+    .map((c) => (c[1] as { args: SendArgs }).args);
+}
+
+describe("notification center", () => {
   beforeEach(async () => {
+    listenHandlers.clear();
     mockInvoke.mockReset();
     mockInvoke.mockResolvedValue(undefined);
-    mockSendNotification.mockReset();
-    mockToastFn.mockReset();
-    mockToastSuccess.mockReset();
-    mockToastError.mockReset();
-    mockToastWarning.mockReset();
     __resetNotificationCenterForTests();
     await ensureNotificationPermission();
   });
 
-  it("defaults to all_unread", () => {
+  it("defaults to all_unread badge mode", () => {
     expect(badgeMode()).toBe("all_unread");
   });
 
@@ -121,10 +101,10 @@ describe("notification center badge modes", () => {
       payload: null,
     });
     expect(pendingPermissionCount()).toBe(2);
-    expect(mockSendNotification).toHaveBeenCalledTimes(2);
+    expect(sendCalls()).toHaveLength(2);
   });
 
-  it("accepts permission events without request ids and sends focus-only notifications", async () => {
+  it("fires an OS notification for permission requests", async () => {
     await __handleNotificationEventForTests({
       harness: "codex",
       event: "PermissionRequest",
@@ -133,42 +113,49 @@ describe("notification center badge modes", () => {
       payload: { tool_name: "shell" },
     });
     expect(pendingPermissionCount()).toBe(1);
-    expect(mockSendNotification).toHaveBeenCalledTimes(1);
-    expect(mockSendNotification.mock.calls[0]?.[0]).toMatchObject({
+    const calls = sendCalls();
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
       title: "Permission requested",
       body: "Codex needs permission for shell.",
-      extra: { sessionId: "codex-1" },
+      sessionId: "codex-1",
     });
-    expect(mockSendNotification.mock.calls[0]?.[0]).not.toHaveProperty("actions");
-    // Permission toasts route through toast.warning and inherit the
-    // Toaster's default auto-close duration rather than pinning to
-    // infinity — the dock badge keeps the request visible after the
-    // toast fades.
-    expect(mockToastWarning).toHaveBeenCalledTimes(1);
-    const [title, opts] = mockToastWarning.mock.calls[0] as [
-      string,
-      { description: string; duration?: number; onDismiss: () => void } | undefined,
-    ];
-    expect(title).toBe("Permission requested");
-    expect(opts?.description).toBe("Codex needs permission for shell.");
-    expect(opts?.duration).toBeUndefined();
   });
 
-  it("manual dismiss on a permission toast aborts the owning session", async () => {
-    await __handleNotificationEventForTests({
+  it("fires OS notifications when an agent transitions to waiting", async () => {
+    __handleAgentStateChangedForTests({
+      session_id: "s-1",
       harness: "claude-code",
-      event: "PermissionRequest",
-      session_id: "sess-abort",
-      request_id: "req-abort",
-      permission_key: "req-abort",
-      payload: null,
+      from: "working",
+      to: "waiting",
     });
-    const opts = mockToastWarning.mock.calls[0]?.[1] as { onDismiss?: () => void } | undefined;
-    expect(opts?.onDismiss).toBeTypeOf("function");
-    opts!.onDismiss!();
-    const abortCalls = mockInvoke.mock.calls.filter((c) => c[0] === "abort_session");
-    expect(abortCalls).toHaveLength(1);
-    expect(abortCalls[0]?.[1]).toEqual({ sessionId: "sess-abort" });
+    await Promise.resolve();
+    await Promise.resolve();
+    const calls = sendCalls();
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
+      title: "Interactive Question",
+      body: "Claude is asking for feedback.",
+      sessionId: "s-1",
+    });
+  });
+
+  it("fires OS notifications when an agent completes", async () => {
+    __handleAgentStateChangedForTests({
+      session_id: "s-2",
+      harness: "codex",
+      from: "working",
+      to: "completed",
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    const calls = sendCalls();
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
+      title: "Finished",
+      body: "Codex finished successfully.",
+      sessionId: "s-2",
+    });
   });
 
   it("decrements pendingPermissionCount when a request is cleared", async () => {
@@ -263,11 +250,44 @@ describe("notification center badge modes", () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    // Exactly one OS notification for the pair.
-    expect(mockSendNotification).toHaveBeenCalledTimes(1);
-    // And exactly one in-app toast (permission took the slot; waiting is
-    // dropped by the dedup gate so we don't show two cards for one event).
-    expect(mockToastWarning).toHaveBeenCalledTimes(1);
-    expect(mockToastFn).not.toHaveBeenCalled();
+    // Exactly one OS notification for the pair — the waiting dispatcher
+    // was suppressed by the dedup gate so the user doesn't see two
+    // banners for the same logical event.
+    expect(sendCalls()).toHaveLength(1);
+  });
+
+  it("forwards notifications:clicked events as terminal-focus-requested", async () => {
+    // Pre-populate `notifications_check_authorization` so `startNotificationCenter` resolves.
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "notifications_check_authorization") {
+        return {
+          status: "granted",
+          bundle_id: "de.raum.desktop",
+          is_dev_mode: false,
+          note: null,
+        };
+      }
+      if (cmd === "config_get") {
+        return { notifications: {} };
+      }
+      return undefined;
+    });
+
+    const dispose = await startNotificationCenter();
+    const handler = listenHandlers.get("notifications:clicked");
+    expect(handler).toBeDefined();
+
+    const seen: string[] = [];
+    const dom = (ev: Event) => {
+      const detail = (ev as CustomEvent<{ sessionId: string }>).detail;
+      seen.push(detail.sessionId);
+    };
+    window.addEventListener("terminal-focus-requested", dom);
+
+    handler!({ payload: { sessionId: "click-target" } });
+    expect(seen).toEqual(["click-target"]);
+
+    window.removeEventListener("terminal-focus-requested", dom);
+    dispose();
   });
 });

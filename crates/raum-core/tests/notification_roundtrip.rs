@@ -109,7 +109,7 @@ async fn prepare_hook_scripts(tmp: &tempfile::TempDir, script_name: &str) -> Pat
                 tmp.path().join("project").join(".codex").join("hooks.json"),
                 Some(semver_lite::Version {
                     major: 0,
-                    minor: 120,
+                    minor: 130,
                     patch: 0,
                 }),
             );
@@ -671,7 +671,7 @@ async fn codex_plan_produces_expected_actions_under_tempdir() {
         tmp.path().join("hooks.json"),
         Some(semver_lite::Version {
             major: 0,
-            minor: 120,
+            minor: 130,
             patch: 0,
         }),
     );

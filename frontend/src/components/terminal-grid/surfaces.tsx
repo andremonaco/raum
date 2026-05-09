@@ -167,6 +167,7 @@ export const TerminalSurfaceHost: Component<{ surface: TerminalSurfaceDescriptor
           active={props.surface.active}
           initialPrompt={props.surface.initialPrompt}
           modelOverride={props.surface.modelOverride}
+          recoverableAfterReboot={props.surface.recoverableAfterReboot}
           onSpawned={(sessionId) => {
             if (props.surface.cellId && props.surface.tabId) {
               setTabSessionId(props.surface.cellId, props.surface.tabId, sessionId);

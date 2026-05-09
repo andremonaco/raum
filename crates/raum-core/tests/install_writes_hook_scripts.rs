@@ -148,7 +148,7 @@ async fn codex_install_writes_dispatcher_and_notify_scripts() {
         hooks_json.clone(),
         Some(semver_lite::Version {
             major: 0,
-            minor: 120,
+            minor: 130,
             patch: 0,
         }),
     );
@@ -181,6 +181,29 @@ async fn codex_install_writes_dispatcher_and_notify_scripts() {
     assert!(
         raw.contains(&notify.display().to_string()),
         "config.toml does not reference codex-notify.sh path: {raw}",
+    );
+    // config.toml uses the renamed feature flag (Codex 0.130+).
+    assert!(
+        raw.contains("hooks = true"),
+        "config.toml missing renamed `[features].hooks` flag: {raw}",
+    );
+    assert!(
+        !raw.contains("codex_hooks"),
+        "config.toml still uses deprecated `codex_hooks` flag: {raw}",
+    );
+    // config.toml pre-seeds a `[hooks.state]` trust entry per raum
+    // hook so Codex's `/hooks` review queue stays empty.
+    let hooks_json_str = hooks_json.display().to_string();
+    for label in ["user_prompt_submit", "stop"] {
+        let key_fragment = format!("{hooks_json_str}:{label}:0:0");
+        assert!(
+            raw.contains(&key_fragment),
+            "config.toml missing trust state for {label}: {raw}",
+        );
+    }
+    assert!(
+        raw.matches("trusted_hash = \"sha256:").count() >= 2,
+        "config.toml missing one or both `trusted_hash` lines: {raw}",
     );
 }
 

@@ -61,6 +61,7 @@ impl TerminalEntry {
             kind: self.kind,
             created_unix: self.created_unix,
             dead: false,
+            recoverable_after_reboot: false,
         }
     }
 }

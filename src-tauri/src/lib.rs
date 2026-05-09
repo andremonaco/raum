@@ -116,7 +116,6 @@ pub fn run() {
                 warn!("single-instance: main window not found");
             }
         }))
-        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
@@ -237,6 +236,7 @@ pub fn run() {
             commands::notifications::notifications_play_sound,
             commands::notifications::notifications_check_authorization,
             commands::notifications::notifications_open_system_settings,
+            notifications::send::notifications_send,
             commands::config_set_harness_flags,
             commands::config_set_claude_fullscreen,
             commands::config_set_worktree_path_pattern,
@@ -344,6 +344,23 @@ pub fn run() {
             // Windows lacks `/dev/fd`.
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             spawn_fd_probe();
+
+            // §11 — install the UNUserNotificationCenter delegate. Must
+            // happen during `.setup` (before the first notification fires)
+            // so click events route back to the frontend, including the
+            // case where macOS relaunches raum after the user clicks an
+            // unread notification while it was quit.
+            #[cfg(target_os = "macos")]
+            {
+                let handle = app.handle().clone();
+                let delegate = notifications::delegate::install(handle.clone());
+                let state: tauri::State<'_, state::AppHandleState> = app.state();
+                if let Ok(mut guard) = state.notification_delegate.lock() {
+                    *guard = Some(delegate);
+                } else {
+                    warn!("notification_delegate mutex poisoned during setup");
+                }
+            }
 
             Ok(())
         })

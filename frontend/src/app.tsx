@@ -1,7 +1,6 @@
 import { Show, createResource, createSignal, onCleanup, onMount, type Component } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { check as checkForUpdate } from "@tauri-apps/plugin-updater";
-import { isPermissionGranted, sendNotification } from "@tauri-apps/plugin-notification";
 import { TopRow } from "./components/top-row";
 import { Sidebar } from "./components/sidebar";
 import { TerminalGrid } from "./components/terminal-grid";
@@ -15,7 +14,7 @@ import {
   type ActiveLayoutState,
   type CellKind,
 } from "./stores/runtimeLayoutStore";
-import { startNotificationCenter } from "./lib/notificationCenter";
+import { notifyBannerEnabled, startNotificationCenter } from "./lib/notificationCenter";
 import { installGlobalContextMenuSuppressor } from "./lib/suppressContextMenu";
 import { installDevtoolsShortcut } from "./lib/devtoolsShortcut";
 import { loadThemeFromConfig } from "./lib/theme/themeController";
@@ -46,23 +45,27 @@ const UPDATE_STARTUP_DELAY_MS = 10_000;
 /** Run one updater check. Surfaces an OS notification only when the
  *  reported version differs from the one we last notified about, so a user
  *  who dismisses a notification isn't re-pinged every poll cycle for the
- *  same release. Swallows all errors — a missing network must not bubble
- *  out of the periodic timer. */
+ *  same release. Honours `notifyBannerEnabled` so a user who has chosen
+ *  silent-with-badge isn't interrupted. Swallows all errors — a missing
+ *  network must not bubble out of the periodic timer. */
 async function runBackgroundUpdateCheck(lastNotified: { version: string | null }): Promise<void> {
   try {
     const update = await checkForUpdate();
     if (!update) return;
     if (lastNotified.version === update.version) return;
     lastNotified.version = update.version;
-    try {
-      if (await isPermissionGranted()) {
-        sendNotification({
-          title: `raum update available: ${update.version}`,
-          body: "Open Settings → Updates to download and install.",
+    if (notifyBannerEnabled()) {
+      try {
+        await invoke("notifications_send", {
+          args: {
+            title: `raum update available: ${update.version}`,
+            body: "Open Settings → Updates to download and install.",
+            sessionId: null,
+          },
         });
+      } catch (e) {
+        console.warn("notifications_send (update) failed", e);
       }
-    } catch {
-      /* notification plugin unavailable — silently skip */
     }
     console.info(`raum: update ${update.version} available`);
   } catch (e) {

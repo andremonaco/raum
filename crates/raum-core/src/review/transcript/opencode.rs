@@ -1,11 +1,19 @@
-//! OpenCode HTTP-based transcript reader.
+//! OpenCode transcript + session discovery helpers.
 
 use std::path::Path;
+use std::time::Duration;
 
 use serde_json::Value;
+use tokio::process::Command;
 use tracing::warn;
 
 use super::TRANSCRIPT_HTTP_TIMEOUT;
+
+/// Upper bound on how long we wait for `opencode session list --format json`
+/// during recovery. The CLI should answer from local storage quickly; if it
+/// stalls, recovery should degrade to "unavailable" instead of hanging the
+/// pane bootstrap.
+const SESSION_LIST_CLI_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// Pull user prompts from a running OpenCode session via its local HTTP
 /// API. Two GETs:
@@ -108,4 +116,118 @@ pub(super) async fn read_opencode_user_prompts(
         }
     }
     out
+}
+
+/// Best-effort OpenCode session-id discovery from the CLI's local session
+/// store. Used by dead-pane recovery when the resumable `sessionID` was not
+/// persisted yet but we still know the pane cwd.
+///
+/// Runs `opencode session list --format json` in `cwd`, then selects the
+/// newest session whose `directory` matches exactly. Returns `None` on any
+/// failure (binary missing, timeout, invalid JSON, no match).
+pub async fn discover_opencode_session_id_via_cli(cwd: &Path) -> Option<String> {
+    let resolved = match which::which("opencode") {
+        Ok(path) => path,
+        Err(_) => return None,
+    };
+    let output = match tokio::time::timeout(
+        SESSION_LIST_CLI_TIMEOUT,
+        Command::new(&resolved)
+            .args(["session", "list", "--format", "json"])
+            .current_dir(cwd)
+            .output(),
+    )
+    .await
+    {
+        Ok(Ok(output)) => output,
+        Ok(Err(e)) => {
+            warn!(error = %e, cwd = %cwd.display(), "opencode session list failed");
+            return None;
+        }
+        Err(_) => {
+            warn!(cwd = %cwd.display(), "opencode session list timed out");
+            return None;
+        }
+    };
+    if !output.status.success() {
+        warn!(
+            cwd = %cwd.display(),
+            status = ?output.status.code(),
+            stderr = %String::from_utf8_lossy(&output.stderr),
+            "opencode session list exited non-zero",
+        );
+        return None;
+    }
+    let stdout = match String::from_utf8(output.stdout) {
+        Ok(stdout) => stdout,
+        Err(e) => {
+            warn!(error = %e, cwd = %cwd.display(), "opencode session list stdout was not utf-8");
+            return None;
+        }
+    };
+    session_id_for_directory_from_list_json(&stdout, cwd)
+}
+
+pub(super) fn session_id_for_directory_from_list_json(raw: &str, cwd: &Path) -> Option<String> {
+    let sessions = serde_json::from_str::<Vec<Value>>(raw).ok()?;
+    let cwd_str = cwd.to_str()?;
+    let mut best_id: Option<String> = None;
+    let mut best_key: (bool, i64) = (false, i64::MIN);
+
+    for (idx, session) in sessions.into_iter().enumerate() {
+        if !session_directory_matches(&session, cwd_str) {
+            continue;
+        }
+        let Some(id) = session_id_from_value(&session) else {
+            continue;
+        };
+        let key = match session_updated_key(&session) {
+            Some(updated) => (true, updated),
+            // The CLI list appears newest-first; preserve that order when
+            // timestamps are absent, but let any real timestamp outrank an
+            // order-only guess.
+            None => (false, -(idx as i64)),
+        };
+        if key > best_key {
+            best_key = key;
+            best_id = Some(id);
+        }
+    }
+
+    best_id
+}
+
+fn session_directory_matches(session: &Value, cwd: &str) -> bool {
+    session
+        .get("directory")
+        .and_then(Value::as_str)
+        .or_else(|| session.get("cwd").and_then(Value::as_str))
+        .or_else(|| {
+            session
+                .pointer("/project/directory")
+                .and_then(Value::as_str)
+        })
+        .is_some_and(|dir| dir == cwd)
+}
+
+fn session_id_from_value(session: &Value) -> Option<String> {
+    session
+        .get("id")
+        .and_then(Value::as_str)
+        .or_else(|| session.get("sessionID").and_then(Value::as_str))
+        .or_else(|| session.get("session_id").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+fn session_updated_key(session: &Value) -> Option<i64> {
+    session
+        .pointer("/time/updated")
+        .and_then(Value::as_i64)
+        .or_else(|| session.pointer("/time/created").and_then(Value::as_i64))
+        .or_else(|| session.get("updatedAt").and_then(Value::as_i64))
+        .or_else(|| session.get("updated_at").and_then(Value::as_i64))
+        .or_else(|| session.get("createdAt").and_then(Value::as_i64))
+        .or_else(|| session.get("created_at").and_then(Value::as_i64))
 }
