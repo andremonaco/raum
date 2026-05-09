@@ -24,12 +24,13 @@
 //!
 //! # Version gate
 //!
-//! Hooks first shipped behind the `codex_hooks` feature flag; the
-//! notification plan confirms the minimum is v0.119. If `detect_version`
-//! reports a lower version, the setup plan skips the hooks.json action
-//! and only writes `config.toml` with a `notify` entry (plus a
-//! `SetupAction::EnsureFeatureFlag` that the executor will skip until
-//! the flag is supported).
+//! Codex 0.130 renamed the `[features].codex_hooks` flag to
+//! `[features].hooks` (openai/codex#20684) and started gating unmanaged
+//! hooks behind a `trusted_hash` review (openai/codex#20321). raum's
+//! plan emits both the renamed flag and a pre-computed `trusted_hash`
+//! per hook, so we require ≥ 0.130. If `detect_version` reports a
+//! lower version, the setup plan skips the hooks.json action and only
+//! writes `config.toml` with a `notify` entry.
 
 use std::path::{Path, PathBuf};
 
@@ -72,14 +73,16 @@ mod tests;
 /// by `terminal_send_keys` on user Enter.
 pub const RAUM_CODEX_HOOK_EVENTS: &[&str] = &["UserPromptSubmit", "Stop"];
 
-/// Minimum Codex version with hook support. The developers.openai.com
-/// docs do not publish a first-supported version number, but the prior
-/// research round (archived in the Phase 3 task description) confirmed
-/// v0.119 as the earliest release shipping `[features] codex_hooks`.
-/// Lower versions get a `notify`-only fallback.
+/// Minimum Codex version this adapter targets for hooks. Codex 0.130
+/// introduced two coupled changes that raum's hook plumbing depends on:
+/// the `[features].codex_hooks` flag was renamed to `[features].hooks`
+/// (openai/codex#20684), and unmanaged hooks are now gated behind a
+/// per-hook `trusted_hash` review (openai/codex#20321) — without a
+/// matching hash entry in `[hooks.state]`, hooks sit in `Untrusted`
+/// state and never run. Lower versions get a `notify`-only fallback.
 pub const CODEX_HOOKS_MINIMUM_VERSION: semver_lite::Version = semver_lite::Version {
     major: 0,
-    minor: 119,
+    minor: 130,
     patch: 0,
 };
 

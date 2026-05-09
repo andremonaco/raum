@@ -15,6 +15,7 @@ use crate::harness::event::{NotificationKind, Reliability};
 use crate::harness::setup::{SetupAction, SetupContext};
 use crate::harness::traits::{HarnessRuntime, NotificationSetup, SessionSpec};
 
+use super::planner::{codex_hook_state_key, codex_hook_trusted_hash};
 use super::{
     CODEX_NOTIFY_SCRIPT_NAME, CodexAdapter, Osc9Parser, OscScrapeChannel, RAUM_CODEX_HOOK_EVENTS,
     classify_osc9_payload, install_codex_hooks_json,
@@ -43,7 +44,7 @@ async fn plan_on_supported_version_emits_notify_and_dispatcher_scripts() {
         hooks_json.clone(),
         Some(semver_lite::Version {
             major: 0,
-            minor: 120,
+            minor: 130,
             patch: 0,
         }),
     );
@@ -83,10 +84,30 @@ async fn plan_on_supported_version_emits_notify_and_dispatcher_scripts() {
     };
     assert_eq!(path, &config_toml);
     assert!(content.contains("# <raum-managed>"));
-    assert!(content.contains("codex_hooks = true"));
+    // Renamed flag (was `codex_hooks` pre-Codex-0.130, now `hooks` —
+    // openai/codex#20684).
+    assert!(content.contains("hooks = true"));
+    assert!(!content.contains("codex_hooks"));
     assert!(content.contains("notify = ["));
     assert!(content.contains("notifications = true"));
     assert!(content.contains("notification_method = \"osc9\""));
+    // Pre-seeded trust state for each raum hook (openai/codex#20321).
+    // The state-key + hash must match what Codex computes at discovery
+    // time, so derive both from the same helpers production code uses.
+    for event in RAUM_CODEX_HOOK_EVENTS {
+        let key = codex_hook_state_key(&hooks_json, event, 0, 0);
+        let hash = codex_hook_trusted_hash(event, &dispatcher_path);
+        let key_quoted = serde_json::to_string(&key).unwrap();
+        let hash_quoted = serde_json::to_string(&hash).unwrap();
+        assert!(
+            content.contains(&format!("[hooks.state.{key_quoted}]")),
+            "missing trust state header for {event}: {content}",
+        );
+        assert!(
+            content.contains(&format!("trusted_hash = {hash_quoted}")),
+            "missing trusted_hash for {event}: {content}",
+        );
+    }
     // codex.sh dispatcher — referenced by each entry in hooks.json. Must
     // be written before the hooks.json entry that points at it.
     let SetupAction::WriteShellScript {
@@ -133,7 +154,7 @@ async fn plan_emits_trusted_project_tables_for_root_and_worktrees() {
         dir.path().join("hooks.json"),
         Some(semver_lite::Version {
             major: 0,
-            minor: 120,
+            minor: 130,
             patch: 0,
         }),
     );
@@ -186,7 +207,7 @@ async fn plan_with_empty_project_dir_emits_no_trust_tables() {
         dir.path().join("hooks.json"),
         Some(semver_lite::Version {
             major: 0,
-            minor: 120,
+            minor: 130,
             patch: 0,
         }),
     );
@@ -247,6 +268,10 @@ async fn plan_on_old_version_skips_hooks_json() {
     assert!(content.contains("notifications = true"));
     assert!(content.contains("notification_method = \"osc9\""));
     assert!(!content.contains("codex_hooks"));
+    // No `[features] hooks` flip and no `[hooks.state]` trust entries
+    // when the binary is too old to know about hooks.
+    assert!(!content.contains("\nhooks = true"));
+    assert!(!content.contains("[hooks.state."));
 }
 
 #[tokio::test]
@@ -257,7 +282,7 @@ async fn plan_notify_script_body_has_event_socket_env_and_codex_tag() {
         dir.path().join("hooks.json"),
         Some(semver_lite::Version {
             major: 0,
-            minor: 120,
+            minor: 130,
             patch: 0,
         }),
     );
@@ -273,6 +298,58 @@ async fn plan_notify_script_body_has_event_socket_env_and_codex_tag() {
     assert!(content.contains("\"source\":\"notify\""));
     // Script reads payload from argv[1], NOT stdin (Codex contract).
     assert!(content.contains("PAYLOAD=\"$1\""));
+}
+
+#[test]
+fn codex_hook_state_key_matches_upstream_format() {
+    // Mirrors `hook_key` in codex-rs/hooks/src/lib.rs:
+    //   "{source_path}:{event_label}:{group_index}:{handler_index}"
+    let path = PathBuf::from("/Users/x/proj/.codex/hooks.json");
+    assert_eq!(
+        codex_hook_state_key(&path, "UserPromptSubmit", 0, 0),
+        "/Users/x/proj/.codex/hooks.json:user_prompt_submit:0:0",
+    );
+    assert_eq!(
+        codex_hook_state_key(&path, "Stop", 0, 0),
+        "/Users/x/proj/.codex/hooks.json:stop:0:0",
+    );
+}
+
+#[test]
+fn codex_hook_trusted_hash_matches_known_canonical_input() {
+    // Pin one (event, hook_script) pair to a deterministic SHA-256 of
+    // the canonical-JSON normalised hook identity. If Codex changes
+    // the hash algorithm, identity shape, or default-timeout
+    // normalisation (currently `None` → 600), this test fires before
+    // the higher-level plan tests do.
+    //
+    // The `command` field reproduces the exact string raum writes
+    // into `hooks.json` (the original capital-case event suffix), not
+    // the snake-cased event label — Codex hashes the command
+    // verbatim (see `command_hook_hash` in
+    // `codex-rs/hooks/src/engine/discovery.rs`).
+    //
+    // Identity (canonical-JSON, sorted keys):
+    //   {"event_name":"user_prompt_submit",
+    //    "hooks":[{"async":false,
+    //              "command":"/tmp/codex.sh UserPromptSubmit",
+    //              "statusMessage":"raum: forwarding UserPromptSubmit",
+    //              "timeout":600,
+    //              "type":"command"}],
+    //    "matcher":".*"}
+    use sha2::{Digest, Sha256};
+    let canonical = br#"{"event_name":"user_prompt_submit","hooks":[{"async":false,"command":"/tmp/codex.sh UserPromptSubmit","statusMessage":"raum: forwarding UserPromptSubmit","timeout":600,"type":"command"}],"matcher":".*"}"#;
+    let digest = Sha256::digest(canonical);
+    let mut expected = String::from("sha256:");
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(expected, "{byte:02x}");
+    }
+    let actual = codex_hook_trusted_hash("UserPromptSubmit", Path::new("/tmp/codex.sh"));
+    assert_eq!(
+        actual, expected,
+        "trusted_hash diverged from canonical-JSON SHA-256",
+    );
 }
 
 #[test]
@@ -439,7 +516,7 @@ async fn plan_emits_legacy_hooks_migration_when_project_scoped() {
     let adapter = CodexAdapter {
         forced_version: Some(semver_lite::Version {
             major: 0,
-            minor: 120,
+            minor: 130,
             patch: 0,
         }),
         ..adapter
@@ -485,7 +562,7 @@ async fn plan_write_toml_path_is_under_home_dir_codex_config() {
     let adapter = CodexAdapter {
         forced_version: Some(semver_lite::Version {
             major: 0,
-            minor: 120,
+            minor: 130,
             patch: 0,
         }),
         ..CodexAdapter::default()

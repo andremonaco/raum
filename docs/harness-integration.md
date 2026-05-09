@@ -77,15 +77,30 @@ is preserved byte-for-byte.
 `CodexAdapter` wires three complementary observation channels:
 
 1. **Hooks** (`<project>/.codex/hooks.json`, gated on `[features]
-   codex_hooks = true` in `~/.codex/config.toml`). Event-driven; each
+   hooks = true` in `~/.codex/config.toml`). Event-driven; each
    managed entry points at `~/.config/raum/hooks/codex.sh <Event>`.
-   Requires Codex ≥ 0.119 — on older builds the plan skips the hooks
-   write and leans on the notify script below. The released hook set raum
-   installs is intentionally coarse: `UserPromptSubmit` and `Stop` only.
-   `SessionStart` is deliberately *not* subscribed — it would arm the
-   silence heuristic at harness boot and promote `Idle → Working` off
-   Codex's TUI startup redraw. `PreToolUse` and `PostToolUse` are
-   Bash-scoped and are not used for visible session status.
+   Requires Codex ≥ 0.130 — Codex 0.130 renamed the feature flag from
+   `codex_hooks` to `hooks` ([openai/codex#20684][rename-pr]) and
+   started gating *unmanaged* hooks behind a per-hook `trusted_hash`
+   review surface ([openai/codex#20321][trust-pr]); on older builds
+   the plan skips the hooks write and leans on the notify script
+   below. To keep the `/hooks` review queue empty raum pre-computes
+   the same hash Codex uses (`sha256:` + canonical-JSON SHA-256 of
+   the normalised `{event_name, matcher, hooks: [Command]}`
+   identity, per `version_for_toml` in
+   `codex-rs/config/src/fingerprint.rs`) and writes it as
+   `[hooks.state."<hooks.json path>:<event>:0:0"].trusted_hash` in
+   the managed `config.toml` block — Codex then admits each hook as
+   `Trusted` on first launch with no operator action. The released
+   hook set raum installs is intentionally coarse: `UserPromptSubmit`
+   and `Stop` only. `SessionStart` is deliberately *not* subscribed
+   — it would arm the silence heuristic at harness boot and promote
+   `Idle → Working` off Codex's TUI startup redraw. `PreToolUse` and
+   `PostToolUse` are Bash-scoped and are not used for visible
+   session status.
+
+   [rename-pr]: https://github.com/openai/codex/pull/20684
+   [trust-pr]: https://github.com/openai/codex/pull/20321
 2. **`notify` script** (top-level `notify = [...]` in
    `~/.codex/config.toml`). Codex invokes `codex-notify.sh` with the
    payload as `argv[1]`; the script forwards it to

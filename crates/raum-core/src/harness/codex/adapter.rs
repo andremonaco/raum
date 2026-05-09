@@ -69,9 +69,11 @@ impl NotificationSetup for CodexAdapter {
     ///    the payload to the raum event socket tagged `source: "notify"`.
     /// 3. `WriteToml { ~/.codex/config.toml }` — managed block setting
     ///    `notify = ["<script>"]`, `[tui] notifications = true /
-    ///    notification_method = "osc9"` (always), and `[features]
-    ///    codex_hooks = true` (only when the installed Codex supports
-    ///    the flag).
+    ///    notification_method = "osc9"` (always), `[features] hooks =
+    ///    true` (only when the installed Codex supports hooks), and a
+    ///    pre-computed `[hooks.state."<path>:..."].trusted_hash` for
+    ///    each raum hook so they bypass Codex's `/hooks` review queue
+    ///    (openai/codex#20321).
     /// 4. `WriteJson { <project>/.codex/hooks.json }` — managed entries
     ///    for `UserPromptSubmit` and `Stop`. **Skipped** when
     ///    `detect_version()` reports < [`CODEX_HOOKS_MINIMUM_VERSION`];
@@ -121,8 +123,18 @@ impl NotificationSetup for CodexAdapter {
                 trusted.push(wt.clone());
             }
         }
-        let notify_body =
-            render_codex_toml_managed_body(&notify_script_path, supports_hooks, &trusted);
+        // The hooks.json path is needed twice — once to seed the
+        // trusted_hash key inside the config.toml managed block, and
+        // again as the `WriteJson` target below — so resolve it up
+        // front.
+        let project_hooks_path = self.hooks_json_path_for_ctx(ctx);
+        let notify_body = render_codex_toml_managed_body(
+            &notify_script_path,
+            supports_hooks,
+            &trusted,
+            &project_hooks_path,
+            &hook_script,
+        );
         plan.push(SetupAction::WriteToml {
             path: self.config_toml_path_for_ctx(ctx),
             content: notify_body,
@@ -130,7 +142,6 @@ impl NotificationSetup for CodexAdapter {
 
         if supports_hooks {
             let hooks_content = render_codex_hooks_json(&hook_script)?;
-            let project_hooks_path = self.hooks_json_path_for_ctx(ctx);
             // Phase 6 migration: strip raum-managed entries out of the
             // user-global `~/.codex/hooks.json` if a prior raum install
             // wrote them there. Skipped when we are already writing to
