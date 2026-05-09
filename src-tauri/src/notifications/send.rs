@@ -20,6 +20,7 @@ use tracing::{info, warn};
 /// Bytes used to separate the `sessionId` prefix from the random suffix
 /// inside a `UNNotificationRequest.identifier`. ASCII Unit Separator —
 /// not a character that should ever appear in a raum session id.
+#[cfg(any(target_os = "macos", test))]
 pub const IDENTIFIER_SEPARATOR: char = '\x1f';
 
 /// Arguments for [`notifications_send`]. Kept small on purpose; sound
@@ -49,6 +50,7 @@ pub struct SendNotificationResult {
 
 /// Build the request identifier that round-trips `session_id` through the
 /// OS. Pure for testing.
+#[cfg(any(target_os = "macos", test))]
 pub fn build_request_identifier(session_id: Option<&str>) -> String {
     let suffix = uuid::Uuid::new_v4().to_string();
     match session_id {
@@ -60,6 +62,7 @@ pub fn build_request_identifier(session_id: Option<&str>) -> String {
 /// Recover the `session_id` from a request identifier produced by
 /// [`build_request_identifier`]. `None` when the identifier had no
 /// session prefix.
+#[cfg(any(target_os = "macos", test))]
 pub fn session_id_from_identifier(identifier: &str) -> Option<String> {
     let (prefix, _) = identifier.split_once(IDENTIFIER_SEPARATOR)?;
     if prefix.is_empty() {
@@ -84,10 +87,9 @@ pub async fn notifications_send<R: Runtime>(
         "notifications_send: dispatching"
     );
 
-    let identifier = build_request_identifier(args.session_id.as_deref());
-
     #[cfg(target_os = "macos")]
     {
+        let identifier = build_request_identifier(args.session_id.as_deref());
         return Ok(send_macos(&args, &identifier).await);
     }
 
