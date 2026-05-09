@@ -7,6 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5](https://github.com/andremonaco/raum/releases/tag/v0.1.5) - 2026-05-07
+
+
+## [0.1.4](https://github.com/andremonaco/raum/releases/tag/v0.1.4) - 2026-05-07
+
+### Added
+
+- feat(harness): provider-replay recovery, dwell-armed review snap, file-drop overlay
+- feat(review): cross-harness review via drag-and-drop snap
+- feat(worktree): merge worktree from sidebar with step-progress dialog
+- feat(layout): persist active project + per-project worktree scope across restarts
+
+### Fixed
+
+- fix(tmux): forward focus-events to the inner harness; ignore .raum/
+
+### Other
+
+- test(tmux): assert burst preservation via capture-pane, not PTY bytes
+- test(tmux): widen burst-marker deadline to 20s for slow Linux CI
+- refactor: split mega-modules and add cross-restart terminal snapshots
+- refactor(tmux): extract StreamCoalescer into its own module
+
+
+## [0.1.3](https://github.com/andremonaco/raum/releases/tag/v0.1.3) - 2026-04-28
+
+### Added
+
+- feat: dead-pane recovery, orphan reaper, off-tree minimize, streamed op progress
+- feat(tabs): show last user prompt as a subtitle on each terminal tab
+- feat(grid): live drag preview with ghost surface and responsive resize
+
+### Fixed
+
+- fix(tmux): join hard-wrapped scrollback rows in capture-pane
+- fix(startup): swap kqueue→fsevent and stop deleting tmux's prefix table
+- fix(deps): pull libc on linux too so the fd probe builds in CI
+- perf(reattach): paint a bounded viewport snapshot + pre-resize tmux
+- fix(git-watcher): rate-limit notify warns + supervisor rebuild on EMFILE pressure
+- fix(harness): split Claude/Codex hook dispatchers + Python fast path
+- fix(terminal): recover the PTY bridge in place instead of marking the pane dead
+- fix(macos): raise RLIMIT_NOFILE on startup so tmux stops hitting EMFILE
+- perf(backend): batch sidebar/poller IPC + non-blocking harness preflight
+
+### Other
+
+- test(tmux): break unique_socket nanos collision with an atomic counter
+- ci(release): enable Developer ID signing + notarization
+
+
+## [0.1.2](https://github.com/andremonaco/raum/releases/tag/v0.1.2) - 2026-04-24
+
+### Added
+
+- *(sidebar)* native open-file via OS handler, in-app CodeMirror editor, click-to-switch branch badge with dirty-tree guard, dir-based GitHeadWatcher that survives macOS atomic HEAD rename ([#20](https://github.com/andremonaco/raum/pull/20))
+
+### Fixed
+
+- *(release)* re-enable automatic release pipeline — replace release-plz release-pr (which silently no-ops on publish=false workspaces because crates.io lookup 404s) with a repo-local `propose-release` workflow that opens the bump PR from conventional commits; marks internal crates as publish=false so the tag cargo-package path is consistent
+
 ## [0.1.1](https://github.com/andremonaco/raum/releases/tag/v0.1.1) - 2026-04-23
 
 ### Added

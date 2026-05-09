@@ -41,6 +41,15 @@ pr_labels = ["release"]
 
 [[package]]
 name = "raum"
+# Use git tags (v0.1.0, v0.1.1, …) as the "last released version" baseline
+# instead of crates.io. Without this, release-plz tries to look up
+# `raum@*.*.*` on the registry, fails (WARN `Package raum@*.*.* not
+# found`), and silently decides `next version = current Cargo.toml
+# version` — meaning no release PR ever opens for this `publish = false`
+# workspace. Set per-package (not at [workspace]) so the internal
+# path-only crates aren't dragged into `cargo package`, which would
+# otherwise fail on their unversioned `path = "…"` deps.
+git_only = true
 git_release_enable = true
 git_tag_enable = true
 # Create the GH release as a draft so the build matrix has time to
