@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6](https://github.com/andremonaco/raum/releases/tag/v0.1.6) - 2026-05-09
+
+### Added
+
+- feat(harness): post-reboot terminal recovery via harness --resume
+
+### Fixed
+
+- fix(notifications): cfg-gate macOS-only identifier helpers for Linux clippy
+- fix(harness): Codex 0.130 hooks — rename feature flag and pre-seed trust hash
+
+
 ## [0.1.5](https://github.com/andremonaco/raum/releases/tag/v0.1.5) - 2026-05-07
 
 
