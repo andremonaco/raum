@@ -36,6 +36,11 @@ pub struct SendNotificationArgs {
     /// prefix of the request identifier so click events can focus the
     /// right pane.
     pub session_id: Option<String>,
+    /// Optional notification kind tag — `"done"` (completed/errored) or
+    /// `"needs_input"` (waiting/permission). Embedded in the request
+    /// identifier so [`crate::notifications::clear`] can selectively
+    /// dismiss delivered notifications by `(session_id, kind)`.
+    pub kind: Option<String>,
 }
 
 /// Result of [`notifications_send`].
@@ -48,14 +53,22 @@ pub struct SendNotificationResult {
     pub error: Option<String>,
 }
 
-/// Build the request identifier that round-trips `session_id` through the
-/// OS. Pure for testing.
+/// Build the request identifier that round-trips `session_id` and
+/// `kind` through the OS. Pure for testing.
+///
+/// Format: `<session_id>\x1f<kind>\x1f<uuid>`. Either field may be
+/// absent — when `kind` is `None`/empty we fall back to the legacy
+/// two-part shape `<session_id>\x1f<uuid>` so the click delegate (which
+/// only inspects the prefix) keeps working unchanged.
 #[cfg(any(target_os = "macos", test))]
-pub fn build_request_identifier(session_id: Option<&str>) -> String {
+pub fn build_request_identifier(session_id: Option<&str>, kind: Option<&str>) -> String {
     let suffix = uuid::Uuid::new_v4().to_string();
-    match session_id {
-        Some(sid) if !sid.is_empty() => format!("{sid}{IDENTIFIER_SEPARATOR}{suffix}"),
-        _ => format!("{IDENTIFIER_SEPARATOR}{suffix}"),
+    let sid = session_id.unwrap_or("");
+    match kind {
+        Some(k) if !k.is_empty() => {
+            format!("{sid}{IDENTIFIER_SEPARATOR}{k}{IDENTIFIER_SEPARATOR}{suffix}")
+        }
+        _ => format!("{sid}{IDENTIFIER_SEPARATOR}{suffix}"),
     }
 }
 
@@ -69,6 +82,29 @@ pub fn session_id_from_identifier(identifier: &str) -> Option<String> {
         None
     } else {
         Some(prefix.to_string())
+    }
+}
+
+/// Recover the `kind` tag from a request identifier produced by
+/// [`build_request_identifier`]. Returns `None` for legacy two-part
+/// identifiers (no kind) and for any identifier that lacks a second
+/// separator (defensive: pre-upgrade notifications still in the OS
+/// queue must not panic).
+///
+/// Currently only exercised by tests — the production dismiss path in
+/// [`crate::notifications::clear`] matches whole identifier prefixes
+/// instead of parsing them — but the helper is the natural counterpart
+/// to [`session_id_from_identifier`] and we want it covered so any future
+/// caller that needs it doesn't reinvent the parser.
+#[cfg(any(target_os = "macos", test))]
+#[allow(dead_code)]
+pub fn kind_from_identifier(identifier: &str) -> Option<String> {
+    let (_, after_session) = identifier.split_once(IDENTIFIER_SEPARATOR)?;
+    let (kind, _) = after_session.split_once(IDENTIFIER_SEPARATOR)?;
+    if kind.is_empty() {
+        None
+    } else {
+        Some(kind.to_string())
     }
 }
 
@@ -89,7 +125,7 @@ pub async fn notifications_send<R: Runtime>(
 
     #[cfg(target_os = "macos")]
     {
-        let identifier = build_request_identifier(args.session_id.as_deref());
+        let identifier = build_request_identifier(args.session_id.as_deref(), args.kind.as_deref());
         return Ok(send_macos(&args, &identifier).await);
     }
 
@@ -245,7 +281,7 @@ mod tests {
 
     #[test]
     fn round_trips_session_id_through_identifier() {
-        let id = build_request_identifier(Some("sess-abc"));
+        let id = build_request_identifier(Some("sess-abc"), None);
         assert!(id.starts_with("sess-abc"));
         assert!(id.contains(IDENTIFIER_SEPARATOR));
         assert_eq!(session_id_from_identifier(&id).as_deref(), Some("sess-abc"));
@@ -253,19 +289,51 @@ mod tests {
 
     #[test]
     fn handles_missing_session_id() {
-        let id = build_request_identifier(None);
+        let id = build_request_identifier(None, None);
         assert!(id.starts_with(IDENTIFIER_SEPARATOR));
         assert!(session_id_from_identifier(&id).is_none());
     }
 
     #[test]
     fn rejects_empty_session_id_prefix() {
-        let id = build_request_identifier(Some(""));
+        let id = build_request_identifier(Some(""), None);
         assert!(session_id_from_identifier(&id).is_none());
     }
 
     #[test]
     fn unrecognised_identifier_returns_none() {
         assert!(session_id_from_identifier("plain-uuid-no-separator").is_none());
+    }
+
+    #[test]
+    fn round_trips_kind_through_identifier() {
+        let id = build_request_identifier(Some("sess-abc"), Some("done"));
+        assert_eq!(session_id_from_identifier(&id).as_deref(), Some("sess-abc"));
+        assert_eq!(kind_from_identifier(&id).as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn round_trips_kind_without_session() {
+        let id = build_request_identifier(None, Some("needs_input"));
+        assert!(session_id_from_identifier(&id).is_none());
+        assert_eq!(kind_from_identifier(&id).as_deref(), Some("needs_input"));
+    }
+
+    #[test]
+    fn legacy_two_part_identifier_yields_no_kind() {
+        // Identifiers minted before this change carry only the session id —
+        // a single \x1f separator. The parser must not panic and must report
+        // `kind = None`.
+        let legacy = build_request_identifier(Some("sess-legacy"), None);
+        assert_eq!(
+            session_id_from_identifier(&legacy).as_deref(),
+            Some("sess-legacy")
+        );
+        assert!(kind_from_identifier(&legacy).is_none());
+    }
+
+    #[test]
+    fn unrecognised_identifier_yields_no_kind() {
+        assert!(kind_from_identifier("plain-uuid-no-separator").is_none());
     }
 }

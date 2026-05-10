@@ -21,6 +21,7 @@
 //!   redeliver them to the frontend as the `notifications:clicked` Tauri
 //!   event.
 
+pub mod clear;
 #[cfg(target_os = "macos")]
 pub mod delegate;
 pub mod send;

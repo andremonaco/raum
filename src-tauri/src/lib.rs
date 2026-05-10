@@ -237,6 +237,7 @@ pub fn run() {
             commands::notifications::notifications_check_authorization,
             commands::notifications::notifications_open_system_settings,
             notifications::send::notifications_send,
+            notifications::clear::notifications_clear,
             commands::config_set_harness_flags,
             commands::config_set_claude_fullscreen,
             commands::config_set_worktree_path_pattern,
