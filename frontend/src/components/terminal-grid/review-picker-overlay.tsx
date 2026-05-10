@@ -8,11 +8,16 @@ import {
   createSignal,
   onCleanup,
   onMount,
+  untrack,
 } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 
 import { type AgentKind } from "../../lib/agentKind";
-import { spawnReviewerPane } from "../../stores/runtimeLayoutStore";
+import {
+  forceMaximizedPane,
+  maximizedPaneId,
+  spawnReviewerPane,
+} from "../../stores/runtimeLayoutStore";
 import { CheckIcon, ChevronDownIcon, HARNESS_ICONS } from "../icons";
 import {
   DropdownMenu,
@@ -68,6 +73,23 @@ export const ReviewPickerOverlay: Component<{ cellId: string }> = (props) => {
 
 const PickerBody: Component<{ picker: PendingReviewPicker }> = (props) => {
   const reviewerKind = (): AgentKind => props.picker.payload.reviewerKind;
+
+  // Auto-expand the host pane for the duration of the picker so the card
+  // has full room to render even on short panes. Restore on unmount, but
+  // only if our maximize is still in effect — bail out if the user toggled
+  // max manually mid-picker so we never clobber a deliberate choice.
+  // The picker swap remounts `PickerBody` wholesale, so a one-time snapshot
+  // of `targetCellId` is the correct semantics — `untrack` matches that.
+  const prevMaxId = untrack(maximizedPaneId);
+  const targetCellId = untrack(() => props.picker.targetCellId);
+  if (prevMaxId !== targetCellId) {
+    forceMaximizedPane(targetCellId);
+  }
+  onCleanup(() => {
+    if (maximizedPaneId() === targetCellId) {
+      forceMaximizedPane(prevMaxId);
+    }
+  });
 
   const [models] = createResource(reviewerKind, async (kind) => {
     try {
