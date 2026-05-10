@@ -40,6 +40,11 @@ pub struct SendNotificationArgs {
     /// `"needs_input"` (waiting/permission). Embedded in the request
     /// identifier so [`crate::notifications::clear`] can selectively
     /// dismiss delivered notifications by `(session_id, kind)`.
+    ///
+    /// Only consumed by the macOS dispatch path (Linux's notify-rust
+    /// flow has no notion of identifier-based dismissal); cfg-gate to
+    /// avoid Linux's `dead_code` denial.
+    #[cfg(any(target_os = "macos", test))]
     pub kind: Option<String>,
 }
 
