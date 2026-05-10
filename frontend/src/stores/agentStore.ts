@@ -7,7 +7,7 @@
  * soon as a harness transitions between states.
  */
 
-import { type Accessor, createMemo, createRoot } from "solid-js";
+import { type Accessor, createMemo, createRoot, createSignal } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
@@ -52,6 +52,38 @@ const [agentStore, setAgentStore] = createStore<AgentStoreState>({
 
 export { agentStore };
 
+/**
+ * §11 — sessions whose terminal-state notification ("done": completed/errored)
+ * the user has implicitly seen by activating their owning project tab.
+ * Excluded from {@link unreadAgentCount} so the dock badge clears on tab
+ * activation. Cleared back out by [`updateSessionState`] when the session
+ * transitions to a non-terminal state — a fresh completion should re-count
+ * as unread.
+ *
+ * Plain `Set` (not Solid store) so callers can mutate synchronously; the
+ * `acknowledgedTick` signal below is the reactive surface that drives memo
+ * retracking.
+ */
+const acknowledgedSessions = new Set<string>();
+const [acknowledgedTick, setAcknowledgedTick] = createSignal(0);
+
+export function markAcknowledged(sessionId: string): void {
+  if (!sessionId) return;
+  if (acknowledgedSessions.has(sessionId)) return;
+  acknowledgedSessions.add(sessionId);
+  setAcknowledgedTick((n) => n + 1);
+}
+
+export function unmarkAcknowledged(sessionId: string): void {
+  if (!sessionId) return;
+  if (!acknowledgedSessions.delete(sessionId)) return;
+  setAcknowledgedTick((n) => n + 1);
+}
+
+export function isAcknowledged(sessionId: string): boolean {
+  return acknowledgedSessions.has(sessionId);
+}
+
 export function setAdapters(items: AgentListItem[]): void {
   // Adapters have no `session_id`; the full list returned by `agent_list`
   // interleaves adapters (session_id null) with live machines. We split them
@@ -82,12 +114,20 @@ export function updateSessionState(
         reliability: reliability ?? null,
       };
   setAgentStore("sessions", sessionId, next);
+
+  // Re-arm: when a previously acknowledged session leaves its terminal
+  // state (because the harness started running again or went idle), drop
+  // the acknowledgement so the next completion shows as unread.
+  if (state === "working" || state === "idle") {
+    unmarkAcknowledged(sessionId);
+  }
 }
 
 export function removeSession(sessionId: string): void {
   const next = { ...agentStore.sessions };
   delete next[sessionId];
   setAgentStore("sessions", reconcile(next));
+  unmarkAcknowledged(sessionId);
 }
 
 // ---- derived selectors ---------------------------------------------------
@@ -101,12 +141,23 @@ interface AgentSelectors {
 }
 
 const agentSelectors: AgentSelectors = createRoot(() => {
-  const unread = createMemo(
-    () =>
-      Object.values(agentStore.sessions).filter(
-        (s) => s.state === "waiting" || s.state === "completed" || s.state === "errored",
-      ).length,
-  );
+  const unread = createMemo(() => {
+    // Touch the tick so the memo retracks when the acknowledged set
+    // mutates. Membership lookups themselves are non-reactive (plain Set).
+    acknowledgedTick();
+    return Object.values(agentStore.sessions).filter((s) => {
+      if (s.state !== "waiting" && s.state !== "completed" && s.state !== "errored") {
+        return false;
+      }
+      // `waiting` is sticky by user request: it should keep contributing to
+      // the badge until the harness leaves the waiting state, regardless of
+      // whether the project tab has been viewed. Only `done`-style states
+      // can be acknowledged via tab activation.
+      if (s.state === "waiting") return true;
+      if (s.session_id && acknowledgedSessions.has(s.session_id)) return false;
+      return true;
+    }).length;
+  });
   return { unreadAgentCount: unread };
 });
 
@@ -175,4 +226,6 @@ export function __resetAgentStoreForTests(): void {
     adapters: [],
     sessions: {},
   });
+  acknowledgedSessions.clear();
+  setAcknowledgedTick(0);
 }
