@@ -29,6 +29,29 @@ pub mod send;
 use tauri::{AppHandle, Manager, Runtime};
 use tracing::{info, warn};
 
+/// `true` when the process is running inside a real `.app` bundle.
+///
+/// In `task dev` Tauri launches the bare Mach-O at `target/debug/raum`, so
+/// `UNUserNotificationCenter.currentNotificationCenter` throws
+/// `NSInternalInconsistencyException` ("bundleProxyForCurrentProcess is
+/// nil") before the window even shows. Every UN* path in this module is
+/// gated on this so dev hot-reload stays alive at the cost of no OS
+/// notifications until the next `task build`.
+///
+/// Detection uses the executable path: a bundled binary lives at
+/// `…/Foo.app/Contents/MacOS/foo`, so the third parent has the `.app`
+/// extension. No objc round-trip needed.
+#[cfg(target_os = "macos")]
+pub fn is_bundled() -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    exe.ancestors()
+        .nth(3)
+        .and_then(std::path::Path::extension)
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("app"))
+}
+
 /// Set (or clear when `count == 0`) the dock / taskbar badge count for the
 /// `main` window. macOS + Linux are the supported raum platforms.
 ///

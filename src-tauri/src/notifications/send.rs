@@ -125,6 +125,16 @@ pub async fn notifications_send<R: Runtime>(
 
     #[cfg(target_os = "macos")]
     {
+        // Calling UNUserNotificationCenter from an unbundled binary
+        // (`task dev`) throws `NSInternalInconsistencyException`. Skip
+        // dispatch and report `delivered: false` so the frontend treats
+        // it the same as a permission-denied or otherwise-dropped send.
+        if !crate::notifications::is_bundled() {
+            return Ok(SendNotificationResult {
+                delivered: false,
+                error: Some("unbundled process (dev mode)".to_string()),
+            });
+        }
         let identifier = build_request_identifier(args.session_id.as_deref(), args.kind.as_deref());
         return Ok(send_macos(&args, &identifier).await);
     }

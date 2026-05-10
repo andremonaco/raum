@@ -55,6 +55,13 @@ pub async fn notifications_clear<R: Runtime>(
 
     #[cfg(target_os = "macos")]
     {
+        // UNUserNotificationCenter throws on unbundled processes (`task
+        // dev`); skip cleanly in dev so command invocations don't crash
+        // the app.
+        if !crate::notifications::is_bundled() {
+            tracing::debug!("notifications_clear: skipping — unbundled process (dev mode)");
+            return Ok(());
+        }
         clear_macos(&args.session_id, &args.kinds).await;
     }
 
