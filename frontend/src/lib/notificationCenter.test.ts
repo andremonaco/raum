@@ -34,6 +34,31 @@ import {
   startNotificationCenter,
   syncDockBadge,
 } from "./notificationCenter";
+import { __resetProjectStoreForTests, upsertProject } from "../stores/projectStore";
+import { __resetTerminalStoreForTests, upsertTerminal } from "../stores/terminalStore";
+import type { AgentKind } from "../stores/agentStore";
+
+function seedProject(slug: string, name: string, sigil: string): void {
+  upsertProject({
+    slug,
+    name,
+    color: "#000000",
+    sigil,
+    rootPath: `/tmp/${slug}`,
+    inRepoSettings: false,
+    hasRaumToml: false,
+  });
+}
+
+function seedSession(sessionId: string, kind: AgentKind, projectSlug: string | null): void {
+  upsertTerminal({
+    session_id: sessionId,
+    project_slug: projectSlug,
+    worktree_id: null,
+    kind,
+    created_unix: 0,
+  });
+}
 
 function lastDockBadgeCall(): number | undefined {
   const calls = mockInvoke.mock.calls.filter((c) => c[0] === "set_dock_badge");
@@ -47,6 +72,12 @@ interface SendArgs {
   title: string;
   body: string;
   sessionId?: string | null;
+  kind?: "done" | "needs_input";
+}
+
+interface ClearArgs {
+  sessionId: string;
+  kinds: Array<"done" | "needs_input">;
 }
 
 function sendCalls(): SendArgs[] {
@@ -55,12 +86,21 @@ function sendCalls(): SendArgs[] {
     .map((c) => (c[1] as { args: SendArgs }).args);
 }
 
+function clearCalls(): ClearArgs[] {
+  return mockInvoke.mock.calls
+    .filter((c) => c[0] === "notifications_clear")
+    .map((c) => (c[1] as { args: ClearArgs }).args);
+}
+
 describe("notification center", () => {
   beforeEach(async () => {
     listenHandlers.clear();
     mockInvoke.mockReset();
     mockInvoke.mockResolvedValue(undefined);
     __resetNotificationCenterForTests();
+    __resetProjectStoreForTests();
+    __resetTerminalStoreForTests();
+    seedProject("raum", "raum", "α");
     await ensureNotificationPermission();
   });
 
@@ -123,6 +163,7 @@ describe("notification center", () => {
   });
 
   it("fires OS notifications when an agent transitions to waiting", async () => {
+    seedSession("s-1", "claude-code", "raum");
     __handleAgentStateChangedForTests({
       session_id: "s-1",
       harness: "claude-code",
@@ -134,13 +175,14 @@ describe("notification center", () => {
     const calls = sendCalls();
     expect(calls).toHaveLength(1);
     expect(calls[0]).toMatchObject({
-      title: "Interactive Question",
-      body: "Claude is asking for feedback.",
+      title: "α raum",
+      body: "Claude needs you.",
       sessionId: "s-1",
     });
   });
 
   it("fires OS notifications when an agent completes", async () => {
+    seedSession("s-2", "codex", "raum");
     __handleAgentStateChangedForTests({
       session_id: "s-2",
       harness: "codex",
@@ -152,9 +194,47 @@ describe("notification center", () => {
     const calls = sendCalls();
     expect(calls).toHaveLength(1);
     expect(calls[0]).toMatchObject({
-      title: "Finished",
-      body: "Codex finished successfully.",
+      title: "α raum",
+      body: "Codex finished.",
       sessionId: "s-2",
+    });
+  });
+
+  it("fires OS notifications when an agent errors out", async () => {
+    seedSession("s-err", "claude-code", "raum");
+    __handleAgentStateChangedForTests({
+      session_id: "s-err",
+      harness: "claude-code",
+      from: "working",
+      to: "errored",
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    const calls = sendCalls();
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
+      title: "α raum",
+      body: "Claude errored.",
+      sessionId: "s-err",
+    });
+  });
+
+  it("falls back to an empty title when the session's project is unknown", async () => {
+    // No seedSession call — terminalStore has no record for this session.
+    __handleAgentStateChangedForTests({
+      session_id: "orphan",
+      harness: "codex",
+      from: "working",
+      to: "completed",
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    const calls = sendCalls();
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
+      title: "",
+      body: "Codex finished.",
+      sessionId: "orphan",
     });
   });
 
@@ -254,6 +334,103 @@ describe("notification center", () => {
     // was suppressed by the dedup gate so the user doesn't see two
     // banners for the same logical event.
     expect(sendCalls()).toHaveLength(1);
+  });
+
+  it("tags completed transitions with kind=done on the OS notification", async () => {
+    __handleAgentStateChangedForTests({
+      session_id: "done-1",
+      harness: "codex",
+      from: "working",
+      to: "completed",
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    const calls = sendCalls();
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.kind).toBe("done");
+    expect(calls[0]?.sessionId).toBe("done-1");
+  });
+
+  it("tags errored transitions with kind=done on the OS notification", async () => {
+    __handleAgentStateChangedForTests({
+      session_id: "err-1",
+      harness: "claude-code",
+      from: "working",
+      to: "errored",
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    const calls = sendCalls();
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.kind).toBe("done");
+  });
+
+  it("tags waiting transitions with kind=needs_input on the OS notification", async () => {
+    __handleAgentStateChangedForTests({
+      session_id: "wait-1",
+      harness: "claude-code",
+      from: "working",
+      to: "waiting",
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    const calls = sendCalls();
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.kind).toBe("needs_input");
+  });
+
+  it("tags permission-event notifications with kind=needs_input", async () => {
+    await __handleNotificationEventForTests({
+      harness: "codex",
+      event: "PermissionRequest",
+      session_id: "perm-1",
+      permission_key: "perm-1",
+      payload: { tool_name: "shell" },
+    });
+    const calls = sendCalls();
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.kind).toBe("needs_input");
+  });
+
+  it("dismisses needs_input OS notifications when the session leaves waiting", async () => {
+    await __handleNotificationEventForTests({
+      harness: "claude-code",
+      event: "PermissionRequest",
+      session_id: "leave-wait",
+      request_id: "req-leave",
+      permission_key: "req-leave",
+      payload: null,
+    });
+
+    // The session resolved its waiting state — either the user answered
+    // in the TUI or the harness moved on. The OS Notification Center
+    // entry should be dismissed alongside the in-memory permission key.
+    __handleAgentStateChangedForTests({
+      session_id: "leave-wait",
+      harness: "claude-code",
+      from: "waiting",
+      to: "working",
+    });
+
+    const clears = clearCalls();
+    expect(clears).toHaveLength(1);
+    expect(clears[0]).toEqual({ sessionId: "leave-wait", kinds: ["needs_input"] });
+  });
+
+  it("dismisses needs_input OS notifications when the session is removed", async () => {
+    await __handleNotificationEventForTests({
+      harness: "codex",
+      event: "PermissionRequest",
+      session_id: "rm-target",
+      permission_key: "rm-target",
+      payload: null,
+    });
+
+    __handleSessionRemovedForTests("rm-target");
+
+    const clears = clearCalls();
+    expect(clears).toHaveLength(1);
+    expect(clears[0]).toEqual({ sessionId: "rm-target", kinds: ["needs_input"] });
   });
 
   it("forwards notifications:clicked events as terminal-focus-requested", async () => {
