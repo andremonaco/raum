@@ -43,8 +43,11 @@ pub struct SendNotificationArgs {
     ///
     /// Only consumed by the macOS dispatch path (Linux's notify-rust
     /// flow has no notion of identifier-based dismissal); cfg-gate to
-    /// avoid Linux's `dead_code` denial.
-    #[cfg(any(target_os = "macos", test))]
+    /// avoid Linux's `dead_code` denial. Tests in this module call
+    /// `build_request_identifier` directly with raw `Option<&str>`
+    /// arguments — they don't construct `SendNotificationArgs` — so
+    /// `cfg(test)` doesn't need to bring the field back on Linux.
+    #[cfg(target_os = "macos")]
     pub kind: Option<String>,
 }
 
