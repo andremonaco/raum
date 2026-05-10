@@ -32,8 +32,18 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { createEffect, createRoot, createSignal } from "solid-js";
 
 import { kindDisplayLabel } from "./agentKind";
-import { unreadAgentCount } from "../stores/agentStore";
+import { agentStore, markAcknowledged, unreadAgentCount } from "../stores/agentStore";
 import type { AgentKind, AgentState, Reliability } from "../stores/agentStore";
+import { activeProjectSlug, projectBySlug } from "../stores/projectStore";
+import { listHarnessSessions, terminalStore } from "../stores/terminalStore";
+
+/**
+ * §11 — kind tag embedded in the OS notification's request identifier so
+ * [`notifications_clear`] can selectively dismiss notifications by
+ * `(sessionId, kind)`. `"done"` covers completed + errored; `"needs_input"`
+ * covers waiting + permission. Both backend and frontend must agree.
+ */
+type NotificationKind = "done" | "needs_input";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -66,14 +76,6 @@ interface NotificationEventPayload {
   request_id?: string | null;
   permission_key: string;
   payload?: Record<string, unknown> | null;
-}
-
-/** Per-agent notification metadata the caller can optionally supply. */
-export interface NotificationContext {
-  /** Display name for the originating project — rendered in the title. */
-  projectName?: string;
-  /** Display name for the worktree — rendered in the body. */
-  worktreeName?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -196,6 +198,15 @@ function clearPendingPermissionsForSession(sessionId: string): void {
     }
   }
   if (mutated) setPendingPermissionCount(pendingPermissionKeys.size);
+
+  // Per the user's rule, "needs input" notifications are sticky until the
+  // harness is running again. The two callers of this helper both fit that
+  // moment exactly:
+  //   * `handleAgentStateChanged` — invoked on `waiting → !waiting`.
+  //   * `agent-session-removed` — the session is gone entirely.
+  // Drop the OS Notification Center entry alongside the in-memory cleanup
+  // above so the user doesn't see a stale "needs input" banner.
+  void clearOsNotifications(sessionId, ["needs_input"]);
 }
 
 // ---------------------------------------------------------------------------
@@ -208,28 +219,12 @@ function clearPendingPermissionsForSession(sessionId: string): void {
  * permission-event + waiting-transition pair. See {@link NOTIFY_DEDUP_MS}.
  */
 const lastNotifyAt = new Map<string, number>();
-const contextBySession = new Map<string, NotificationContext>();
 
 function shouldDedupNotify(sessionId: string, now: number): boolean {
   const prev = lastNotifyAt.get(sessionId);
   if (prev !== undefined && now - prev < NOTIFY_DEDUP_MS) return true;
   lastNotifyAt.set(sessionId, now);
   return false;
-}
-
-/**
- * Register (or update) the human-readable context for a session. The title
- * and body of the OS notification are built from these strings. Callers are
- * expected to update this when a worktree is renamed or a project is
- * registered; we persist nothing.
- */
-export function setNotificationContext(sessionId: string, ctx: NotificationContext): void {
-  contextBySession.set(sessionId, ctx);
-}
-
-export function clearNotificationContext(sessionId: string): void {
-  contextBySession.delete(sessionId);
-  lastNotifyAt.delete(sessionId);
 }
 
 // ---------------------------------------------------------------------------
@@ -315,11 +310,16 @@ export async function ensureNotificationPermission(): Promise<"granted" | "denie
  * Fire an OS notification via the Rust `notifications_send` command.
  * Errors are swallowed and logged — notifications are best-effort UX and
  * must never abort a state-change handler.
+ *
+ * `kind` is embedded in the request identifier on macOS so the
+ * `notifications_clear` command can selectively dismiss this notification
+ * later (on tab activation or when the harness leaves `waiting`).
  */
 async function emitOsNotification(
   title: string,
   body: string,
-  sessionId?: string | null,
+  sessionId: string | null | undefined,
+  kind: NotificationKind,
 ): Promise<void> {
   try {
     await invoke("notifications_send", {
@@ -327,6 +327,7 @@ async function emitOsNotification(
         title,
         body,
         sessionId: sessionId ?? null,
+        kind,
       },
     });
   } catch (e) {
@@ -334,20 +335,46 @@ async function emitOsNotification(
   }
 }
 
-function titleFor(ctx: NotificationContext | undefined, harness: AgentKind): string {
-  void ctx;
-  void harness;
-  return "Interactive Question";
+/**
+ * Ask the backend to dismiss every delivered notification owned by
+ * `sessionId` whose embedded kind matches one of `kinds`. macOS-only
+ * dismissal; Linux is a no-op on the backend (notify-rust has no clean
+ * dismiss API). Best-effort — failures are logged and swallowed.
+ */
+async function clearOsNotifications(sessionId: string, kinds: NotificationKind[]): Promise<void> {
+  if (!sessionId || kinds.length === 0) return;
+  try {
+    await invoke("notifications_clear", {
+      args: {
+        sessionId,
+        kinds,
+      },
+    });
+  } catch (e) {
+    console.warn("notifications_clear failed", e);
+  }
 }
 
-function bodyFor(
-  ctx: NotificationContext | undefined,
+/**
+ * Build `{ title, body }` for an agent-state notification. Title carries
+ * project identity ("<sigil> <projectName>", with either side dropped if
+ * the project can't be resolved), body carries the calm verb phrase
+ * ("Claude needs you.", "Codex finished.", "Codex errored."). Reads
+ * project metadata directly from the live stores so renames are picked
+ * up without any extra wiring.
+ */
+function composeNotification(
   sessionId: string,
   harness: AgentKind,
-): string {
-  void ctx;
-  void sessionId;
-  return `${kindDisplayLabel(harness)} is asking for feedback.`;
+  verb: "needs you" | "finished" | "errored",
+): { title: string; body: string } {
+  const slug = terminalStore.byId[sessionId]?.project_slug ?? null;
+  const project = slug ? (projectBySlug().get(slug) ?? null) : null;
+  const sigil = project?.sigil ?? "";
+  const name = project?.name ?? "";
+  const title = [sigil, name].filter(Boolean).join(" ");
+  const body = `${kindDisplayLabel(harness)} ${verb}.`;
+  return { title, body };
 }
 
 async function playSound(path: string): Promise<void> {
@@ -399,7 +426,9 @@ export async function sendTestNotification(): Promise<void> {
   const title = "raum: test notification";
   const body = "If you see this, notifications are working.";
   void playWaitingSound();
-  await emitOsNotification(title, body);
+  // Tag the test as `done` so an opportunistic `notifications_clear` for a
+  // real session never accidentally targets it (no session id is passed).
+  await emitOsNotification(title, body, null, "done");
   // The first send on macOS may surface the OS authorization prompt;
   // re-probe so the badge picks up the new state without forcing the
   // user to reopen settings.
@@ -462,9 +491,7 @@ async function dispatchWaitingNotification(sessionId: string, harness: AgentKind
   if (!notifyOnWaiting()) return;
   if (shouldDedupNotify(sessionId, Date.now())) return;
 
-  const ctx = contextBySession.get(sessionId);
-  const title = titleFor(ctx, harness);
-  const body = bodyFor(ctx, sessionId, harness);
+  const { title, body } = composeNotification(sessionId, harness, "needs you");
 
   void playWaitingSound();
 
@@ -473,7 +500,7 @@ async function dispatchWaitingNotification(sessionId: string, harness: AgentKind
   // `handleAgentStateChanged`'s unread/pending counters.
   if (!notifyBannerEnabled()) return;
 
-  await emitOsNotification(title, body, sessionId);
+  await emitOsNotification(title, body, sessionId, "needs_input");
 }
 
 async function dispatchDoneNotification(
@@ -483,14 +510,11 @@ async function dispatchDoneNotification(
 ): Promise<void> {
   if (!notifyOnDone()) return;
 
-  const ctx = contextBySession.get(sessionId);
-  void ctx;
-  const harnessName = kindDisplayLabel(harness);
-  const title = doneState === "completed" ? "Finished" : "Error";
-  const body =
-    doneState === "completed"
-      ? `${harnessName} finished successfully.`
-      : `${harnessName} hit an error.`;
+  const { title, body } = composeNotification(
+    sessionId,
+    harness,
+    doneState === "completed" ? "finished" : "errored",
+  );
 
   const soundPath = await readSoundPath();
   if (soundPath) void playSound(soundPath);
@@ -498,7 +522,7 @@ async function dispatchDoneNotification(
   // Banner master switch off → silent-with-badge.
   if (!notifyBannerEnabled()) return;
 
-  await emitOsNotification(title, body, sessionId);
+  await emitOsNotification(title, body, sessionId, "done");
 }
 
 // ---------------------------------------------------------------------------
@@ -580,7 +604,14 @@ export async function startNotificationCenter(): Promise<UnlistenFn> {
   // §11.3 — mode-aware dock/taskbar badge driver. Reads `badgeMode` +
   // `pendingPermissionCount` + `unreadAgentCount` so the badge stays in
   // sync with whichever verbosity level the user has picked.
-  const disposeBadge = createRoot((dispose) => {
+  //
+  // Tab-activation effect (sibling): when the user switches to a project
+  // tab, every session in that project that's currently in `completed` /
+  // `errored` is implicitly acknowledged — the notification has done its
+  // job, the user is looking at the project. Drop the in-app
+  // unread-contribution and ask the OS to remove the matching banners
+  // from Notification Center. `waiting` deliberately stays sticky.
+  const disposeReactive = createRoot((dispose) => {
     createEffect(() => {
       const mode = badgeMode();
       if (mode === "off") {
@@ -591,6 +622,22 @@ export async function startNotificationCenter(): Promise<UnlistenFn> {
         syncDockBadge(unreadAgentCount());
       }
     });
+
+    createEffect(() => {
+      const slug = activeProjectSlug();
+      if (!slug) return;
+      const records = listHarnessSessions(slug);
+      for (const record of records) {
+        const sessionId = record.session_id;
+        if (!sessionId) continue;
+        const agent = agentStore.sessions[sessionId];
+        if (!agent) continue;
+        if (agent.state !== "completed" && agent.state !== "errored") continue;
+        markAcknowledged(sessionId);
+        void clearOsNotifications(sessionId, ["done"]);
+      }
+    });
+
     return dispose;
   });
 
@@ -599,7 +646,7 @@ export async function startNotificationCenter(): Promise<UnlistenFn> {
     unlistenRemoved();
     unlistenPermission();
     unlistenClick();
-    disposeBadge();
+    disposeReactive();
     lastNotifyAt.clear();
   };
 }
@@ -622,8 +669,6 @@ async function dispatchPermissionNotification(payload: NotificationEventPayload)
   const sessionId = payload.session_id ?? "";
   if (sessionId && shouldDedupNotify(sessionId, Date.now())) return;
 
-  const ctx = payload.session_id ? contextBySession.get(payload.session_id) : undefined;
-  void ctx;
   const title = "Permission requested";
   const summary = permissionSummaryFor(payload);
 
@@ -635,7 +680,7 @@ async function dispatchPermissionNotification(payload: NotificationEventPayload)
   // banner.
   if (!notifyBannerEnabled()) return;
 
-  await emitOsNotification(title, summary, sessionId || null);
+  await emitOsNotification(title, summary, sessionId || null, "needs_input");
 }
 
 function permissionSummaryFor(payload: NotificationEventPayload): string {
@@ -676,7 +721,6 @@ export function syncDockBadge(count: number): void {
 /** @internal — reset every bit of module state so tests don't bleed. */
 export function __resetNotificationCenterForTests(): void {
   lastNotifyAt.clear();
-  contextBySession.clear();
   setPermissionState("unknown");
   setNotificationBundleId("");
   setNotificationDevMode(false);

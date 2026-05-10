@@ -1236,6 +1236,22 @@ export function clearMaximize(): void {
   setMaximizedPaneId(null);
 }
 
+/**
+ * Imperative maximize setter. Unlike `toggleMaximize`, the caller specifies
+ * the desired end state. Pulses the maximize animation symmetrically on
+ * open and restore so the chrome transition matches user-driven double-click.
+ * No-op when already at target.
+ *
+ * Use case: transient overlays (e.g. the review picker) that need the host
+ * pane full-window for the duration of the overlay.
+ */
+export function forceMaximizedPane(paneId: string | null): void {
+  const current = maximizedPaneId();
+  if (current === paneId) return;
+  pulseMaximizeAnim(paneId ?? current);
+  setMaximizedPaneId(paneId);
+}
+
 // ---- focus cycling --------------------------------------------------------
 
 export function focusPaneByIndex(oneBasedIndex: number): void {

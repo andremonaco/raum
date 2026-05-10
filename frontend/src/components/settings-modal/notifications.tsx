@@ -150,12 +150,8 @@ const NotificationBannerPreview: Component<{ enabled: boolean }> = (props) => {
           <span class="text-[10px] font-medium text-foreground">raum</span>
           <span class="truncate text-[9px] text-muted-foreground">now</span>
         </div>
-        <p class="mt-0.5 truncate text-[11px] font-semibold text-foreground">
-          Interactive Question
-        </p>
-        <p class="mt-0.5 line-clamp-2 text-[10px] text-muted-foreground">
-          Claude Code is asking for feedback.
-        </p>
+        <p class="mt-0.5 truncate text-[11px] font-semibold text-foreground">α raum</p>
+        <p class="mt-0.5 line-clamp-2 text-[10px] text-muted-foreground">Claude needs you.</p>
       </div>
       <Show when={!props.enabled}>
         <span class="pointer-events-none absolute inset-x-0 bottom-1 text-center text-[9px] font-medium uppercase tracking-wider text-muted-foreground">

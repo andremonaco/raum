@@ -237,6 +237,7 @@ pub fn run() {
             commands::notifications::notifications_check_authorization,
             commands::notifications::notifications_open_system_settings,
             notifications::send::notifications_send,
+            notifications::clear::notifications_clear,
             commands::config_set_harness_flags,
             commands::config_set_claude_fullscreen,
             commands::config_set_worktree_path_pattern,
@@ -352,13 +353,26 @@ pub fn run() {
             // unread notification while it was quit.
             #[cfg(target_os = "macos")]
             {
-                let handle = app.handle().clone();
-                let delegate = notifications::delegate::install(handle.clone());
-                let state: tauri::State<'_, state::AppHandleState> = app.state();
-                if let Ok(mut guard) = state.notification_delegate.lock() {
-                    *guard = Some(delegate);
+                // Skip when running unbundled (e.g. `task dev` launches
+                // `target/debug/raum` directly): UNUserNotificationCenter
+                // throws on a process with no `.app` parent and crashes the
+                // app at startup. Release builds run from `Raum.app` and
+                // proceed normally.
+                if notifications::is_bundled() {
+                    let handle = app.handle().clone();
+                    let delegate = notifications::delegate::install(handle.clone());
+                    let state: tauri::State<'_, state::AppHandleState> = app.state();
+                    if let Ok(mut guard) = state.notification_delegate.lock() {
+                        *guard = Some(delegate);
+                    } else {
+                        warn!("notification_delegate mutex poisoned during setup");
+                    }
                 } else {
-                    warn!("notification_delegate mutex poisoned during setup");
+                    info!(
+                        "notifications: skipping UNUserNotificationCenter \
+                         delegate install — process is not running from a \
+                         .app bundle (dev mode)"
+                    );
                 }
             }
 
