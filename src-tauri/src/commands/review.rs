@@ -174,6 +174,7 @@ pub async fn prepare_review<R: Runtime>(
     let branch = detect_branch(&cwd).unwrap_or_else(|| "HEAD".to_string());
     let base = detect_base_branch(&cwd).unwrap_or_else(|| "main".to_string());
     let files_changed = git_changed_files(&cwd, &base);
+    let uncommitted_files = git_uncommitted_files(&cwd);
     let commits_ahead = git_commits_ahead(&cwd, &base);
 
     let transcript_path = discover_transcript_path(reviewed_kind, &cwd, &home_dir);
@@ -182,6 +183,7 @@ pub async fn prepare_review<R: Runtime>(
     let initial_prompt = render_review_brief(&BriefInputs {
         prompts: &prompts,
         files_changed: &files_changed,
+        uncommitted_files: &uncommitted_files,
         branch: &branch,
         base: &base,
         commits_ahead,
@@ -193,6 +195,7 @@ pub async fn prepare_review<R: Runtime>(
         reviewed_session_id = %args.reviewed_session_id,
         prompts = prompts.len(),
         files = files_changed.len(),
+        uncommitted = uncommitted_files.len(),
         brief_bytes = initial_prompt.len(),
         "prepared review brief",
     );
@@ -462,6 +465,54 @@ fn git_changed_files(cwd: &Path, base: &str) -> Vec<String> {
         .collect()
 }
 
+/// Collect files dirty in the working tree relative to HEAD — staged,
+/// unstaged, and untracked. Parses `git status --porcelain -z` so file
+/// names with spaces or special characters round-trip safely. Best-effort:
+/// any failure returns an empty list, matching the rest of the git
+/// helpers.
+///
+/// Renames are split into both sides (`R old -> new`) so the reviewer
+/// sees both paths.
+fn git_uncommitted_files(cwd: &Path) -> Vec<String> {
+    let out = match Command::new("git")
+        .current_dir(cwd)
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+
+    // `-z` separator: each entry is `XY <path>\0`; for renames/copies the
+    // original path follows in a second `\0`-terminated field.
+    let mut files: Vec<String> = Vec::new();
+    let mut iter = out.stdout.split(|&b| b == 0);
+    while let Some(raw) = iter.next() {
+        if raw.is_empty() {
+            continue;
+        }
+        // First 3 bytes are "XY ". Defensive against shorter rows.
+        if raw.len() < 4 {
+            continue;
+        }
+        let status = &raw[..2];
+        let path = String::from_utf8_lossy(&raw[3..]).into_owned();
+        files.push(path);
+        // Renames/copies have an extra path entry to consume (the old name).
+        if status[0] == b'R' || status[0] == b'C' {
+            if let Some(old) = iter.next() {
+                let old_path = String::from_utf8_lossy(old).into_owned();
+                if !old_path.is_empty() {
+                    files.push(old_path);
+                }
+            }
+        }
+    }
+    files.sort();
+    files.dedup();
+    files
+}
+
 fn git_commits_ahead(cwd: &Path, base: &str) -> usize {
     let range = format!("{base}..HEAD");
     let Ok(out) = Command::new("git")
@@ -550,7 +601,49 @@ mod tests {
         assert!(detect_branch(dir.path()).is_none());
         assert!(detect_base_branch(dir.path()).is_none());
         assert!(git_changed_files(dir.path(), "main").is_empty());
+        assert!(git_uncommitted_files(dir.path()).is_empty());
         assert_eq!(git_commits_ahead(dir.path(), "main"), 0);
+    }
+
+    #[test]
+    fn git_uncommitted_files_picks_up_staged_unstaged_and_untracked() {
+        let dir = tempdir().unwrap();
+        init_repo(dir.path());
+        let run = |args: &[&str]| {
+            StdCommand::new("git")
+                .current_dir(dir.path())
+                .args(args)
+                .output()
+                .expect("git");
+        };
+        // Untracked file.
+        fs::write(dir.path().join("untracked.rs"), "// new").unwrap();
+        // Staged new file.
+        fs::write(dir.path().join("staged.rs"), "// staged").unwrap();
+        run(&["add", "staged.rs"]);
+        // Unstaged modification of an existing tracked file.
+        fs::write(dir.path().join("README.md"), "hi modified").unwrap();
+
+        let dirty = git_uncommitted_files(dir.path());
+        assert!(
+            dirty.iter().any(|p| p == "untracked.rs"),
+            "expected untracked.rs in {dirty:?}",
+        );
+        assert!(
+            dirty.iter().any(|p| p == "staged.rs"),
+            "expected staged.rs in {dirty:?}",
+        );
+        assert!(
+            dirty.iter().any(|p| p == "README.md"),
+            "expected README.md in {dirty:?}",
+        );
+    }
+
+    #[test]
+    fn git_uncommitted_files_empty_on_clean_repo() {
+        let dir = tempdir().unwrap();
+        init_repo(dir.path());
+        assert!(git_uncommitted_files(dir.path()).is_empty());
     }
 
     #[test]
