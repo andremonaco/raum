@@ -2,7 +2,7 @@ import { Component, For, Show, createEffect, createMemo, createSignal } from "so
 
 import { type AgentKind } from "../../lib/agentKind";
 import { resolveDisplayedTabLabel } from "../../lib/terminalTabLabel";
-import { agentStore } from "../../stores/agentStore";
+import { agentStore, isAcknowledgedReactive } from "../../stores/agentStore";
 import type { AgentState } from "../../stores/agentStore";
 import {
   runtimeLayoutStore,
@@ -77,6 +77,17 @@ export const TabItem: Component<{
     return s === "working" || s === "waiting";
   };
 
+  // True while the harness has completed its turn AND the user hasn't
+  // implicitly "read" the result by focusing this tab inside its pane.
+  // Drives the calm green chrome — quiet bg differentiation, matching the
+  // existing waiting-state pattern.
+  const isUnreadCompleted = () => {
+    if (tabState() !== "completed") return false;
+    const sid = props.tab.sessionId;
+    if (!sid) return false;
+    return !isAcknowledgedReactive(sid);
+  };
+
   const HarnessIcon = () => {
     const Icon = HARNESS_ICONS[props.kind as keyof typeof HARNESS_ICONS];
     if (!Icon) return null;
@@ -144,12 +155,17 @@ export const TabItem: Component<{
         classList={{
           "h-[22px]": !!lastPromptSubtitle(),
           "h-[18px]": !lastPromptSubtitle(),
-          "bg-selected text-foreground": props.isActive && tabState() !== "waiting",
+          "bg-selected text-foreground":
+            props.isActive && tabState() !== "waiting" && !isUnreadCompleted(),
           "bg-selected text-warning": props.isActive && tabState() === "waiting",
+          "bg-selected text-success":
+            props.isActive && tabState() !== "waiting" && isUnreadCompleted(),
           "text-foreground-subtle hover:bg-hover hover:text-foreground":
-            !props.isActive && tabState() !== "waiting",
+            !props.isActive && tabState() !== "waiting" && !isUnreadCompleted(),
           "bg-warning/15 text-warning hover:bg-warning/25":
             !props.isActive && tabState() === "waiting",
+          "bg-success/15 text-success hover:bg-success/25":
+            !props.isActive && tabState() !== "waiting" && isUnreadCompleted(),
           wiggle: bumping(),
         }}
         onClick={(e: MouseEvent) => {

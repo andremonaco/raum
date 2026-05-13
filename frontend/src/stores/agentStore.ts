@@ -84,6 +84,15 @@ export function isAcknowledged(sessionId: string): boolean {
   return acknowledgedSessions.has(sessionId);
 }
 
+/** Reactive sibling of {@link isAcknowledged}: subscribes the caller to
+ *  `acknowledgedTick`, so computations/memos/effects that read this re-run
+ *  when the set mutates. Use inside Solid tracking contexts (JSX, memos,
+ *  effects); outside of those it behaves the same as `isAcknowledged`. */
+export function isAcknowledgedReactive(sessionId: string): boolean {
+  acknowledgedTick();
+  return acknowledgedSessions.has(sessionId);
+}
+
 export function setAdapters(items: AgentListItem[]): void {
   // Adapters have no `session_id`; the full list returned by `agent_list`
   // interleaves adapters (session_id null) with live machines. We split them

@@ -20,7 +20,7 @@ import { batch, createMemo, createRoot, createSignal, type Accessor } from "soli
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { createStore, reconcile } from "solid-js/store";
-import { agentStore, type AgentKind, type AgentState } from "./agentStore";
+import { agentStore, isAcknowledgedReactive, type AgentKind, type AgentState } from "./agentStore";
 import { removeTabsBySessionId, replaceTabsSessionId } from "./runtimeLayoutStore";
 import { clearReviewLinkForSession } from "./reviewLinkStore";
 
@@ -547,6 +547,12 @@ interface Selectors {
   activeCount: Accessor<number>;
   waitingCount: Accessor<number>;
   idleCount: Accessor<number>;
+  /** Per-project count of harnesses in `Completed` state whose result the
+   *  user hasn't implicitly acknowledged yet (see `markAcknowledged` in
+   *  `agentStore`). Drives the green project-tab dot. Separate memo from
+   *  `harnessCountsByProject` so the long-running membership counter
+   *  doesn't observe agent-state churn. */
+  unreadCompletedByProject: Accessor<Record<string, number>>;
 }
 
 function resolveHarnessIds(ids: ReadonlySet<string>): TerminalRecord[] {
@@ -646,6 +652,23 @@ const selectors: Selectors = createRoot(() => {
   const activeN = createMemo(() => global().active);
   const waitingN = createMemo(() => global().waiting);
   const idleN = createMemo(() => global().idle);
+
+  const unreadCompleted = createMemo<Record<string, number>>(() => {
+    const buckets = idsByProjectSlug();
+    const out: Record<string, number> = {};
+    for (const [slug, ids] of buckets) {
+      let n = 0;
+      for (const id of ids) {
+        const session = agentStore.sessions[id];
+        if (session?.state !== "completed") continue;
+        if (isAcknowledgedReactive(id)) continue;
+        n += 1;
+      }
+      out[slug] = n;
+    }
+    return out;
+  });
+
   return {
     activeTerminals: active,
     waitingTerminals: waiting,
@@ -656,6 +679,7 @@ const selectors: Selectors = createRoot(() => {
     activeCount: activeN,
     waitingCount: waitingN,
     idleCount: idleN,
+    unreadCompletedByProject: unreadCompleted,
   };
 });
 
@@ -677,6 +701,14 @@ export const activeCount = selectors.activeCount;
 export const waitingCount = selectors.waitingCount;
 /** Count of harnesses at rest (state = `idle`). */
 export const idleCount = selectors.idleCount;
+/** Per-project count of completed harnesses whose result the user hasn't
+ *  acknowledged yet. Drives the green project-tab dot. */
+export const unreadCompletedByProject = selectors.unreadCompletedByProject;
+
+export function unreadCompletedForProject(projectSlug: string | null | undefined): number {
+  if (!projectSlug) return 0;
+  return unreadCompletedByProject()[projectSlug] ?? 0;
+}
 
 export type CrossProjectHarnessMode = "awaiting" | "working" | "completed";
 

@@ -1313,12 +1313,21 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       }, COPY_FLASH_MS);
     };
     let dragActive = false;
-    const onMouseDown = (): void => {
+    const onMouseDown = (ev: MouseEvent): void => {
+      // A double-click's second mousedown triggers xterm's native
+      // word-selection — and double-click is bound to toggle maximize.
+      // Don't arm the copy path for those clicks, otherwise the clipboard
+      // gets clobbered on every maximize toggle.
+      if (ev.detail >= 2) {
+        dragActive = false;
+        return;
+      }
       dragActive = true;
     };
-    const onWindowMouseUp = (): void => {
+    const onWindowMouseUp = (ev: MouseEvent): void => {
       if (!dragActive) return;
       dragActive = false;
+      if (ev.detail >= 2) return;
       void copySelection();
     };
     const onKeyUp = (ev: KeyboardEvent): void => {
