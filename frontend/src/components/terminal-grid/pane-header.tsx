@@ -1,6 +1,7 @@
-import { Component, For } from "solid-js";
+import { Component, For, Show, createMemo } from "solid-js";
 
 import { type AgentKind } from "../../lib/agentKind";
+import { agentStore, isAcknowledgedReactive } from "../../stores/agentStore";
 import { ROOT_TARGET, beginDrag } from "../../lib/paneDnD";
 import { resolveSpawnWorktree } from "../../lib/resolveSpawnWorktree";
 import { extractSnippet } from "../../lib/terminalSnippet";
@@ -35,6 +36,22 @@ import { type PaneHeaderProps } from "./types";
 import { getScopedProjection, requestTerminalKill, zoneToDirection } from "./utils";
 
 export const PaneHeader: Component<PaneHeaderProps> = (props) => {
+  // True when at least one non-active tab in this pane points at a
+  // harness session whose Completed transition the user hasn't
+  // acknowledged yet. Surfaces as a small green dot next to the chrome
+  // buttons so completions sitting behind the active tab still nudge for
+  // attention. Active-tab completions are already tinted in the tab
+  // strip, so they don't contribute.
+  const hasHiddenCompletion = createMemo(() => {
+    return props.tabs.some((tab) => {
+      if (tab.id === props.activeTabId) return false;
+      const sid = tab.sessionId;
+      if (!sid) return false;
+      if (agentStore.sessions[sid]?.state !== "completed") return false;
+      return !isAcknowledgedReactive(sid);
+    });
+  });
+
   function onCloseTab(ev: MouseEvent, tab: CellTab) {
     ev.stopPropagation();
     requestTerminalKill(tab.sessionId, "PaneHeader");
@@ -188,6 +205,13 @@ export const PaneHeader: Component<PaneHeaderProps> = (props) => {
       </div>
 
       <div class="flex shrink-0 items-center gap-1 px-1.5">
+        <Show when={hasHiddenCompletion()}>
+          <span
+            aria-label="Completed harness in this pane"
+            title="Completed harness in this pane"
+            class="mr-0.5 inline-block h-1.5 w-1.5 shrink-0 rounded-full bg-success"
+          />
+        </Show>
         <ChromeButton
           label="Minimize to dock"
           onClick={(e) => {

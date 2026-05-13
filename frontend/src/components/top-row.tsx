@@ -41,11 +41,13 @@ import {
 } from "../stores/agentStore";
 import {
   activeCount,
+  harnessCountsForProject,
   idleCount,
   refreshTerminals,
   seedLastPromptsFromAgents,
   setTerminals,
   subscribeTerminalEvents,
+  unreadCompletedForProject,
   waitingCount,
   waitingTerminals,
   type TerminalListItem,
@@ -160,6 +162,22 @@ const ProjectTab: Component<ProjectTabProps> = (props) => {
   const [hexInput, setHexInput] = createSignal("");
 
   const branch = createMemo(() => branchForProject(props.project.slug, props.project.rootPath));
+
+  // Per-project attention counts driving the small status dots on the
+  // project tab. `waiting` mirrors the cross-project "needs input"
+  // counter; `unreadCompleted` mirrors the pane-level green
+  // unread-completed chrome — both clear automatically as the user
+  // focuses panes inside the project.
+  const waitingForProject = createMemo(() => harnessCountsForProject(props.project.slug).waiting);
+  const unreadCompletedForProj = createMemo(() => unreadCompletedForProject(props.project.slug));
+  const attentionTooltip = () => {
+    const parts: string[] = [];
+    const w = waitingForProject();
+    const c = unreadCompletedForProj();
+    if (w > 0) parts.push(`${w} need${w === 1 ? "s" : ""} input`);
+    if (c > 0) parts.push(`${c} completed (unread)`);
+    return parts.join(" · ");
+  };
 
   // Persist a new color. The popover stays open so the user can keep
   // tweaking (mirrors the sigil picker behaviour below).
@@ -310,6 +328,20 @@ const ProjectTab: Component<ProjectTabProps> = (props) => {
               }}
             >
               <span class="truncate">{props.project.name || props.project.slug}</span>
+              <Show when={waitingForProject() > 0 || unreadCompletedForProj() > 0}>
+                <span
+                  class="inline-flex shrink-0 items-center gap-1"
+                  aria-label={attentionTooltip()}
+                  title={attentionTooltip()}
+                >
+                  <Show when={waitingForProject() > 0}>
+                    <span class="inline-block h-1.5 w-1.5 rounded-full bg-warning animate-pulse" />
+                  </Show>
+                  <Show when={unreadCompletedForProj() > 0}>
+                    <span class="inline-block h-1.5 w-1.5 rounded-full bg-success" />
+                  </Show>
+                </span>
+              </Show>
               <Show when={branch()}>
                 <span
                   class="inline-flex items-center gap-0.5 rounded bg-muted/60 px-1.5 py-0.5 font-mono text-[10px] transition-colors"
@@ -331,7 +363,7 @@ const ProjectTab: Component<ProjectTabProps> = (props) => {
           <TooltipTrigger
             as="button"
             type="button"
-            class="inline-flex h-7 w-7 select-none items-center justify-center rounded-md font-mono text-[13px] leading-none tabular-nums transition-opacity"
+            class="relative inline-flex h-7 w-7 select-none items-center justify-center rounded-md font-mono text-[13px] leading-none tabular-nums transition-opacity"
             classList={{
               "opacity-100": props.active,
               "opacity-60 group-hover:opacity-100": !props.active,
@@ -347,9 +379,29 @@ const ProjectTab: Component<ProjectTabProps> = (props) => {
             }}
           >
             {props.project.sigil}
+            {/* Waiting takes precedence — it represents a harness blocked on
+                the user; unread completed is the gentler nudge. Only one
+                dot in compact mode so the sigil stays legible. */}
+            <Show when={waitingForProject() > 0}>
+              <span
+                aria-hidden="true"
+                class="pointer-events-none absolute right-0.5 top-0.5 h-1.5 w-1.5 rounded-full bg-warning animate-pulse"
+              />
+            </Show>
+            <Show when={waitingForProject() === 0 && unreadCompletedForProj() > 0}>
+              <span
+                aria-hidden="true"
+                class="pointer-events-none absolute right-0.5 top-0.5 h-1.5 w-1.5 rounded-full bg-success"
+              />
+            </Show>
           </TooltipTrigger>
           <TooltipPortal>
-            <TooltipContent>{props.project.name || props.project.slug}</TooltipContent>
+            <TooltipContent>
+              {props.project.name || props.project.slug}
+              <Show when={attentionTooltip()}>
+                <span class="ml-1 opacity-70">· {attentionTooltip()}</span>
+              </Show>
+            </TooltipContent>
           </TooltipPortal>
         </Tooltip>
       </Show>

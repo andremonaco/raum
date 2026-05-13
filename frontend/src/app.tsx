@@ -20,6 +20,7 @@ import { installDevtoolsShortcut } from "./lib/devtoolsShortcut";
 import { loadThemeFromConfig } from "./lib/theme/themeController";
 import { initHomeDir } from "./lib/pathDisplay";
 import { installFileDrop } from "./lib/fileDrop";
+import { installPaneFocusAcknowledger } from "./lib/paneFocusAcknowledger";
 import { previewOnboarding, setPreviewOnboarding } from "./lib/devOnboardingPreview";
 import { startShellContextPoller } from "./lib/shellContextPoller";
 import { hydrateActiveWorktreeScopes, prewarmAllWorktrees } from "./stores/worktreeStore";
@@ -188,6 +189,7 @@ const App: Component = () => {
       })
       .catch((e) => console.warn("installFileDrop failed", e));
     const stopShellContextPoller = startShellContextPoller();
+    installPaneFocusAcknowledger();
     onCleanup(() => {
       disposed = true;
       stopFileDrop?.();
