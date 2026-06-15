@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.9](https://github.com/andremonaco/raum/releases/tag/v0.1.9) - 2026-06-15
+
+### Added
+
+- feat(backend): control-mode transport, worktree status service, webview health
+
+### Fixed
+
+- fix(sessions): make sessions.toml the single authority + reconcile orphan tmux sessions
+
+### Other
+
+- refactor(review): brief hands reviewer the session log + changed files, no priming
+
+
 ## [0.1.8](https://github.com/andremonaco/raum/releases/tag/v0.1.8) - 2026-05-13
 
 
