@@ -37,10 +37,20 @@ interface PaneEntry {
   visible: boolean;
   /** Monotonic counter used for LRU ordering. Higher = more recently used. */
   mru: number;
+  /** Held WebGL when the page was backgrounded; re-promote on return. */
+  pendingRepromote: boolean;
 }
 
 const panes = new Map<string, PaneEntry>();
 let mruCounter = 0;
+
+/**
+ * True while the page itself is hidden (screen locked / window fully
+ * occluded). WebGL contexts held during that window are pure GPU-memory
+ * pressure — macOS sometimes responds by killing the whole WebContent
+ * process — so we release them all and re-promote when the page returns.
+ */
+let backgrounded = false;
 
 /**
  * Solid signal of WARN messages emitted by the scheduler. Components can
@@ -157,6 +167,7 @@ export function registerPane(
     forbidWebgl: !!opts.forbidWebgl,
     visible: opts.visible !== false,
     mru: mruCounter++,
+    pendingRepromote: false,
   };
   panes.set(paneId, entry);
   installCanvas(entry);
@@ -197,6 +208,7 @@ export async function requestWebgl(paneId: string): Promise<void> {
   const entry = panes.get(paneId);
   if (!entry) return;
   entry.mru = mruCounter++;
+  if (backgrounded) return;
   if (entry.renderer === "webgl") return;
   if (entry.forbidWebgl) return;
   if (!entry.visible) return;
@@ -206,6 +218,59 @@ export async function requestWebgl(paneId: string): Promise<void> {
     if (lru) installCanvas(lru);
   }
   await installWebgl(entry);
+}
+
+/**
+ * Release every WebGL context because the page went hidden. Demoted panes
+ * are marked for re-promotion — this is *not* a context loss, so
+ * `forbidWebgl` stays untouched.
+ */
+export function demoteAllForBackground(): void {
+  backgrounded = true;
+  for (const entry of panes.values()) {
+    if (entry.renderer !== "webgl") continue;
+    entry.pendingRepromote = true;
+    installCanvas(entry);
+  }
+}
+
+/**
+ * Page is visible again: re-promote the panes that held WebGL when it went
+ * hidden. Promotion runs oldest-first so the pre-background LRU order
+ * survives the mru re-stamping inside [`requestWebgl`].
+ */
+export async function endBackgroundDemotion(): Promise<void> {
+  backgrounded = false;
+  const marked = Array.from(panes.values())
+    .filter((e) => e.pendingRepromote)
+    .sort((a, b) => a.mru - b.mru);
+  for (const entry of marked) {
+    entry.pendingRepromote = false;
+    if (!entry.visible || entry.forbidWebgl) continue;
+    await requestWebgl(entry.paneId);
+  }
+}
+
+/**
+ * Wire `document.visibilitychange` to the background demotion above.
+ * macOS marks the page hidden when the window is fully occluded — which
+ * includes the locked screen — so this sheds up to [`MAX_WEBGL_PANES`] GPU
+ * contexts for the duration of a lock. Best-effort hardening: if the OS
+ * kills the WebContent process anyway, the backend's focus-gated health
+ * check reloads the page. Returns a remover for `onCleanup`.
+ */
+export function installBackgroundRendererDemotion(): () => void {
+  const onVisibilityChange = (): void => {
+    if (document.hidden) {
+      demoteAllForBackground();
+    } else {
+      void endBackgroundDemotion();
+    }
+  };
+  document.addEventListener("visibilitychange", onVisibilityChange);
+  return () => {
+    document.removeEventListener("visibilitychange", onVisibilityChange);
+  };
 }
 
 export interface SchedulerSnapshot {
@@ -252,5 +317,6 @@ export function __resetSchedulerForTests(): void {
   }
   panes.clear();
   mruCounter = 0;
+  backgrounded = false;
   setWarnings([]);
 }

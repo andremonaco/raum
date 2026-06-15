@@ -9,12 +9,15 @@
  * `updateSessionState` automatically re-arms the unread state, so the
  * next completion lights the tab up again.
  *
- * Defining "viewed" as `focusedPaneId === cellId && pane.activeTabId
- * resolves to this session` matches the email-unread feel the user asked
- * for: just focusing a neighbouring pane, or sitting on a different tab
- * inside the same pane, does not clear the marker.
+ * The state read is wrapped in `untrack` — without it, Solid would
+ * re-run this effect on every state change, so a completion that
+ * arrives while the user is already focused on the pane would
+ * acknowledge itself instantly and the green chrome would never paint.
+ * Focus-transition is the only signal we want to react to here; the
+ * "already-focused, click again" case is handled by explicit
+ * acknowledge calls inside `claimFocus` / `onFocusCapture`.
  */
-import { createEffect } from "solid-js";
+import { createEffect, untrack } from "solid-js";
 
 import { agentStore, markAcknowledged } from "../stores/agentStore";
 import { focusedPaneId, runtimeLayoutStore } from "../stores/runtimeLayoutStore";
@@ -28,7 +31,7 @@ export function installPaneFocusAcknowledger(): void {
     const activeTab = pane.tabs.find((t) => t.id === pane.activeTabId);
     const sessionId = activeTab?.sessionId;
     if (!sessionId) return;
-    const state = agentStore.sessions[sessionId]?.state;
+    const state = untrack(() => agentStore.sessions[sessionId]?.state);
     if (state === "completed" || state === "errored") {
       markAcknowledged(sessionId);
     }

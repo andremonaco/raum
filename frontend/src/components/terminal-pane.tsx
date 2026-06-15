@@ -63,6 +63,7 @@ import {
   terminalResizeScheduleDelay,
 } from "../lib/terminalResize";
 import { createXtermWritePump } from "../lib/xtermWritePump";
+import { findSplicePoint, renderRecoveryPayload, SPLICE_TAIL_LINES } from "../lib/tmuxBackfill";
 import { getXtermOptions } from "../lib/xtermConfig";
 import { getCurrentXtermTheme, subscribeThemeChange } from "../lib/theme/themeController";
 import { FALLBACK_XTERM_THEME } from "../lib/theme/toXtermTheme";
@@ -336,6 +337,125 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
   let recoverDeadPaneRef: (() => void) | null = null;
   let manualReconnectRef: (() => void) | null = null;
   let reattachInFlightTimer: ReturnType<typeof setTimeout> | null = null;
+  let outputPump: ReturnType<typeof createXtermWritePump> | null = null;
+
+  // Tier 2 — tmux-history backfill for regular shell panes. tmux's attached
+  // client can drop into redraw-compression mode when raum's drain pipeline
+  // falls behind, swallowing intermediate lines from xterm's scrollback
+  // even though tmux itself retains them. After every burst goes quiet for
+  // BACKFILL_QUIET_MS the pane snapshots its xterm tail, asks the backend
+  // for tmux's full plain-text capture, splices them, and appends any
+  // missing lines with a visible marker.
+  //
+  // Skipped for harness panes (Claude Code / Codex / OpenCode) — they live
+  // in alt-screen and their scrollback uses a separate snapshot path;
+  // injecting raw bytes there would corrupt the alt-screen view.
+  //
+  // The watermark tracks the last `missingLines.length` we recovered for
+  // *this* session so a recovery-of-a-recovery doesn't double-print: the
+  // recovered marker + body is itself part of the xterm tail on the next
+  // quiet window, which the splice algorithm matches against, so we only
+  // ever append truly new content.
+  const BACKFILL_QUIET_MS = 500;
+  let backfillTimer: ReturnType<typeof setTimeout> | null = null;
+  let backfillInFlight = false;
+  let backfillEverFired = false;
+  let backfillSessionId: string | null = null;
+  const cancelBackfill = (): void => {
+    if (backfillTimer !== null) {
+      clearTimeout(backfillTimer);
+      backfillTimer = null;
+    }
+  };
+  const runBackfillRecovery = async (id: string): Promise<void> => {
+    backfillInFlight = true;
+    try {
+      const target = term;
+      const pump = outputPump;
+      if (!target || !pump) return;
+      // Re-check alt-screen at run time: the schedule-time check can go
+      // stale during the quiet window (user opened vim/less between the
+      // last frame and the timer firing). Injecting recovery bytes into
+      // an alt-screen pane would corrupt the TUI frame.
+      if (target.buffer.active.type === "alternate") return;
+      // Pin the channel generation now: if a reattach/self-heal rotates
+      // the output channel while the capture invoke is in flight, the
+      // pump discards this payload instead of splicing a stale tail into
+      // the freshly repainted buffer.
+      const generation = pump.generation();
+      // Snapshot the bottom of xterm's normal buffer. The buffer's
+      // `length` includes scrollback; reading from
+      // `length - SPLICE_TAIL_LINES` walks the most recent rows.
+      const buffer = target.buffer.normal;
+      const total = buffer.length;
+      if (total === 0) return;
+      const start = Math.max(0, total - SPLICE_TAIL_LINES);
+      const tail: string[] = [];
+      for (let row = start; row < total; row += 1) {
+        tail.push(buffer.getLine(row)?.translateToString(true) ?? "");
+      }
+      type PaneTextHit = { sessionId: string; normal: string; alternate: string | null };
+      let hits: PaneTextHit[];
+      try {
+        hits = await invoke<PaneTextHit[]>("terminal_capture_text", {
+          sessionIds: [id],
+        });
+      } catch {
+        return;
+      }
+      // If the pane was reattached / replaced while we were waiting on the
+      // capture, drop the result on the floor.
+      if (id !== sessionId()) return;
+      const hit = hits.find((h) => h.sessionId === id);
+      if (!hit) return;
+      // tmux's `capture-pane -p` uses `\n` between rows; `normal` is the
+      // full normal-buffer history regardless of whether the pane is
+      // currently on alt-screen.
+      const tmuxLines = hit.normal.split("\n");
+      const result = findSplicePoint(tail, tmuxLines);
+      if (result.missingCount === 0) return;
+      const payload = renderRecoveryPayload(result.missingLines);
+      if (payload.length === 0) return;
+      // Push through the same write pump so frames stay ordered relative to
+      // any live output that just arrived. The generation pinned above lets
+      // the pump discard this payload if the channel rotated mid-recovery.
+      const encoder = new TextEncoder();
+      pump.enqueue(generation, encoder.encode(payload));
+    } finally {
+      backfillInFlight = false;
+    }
+  };
+  const scheduleBackfill = (): void => {
+    // Harness panes manage their own scrollback (alt-screen + snapshot
+    // store); never inject raw bytes into them.
+    if (isHarnessKind(props.kind)) return;
+    // Skip while xterm is in alt-screen (the user ran vim/less/htop in the
+    // shell pane); tmux's plain capture would mismatch the alt frame.
+    if (term?.buffer.active.type === "alternate") return;
+    const id = sessionId();
+    if (!id) return;
+    // Drop the stale timer on session rotation so we never apply a tail
+    // from the wrong session.
+    if (backfillSessionId !== id) {
+      backfillSessionId = id;
+      backfillEverFired = false;
+    }
+    cancelBackfill();
+    backfillTimer = setTimeout(() => {
+      backfillTimer = null;
+      if (backfillInFlight) return;
+      const currentId = sessionId();
+      if (!currentId || currentId !== backfillSessionId) return;
+      // Skip the very first quiet window after the pane attaches: tmux's
+      // history is the source of truth and would otherwise replay every
+      // pre-existing line into xterm on top of what reattach already drew.
+      if (!backfillEverFired) {
+        backfillEverFired = true;
+        return;
+      }
+      void runBackfillRecovery(currentId);
+    }, BACKFILL_QUIET_MS);
+  };
 
   const normalBuffer = () => term?.buffer.normal ?? null;
   const hasDetachedHistory = (): boolean => {
@@ -477,6 +597,32 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
 
       term.open(host);
 
+      // Route clipboard pastes through tmux (`paste-buffer -p`) instead of
+      // xterm's synthesized bytes. xterm only wraps a paste in bracketed-
+      // paste markers when it has seen DECSET 2004 on its own stream — state
+      // that goes stale across reloads/reattaches (and that the raw control-
+      // mode transport replays but xterm may miss mid-rotation). tmux always
+      // knows whether the inner app opted in, so the paste arrives bracketed
+      // exactly when it should. Capture phase on the pane host beats xterm's
+      // own textarea listener; scoping to the textarea leaves the prompt
+      // overlay's inputs untouched.
+      const onHostPaste = (ev: ClipboardEvent): void => {
+        if (!term || ev.target !== term.textarea) return;
+        const id = sessionId();
+        if (!id) return;
+        const text = ev.clipboardData?.getData("text") ?? "";
+        if (!text) return;
+        ev.preventDefault();
+        ev.stopImmediatePropagation();
+        void invoke("terminal_paste_text", { sessionId: id, text }).catch((e) => {
+          console.error("[TerminalPane] terminal_paste_text failed", e);
+        });
+      };
+      host.addEventListener("paste", onHostPaste, true);
+      onCleanup(() => {
+        host?.removeEventListener("paste", onHostPaste, true);
+      });
+
       // Track scroll position so the pane can surface a "jump to bottom"
       // button while the viewport is detached from the tail. xterm fires
       // `onScroll` both on user scroll and when new output advances baseY,
@@ -539,7 +685,7 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
     // `ArrayBuffer` (small payloads via eval of `new Uint8Array(...).buffer`,
     // large payloads via fetch → `Response.arrayBuffer()`). xterm.js `write`
     // accepts `string | Uint8Array`, not ArrayBuffer, so we always wrap here.
-    const outputPump = createXtermWritePump({
+    const pump = createXtermWritePump({
       getTerminal: () => term,
       onWriteParsed: () => {
         const id = sessionId();
@@ -547,6 +693,10 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         const addon = serializeAddon;
         if (!id || !target || !addon) return;
         markOutput(id);
+        // Every parsed frame restarts the per-pane 500 ms quiet timer
+        // that drives tmux-history backfill. Cheap (just a setTimeout
+        // reset); the heavy work only fires once output goes quiet.
+        scheduleBackfill();
         // Skip persistence while the buffer is in alt-screen mode. Alt-screen
         // TUIs (Codex, OpenCode, fullscreen Claude) repaint from source on
         // every SIGWINCH, so raum's reattach path uses a SIGWINCH bounce
@@ -565,13 +715,14 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         });
       },
     });
+    outputPump = pump;
 
     const makeOutputChannel = (
       generation: number,
     ): Channel<ArrayBuffer | Uint8Array | number[]> => {
       const next = new Channel<ArrayBuffer | Uint8Array | number[]>();
       next.onmessage = (data) => {
-        if (generation !== outputPump.generation()) return;
+        if (generation !== pump.generation()) return;
         try {
           let bytes: Uint8Array;
           if (data instanceof Uint8Array) {
@@ -586,16 +737,16 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
             console.warn("[TerminalPane] unexpected channel payload", data);
             return;
           }
-          outputPump.enqueue(generation, bytes);
+          pump.enqueue(generation, bytes);
         } catch (err) {
           console.error("[TerminalPane] channel payload handling failed", err);
         }
       };
       return next;
     };
-    let channel = makeOutputChannel(outputPump.generation());
+    let channel = makeOutputChannel(pump.generation());
     const rotateOutputChannel = (resetOnFirstOutput: boolean): typeof channel => {
-      const generation = outputPump.rotate(resetOnFirstOutput);
+      const generation = pump.rotate(resetOnFirstOutput);
       channel = makeOutputChannel(generation);
       return channel;
     };
@@ -603,7 +754,7 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       void loadTerminalSnapshotBytes(targetSessionId)
         .then((snapshot) => {
           if (!snapshot) return;
-          outputPump.enqueue(outputPump.generation(), snapshot);
+          pump.enqueue(pump.generation(), snapshot);
         })
         .catch((err) => {
           if (import.meta.env.DEV) {
@@ -1400,6 +1551,7 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       clearTimeout(reattachInFlightTimer);
       reattachInFlightTimer = null;
     }
+    cancelBackfill();
     clearResizeRepin();
     try {
       resizeObserver?.disconnect();
