@@ -5,7 +5,13 @@
  */
 
 import type { ProjectListItem } from "../../stores/projectStore";
-import type { Worktree } from "../../stores/worktreeStore";
+import type {
+  FileChange,
+  FileChangeKind,
+  Worktree,
+  WorktreeStatus,
+} from "../../stores/worktreeStore";
+import type { CommitFileChange } from "./git-commands";
 
 export interface HarnessCounts {
   active: number;
@@ -41,6 +47,74 @@ export interface WorktreeRowProps {
    */
   onRequestMerge?: () => void;
 }
+
+/** What the diff-viewer modal should show: a working-tree diff (staged or
+ *  unstaged side) or a file's diff within one commit. */
+export type DiffTarget =
+  | { mode: "worktree"; file: string; staged: boolean }
+  | { mode: "commit"; file: string; hash: string; shortHash: string };
+
+export type ExpandedTabId = "changes" | "history" | "files";
+
+export interface SegmentedSwitcherProps {
+  tabs: readonly { id: string; label: string }[];
+  active: string;
+  onChange: (id: string) => void;
+}
+
+export interface WorktreeExpandedProps {
+  worktree: Worktree;
+  projectSlug: string;
+  status: WorktreeStatus;
+  /** True until the first status (push or fetch) lands for this path. */
+  statusPending: boolean;
+  onOpenDiff: (target: DiffTarget) => void;
+  onOpenEditor: (absPath: string) => void;
+}
+
+export interface ChangesViewProps {
+  worktree: Worktree;
+  projectSlug: string;
+  status: WorktreeStatus;
+  statusPending: boolean;
+  onOpenDiff: (target: DiffTarget) => void;
+  onOpenEditor: (absPath: string) => void;
+}
+
+export interface HistoryViewProps {
+  worktree: Worktree;
+  /** True while the History tab is the visible panel — used to refresh the
+   *  newest page on re-activation. */
+  active: boolean;
+  onOpenDiff: (target: DiffTarget) => void;
+}
+
+export interface FileBrowserProps {
+  worktree: Worktree;
+  status: WorktreeStatus;
+  onOpenEditor: (absPath: string) => void;
+}
+
+export interface FileChangeRowProps {
+  path: string;
+  origPath?: string | null;
+  kind: FileChangeKind;
+  insertions?: number | null;
+  deletions?: number | null;
+  /** Brighter filename — used for staged rows (matches the old styling). */
+  emphasized?: boolean;
+  title?: string;
+  onOpen: () => void;
+  onContextMenu?: (e: MouseEvent) => void;
+}
+
+export interface StatusLetterProps {
+  kind: FileChangeKind;
+}
+
+/** Re-exported domain types so sidebar sub-modules can import from one
+ *  place without reaching into the store/lib modules directly. */
+export type { CommitFileChange, FileChange };
 
 export interface DiscardConfirmDialogProps {
   target: { kind: "file"; file: string } | { kind: "all" } | null;

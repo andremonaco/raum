@@ -91,7 +91,11 @@ import {
   SearchIcon,
 } from "./icons";
 import { resolveSessionTabLabel } from "../lib/harnessTabLabel";
-import { branchForProject, subscribeWorktreeBranchEvents } from "../stores/worktreeStore";
+import {
+  branchForProject,
+  subscribeWorktreeBranchEvents,
+  subscribeWorktreeStatusEvents,
+} from "../stores/worktreeStore";
 import { resolveSpawnWorktree } from "../lib/resolveSpawnWorktree";
 import { ProjectSettingsDialog } from "./project-settings-dialog";
 
@@ -478,6 +482,7 @@ export const TopRow: Component = () => {
     let unlistenAgent: UnlistenFn | undefined;
     let unlistenTerminal: UnlistenFn | undefined;
     let unlistenBranches: UnlistenFn | undefined;
+    let unlistenWorktreeStatus: UnlistenFn | undefined;
     let unlistenMenu: UnlistenFn | undefined;
     let unlistenPaneActivity: UnlistenFn | undefined;
     let unlistenReviewLinks: UnlistenFn | undefined;
@@ -564,12 +569,20 @@ export const TopRow: Component = () => {
       .catch(() => {
         /* Tauri context unavailable (tests). */
       });
+    subscribeWorktreeStatusEvents()
+      .then((u) => {
+        unlistenWorktreeStatus = u;
+      })
+      .catch(() => {
+        /* Tauri context unavailable (tests). */
+      });
 
     onCleanup(() => {
       unlistenProject?.();
       unlistenAgent?.();
       unlistenTerminal?.();
       unlistenBranches?.();
+      unlistenWorktreeStatus?.();
       unlistenMenu?.();
       unlistenPaneActivity?.();
       unlistenReviewLinks?.();

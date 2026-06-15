@@ -26,11 +26,17 @@ import { Scrollable } from "./ui/scrollable";
 import { tildify } from "../lib/pathDisplay";
 import { LoaderIcon } from "./icons";
 
+/** Where the diff comes from: the working tree (staged or unstaged side)
+ *  or one file's change within a specific commit. */
+export type DiffSource =
+  | { kind: "worktree"; staged: boolean }
+  | { kind: "commit"; hash: string; shortHash: string };
+
 export interface DiffViewerModalProps {
   open: boolean;
   worktreePath: string | null;
   file: string | null;
-  staged: boolean;
+  source: DiffSource;
   onClose: () => void;
 }
 
@@ -169,7 +175,12 @@ export const DiffViewerModal: Component<DiffViewerModalProps> = (props) => {
     setError(null);
     setLoading(true);
     setDiff("");
-    invoke<string>("git_diff", { worktreePath, file, staged: props.staged })
+    const source = props.source;
+    const request =
+      source.kind === "commit"
+        ? invoke<string>("git_diff_commit", { worktreePath, file, hash: source.hash })
+        : invoke<string>("git_diff", { worktreePath, file, staged: source.staged });
+    request
       .then((text) => {
         if (currentRequest !== requestId) return;
         setDiff(text);
@@ -217,14 +228,24 @@ export const DiffViewerModal: Component<DiffViewerModalProps> = (props) => {
             <div class="min-w-0 flex-1">
               <div class="flex items-center gap-2">
                 <span class="truncate font-mono text-xs text-foreground">{fileName()}</span>
+                {/* Commit mode keeps the chip neutral — no color, just the
+                    hash (restrained chrome). */}
                 <span
                   class="shrink-0 rounded border px-1 py-px font-mono text-[9px] uppercase tracking-wider"
                   classList={{
-                    "border-success/40 bg-success/10 text-success": props.staged,
-                    "border-warning/40 bg-warning/10 text-warning": !props.staged,
+                    "border-success/40 bg-success/10 text-success":
+                      props.source.kind === "worktree" && props.source.staged,
+                    "border-warning/40 bg-warning/10 text-warning":
+                      props.source.kind === "worktree" && !props.source.staged,
+                    "border-border-subtle bg-hover text-foreground-subtle":
+                      props.source.kind === "commit",
                   }}
                 >
-                  {props.staged ? "staged" : "unstaged"}
+                  {props.source.kind === "commit"
+                    ? props.source.shortHash
+                    : props.source.staged
+                      ? "staged"
+                      : "unstaged"}
                 </span>
               </div>
               <p class="truncate font-mono text-[10px] text-muted-foreground/50">

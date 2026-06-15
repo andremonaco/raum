@@ -23,6 +23,7 @@ import {
   ALL_WORKTREES_SCOPE,
   activeWorktreeStore,
   clearWorktreeListCache,
+  pruneWorktreeStatus,
   refreshWorktreeList,
   refreshWorktreeStatuses,
   worktreesByProject,
@@ -196,6 +197,7 @@ export const ProjectSection: Component<ProjectSectionProps> = (sectionProps) => 
                 worktree={target.wt}
                 onClose={closeDeleteTarget}
                 onDeleted={() => {
+                  pruneWorktreeStatus(target.wt.path);
                   clearWorktreeListCache(slug());
                   void refreshWorktreeList(slug());
                 }}
@@ -210,6 +212,7 @@ export const ProjectSection: Component<ProjectSectionProps> = (sectionProps) => 
               project={sectionProps.project}
               onClose={closeDeleteTarget}
               onUnlinked={() => {
+                for (const wt of items()) pruneWorktreeStatus(wt.path);
                 removeProject(slug());
                 clearWorktreeListCache(slug());
               }}
