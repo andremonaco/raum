@@ -172,12 +172,20 @@ pub(crate) fn sessions_for_project(
 }
 
 /// Session ids that must never be auto-reaped as orphans or stale: every id
-/// the registry knows (live bridges + rehydrate ghosts), every row tracked in
-/// `state/sessions.toml`, and every session referenced by a tab of the
-/// persisted active layout. The layout source matters for sessions created
-/// before shell tracking existed (no tracked row yet): the user demonstrably
-/// still has a pane bound to them, so reaping would destroy a recoverable
-/// terminal — the "shell panes come back black after relaunch" bug.
+/// the registry knows (live bridges + rehydrate/adopt ghosts) and every row
+/// tracked in `state/sessions.toml`.
+///
+/// `active-layout.toml` is deliberately NOT consulted. It is a frontend-owned
+/// geometry cache written on a 500 ms debounce; a crash or Cmd+R within that
+/// window leaves a dead tab id behind, and reading it here used to *re-protect
+/// a corpse* on the next launch — a stale tab kept a long-dead session id in
+/// the protected set forever, so the counter never drained. The single
+/// authority for "which sessions exist" is now `state/sessions.toml` (S2),
+/// which every spawn/reattach writes and every kill prunes; the boot reconcile
+/// (`terminal::reconcile`) guarantees every live tmux session has an S2 row
+/// (adopting orphans), so layout-based protection is both redundant and
+/// harmful. Shells are tracked in S2 too (see `terminal_spawn`), so the old
+/// "shell panes come back black" case is covered by the registry/S2 union.
 ///
 /// Lock failures are errors (callers must not kill with an incomplete set);
 /// unreadable/missing TOML files are tolerated so a fresh install with no
@@ -203,15 +211,6 @@ pub(crate) fn protected_session_ids(state: &AppHandleState) -> Result<HashSet<St
                 protected.insert(row.session_id);
             }
         }
-        if let Ok(layout) = store.read_active_layout() {
-            for cell in layout.cells {
-                for tab in cell.tabs {
-                    if let Some(id) = tab.session_id {
-                        protected.insert(id);
-                    }
-                }
-            }
-        }
     }
     Ok(protected)
 }
@@ -227,10 +226,11 @@ pub(crate) fn protected_session_ids(state: &AppHandleState) -> Result<HashSet<St
 ///
 /// Returns the list of session ids that were killed.
 #[tauri::command]
-pub async fn terminal_kill_orphans(
+pub async fn terminal_kill_orphans<R: Runtime>(
+    app: AppHandle<R>,
     state: tauri::State<'_, AppHandleState>,
 ) -> Result<Vec<String>, String> {
-    kill_orphans_inner(&state).await
+    kill_orphans_inner(&app, &state).await
 }
 
 /// Shared body for [`terminal_kill_orphans`]. Lives here so the boot-time
@@ -240,7 +240,8 @@ pub async fn terminal_kill_orphans(
 /// client pipes + hook IPC), so under load this is the main lever we have
 /// to keep `EMFILE` from breaking the git watcher and other background
 /// IO.
-pub(crate) async fn kill_orphans_inner(
+pub(crate) async fn kill_orphans_inner<R: Runtime>(
+    app: &AppHandle<R>,
     state: &tauri::State<'_, AppHandleState>,
 ) -> Result<Vec<String>, String> {
     const ORPHAN_AGE_FLOOR_SECS: u64 = 30;
@@ -278,23 +279,66 @@ pub(crate) async fn kill_orphans_inner(
         let kill_res = tokio::task::spawn_blocking(move || kill_tmux.kill_session(&kill_id))
             .await
             .map_err(|e| format!("spawn_blocking join: {e}"))?;
-        if kill_res.is_ok() {
-            tracing::info!(session_id = %s.id, age_secs = age, "killed orphan tmux session");
-            killed.push(s.id);
-        } else if let Err(e) = kill_res {
-            tracing::warn!(session_id = %s.id, error = %e, "orphan kill failed");
+        match kill_res {
+            Ok(()) => {
+                tracing::info!(session_id = %s.id, age_secs = age, "killed orphan tmux session");
+                // Drop every local record of the session so the counter
+                // settles without waiting for a relaunch, and so a stale S2
+                // row can't re-protect the now-dead id on the next boot.
+                finalize_session_removal(app, state, &s.id);
+                killed.push(s.id);
+            }
+            Err(TmuxError::NonZero { stderr, .. }) if is_session_not_found(&stderr) => {
+                // Already gone in tmux — still reclaim our local records.
+                finalize_session_removal(app, state, &s.id);
+                killed.push(s.id);
+            }
+            Err(e) => {
+                tracing::warn!(session_id = %s.id, error = %e, "orphan kill failed");
+            }
         }
     }
 
     Ok(killed)
 }
 
+/// Reclaim every local record of `session_id` after its tmux session is gone:
+/// the in-memory registry entry/ghost, the harness runtime + state machine,
+/// its `state/sessions.toml` row (so a dead id can't re-protect itself next
+/// boot), and its terminal snapshot — then tell the frontend to drop the row
+/// so the counter moves immediately. Used by every reaper path; the
+/// interactive `terminal_kill` does the same sequence inline.
+fn finalize_session_removal<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &tauri::State<'_, AppHandleState>,
+    session_id: &str,
+) {
+    if let Ok(mut reg) = state.terminals.lock() {
+        if let Some(entry) = reg.remove(session_id) {
+            shutdown_removed_entry(entry, true);
+        }
+    }
+    cleanup_harness_session(state, session_id);
+    if let Err(e) = raum_core::snapshot_store::delete_for_session(session_id) {
+        tracing::warn!(
+            session_id = %session_id,
+            error = %e,
+            "finalize_session_removal: failed to delete terminal snapshot"
+        );
+    }
+    emit_terminal_session_removed(app, session_id);
+    emit_agent_session_removed(app, session_id);
+}
+
 /// §3.7 — stale-session reaper, invoked from the in-app "Orphaned sessions"
-/// group. No CLI surface. Protected sessions (live registry, `sessions.toml`,
-/// persisted active layout — see [`protected_session_ids`]) are exempt; only
-/// untracked leftovers are age-reaped.
+/// group. No CLI surface. Protected sessions (live registry + `sessions.toml`
+/// — see [`protected_session_ids`]) are exempt; only untracked leftovers older
+/// than `threshold_days` are age-reaped. After killing, every local record is
+/// reclaimed and a removal event is emitted so the counter settles without a
+/// relaunch.
 #[tauri::command]
-pub async fn terminal_reap_stale(
+pub async fn terminal_reap_stale<R: Runtime>(
+    app: AppHandle<R>,
     state: tauri::State<'_, AppHandleState>,
     threshold_days: u32,
 ) -> Result<Vec<String>, String> {
@@ -304,21 +348,8 @@ pub async fn terminal_reap_stale(
         .await
         .map_err(|e| format!("spawn_blocking join: {e}"))?;
 
-    // Clean up registry entries for any session we reaped.
-    {
-        let mut reg = state
-            .terminals
-            .lock()
-            .map_err(|e| format!("terminals lock: {e}"))?;
-        for id in &killed {
-            if let Some(mut e) = reg.remove(id) {
-                if let Some(m) = e.monitor_task.take() {
-                    m.abort();
-                }
-                e.bridge.shutdown_silent();
-                drop(e);
-            }
-        }
+    for id in &killed {
+        finalize_session_removal(&app, &state, id);
     }
     Ok(killed)
 }

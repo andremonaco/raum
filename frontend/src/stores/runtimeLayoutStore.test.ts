@@ -26,6 +26,7 @@ import {
   removeTabsBySessionId,
   runtimeLayoutStore,
   setActiveTabId,
+  placedSessionIds,
   setRuntimeLayout,
   setFocusedPaneId,
   minimizedPaneIds,
@@ -710,5 +711,29 @@ describe("runtimeLayoutStore (BSP)", () => {
     expect(runtimeLayoutStore.cells.map((c) => c.id)).toEqual(["a"]);
     expect(runtimeLayoutStore.panes["b"]).toBeDefined();
     expect(minimizedPaneIds().has("b")).toBe(true);
+  });
+
+  it("placedSessionIds returns every session bound to a pane tab", () => {
+    setRuntimeLayout([
+      cell("a", { x: 0, y: 0, w: LAYOUT_UNIT / 2, h: LAYOUT_UNIT }),
+      cell("b", { x: LAYOUT_UNIT / 2, y: 0, w: LAYOUT_UNIT / 2, h: LAYOUT_UNIT }),
+    ]);
+    setTabSessionId("a", "tab-a", "raum-claude-1-1");
+    setTabSessionId("b", "tab-b", "raum-sh-2-2");
+    const placed = placedSessionIds();
+    expect(placed.size).toBe(2);
+    expect(placed.has("raum-claude-1-1")).toBe(true);
+    expect(placed.has("raum-sh-2-2")).toBe(true);
+    // A session with no tab is an orphan — not placed.
+    expect(placed.has("raum-codex-9-9")).toBe(false);
+  });
+
+  it("placedSessionIds counts minimized panes as placed (restorable, not orphans)", () => {
+    setRuntimeLayout([cell("a", { x: 0, y: 0, w: LAYOUT_UNIT, h: LAYOUT_UNIT })]);
+    setTabSessionId("a", "tab-a", "raum-claude-1-1");
+    minimizePane("a");
+    // The pane left the tree but stays in `panes`, so its session is still
+    // something the user can restore — it must not be treated as an orphan.
+    expect(placedSessionIds().has("raum-claude-1-1")).toBe(true);
   });
 });

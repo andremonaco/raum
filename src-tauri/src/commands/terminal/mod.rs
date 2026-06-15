@@ -24,6 +24,7 @@ mod io;
 mod kill;
 mod query;
 mod reattach;
+mod reconcile;
 mod registry;
 mod resize;
 mod respawn;
@@ -52,12 +53,13 @@ pub(super) const SNAPSHOT_REPLAY_CHUNK_BYTES: usize = 32 * 1024;
 pub(crate) use entry::emit_terminal_session_upserted;
 pub use io::{terminal_paste_paths, terminal_paste_text, terminal_send_keys};
 pub(crate) use kill::{
-    kill_orphans_inner, kill_session_inner, protected_session_ids, sessions_for_project,
-    sessions_for_worktree,
+    kill_session_inner, protected_session_ids, sessions_for_project, sessions_for_worktree,
 };
 pub use kill::{terminal_kill, terminal_kill_orphans, terminal_reap_stale};
 pub use query::{terminal_list, terminal_pane_context, terminal_pane_context_batch};
 pub use reattach::{terminal_provider_replace, terminal_provider_replay, terminal_reattach};
+pub(crate) use reconcile::reconcile_inner;
+pub use reconcile::terminal_reconcile;
 pub use registry::{GhostEntry, TerminalListItem, TerminalRegistry};
 pub use resize::terminal_resize;
 pub use respawn::{terminal_respawn_dead, terminal_self_heal};
@@ -81,6 +83,8 @@ pub use query::{
 pub use reattach::{
     __cmd__terminal_provider_replace, __cmd__terminal_provider_replay, __cmd__terminal_reattach,
 };
+#[doc(hidden)]
+pub use reconcile::__cmd__terminal_reconcile;
 #[doc(hidden)]
 pub use resize::__cmd__terminal_resize;
 #[doc(hidden)]

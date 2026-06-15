@@ -166,6 +166,7 @@ pub fn run() {
             commands::terminal::terminal_pane_context_batch,
             commands::terminal::terminal_reap_stale,
             commands::terminal::terminal_kill_orphans,
+            commands::terminal::terminal_reconcile,
             commands::terminal::terminal_snapshot_persist,
             commands::terminal::terminal_snapshot_load,
             commands::terminal::terminal_snapshot_delete,
@@ -347,14 +348,14 @@ pub fn run() {
             // transitions work from the first frame of the webview).
             bootstrap_rehydrate_sessions(app);
 
-            // Auto-sweep orphan tmux sessions on boot, on a 5-min timer,
-            // and on window focus. Each orphan holds ~10–20 fds (PTY +
-            // client pipes + hook IPC), so without this the same
-            // `EMFILE`-driven `git_watcher` failures we saw in
-            // `raum.log.2026-04-27` recur after a few rapid Cmd+R cycles.
-            // Manual sweep button in `top-row.tsx` still works for
-            // explicit "something feels off" gestures.
-            bootstrap_orphan_reaper(app);
+            // Reconcile the live tmux socket with the tracked-session set on a
+            // 5-min timer and on window focus: any live session raum has no
+            // record of is adopted so it surfaces as a closable orphan pane
+            // rather than an invisible fd leak. The boot pass runs inside
+            // `bootstrap_rehydrate_sessions`; this handles post-launch
+            // appearances. Gated on the rehydrate-complete signal so a focus
+            // event during launch can't race recovery.
+            bootstrap_reconciler(app);
 
             // Detect a WKWebView whose WebContent process died during
             // screen lock (wry never surfaces the termination to Tauri)
@@ -565,6 +566,7 @@ fn bootstrap_rehydrate_sessions(app: &mut tauri::App) {
                 Ok(ids) => ids,
                 Err(e) => {
                     warn!(error = %e, "rehydrate: protected-session read failed; skipping reap");
+                    let _ = state.rehydrate_done_tx.send(true);
                     return;
                 }
             }
@@ -618,10 +620,14 @@ fn bootstrap_rehydrate_sessions(app: &mut tauri::App) {
             Ok(Ok(sessions)) => sessions.into_iter().map(|s| s.id).collect(),
             Ok(Err(e)) => {
                 warn!(error = %e, "rehydrate: tmux list_sessions failed; skipping");
+                let state: tauri::State<'_, state::AppHandleState> = app_handle.state();
+                let _ = state.rehydrate_done_tx.send(true);
                 return;
             }
             Err(e) => {
                 warn!(error = %e, "rehydrate: list_sessions join failed");
+                let state: tauri::State<'_, state::AppHandleState> = app_handle.state();
+                let _ = state.rehydrate_done_tx.send(true);
                 return;
             }
         };
@@ -656,22 +662,45 @@ fn bootstrap_rehydrate_sessions(app: &mut tauri::App) {
             let state: tauri::State<'_, state::AppHandleState> = app_handle.state();
             let Ok(store) = state.config_store.lock() else {
                 warn!("rehydrate: config_store lock poisoned");
+                let _ = state.rehydrate_done_tx.send(true);
                 return;
             };
             store.read_sessions().unwrap_or_default().sessions
         };
 
         let plan = commands::agent_hydrate::rehydrate_plan(&tracked, &live_ids);
-        if plan.is_empty() {
-            info!("rehydrate: nothing to do");
-            return;
-        }
 
         // 4. Apply. The applier spawns inside the same task; it runs
         // quickly because all per-session work is in-memory registry
-        // mutation + a couple of Tauri emits.
+        // mutation + a couple of Tauri emits. An empty plan (no tracked
+        // rows to replay) still falls through to the reconcile below so
+        // live-but-untracked sessions are adopted rather than left invisible.
         let state: tauri::State<'_, state::AppHandleState> = app_handle.state();
-        let _report = commands::agent_hydrate::apply_rehydrate_plan(&app_handle, &state, plan);
+        if plan.is_empty() {
+            info!("rehydrate: no tracked rows to replay");
+        } else {
+            let _report = commands::agent_hydrate::apply_rehydrate_plan(&app_handle, &state, plan);
+        }
+
+        // 5. Reconcile the other direction: adopt every live tmux session that
+        // rehydrate did NOT account for (no `sessions.toml` row — a spawn that
+        // crashed before tracking, a forgotten-while-alive row, leftovers from
+        // an older build). Without this they stay invisible to the frontend
+        // and either leak fds or get silently age-reaped. Adoption writes a
+        // tracked row + a live ghost so they surface in the orphan tray.
+        match commands::terminal::reconcile_inner(&app_handle, &state).await {
+            Ok(adopted) if !adopted.is_empty() => {
+                info!(count = adopted.len(), ids = ?adopted, "rehydrate: adopted orphan tmux sessions");
+            }
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "rehydrate: reconcile failed"),
+        }
+
+        // 6. Latch the rehydrate-complete signal. The reconciler's focus/timer
+        // triggers wait on this so they can't race the boot pass, and the
+        // (now backstop-only) orphan reaper stays gated behind a fully
+        // populated registry + tracked set.
+        let _ = state.rehydrate_done_tx.send(true);
     });
 }
 
@@ -732,46 +761,44 @@ fn current_nofile_soft_limit() -> u64 {
     if rc == 0 { lim.rlim_cur } else { 0 }
 }
 
-/// Auto-trigger `terminal_kill_orphans` at startup, on a slow timer, and
-/// on window focus. Without this, `EMFILE`-driven failures (the
-/// `git_watcher: notify error` storm in `raum.log.2026-04-27`) recur after
-/// a few rapid Cmd+R cycles because each orphan tmux session holds
-/// ~10–20 fds (PTY + client pipes + hook IPC). The function itself is
-/// cheap when there's nothing to do, and the 30 s age floor inside
-/// `kill_orphans_inner` prevents it from racing freshly-spawned sessions
-/// — so triggering it on every focus event is safe.
-fn bootstrap_orphan_reaper(app: &mut tauri::App) {
+/// Reconcile the live `-L raum` tmux socket with raum's tracked-session set on
+/// a slow timer and on every window focus. Any live session raum has no record
+/// of is ADOPTED (tracked row + live ghost) so it surfaces as a closable
+/// orphan pane in the dock tray — the user closes it. raum never auto-kills a
+/// live session it might still want; the invariant is "every live tmux session
+/// is visible," not "kill everything untracked."
+///
+/// This replaces the old focus/timer `terminal_kill_orphans` auto-reaper,
+/// which (a) silently destroyed live sessions and (b) raced relaunch by
+/// firing against an empty registry. fd pressure (the
+/// `git_watcher: notify error` EMFILE storm in `raum.log.2026-04-27`) is now
+/// bounded by surfacing leaks for the user to close, plus the boot
+/// `reap_stale(1)` backstop for sessions abandoned over a day. The boot pass
+/// runs inside `bootstrap_rehydrate_sessions` (step 5); this covers sessions
+/// that appear *after* launch (e.g. a spawn whose tracking write lost to a
+/// crash).
+fn bootstrap_reconciler(app: &mut tauri::App) {
     use std::time::Duration;
-    const BOOT_DELAY: Duration = Duration::from_secs(30);
     const PERIODIC_INTERVAL: Duration = Duration::from_secs(300);
 
     let handle = app.handle().clone();
     let main_window = app.get_webview_window("main");
 
-    // Boot reap. Delayed so `bootstrap_rehydrate_sessions` finishes
-    // registering surviving sessions and any *genuinely* leaked
-    // session is past the age floor.
-    let boot_handle = handle.clone();
-    tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(BOOT_DELAY).await;
-        run_orphan_reaper(&boot_handle, "boot").await;
-    });
-
-    // Periodic sweep every 5 minutes.
+    // Periodic reconcile every 5 minutes.
     let timer_handle = handle.clone();
     tauri::async_runtime::spawn(async move {
         let mut tick = tokio::time::interval(PERIODIC_INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // Skip the immediate first tick — interval fires once at start
-        // and we already have the boot reap above.
+        // Skip the immediate first tick — the boot reconcile already ran
+        // inside `bootstrap_rehydrate_sessions`.
         tick.tick().await;
         loop {
             tick.tick().await;
-            run_orphan_reaper(&timer_handle, "timer").await;
+            run_reconcile(&timer_handle, "timer").await;
         }
     });
 
-    // Window-focus reap. The callback runs on Tauri's event thread —
+    // Window-focus reconcile. The callback runs on Tauri's event thread —
     // dispatch onto the async runtime so we don't block it.
     if let Some(win) = main_window {
         let focus_handle = handle.clone();
@@ -779,12 +806,12 @@ fn bootstrap_orphan_reaper(app: &mut tauri::App) {
             if let tauri::WindowEvent::Focused(true) = event {
                 let h = focus_handle.clone();
                 tauri::async_runtime::spawn(async move {
-                    run_orphan_reaper(&h, "focus").await;
+                    run_reconcile(&h, "focus").await;
                 });
             }
         });
     } else {
-        warn!("bootstrap_orphan_reaper: main window not found");
+        warn!("bootstrap_reconciler: main window not found");
     }
 }
 
@@ -809,22 +836,41 @@ fn bootstrap_webview_health(app: &mut tauri::App) {
     });
 }
 
-/// Run one pass of the orphan reaper. Quiet on the happy path so a
-/// 5-min timer doesn't pollute the log; only logs when sessions were
-/// actually reaped or when the call itself failed.
-async fn run_orphan_reaper(handle: &tauri::AppHandle, trigger: &'static str) {
+/// Run one reconcile pass. Quiet on the happy path so a 5-min timer doesn't
+/// pollute the log; only logs when sessions were adopted or the call failed.
+///
+/// Gated on the rehydrate-complete signal (with a timeout): a `Focused(true)`
+/// during early launch must not reconcile against a half-populated registry,
+/// or it would adopt — as project-less orphans — sessions the boot rehydrate
+/// is about to register with full metadata.
+async fn run_reconcile(handle: &tauri::AppHandle, trigger: &'static str) {
+    const GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+    let mut rehydrate_done = {
+        let state: tauri::State<'_, state::AppHandleState> = handle.state();
+        state.rehydrate_done_tx.subscribe()
+    };
+    if tokio::time::timeout(GATE_TIMEOUT, rehydrate_done.wait_for(|&done| done))
+        .await
+        .is_err()
+    {
+        warn!(
+            trigger = trigger,
+            "reconcile: timed out waiting for rehydrate-complete; proceeding anyway",
+        );
+    }
+
     let state: tauri::State<'_, state::AppHandleState> = handle.state();
-    match commands::terminal::kill_orphans_inner(&state).await {
-        Ok(killed) if !killed.is_empty() => {
+    match commands::terminal::reconcile_inner(handle, &state).await {
+        Ok(adopted) if !adopted.is_empty() => {
             info!(
                 trigger = trigger,
-                killed = killed.len(),
-                "terminal_kill_orphans: reaped orphan tmux sessions",
+                adopted = adopted.len(),
+                "reconcile: adopted orphan tmux sessions",
             );
         }
         Ok(_) => {}
         Err(e) => {
-            warn!(trigger = trigger, error = %e, "terminal_kill_orphans: failed");
+            warn!(trigger = trigger, error = %e, "reconcile: failed");
         }
     }
 }
@@ -834,7 +880,7 @@ async fn run_orphan_reaper(handle: &tauri::AppHandle, trigger: &'static str) {
 /// service's fallback ticks while the app is backgrounded and (b) triggers
 /// a catch-up recompute on focus gain. Registered as another
 /// `on_window_event` handler — Tauri appends listeners (same pattern as
-/// `bootstrap_orphan_reaper` / `bootstrap_webview_health`).
+/// `bootstrap_reconciler` / `bootstrap_webview_health`).
 fn bootstrap_status_service(app: &mut tauri::App) {
     let svc = commands::worktree::WorktreeStatusService::new(app.handle().clone());
     let state: tauri::State<'_, state::AppHandleState> = app.state();

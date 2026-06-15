@@ -368,6 +368,23 @@ export function touchPaneBySession(sessionId: string): void {
   }
 }
 
+/** Set of every session id currently bound to a tab of some pane in the
+ *  layout — i.e. every session the user can actually see or restore (minimized
+ *  panes stay in `panes`, so they count as placed). The complement of this set
+ *  against the backend's `terminal_list` is the orphan set: live/tracked
+ *  sessions with no on-screen home, surfaced for the user to close. Reactive —
+ *  reads `runtimeLayoutStore.panes`, so callers inside a memo re-run when the
+ *  layout changes. */
+export function placedSessionIds(): Set<string> {
+  const ids = new Set<string>();
+  for (const pane of Object.values(runtimeLayoutStore.panes)) {
+    for (const tab of pane.tabs) {
+      if (tab.sessionId) ids.add(tab.sessionId);
+    }
+  }
+  return ids;
+}
+
 /** Listen for `agent-state-changed` events and bump the owning pane's
  *  `lastActivityMs` on each transition. Call once at app startup; the
  *  returned function unsubscribes. Runs in parallel with the existing

@@ -98,6 +98,16 @@ pub struct AppHandleState {
     /// whose WebContent process was killed during screen lock and reload
     /// it instead of leaving a black, dead window.
     pub webview_health: crate::commands::webview_health::WebviewHealthState,
+    /// Latches `true` once `bootstrap_rehydrate_sessions` has finished
+    /// applying its plan AND the post-rehydrate reconcile has adopted every
+    /// live-but-untracked tmux session. The orphan reaper's boot/timer/focus
+    /// triggers wait on this (with a timeout) before running so a relaunch's
+    /// `Focused(true)` reap cannot kill a surviving session in the window
+    /// between launch and reattach — back when this was ungated, the focus
+    /// reaper fired against an empty registry and destroyed live panes.
+    /// A `watch` channel so waiters observe the already-`true` case without a
+    /// race; hand out receivers via `rehydrate_done_tx.subscribe()`.
+    pub rehydrate_done_tx: tokio::sync::watch::Sender<bool>,
     /// macOS-only: retained `UNUserNotificationCenterDelegate` instance.
     /// Stored here because Objective-C will deallocate the delegate the
     /// moment its `Retained` ref count hits zero, which would silently
@@ -138,6 +148,7 @@ impl Default for AppHandleState {
             review_links: Mutex::new(HashMap::new()),
             models_cache: ModelsCache::default(),
             webview_health: crate::commands::webview_health::WebviewHealthState::default(),
+            rehydrate_done_tx: tokio::sync::watch::channel(false).0,
             #[cfg(target_os = "macos")]
             notification_delegate: Mutex::new(None),
         }
