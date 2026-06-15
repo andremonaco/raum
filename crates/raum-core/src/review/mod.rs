@@ -3,13 +3,14 @@
 //!
 //! When the user drops one harness pane onto another, raum spawns a fresh
 //! reviewer harness in the reviewed harness's worktree and seeds it with a
-//! short "review brief" — a list of the prompts the reviewed harness
-//! received, the files it touched, and a pointer to its own transcript file
-//! on disk for self-exploration.
+//! short "review brief". The brief deliberately does not prime the reviewer:
+//! it hands over a pointer to the reviewed harness's own session log on disk
+//! plus the list of files that were touched, and lets the reviewer dig into
+//! git (recent commits, open working tree) and form its own view.
 //!
-//! The brief is intentionally *small* (no full-conversation dump) so it works
-//! across every harness CLI we support — every supported CLI accepts a
-//! positional first prompt argument.
+//! The brief is intentionally *small* (no full-conversation dump, no replay of
+//! the original instructions) so it works across every harness CLI we support
+//! — every supported CLI accepts a positional first prompt argument.
 
 pub mod brief;
 pub mod inject;

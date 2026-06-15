@@ -1,42 +1,43 @@
 //! Pure renderer for the cross-harness review brief.
 //!
-//! No I/O. The caller (the `start_review` Tauri command) gathers the inputs —
-//! prompt log, `git diff --name-only`, branch/base, optional transcript path —
-//! and hands them to [`render_review_brief`], which produces the single string
-//! the new reviewer harness sees as its first prompt.
+//! No I/O. The caller (the `prepare_review` Tauri command) gathers the inputs
+//! — the changed-file list, branch/base, and a pointer to the reviewed
+//! harness's own session log on disk — and hands them to
+//! [`render_review_brief`], which produces the single string the new reviewer
+//! harness sees as its first prompt.
+//!
+//! The brief deliberately does **not** prime the reviewer: it never replays
+//! the instructions the colleague received or asks leading questions. It hands
+//! over two things — the session log to read and the files that were touched —
+//! and lets the reviewer dig into git and form its own view.
 
 use std::fmt::Write as _;
 use std::path::Path;
 
 /// Cap on how many touched files we list verbatim before collapsing the rest
-/// into a "+N more" footer. Reviewers can always run `git diff --stat` for
-/// the full list.
+/// into a "+N more" footer. Reviewers can always run `git status` /
+/// `git log --stat` for the full list.
 pub const MAX_FILES_LISTED: usize = 100;
 
 /// Inputs to [`render_review_brief`]. Borrows everything so the caller keeps
 /// ownership; the renderer is pure and produces a fresh `String`.
 #[derive(Debug, Clone)]
 pub struct BriefInputs<'a> {
-    /// Chronological user prompts that the reviewed harness received,
-    /// straight from its own on-disk transcript. Empty is allowed — the
-    /// brief omits the section.
-    pub prompts: &'a [String],
-    /// Files changed in the worktree relative to `base`. Already filtered
-    /// down to the diff between `base` and HEAD by the caller — committed
-    /// work only.
+    /// Every file the reviewed colleague touched — committed since `base`
+    /// and/or dirty in the working tree — already merged and deduped by the
+    /// caller. This list plus the session log is the whole signal; the
+    /// reviewer derives the actual changes from git itself. Empty is allowed
+    /// and triggers a "nothing detected" warning.
     pub files_changed: &'a [String],
-    /// Files dirty in the working tree relative to HEAD: staged, unstaged,
-    /// or untracked. The reviewed colleague may have left work uncommitted,
-    /// and the reviewer must inspect this on top of `files_changed`.
-    pub uncommitted_files: &'a [String],
     /// The current branch the reviewed harness was working on.
     pub branch: &'a str,
     /// Base branch the worktree was forked from (typically `main`).
     pub base: &'a str,
     /// Number of commits ahead of `base`. Surfaced verbatim in the brief.
     pub commits_ahead: usize,
-    /// Absolute path to the harness's own transcript file, if discovered.
-    /// `None` is fine — the brief simply omits the pointer line.
+    /// Absolute path to the harness's own session log on disk, if one exists
+    /// (Claude Code / Codex). `None` for harnesses with no on-disk transcript
+    /// (OpenCode) — the brief then leans on the file list and git.
     pub transcript_path: Option<&'a Path>,
     /// Display name of the harness being reviewed (e.g. "Claude Code"). Used
     /// only in the prose, not for behavior.
@@ -47,24 +48,28 @@ pub struct BriefInputs<'a> {
 /// re-render it nicely in any chat UI.
 #[must_use]
 pub fn render_review_brief(inputs: &BriefInputs<'_>) -> String {
-    let mut out = String::with_capacity(2048);
-    out.push_str("Please review the work of your colleague (a ");
-    out.push_str(inputs.reviewed_harness);
-    out.push_str(" session).\n\n");
+    let mut out = String::with_capacity(1024);
+    let _ = writeln!(
+        out,
+        "Please review the work your colleague (a {} session) just did.\n",
+        inputs.reviewed_harness,
+    );
 
-    if inputs.prompts.is_empty() {
-        out.push_str(
-            "No user prompts could be read from that session's transcript on \
-             disk — the harness may not write its conversation in a format \
-             raum knows how to read yet, or the file was rotated away. \
-             Inspect the diff directly and proceed.\n\n",
+    // Point at the session log — don't summarize it or replay the prompts.
+    // The reviewer reads it to learn what the colleague was asked to do and
+    // how they got there, then forms its own view.
+    if let Some(path) = inputs.transcript_path {
+        let _ = writeln!(
+            out,
+            "Their full session log is on disk — read it to see what they were \
+             asked to do and how they got there:\n\n`{}`\n",
+            path.display(),
         );
     } else {
-        out.push_str("These were the instructions it received, in order:\n\n");
-        for (i, prompt) in inputs.prompts.iter().enumerate() {
-            let _ = writeln!(out, "{}. {}", i + 1, indent_continuation(prompt));
-        }
-        out.push('\n');
+        out.push_str(
+            "No on-disk session log is available for this harness, so work \
+             from the changed files and git state below.\n\n",
+        );
     }
 
     let _ = writeln!(
@@ -80,91 +85,39 @@ pub fn render_review_brief(inputs: &BriefInputs<'_>) -> String {
         },
     );
 
-    if inputs.files_changed.is_empty() && inputs.uncommitted_files.is_empty() {
+    if inputs.files_changed.is_empty() {
         out.push_str(
-            "No committed or uncommitted changes were detected in this \
-             worktree. Before concluding there's nothing to review, double-\
-             check with `git status` and `git log` — the base branch may be \
-             wrong, or the colleague may be working in a different worktree \
-             than expected.\n\n",
+            "No changed files were detected — committed or in the working \
+             tree. Before concluding there's nothing to review, double-check \
+             with `git status` and `git log`: the base branch may be wrong, or \
+             your colleague may be working in a different worktree than \
+             expected.\n\n",
         );
     } else {
-        if !inputs.files_changed.is_empty() {
-            let listed = inputs.files_changed.len().min(MAX_FILES_LISTED);
-            let _ = writeln!(out, "Files changed in commits (vs `{}`):\n", inputs.base);
-            for path in &inputs.files_changed[..listed] {
-                let _ = writeln!(out, "- `{path}`");
-            }
-            if inputs.files_changed.len() > listed {
-                let _ = writeln!(
-                    out,
-                    "- … and {} more (run `git diff --stat {}...HEAD` for the full list).",
-                    inputs.files_changed.len() - listed,
-                    inputs.base,
-                );
-            }
-            out.push('\n');
+        let listed = inputs.files_changed.len().min(MAX_FILES_LISTED);
+        out.push_str("Files your colleague changed:\n\n");
+        for path in &inputs.files_changed[..listed] {
+            let _ = writeln!(out, "- `{path}`");
         }
-        if !inputs.uncommitted_files.is_empty() {
-            let listed = inputs.uncommitted_files.len().min(MAX_FILES_LISTED);
-            out.push_str(
-                "Uncommitted local changes (staged, unstaged, or untracked — \
-                 not in any commit yet):\n\n",
+        if inputs.files_changed.len() > listed {
+            let _ = writeln!(
+                out,
+                "- … and {} more (run `git status` and `git log --stat` for the full list).",
+                inputs.files_changed.len() - listed,
             );
-            for path in &inputs.uncommitted_files[..listed] {
-                let _ = writeln!(out, "- `{path}`");
-            }
-            if inputs.uncommitted_files.len() > listed {
-                let _ = writeln!(
-                    out,
-                    "- … and {} more (run `git status` for the full list).",
-                    inputs.uncommitted_files.len() - listed,
-                );
-            }
-            out.push('\n');
         }
+        out.push('\n');
     }
 
-    if let Some(path) = inputs.transcript_path {
-        let _ = writeln!(
-            out,
-            "Full implementation conversation (read it if you want more context): \
-             `{}`\n",
-            path.display(),
-        );
-    }
-
-    let _ = writeln!(
-        out,
-        "Was the task implemented successfully? Are there any blind spots? \
-         The work may be partly committed and partly still in the working \
-         tree — inspect **both**: `git diff {base}...HEAD` for committed \
-         changes, plus `git status` and `git diff HEAD` (and `git diff` for \
-         unstaged, `git diff --cached` for staged) for uncommitted work. \
-         Read new/untracked files directly. Dig through the touched code, \
-         and form your own view before reporting. Come back with concrete \
-         improvements or gaps — or, if it's good, just approve.",
-        base = inputs.base,
+    out.push_str(
+        "To see what actually changed, inspect those files and the diffs \
+         behind them: check the recent commits that touched them \
+         (`git log -p -- <file>`) and the open working tree (`git status`, \
+         `git diff HEAD`). Form your own view of whether the work is sound, \
+         then report back.",
     );
 
     out
-}
-
-/// Multi-line prompts get continuation lines indented so the numbered list
-/// stays readable in markdown.
-fn indent_continuation(text: &str) -> String {
-    let trimmed = text.trim();
-    if !trimmed.contains('\n') {
-        return trimmed.to_string();
-    }
-    let mut lines = trimmed.lines();
-    let first = lines.next().unwrap_or("").to_string();
-    let rest: Vec<String> = lines.map(|l| format!("   {l}")).collect();
-    if rest.is_empty() {
-        first
-    } else {
-        format!("{first}\n{}", rest.join("\n"))
-    }
 }
 
 #[cfg(test)]
@@ -177,18 +130,11 @@ mod tests {
     }
 
     #[test]
-    fn renders_full_brief_with_all_sections() {
-        let prompts = vec![
-            s("add a function `foo` that returns 42"),
-            s("now make it async"),
-            s("write a test for it"),
-        ];
+    fn renders_full_brief_without_priming() {
         let files = vec!["src/foo.rs".to_string(), "src/lib.rs".to_string()];
         let xpath = PathBuf::from("/Users/andre/.claude/projects/-x/abc.jsonl");
         let inputs = BriefInputs {
-            prompts: &prompts,
             files_changed: &files,
-            uncommitted_files: &[],
             branch: "feat/foo",
             base: "main",
             commits_ahead: 2,
@@ -197,21 +143,24 @@ mod tests {
         };
         let out = render_review_brief(&inputs);
         assert!(out.contains("Claude Code"));
-        assert!(out.contains("1. add a function"));
-        assert!(out.contains("3. write a test"));
         assert!(out.contains("`feat/foo`"));
         assert!(out.contains("(base: `main`, 2 commits ahead)"));
+        assert!(out.contains("Files your colleague changed"));
         assert!(out.contains("`src/foo.rs`"));
         assert!(out.contains("/Users/andre/.claude/projects/-x/abc.jsonl"));
-        assert!(out.contains("git diff main...HEAD"));
+        assert!(out.contains("git log -p"));
+        assert!(out.contains("git diff HEAD"));
+        // Must not prime the reviewer with the original instructions or
+        // leading questions.
+        assert!(!out.contains("instructions it received"));
+        assert!(!out.contains("implemented successfully"));
+        assert!(!out.contains("blind spots"));
     }
 
     #[test]
     fn singular_commit_grammar() {
         let inputs = BriefInputs {
-            prompts: &[],
             files_changed: &[],
-            uncommitted_files: &[],
             branch: "x",
             base: "main",
             commits_ahead: 1,
@@ -226,79 +175,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_prompts_section_still_actionable() {
+    fn lists_changed_files() {
+        let files = vec!["src/done.rs".to_string(), "src/wip.rs".to_string()];
         let inputs = BriefInputs {
-            prompts: &[],
-            files_changed: &["a.rs".to_string()],
-            uncommitted_files: &[],
-            branch: "x",
-            base: "main",
-            commits_ahead: 1,
-            transcript_path: None,
-            reviewed_harness: "Codex",
-        };
-        let out = render_review_brief(&inputs);
-        assert!(out.contains("No user prompts could be read"));
-        assert!(out.contains("`a.rs`"));
-        assert!(!out.contains("instructions it received"));
-    }
-
-    #[test]
-    fn empty_files_section_warns() {
-        let prompts = vec![s("do something")];
-        let inputs = BriefInputs {
-            prompts: &prompts,
-            files_changed: &[],
-            uncommitted_files: &[],
-            branch: "x",
-            base: "main",
-            commits_ahead: 0,
-            transcript_path: None,
-            reviewed_harness: "Codex",
-        };
-        let out = render_review_brief(&inputs);
-        assert!(out.contains("No committed or uncommitted changes"));
-        assert!(out.contains("0 commits ahead"));
-    }
-
-    #[test]
-    fn uncommitted_only_brief_lists_dirty_files_and_skips_no_changes_warning() {
-        let prompts = vec![s("do the thing")];
-        let dirty = vec!["src/dirty.rs".to_string(), "src/new_file.rs".to_string()];
-        let inputs = BriefInputs {
-            prompts: &prompts,
-            files_changed: &[],
-            uncommitted_files: &dirty,
-            branch: "feat/wip",
-            base: "main",
-            commits_ahead: 0,
-            transcript_path: None,
-            reviewed_harness: "Claude Code",
-        };
-        let out = render_review_brief(&inputs);
-        assert!(
-            !out.contains("No committed or uncommitted changes"),
-            "should not warn when uncommitted files exist; got: {out}",
-        );
-        assert!(out.contains("Uncommitted local changes"));
-        assert!(out.contains("`src/dirty.rs`"));
-        assert!(out.contains("`src/new_file.rs`"));
-        // Reviewer must be told to consult `git status` for dirty state.
-        assert!(out.contains("git status"));
-        assert!(out.contains("git diff HEAD"));
-        // And there should be no "Files changed in commits" header when
-        // nothing is committed.
-        assert!(!out.contains("Files changed in commits"));
-    }
-
-    #[test]
-    fn both_committed_and_uncommitted_render_separate_sections() {
-        let committed = vec!["src/done.rs".to_string()];
-        let dirty = vec!["src/wip.rs".to_string()];
-        let inputs = BriefInputs {
-            prompts: &[],
-            files_changed: &committed,
-            uncommitted_files: &dirty,
+            files_changed: &files,
             branch: "feat/mix",
             base: "main",
             commits_ahead: 1,
@@ -306,19 +186,50 @@ mod tests {
             reviewed_harness: "Codex",
         };
         let out = render_review_brief(&inputs);
-        assert!(out.contains("Files changed in commits (vs `main`)"));
+        assert!(out.contains("Files your colleague changed"));
         assert!(out.contains("`src/done.rs`"));
-        assert!(out.contains("Uncommitted local changes"));
         assert!(out.contains("`src/wip.rs`"));
+        assert!(!out.contains("No changed files were detected"));
     }
 
     #[test]
-    fn missing_transcript_omits_pointer_line() {
-        let prompts = vec![s("hi")];
+    fn empty_files_section_warns() {
         let inputs = BriefInputs {
-            prompts: &prompts,
-            files_changed: &["a".into()],
-            uncommitted_files: &[],
+            files_changed: &[],
+            branch: "x",
+            base: "main",
+            commits_ahead: 0,
+            transcript_path: None,
+            reviewed_harness: "Codex",
+        };
+        let out = render_review_brief(&inputs);
+        assert!(out.contains("No changed files were detected"));
+        assert!(out.contains("0 commits ahead"));
+    }
+
+    #[test]
+    fn present_transcript_points_at_the_log() {
+        let files = vec![s("a.rs")];
+        let xpath = PathBuf::from("/home/u/.codex/sessions/2026/06/14/rollout-abc.jsonl");
+        let inputs = BriefInputs {
+            files_changed: &files,
+            branch: "b",
+            base: "main",
+            commits_ahead: 1,
+            transcript_path: Some(&xpath),
+            reviewed_harness: "Codex",
+        };
+        let out = render_review_brief(&inputs);
+        assert!(out.contains("session log is on disk"));
+        assert!(out.contains("rollout-abc.jsonl"));
+        assert!(!out.contains("No on-disk session log"));
+    }
+
+    #[test]
+    fn missing_transcript_renders_fallback_note() {
+        let files = vec![s("a.rs")];
+        let inputs = BriefInputs {
+            files_changed: &files,
             branch: "b",
             base: "main",
             commits_ahead: 1,
@@ -326,7 +237,10 @@ mod tests {
             reviewed_harness: "OpenCode",
         };
         let out = render_review_brief(&inputs);
-        assert!(!out.contains("Full implementation conversation"));
+        assert!(out.contains("No on-disk session log is available"));
+        assert!(!out.contains("session log is on disk"));
+        // The file list is still the fallback signal.
+        assert!(out.contains("`a.rs`"));
     }
 
     #[test]
@@ -335,9 +249,7 @@ mod tests {
             .map(|i| format!("src/file_{i:03}.rs"))
             .collect();
         let inputs = BriefInputs {
-            prompts: &[],
             files_changed: &files,
-            uncommitted_files: &[],
             branch: "b",
             base: "main",
             commits_ahead: 1,
@@ -348,42 +260,6 @@ mod tests {
         assert!(out.contains(&format!("`src/file_{:03}.rs`", MAX_FILES_LISTED - 1)));
         assert!(!out.contains(&format!("`src/file_{MAX_FILES_LISTED:03}.rs`")));
         assert!(out.contains("and 7 more"));
-    }
-
-    #[test]
-    fn long_uncommitted_list_collapses_to_more_footer() {
-        let dirty: Vec<String> = (0..MAX_FILES_LISTED + 4)
-            .map(|i| format!("src/dirty_{i:03}.rs"))
-            .collect();
-        let inputs = BriefInputs {
-            prompts: &[],
-            files_changed: &[],
-            uncommitted_files: &dirty,
-            branch: "b",
-            base: "main",
-            commits_ahead: 0,
-            transcript_path: None,
-            reviewed_harness: "Codex",
-        };
-        let out = render_review_brief(&inputs);
-        assert!(out.contains("and 4 more"));
-        assert!(out.contains("run `git status`"));
-    }
-
-    #[test]
-    fn multi_line_prompt_indents_continuation() {
-        let prompts = vec![s("first line\nsecond line\nthird line")];
-        let inputs = BriefInputs {
-            prompts: &prompts,
-            files_changed: &[],
-            uncommitted_files: &[],
-            branch: "x",
-            base: "main",
-            commits_ahead: 0,
-            transcript_path: None,
-            reviewed_harness: "Codex",
-        };
-        let out = render_review_brief(&inputs);
-        assert!(out.contains("1. first line\n   second line\n   third line\n"));
+        assert!(out.contains("git log --stat"));
     }
 }

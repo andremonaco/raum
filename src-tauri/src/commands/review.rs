@@ -112,13 +112,7 @@ pub async fn prepare_review<R: Runtime>(
 
     // Snapshot identity + per-pane metadata under the registry lock, then
     // drop it before doing I/O. We never await while holding the lock.
-    let (
-        reviewer_kind,
-        reviewed_kind,
-        reviewed_project_slug,
-        reviewed_worktree_id,
-        reviewed_opencode_port,
-    ) = {
+    let (reviewer_kind, reviewed_kind, reviewed_project_slug, reviewed_worktree_id) = {
         let reg = state
             .terminals
             .lock()
@@ -129,16 +123,11 @@ pub async fn prepare_review<R: Runtime>(
         let reviewed = reg
             .item(&args.reviewed_session_id)
             .ok_or_else(|| "Reviewed pane no longer exists.".to_string())?;
-        // OpenCode lives behind a local HTTP API; we pinned the port at
-        // launch and stored it on the tracked session row. The transcript
-        // reader needs it to query the server's session endpoints.
-        let opencode_port = read_opencode_port_for_session(&state, &args.reviewed_session_id);
         (
             reviewer.kind,
             reviewed.kind,
             reviewed.project_slug.clone(),
             reviewed.worktree_id.clone(),
-            opencode_port,
         )
     };
 
@@ -162,40 +151,42 @@ pub async fn prepare_review<R: Runtime>(
         return Err("Reviewed pane's worktree directory is unavailable.".to_string());
     }
 
-    // Read prompts directly from the harness's own on-disk transcript
-    // (Claude Code / Codex) or local HTTP API (OpenCode). raum no longer
-    // maintains its own prompt log — the harness's storage is the single
-    // source of truth (`raum_core::review::transcript`).
-    let home_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
-    let prompts =
-        read_session_user_prompts(reviewed_kind, &cwd, &home_dir, reviewed_opencode_port).await;
-
-    // Git probes (cheap; bounded by the worktree's own git tree size).
-    let branch = detect_branch(&cwd).unwrap_or_else(|| "HEAD".to_string());
-    let base = detect_base_branch(&cwd).unwrap_or_else(|| "main".to_string());
-    let files_changed = git_changed_files(&cwd, &base);
-    let uncommitted_files = git_uncommitted_files(&cwd);
-    let commits_ahead = git_commits_ahead(&cwd, &base);
-
-    let transcript_path = discover_transcript_path(reviewed_kind, &cwd, &home_dir);
-    let reviewed_harness_label = harness_display_name(reviewed_kind);
+    // The brief no longer replays the colleague's prompts — it points the
+    // reviewer at the session log on disk plus the files that changed, then
+    // lets it dig into git itself. All we gather here is git state and the
+    // transcript path. These are blocking subprocess / filesystem calls, so
+    // run them off the async executor.
+    let (branch, base, files_changed, commits_ahead, transcript_path) =
+        tokio::task::spawn_blocking(move || {
+            let home_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+            let branch = detect_branch(&cwd).unwrap_or_else(|| "HEAD".to_string());
+            let base = detect_base_branch(&cwd).unwrap_or_else(|| "main".to_string());
+            // Files changed = committed since base ∪ dirty working tree,
+            // deduped. We don't prescribe a diff range; the reviewer derives
+            // the actual changes from git.
+            let mut files = git_changed_files(&cwd, &base);
+            files.extend(git_uncommitted_files(&cwd));
+            files.sort();
+            files.dedup();
+            let commits_ahead = git_commits_ahead(&cwd, &base);
+            let transcript_path = discover_transcript_path(reviewed_kind, &cwd, &home_dir);
+            (branch, base, files, commits_ahead, transcript_path)
+        })
+        .await
+        .map_err(|e| format!("git probe task failed: {e}"))?;
 
     let initial_prompt = render_review_brief(&BriefInputs {
-        prompts: &prompts,
         files_changed: &files_changed,
-        uncommitted_files: &uncommitted_files,
         branch: &branch,
         base: &base,
         commits_ahead,
         transcript_path: transcript_path.as_deref(),
-        reviewed_harness: reviewed_harness_label,
+        reviewed_harness: harness_display_name(reviewed_kind),
     });
     debug!(
         reviewer_session_id = %args.reviewer_session_id,
         reviewed_session_id = %args.reviewed_session_id,
-        prompts = prompts.len(),
         files = files_changed.len(),
-        uncommitted = uncommitted_files.len(),
         brief_bytes = initial_prompt.len(),
         "prepared review brief",
     );
