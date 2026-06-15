@@ -207,7 +207,12 @@ pub fn project_register<R: Runtime>(
 
     drop(store);
 
-    match GitHeadWatcher::start(project.slug.clone(), &project.root_path, app) {
+    let status_pulse = state
+        .status_service
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|svc| svc.pulse_sender()));
+    match GitHeadWatcher::start(project.slug.clone(), &project.root_path, app, status_pulse) {
         Ok(watcher) => {
             if let Ok(mut watchers) = state.git_watchers.lock() {
                 watchers.insert(project.slug.clone(), watcher);
@@ -492,8 +497,9 @@ pub struct GitignoreNode {
 }
 
 /// OS-generated metadata files that clutter the tree and are never useful for
-/// worktree hydration. Checked against the final path component only.
-fn is_noise_filename(name: &str) -> bool {
+/// worktree hydration. Checked against the final path component only. Also
+/// used by the worktree file browser (`worktree_list_dir`).
+pub(crate) fn is_noise_filename(name: &str) -> bool {
     matches!(
         name,
         ".DS_Store"
@@ -663,11 +669,10 @@ pub fn project_list_dir(
 
     let root = project.root_path;
 
-    // Prevent path traversal: join then verify the result is still inside root.
-    let target = root.join(&rel_path);
-    if !target.starts_with(&root) {
-        return Err(format!("path escapes project root: {rel_path}"));
-    }
+    // Prevent path traversal. Note: a naive `join(..).starts_with(root)`
+    // check passes `../x` (component-wise comparison, no normalization) —
+    // use the strict resolver instead.
+    let target = crate::commands::worktree::resolve_inside_root(&root, &rel_path)?;
     if !target.is_dir() {
         return Ok(vec![]);
     }

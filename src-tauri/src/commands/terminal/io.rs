@@ -128,6 +128,45 @@ pub async fn terminal_paste_paths(
     .map_err(|e| format!("tmux paste: {e}"))
 }
 
+/// Paste arbitrary clipboard text into a pane as a *paste event*.
+///
+/// The frontend routes Cmd+V here instead of letting xterm.js synthesize the
+/// bytes itself: xterm only wraps pastes in bracketed-paste markers when it
+/// has seen DECSET 2004 — state it can lose across reloads/reattaches —
+/// whereas tmux always knows whether the inner application requested
+/// bracketing. `paste-buffer -p` emits the CSIs exactly when the pane opted
+/// in, so multi-line pastes into harnesses arrive as one paste instead of a
+/// burst of Enter-submitted lines, and plain shells still see ordinary text.
+#[tauri::command]
+pub async fn terminal_paste_text(
+    state: tauri::State<'_, AppHandleState>,
+    session_id: String,
+    text: String,
+) -> Result<(), String> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    let exists = {
+        let reg = state
+            .terminals
+            .lock()
+            .map_err(|e| format!("terminals lock: {e}"))?;
+        reg.get_bridge(&session_id).is_some()
+    };
+    if !exists {
+        return Err("not-found".to_string());
+    }
+    let tmux = state.tmux.clone();
+    let buffer_name = format!("raum-paste-{session_id}");
+    let target = session_id.clone();
+    tokio::task::spawn_blocking(move || {
+        tmux.paste_into_pane(&target, &buffer_name, text.as_bytes(), true)
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking join: {e}"))?
+    .map_err(|e| format!("tmux paste: {e}"))
+}
+
 /// Render the drop payload according to the active pane's paste mode. The
 /// logic is pulled out for unit-testability — no tmux calls involved.
 #[must_use]

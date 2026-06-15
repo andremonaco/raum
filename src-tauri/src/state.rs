@@ -33,6 +33,13 @@ pub struct AppHandleState {
     /// `worktree-branches-changed` when the underlying HEAD changes so the UI
     /// can refresh branch badges without polling.
     pub git_watchers: Mutex<HashMap<String, GitHeadWatcher>>,
+    /// Backend-owned worktree status service: per-subscribed-path watch
+    /// tasks that recompute git status on triggers (mutations, watcher
+    /// pulses, focus, slow fallback) and push `worktree-status-changed`
+    /// events. Populated once during Tauri `setup` (needs an `AppHandle`);
+    /// `None` when setup failed — status then degrades to the one-shot
+    /// `worktree_status` command.
+    pub status_service: Mutex<Option<crate::commands::worktree::WorktreeStatusService>>,
     /// §7.6 — hook-event UDS socket handle. Populated once during Tauri
     /// `setup`; `None` when socket bind failed (logged as a warning so we
     /// degrade to the silence heuristic instead of crashing the app).
@@ -86,6 +93,11 @@ pub struct AppHandleState {
     /// re-spawning `opencode models` or re-reading `models_cache.json` on
     /// every picker open) keeps the picker snappy during the snap dance.
     pub models_cache: ModelsCache,
+    /// Focus-gated webview liveness gate (ping/pong nonces + in-flight
+    /// flag). Used by `commands::webview_health` to detect a WKWebView
+    /// whose WebContent process was killed during screen lock and reload
+    /// it instead of leaving a black, dead window.
+    pub webview_health: crate::commands::webview_health::WebviewHealthState,
     /// macOS-only: retained `UNUserNotificationCenterDelegate` instance.
     /// Stored here because Objective-C will deallocate the delegate the
     /// moment its `Retained` ref count hits zero, which would silently
@@ -116,6 +128,7 @@ impl Default for AppHandleState {
             agents: Mutex::new(AgentRegistry::with_defaults()),
             agent_events: AgentEventBus::new(),
             git_watchers: Mutex::new(HashMap::new()),
+            status_service: Mutex::new(None),
             event_socket: Mutex::new(None),
             harness_runtimes: HarnessRuntimeRegistry::new(),
             channel_event_tx: Mutex::new(None),
@@ -124,6 +137,7 @@ impl Default for AppHandleState {
             last_hook_at: Arc::new(Mutex::new(None)),
             review_links: Mutex::new(HashMap::new()),
             models_cache: ModelsCache::default(),
+            webview_health: crate::commands::webview_health::WebviewHealthState::default(),
             #[cfg(target_os = "macos")]
             notification_delegate: Mutex::new(None),
         }

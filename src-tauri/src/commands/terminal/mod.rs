@@ -50,9 +50,10 @@ pub(super) const SNAPSHOT_REPLAY_CHUNK_BYTES: usize = 32 * 1024;
 // `commands::terminal` so `lib.rs`, `agent_hydrate.rs`, `worktree.rs`,
 // `project.rs`, and `state.rs` keep resolving without edits.
 pub(crate) use entry::emit_terminal_session_upserted;
-pub use io::{terminal_paste_paths, terminal_send_keys};
+pub use io::{terminal_paste_paths, terminal_paste_text, terminal_send_keys};
 pub(crate) use kill::{
-    kill_orphans_inner, kill_session_inner, sessions_for_project, sessions_for_worktree,
+    kill_orphans_inner, kill_session_inner, protected_session_ids, sessions_for_project,
+    sessions_for_worktree,
 };
 pub use kill::{terminal_kill, terminal_kill_orphans, terminal_reap_stale};
 pub use query::{terminal_list, terminal_pane_context, terminal_pane_context_batch};
@@ -69,7 +70,7 @@ pub use spawn::terminal_spawn;
 // look up `commands::terminal::__cmd__<name>` — so the dispatcher modules
 // must be re-exported from this `mod.rs` alongside their public function.
 #[doc(hidden)]
-pub use io::{__cmd__terminal_paste_paths, __cmd__terminal_send_keys};
+pub use io::{__cmd__terminal_paste_paths, __cmd__terminal_paste_text, __cmd__terminal_send_keys};
 #[doc(hidden)]
 pub use kill::{__cmd__terminal_kill, __cmd__terminal_kill_orphans, __cmd__terminal_reap_stale};
 #[doc(hidden)]

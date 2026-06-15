@@ -6,6 +6,7 @@ use std::process::Command;
 use raum_hydration::worktree_list as git_worktree_list;
 
 use super::config_io::{load_effective, rescan_git_watcher};
+use super::status_service::trigger_status_refresh;
 use super::types::{BranchMergeStatus, WorktreeBranchList};
 use crate::state::AppHandleState;
 
@@ -126,6 +127,7 @@ pub fn git_checkout_branch(
     }
 
     rescan_git_watcher(&state, &project_slug, &effective.root_path);
+    trigger_status_refresh(&state, &root);
     Ok(())
 }
 

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use raum_core::AgentKind;
 use raum_core::harness::ModelOverride;
-use raum_tmux::{PaneContext, PtyBridgeHandle};
+use raum_tmux::{PaneContext, TerminalBridge};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Runtime};
 use tokio::task::JoinHandle;
@@ -27,9 +27,10 @@ pub struct TerminalEntry {
     pub worktree_id: Option<String>,
     pub kind: AgentKind,
     pub created_unix: u64,
-    /// PTY-wrapped `tmux attach-session` client. Cloning the handle is cheap
-    /// (Arc bump); the bridge tears down when the last clone drops.
-    pub bridge: PtyBridgeHandle,
+    /// Attached tmux client (control-mode by default, PTY-wrapped legacy
+    /// fallback). Cloning the handle is cheap (Arc bump); the bridge tears
+    /// down when the last clone drops.
+    pub bridge: TerminalBridge,
     /// Set before intentionally tearing down/replacing this PTY bridge.
     /// Reader/coalescer threads may still flush a short tail after
     /// `shutdown_silent`; this drops stale bytes before they hit xterm.

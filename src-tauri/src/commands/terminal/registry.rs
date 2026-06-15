@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use raum_core::AgentKind;
-use raum_tmux::PtyBridgeHandle;
+use raum_tmux::TerminalBridge;
 use serde::Serialize;
 use tokio::task::JoinHandle;
 
@@ -110,14 +110,14 @@ impl TerminalRegistry {
         self.entries.remove(session_id)
     }
 
-    pub fn get_bridge(&self, session_id: &str) -> Option<PtyBridgeHandle> {
+    pub fn get_bridge(&self, session_id: &str) -> Option<TerminalBridge> {
         self.entries.get(session_id).map(|e| e.bridge.clone())
     }
 
     /// Fetch both the bridge and the last-known dims atomically under the
     /// registry lock. Used by `terminal_resize` to pick a resize ordering
     /// that avoids tmux's hatched "|..." pattern.
-    pub fn get_bridge_and_size(&self, session_id: &str) -> Option<(PtyBridgeHandle, u16, u16)> {
+    pub fn get_bridge_and_size(&self, session_id: &str) -> Option<(TerminalBridge, u16, u16)> {
         self.entries
             .get(session_id)
             .map(|e| (e.bridge.clone(), e.last_cols, e.last_rows))
@@ -281,7 +281,7 @@ impl std::fmt::Debug for TerminalRegistry {
 /// them on the existing entry or drop them when the entry has been
 /// removed concurrently.
 pub(super) struct BridgeRuntime {
-    pub(super) bridge: PtyBridgeHandle,
+    pub(super) bridge: TerminalBridge,
     pub(super) bridge_output_cancelled: Arc<AtomicBool>,
     pub(super) monitor_task: Option<JoinHandle<()>>,
     pub(super) context_task: Option<JoinHandle<()>>,

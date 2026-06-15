@@ -835,8 +835,11 @@ impl TmuxManager {
 
     /// §3.7 — stale-session reaper. Kills any session whose `session_created`
     /// timestamp is older than `threshold_days` and returns the ids that were
-    /// killed. No CLI surface — only reachable via Tauri `terminal_reap_stale`.
-    pub fn reap_stale(&self, threshold_days: u32) -> Vec<String> {
+    /// killed. Sessions in `keep` are never reaped regardless of age — callers
+    /// pass the ids tracked in `state/sessions.toml` so panes the user still
+    /// has in their layout (shells included) survive arbitrarily long gaps
+    /// between app runs. Only genuinely untracked leftovers are age-reaped.
+    pub fn reap_stale(&self, threshold_days: u32, keep: &HashSet<String>) -> Vec<String> {
         let Ok(live) = self.list_sessions() else {
             return Vec::new();
         };
@@ -846,7 +849,7 @@ impl TmuxManager {
         let threshold_secs = u64::from(threshold_days) * 24 * 60 * 60;
         let mut killed = Vec::new();
         for s in live {
-            if s.created_unix == 0 {
+            if s.created_unix == 0 || keep.contains(&s.id) {
                 continue;
             }
             let age = now.saturating_sub(s.created_unix);

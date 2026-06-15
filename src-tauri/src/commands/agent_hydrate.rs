@@ -675,6 +675,34 @@ mod tests {
     }
 
     #[test]
+    fn rehydrate_plan_registers_live_shell_sessions() {
+        // Shell sessions are tracked in `sessions.toml` (see
+        // `terminal_spawn`) so the orphan/stale reapers leave them alone
+        // across app restarts. A live shell row must come back as
+        // Register — the applier inserts an identity-only ghost without
+        // any harness runtime — so `kill_orphans_inner` sees it as
+        // tracked and the frontend can reattach to the surviving pane.
+        let tracked_rows = vec![tracked(
+            "raum-shell-1",
+            AgentKind::Shell,
+            Some("acme"),
+            None,
+            None,
+        )];
+        let live_ids = live(&["raum-shell-1"]);
+        let plan = rehydrate_plan(&tracked_rows, &live_ids);
+        assert_eq!(plan.len(), 1);
+        assert!(matches!(
+            &plan[0],
+            RehydrateJob::Register {
+                session_id,
+                harness: AgentKind::Shell,
+                ..
+            } if session_id == "raum-shell-1"
+        ));
+    }
+
+    #[test]
     fn rehydrate_plan_dedupes_duplicate_session_ids() {
         let tracked_rows = vec![
             tracked("raum-a", AgentKind::ClaudeCode, Some("acme"), None, None),

@@ -1,13 +1,23 @@
 //! Per-file git plumbing called by the sidebar's stage / unstage / diff /
 //! discard buttons. Each command is a thin wrapper around git on the
-//! blocking pool — no shared state.
+//! blocking pool. Mutating commands nudge the status service on success so
+//! the sidebar updates via the `worktree-status-changed` push instead of a
+//! follow-up frontend fetch.
 
 use std::process::Command;
+
+use super::status_service::trigger_status_refresh;
+use crate::state::AppHandleState;
 
 /// Stage one or more files in the worktree at `worktree_path`.
 /// Pass `files: ["."]` to stage everything.
 #[tauri::command]
-pub async fn git_stage(worktree_path: String, files: Vec<String>) -> Result<(), String> {
+pub async fn git_stage(
+    state: tauri::State<'_, AppHandleState>,
+    worktree_path: String,
+    files: Vec<String>,
+) -> Result<(), String> {
+    let path = worktree_path.clone();
     tokio::task::spawn_blocking(move || {
         let mut cmd = Command::new("git");
         cmd.args(["-C", &worktree_path, "add", "--"]);
@@ -21,13 +31,20 @@ pub async fn git_stage(worktree_path: String, files: Vec<String>) -> Result<(), 
         Ok(())
     })
     .await
-    .map_err(|e| format!("spawn_blocking join: {e}"))?
+    .map_err(|e| format!("spawn_blocking join: {e}"))??;
+    trigger_status_refresh(&state, &path);
+    Ok(())
 }
 
 /// Unstage one or more files in the worktree at `worktree_path`.
 /// Pass `files: ["."]` to unstage everything.
 #[tauri::command]
-pub async fn git_unstage(worktree_path: String, files: Vec<String>) -> Result<(), String> {
+pub async fn git_unstage(
+    state: tauri::State<'_, AppHandleState>,
+    worktree_path: String,
+    files: Vec<String>,
+) -> Result<(), String> {
+    let path = worktree_path.clone();
     tokio::task::spawn_blocking(move || {
         let mut cmd = Command::new("git");
         cmd.args(["-C", &worktree_path, "reset", "HEAD", "--"]);
@@ -41,7 +58,9 @@ pub async fn git_unstage(worktree_path: String, files: Vec<String>) -> Result<()
         Ok(())
     })
     .await
-    .map_err(|e| format!("spawn_blocking join: {e}"))?
+    .map_err(|e| format!("spawn_blocking join: {e}"))??;
+    trigger_status_refresh(&state, &path);
+    Ok(())
 }
 
 /// Discard unstaged changes for the listed files in `worktree_path`.
@@ -54,7 +73,12 @@ pub async fn git_unstage(worktree_path: String, files: Vec<String>) -> Result<()
 /// Errors short-circuit: the first failing file stops the batch and surfaces
 /// its stderr.
 #[tauri::command]
-pub async fn git_discard(worktree_path: String, files: Vec<String>) -> Result<(), String> {
+pub async fn git_discard(
+    state: tauri::State<'_, AppHandleState>,
+    worktree_path: String,
+    files: Vec<String>,
+) -> Result<(), String> {
+    let path = worktree_path.clone();
     tokio::task::spawn_blocking(move || {
         for file in &files {
             let status_out = Command::new("git")
@@ -107,7 +131,9 @@ pub async fn git_discard(worktree_path: String, files: Vec<String>) -> Result<()
         Ok(())
     })
     .await
-    .map_err(|e| format!("spawn_blocking join: {e}"))?
+    .map_err(|e| format!("spawn_blocking join: {e}"))??;
+    trigger_status_refresh(&state, &path);
+    Ok(())
 }
 
 /// Discard every unstaged change in `worktree_path`.
@@ -116,7 +142,11 @@ pub async fn git_discard(worktree_path: String, files: Vec<String>) -> Result<()
 /// `git clean -fd` (remove untracked files + directories). The index is left
 /// alone so anything already staged survives.
 #[tauri::command]
-pub async fn git_discard_all(worktree_path: String) -> Result<(), String> {
+pub async fn git_discard_all(
+    state: tauri::State<'_, AppHandleState>,
+    worktree_path: String,
+) -> Result<(), String> {
+    let path = worktree_path.clone();
     tokio::task::spawn_blocking(move || {
         let out = Command::new("git")
             .args(["-C", &worktree_path, "checkout", "--", "."])
@@ -135,7 +165,9 @@ pub async fn git_discard_all(worktree_path: String) -> Result<(), String> {
         Ok(())
     })
     .await
-    .map_err(|e| format!("spawn_blocking join: {e}"))?
+    .map_err(|e| format!("spawn_blocking join: {e}"))??;
+    trigger_status_refresh(&state, &path);
+    Ok(())
 }
 
 /// Return the unified diff for a single file in the worktree at `worktree_path`.

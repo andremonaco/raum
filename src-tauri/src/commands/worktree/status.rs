@@ -1,197 +1,145 @@
-//! §9.1 — `worktree_status` polling. Used by the sidebar to render the
-//! dirty indicator and the Open/Staged file groups every 2 s.
+//! §9.1 — worktree status compute. One status pass = two *parallel* git
+//! subprocesses (`git status --porcelain=v2 -z` + `git diff --numstat -z`),
+//! parsed by the pure functions in [`super::git_parse`]. Recomputes are
+//! driven by the backend status service (`super::status_service`) on
+//! subscribe/mutation/watcher/focus triggers plus a slow fallback tick — the
+//! frontend no longer polls.
+//!
+//! Every invocation sets `GIT_OPTIONAL_LOCKS=0`: without it `git status`
+//! opportunistically rewrites `.git/index` (stat-cache refresh), which would
+//! feed back into the index watcher that triggers recomputes — a perfect
+//! self-oscillator — and can contend on `index.lock` with the user's own git
+//! commands running in a pane.
+//!
+//! `--untracked-files=all` is kept deliberately: the sidebar needs individual
+//! untracked paths, and with event-driven recomputes (instead of the old
+//! 2 s × N-rows poll storm) the full-scan cost is paid rarely.
 
 use std::collections::HashMap;
 use std::process::Command;
 
+use super::git_parse::{assemble_status, parse_numstat_z, parse_porcelain_v2_z};
 use super::types::WorktreeStatus;
 
-/// §9.1 — poll `git status --porcelain=v2` for the worktree at `path`.
-///
-/// We parse the v2 format because it's stable across git versions and
-/// unambiguously separates path fields (tab-separated for renames; the
-/// pathname is always the last field on the line). The three buckets returned
-/// map to the sidebar's display groups:
-///
-/// * `untracked` — lines beginning with `?`.
-/// * `modified` — entries whose *worktree* status char (`XY`, Y) is non-`.`.
-/// * `staged` — entries whose *index* status char (`XY`, X) is non-`.`.
-///
-/// A single path can appear in both `modified` and `staged` when it has both
-/// index and worktree changes; the sidebar surfaces both buckets so the user
-/// can see it in each.
-pub(super) fn worktree_status_for_path(path: &str) -> Result<WorktreeStatus, String> {
-    let output = Command::new("git")
+/// Build a `git -C <path> …` command with optional locks disabled (see
+/// module docs for why that flag is load-bearing).
+pub(super) fn git_cmd(path: &str) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.env("GIT_OPTIONAL_LOCKS", "0").args(["-C", path]);
+    cmd
+}
+
+/// Run + parse the porcelain status. `Ok(None)` means git exited non-zero —
+/// usually "not a git repository" because the worktree dir was deleted out
+/// from under us; callers degrade to a clean default rather than poisoning
+/// the sidebar with an error row.
+fn run_porcelain_status(path: &str) -> Result<Option<super::git_parse::PorcelainStatus>, String> {
+    let output = git_cmd(path)
         .args([
-            "-C",
-            path,
             "status",
             "--porcelain=v2",
             "--branch",
             "--untracked-files=all",
+            "-z",
         ])
         .output()
         .map_err(|e| format!("git status: {e}"))?;
     if !output.status.success() {
-        // Non-zero exit is usually "not a git repository" when a
-        // worktree path was deleted out from under us. Treat as empty /
-        // clean rather than poisoning the sidebar with an error row.
-        return Ok(WorktreeStatus::default());
+        return Ok(None);
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let (mut status, branch) = parse_porcelain_v2_with_branch(stdout.as_ref());
-
-    // Also fetch line-level diff stats vs HEAD. `git diff --shortstat HEAD`
-    // covers both staged and unstaged changes in the working tree.
-    // On a brand-new repo with no commits, this will fail — treat as 0/0.
-    let diff_out = Command::new("git")
-        .args(["-C", path, "diff", "--shortstat", "HEAD"])
-        .output();
-    if let Ok(diff_out) = diff_out {
-        if diff_out.status.success() {
-            let diff_str = String::from_utf8_lossy(&diff_out.stdout);
-            let (ins, del) = parse_shortstat(diff_str.as_ref());
-            status.insertions = ins;
-            status.deletions = del;
-        }
-    }
-
-    if let Some(ref br) = branch {
-        status.stash_count = count_stash_for_branch(path, br);
-    }
-
-    Ok(status)
+    Ok(Some(parse_porcelain_v2_z(&output.stdout)))
 }
 
+/// Run + parse `git diff --numstat HEAD`. Failure (unborn HEAD on a brand-new
+/// repo) degrades to an empty map → totals 0/0, per-file counts `None`.
+fn run_numstat(path: &str) -> HashMap<String, (Option<u32>, Option<u32>)> {
+    let output = git_cmd(path)
+        .args(["diff", "--numstat", "-z", "-M", "HEAD"])
+        .output();
+    match output {
+        Ok(out) if out.status.success() => parse_numstat_z(&out.stdout),
+        _ => HashMap::new(),
+    }
+}
+
+/// One full status computation for the worktree at `path`.
+///
+/// `cached_stash`: pass a cached count to skip the `git stash list`
+/// subprocess (the status service holds one with a TTL); `None` recounts.
+pub(super) async fn compute_status(
+    path: String,
+    cached_stash: Option<u32>,
+) -> Result<WorktreeStatus, String> {
+    let status_path = path.clone();
+    let status_task = tokio::task::spawn_blocking(move || run_porcelain_status(&status_path));
+    let numstat_path = path.clone();
+    let numstat_task = tokio::task::spawn_blocking(move || run_numstat(&numstat_path));
+    let (status_res, numstat_res) = tokio::join!(status_task, numstat_task);
+
+    let porcelain = status_res.map_err(|e| format!("spawn_blocking join: {e}"))??;
+    let Some(porcelain) = porcelain else {
+        return Ok(WorktreeStatus::default());
+    };
+    let numstat = numstat_res.map_err(|e| format!("spawn_blocking join: {e}"))?;
+
+    let stash_count = if let Some(n) = cached_stash {
+        n
+    } else if let Some(branch) = porcelain.branch.clone() {
+        let stash_path = path.clone();
+        tokio::task::spawn_blocking(move || count_stash_for_branch(&stash_path, &branch))
+            .await
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    Ok(assemble_status(porcelain, &numstat, stash_count))
+}
+
+/// Cheap dirty probe for merge guards: porcelain v1 emptiness. Includes
+/// untracked files (default mode), matching what the full status reports as
+/// `dirty`. Synchronous — call from the blocking pool.
+pub(super) fn is_dirty(path: &str) -> bool {
+    git_cmd(path)
+        .args(["status", "--porcelain", "-z"])
+        .output()
+        .is_ok_and(|o| o.status.success() && !o.stdout.is_empty())
+}
+
+/// One-shot status fetch. Kept for consumers that need a fresh value outside
+/// the subscription stream (delete-worktree modal, startup pre-warm).
 #[tauri::command]
 pub async fn worktree_status(path: String) -> Result<WorktreeStatus, String> {
-    // `git status` shells out — offload to the blocking pool so a slow repo
-    // (fsck-in-progress, cold cache) doesn't stall the tokio runtime the
-    // webview IPC uses. The 2-second poll cadence means this is the hottest
-    // blocking-pool customer in the sidebar.
-    tokio::task::spawn_blocking(move || worktree_status_for_path(&path))
-        .await
-        .map_err(|e| format!("spawn_blocking join: {e}"))?
+    compute_status(path, None).await
 }
 
+/// Batch variant of [`worktree_status`]. Off the hot path since the status
+/// service took over live updates — used by the startup pre-warm only.
 #[tauri::command]
 pub async fn worktree_status_batch(
     paths: Vec<String>,
 ) -> Result<HashMap<String, WorktreeStatus>, String> {
     let mut tasks = tokio::task::JoinSet::new();
     for path in paths {
-        tasks.spawn_blocking(move || {
-            let status = worktree_status_for_path(&path).unwrap_or_default();
+        tasks.spawn(async move {
+            let status = compute_status(path.clone(), None).await.unwrap_or_default();
             (path, status)
         });
     }
 
     let mut out = HashMap::new();
     while let Some(result) = tasks.join_next().await {
-        let (path, status) = result.map_err(|e| format!("spawn_blocking join: {e}"))?;
+        let (path, status) = result.map_err(|e| format!("join: {e}"))?;
         out.insert(path, status);
     }
     Ok(out)
 }
 
-/// Parse `git status --porcelain=v2` output into the three buckets the sidebar
-/// renders. Split out for unit testing without a live repo.
-#[cfg(test)]
-pub(super) fn parse_porcelain_v2(stdout: &str) -> WorktreeStatus {
-    parse_porcelain_v2_with_branch(stdout).0
-}
-
-fn parse_porcelain_v2_with_branch(stdout: &str) -> (WorktreeStatus, Option<String>) {
-    let mut status = WorktreeStatus::default();
-    let mut branch = None;
-    for line in stdout.lines() {
-        if line.is_empty() {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("# branch.head ") {
-            if rest != "(detached)" {
-                branch = Some(rest.to_string());
-            }
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("# branch.upstream ") {
-            if !rest.is_empty() {
-                status.upstream = Some(rest.to_string());
-            }
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("# branch.ab ") {
-            for part in rest.split_whitespace() {
-                if let Some(n) = part.strip_prefix('+').and_then(|n| n.parse().ok()) {
-                    status.ahead = n;
-                } else if let Some(n) = part.strip_prefix('-').and_then(|n| n.parse().ok()) {
-                    status.behind = n;
-                }
-            }
-            continue;
-        }
-        let mut parts = line.splitn(2, ' ');
-        let marker = parts.next().unwrap_or("");
-        let rest = parts.next().unwrap_or("");
-        match marker {
-            // Untracked: "? <path>"
-            "?" if !rest.is_empty() => {
-                status.untracked.push(rest.to_string());
-            }
-            "1" => {
-                // Ordinary changed entry:
-                //   "1 XY sub <mH> <mI> <mW> <hH> <hI> <path>"
-                push_changed_path("1", rest, &mut status);
-            }
-            "2" => {
-                // Renamed / copied entry:
-                //   "2 XY sub <mH> <mI> <mW> <hH> <hI> <X><score> <path>\t<orig>"
-                push_changed_path("2", rest, &mut status);
-            }
-            // "u " (unmerged) and "#" (branch header) are ignored on purpose —
-            // the sidebar only visualizes dirty vs clean at this layer.
-            _ => {}
-        }
-    }
-    status.dirty =
-        !status.untracked.is_empty() || !status.modified.is_empty() || !status.staged.is_empty();
-    (status, branch)
-}
-
-fn push_changed_path(marker: &str, rest: &str, out: &mut WorktreeStatus) {
-    // `rest` begins with "XY ..." — split off the XY pair then walk to the path.
-    let xy = rest.get(..2).unwrap_or("..");
-    let index_char = xy.chars().next().unwrap_or('.');
-    let worktree_char = xy.chars().nth(1).unwrap_or('.');
-
-    // The path is the final whitespace-separated field for marker "1"; for
-    // marker "2" it's the field before the TAB separator (then the original
-    // path follows the TAB). We use `rsplit_once('\t')` to peel the TAB half
-    // off first; whatever is left has the path as its final space-separated
-    // field.
-    let pre_tab = rest.rsplit_once('\t').map_or(rest, |(left, _)| left);
-    let Some(path) = pre_tab.rsplit_once(' ').map(|(_, p)| p) else {
-        return;
-    };
-    let path = path.to_string();
-
-    // Rename entries (marker "2") always have an index change; guard just in
-    // case a future git version breaks that invariant.
-    if marker == "2" || index_char != '.' {
-        out.staged.push(path.clone());
-    }
-    if worktree_char != '.' {
-        out.modified.push(path);
-    }
-}
-
 /// Count the stash entries whose `WIP on <branch>` / `On <branch>` header
 /// matches `branch`. `git stash list` is repo-wide, but each entry records
 /// the branch it was stashed from, so we filter client-side.
-fn count_stash_for_branch(path: &str, branch: &str) -> u32 {
-    let out = Command::new("git")
-        .args(["-C", path, "stash", "list"])
-        .output();
+pub(super) fn count_stash_for_branch(path: &str, branch: &str) -> u32 {
+    let out = git_cmd(path).args(["stash", "list"]).output();
     let Ok(out) = out else { return 0 };
     if !out.status.success() {
         return 0;
@@ -202,29 +150,4 @@ fn count_stash_for_branch(path: &str, branch: &str) -> u32 {
     s.lines()
         .filter(|l| l.contains(&wip_tag) || l.contains(&on_tag))
         .count() as u32
-}
-
-/// Parse `git diff --shortstat HEAD` output into `(insertions, deletions)`.
-/// Example line: " 3 files changed, 12 insertions(+), 4 deletions(-)"
-/// When only insertions or only deletions, one clause is absent.
-fn parse_shortstat(s: &str) -> (u32, u32) {
-    let mut ins: u32 = 0;
-    let mut del: u32 = 0;
-    for part in s.split(',') {
-        let part = part.trim();
-        if part.contains("insertion") {
-            ins = part
-                .split_whitespace()
-                .next()
-                .and_then(|n| n.parse().ok())
-                .unwrap_or(0);
-        } else if part.contains("deletion") {
-            del = part
-                .split_whitespace()
-                .next()
-                .and_then(|n| n.parse().ok())
-                .unwrap_or(0);
-        }
-    }
-    (ins, del)
 }

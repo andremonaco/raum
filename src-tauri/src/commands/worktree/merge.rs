@@ -11,7 +11,8 @@ use super::branches::ahead_behind;
 use super::config_io::{blocking, load_effective, rescan_git_watcher};
 use super::create::get_raum_base_branch;
 use super::remove::{delete_local_branch, sessions_for_worktree_strs};
-use super::status::worktree_status_for_path;
+use super::status::is_dirty;
+use super::status_service::trigger_status_refresh;
 use super::types::WorktreeMergePreview;
 use crate::commands::terminal::kill_session_inner;
 use crate::commands::worktree_progress::{
@@ -211,10 +212,8 @@ pub async fn worktree_merge_preview(
         let target_worktree_path = worktree_path_for_branch(&repo_root, &target_branch);
         let target_checked_out = target_worktree_path.is_some();
 
-        let source_dirty = worktree_status_for_path(&source_path).is_ok_and(|s| s.dirty);
-        let target_dirty = target_worktree_path
-            .as_ref()
-            .is_some_and(|p| worktree_status_for_path(p).is_ok_and(|s| s.dirty));
+        let source_dirty = is_dirty(&source_path);
+        let target_dirty = target_worktree_path.as_ref().is_some_and(|p| is_dirty(p));
 
         let (ahead, behind) = ahead_behind(&repo_root_str, &target_branch, &source_branch);
         let already_merged = ahead == 0;
@@ -341,10 +340,10 @@ pub async fn worktree_merge<R: tauri::Runtime>(
         let tb = target_branch.clone();
         let sb = source_branch.clone();
         let res = blocking("merge guards", move || {
-            if worktree_status_for_path(&p).is_ok_and(|s| s.dirty) {
+            if is_dirty(&p) {
                 return Err("source worktree has uncommitted changes".to_string());
             }
-            if worktree_status_for_path(&tp).is_ok_and(|s| s.dirty) {
+            if is_dirty(&tp) {
                 return Err(format!("target worktree (`{tb}`) has uncommitted changes"));
             }
             let conflicts = detect_conflicts(&root_str, &tb, &sb).unwrap_or_default();
@@ -584,6 +583,10 @@ pub async fn worktree_merge<R: tauri::Runtime>(
         StepStatus::Running,
     );
     rescan_git_watcher(&state, &project_slug, &repo_root);
+    // The merge mutated the target worktree (and possibly removed the
+    // source); nudge both so subscribed sidebar rows update immediately.
+    trigger_status_refresh(&state, &target_path);
+    trigger_status_refresh(&state, &path);
     emit_step(
         &on_progress,
         MERGE_STEP_RESCAN.0,

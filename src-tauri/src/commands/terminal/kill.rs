@@ -171,13 +171,59 @@ pub(crate) fn sessions_for_project(
         .unwrap_or_default()
 }
 
+/// Session ids that must never be auto-reaped as orphans or stale: every id
+/// the registry knows (live bridges + rehydrate ghosts), every row tracked in
+/// `state/sessions.toml`, and every session referenced by a tab of the
+/// persisted active layout. The layout source matters for sessions created
+/// before shell tracking existed (no tracked row yet): the user demonstrably
+/// still has a pane bound to them, so reaping would destroy a recoverable
+/// terminal — the "shell panes come back black after relaunch" bug.
+///
+/// Lock failures are errors (callers must not kill with an incomplete set);
+/// unreadable/missing TOML files are tolerated so a fresh install with no
+/// state files doesn't brick the reapers.
+pub(crate) fn protected_session_ids(state: &AppHandleState) -> Result<HashSet<String>, String> {
+    let mut protected: HashSet<String> = HashSet::new();
+    {
+        let reg = state
+            .terminals
+            .lock()
+            .map_err(|e| format!("terminals lock: {e}"))?;
+        for item in reg.list() {
+            protected.insert(item.session_id);
+        }
+    }
+    {
+        let store = state
+            .config_store
+            .lock()
+            .map_err(|e| format!("config_store lock: {e}"))?;
+        if let Ok(persisted) = store.read_sessions() {
+            for row in persisted.sessions {
+                protected.insert(row.session_id);
+            }
+        }
+        if let Ok(layout) = store.read_active_layout() {
+            for cell in layout.cells {
+                for tab in cell.tabs {
+                    if let Some(id) = tab.session_id {
+                        protected.insert(id);
+                    }
+                }
+            }
+        }
+    }
+    Ok(protected)
+}
+
 /// One-shot orphan reaper: kills any tmux session on the `-L raum` socket
-/// that is NOT in the live `TerminalRegistry` AND NOT in `sessions.toml`,
-/// provided it has aged past a 30-second floor (so we can't race a
-/// freshly-spawned session whose registry insert / config debounce hasn't
-/// completed yet). Surfaces the user's "23 idle harnesses while I see 8"
-/// case: pre-fix Cmd+R could leak tmux windows, and the only way to recover
-/// without restarting was to hand-run `tmux -L raum kill-session`.
+/// that is NOT protected (see [`protected_session_ids`]: live registry,
+/// `sessions.toml`, persisted active layout), provided it has aged past a
+/// 30-second floor (so we can't race a freshly-spawned session whose
+/// registry insert / config debounce hasn't completed yet). Surfaces the
+/// user's "23 idle harnesses while I see 8" case: pre-fix Cmd+R could leak
+/// tmux windows, and the only way to recover without restarting was to
+/// hand-run `tmux -L raum kill-session`.
 ///
 /// Returns the list of session ids that were killed.
 #[tauri::command]
@@ -208,27 +254,7 @@ pub(crate) async fn kill_orphans_inner(
             .map_err(|e| format!("tmux list-sessions: {e}"))?
     };
 
-    let mut tracked: HashSet<String> = HashSet::new();
-    {
-        let reg = state
-            .terminals
-            .lock()
-            .map_err(|e| format!("terminals lock: {e}"))?;
-        for item in reg.list() {
-            tracked.insert(item.session_id);
-        }
-    }
-    {
-        let store = state
-            .config_store
-            .lock()
-            .map_err(|e| format!("config_store lock: {e}"))?;
-        if let Ok(persisted) = store.read_sessions() {
-            for row in persisted.sessions {
-                tracked.insert(row.session_id);
-            }
-        }
-    }
+    let tracked = protected_session_ids(state)?;
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -264,14 +290,17 @@ pub(crate) async fn kill_orphans_inner(
 }
 
 /// §3.7 — stale-session reaper, invoked from the in-app "Orphaned sessions"
-/// group. No CLI surface.
+/// group. No CLI surface. Protected sessions (live registry, `sessions.toml`,
+/// persisted active layout — see [`protected_session_ids`]) are exempt; only
+/// untracked leftovers are age-reaped.
 #[tauri::command]
 pub async fn terminal_reap_stale(
     state: tauri::State<'_, AppHandleState>,
     threshold_days: u32,
 ) -> Result<Vec<String>, String> {
     let tmux = state.tmux.clone();
-    let killed = tokio::task::spawn_blocking(move || tmux.reap_stale(threshold_days))
+    let keep = protected_session_ids(&state)?;
+    let killed = tokio::task::spawn_blocking(move || tmux.reap_stale(threshold_days, &keep))
         .await
         .map_err(|e| format!("spawn_blocking join: {e}"))?;
 

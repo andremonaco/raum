@@ -161,6 +161,7 @@ pub fn run() {
             commands::terminal::terminal_list,
             commands::terminal::terminal_send_keys,
             commands::terminal::terminal_paste_paths,
+            commands::terminal::terminal_paste_text,
             commands::terminal::terminal_pane_context,
             commands::terminal::terminal_pane_context_batch,
             commands::terminal::terminal_reap_stale,
@@ -219,6 +220,12 @@ pub fn run() {
             // §9 — sidebar surface (Wave 3C).
             commands::worktree_status,
             commands::worktree_status_batch,
+            commands::worktree_status_subscribe,
+            commands::worktree_status_refresh,
+            commands::git_log,
+            commands::git_commit_files,
+            commands::git_diff_commit,
+            commands::worktree_list_dir,
             commands::git_stage,
             commands::git_unstage,
             commands::git_diff,
@@ -260,6 +267,11 @@ pub fn run() {
             // Devtools — opened via keyboard shortcut since the native
             // right-click "Inspect" entry is globally suppressed.
             commands::devtools::open_devtools,
+            // Focus-gated webview liveness check — recovers from macOS
+            // killing the WKWebView WebContent process during screen lock
+            // (black, dead window until app restart otherwise).
+            commands::webview_health::webview_ready,
+            commands::webview_health::webview_pong,
         ])
         .setup(|app| {
             let main_window = app.get_webview_window("main").unwrap();
@@ -302,6 +314,11 @@ pub fn run() {
             // up through `merged_keymap` so user overrides take effect.
             register_global_shortcuts(app.handle());
 
+            // Must come before `bootstrap_git_watchers` — the watchers take
+            // the service's pulse sender so terminal-driven commits/stages
+            // refresh the sidebar status.
+            bootstrap_status_service(app);
+
             bootstrap_git_watchers(app);
 
             // §7.6 — bring up the hook-event UDS socket and bridge it into
@@ -338,6 +355,11 @@ pub fn run() {
             // Manual sweep button in `top-row.tsx` still works for
             // explicit "something feels off" gestures.
             bootstrap_orphan_reaper(app);
+
+            // Detect a WKWebView whose WebContent process died during
+            // screen lock (wry never surfaces the termination to Tauri)
+            // and reload it instead of leaving a black, dead window.
+            bootstrap_webview_health(app);
 
             // 5-min fd-count probe. Existence of this line in the log
             // turns the next leak repro into "read one number" instead
@@ -532,10 +554,24 @@ fn bootstrap_rehydrate_sessions(app: &mut tauri::App) {
 
     tauri::async_runtime::spawn(async move {
         // 1. Reap stale tmux sessions first so they disappear from
-        // `list_sessions()` before we build the plan.
+        // `list_sessions()` before we build the plan. Protected sessions
+        // (registry, `state/sessions.toml`, persisted active layout —
+        // harnesses AND shells) are exempt: they belong to panes the user
+        // still has in their layout, so age alone must never kill them.
+        // Only untracked leftovers are age-reaped.
+        let keep = {
+            let state: tauri::State<'_, state::AppHandleState> = app_handle.state();
+            match commands::terminal::protected_session_ids(&state) {
+                Ok(ids) => ids,
+                Err(e) => {
+                    warn!(error = %e, "rehydrate: protected-session read failed; skipping reap");
+                    return;
+                }
+            }
+        };
         let killed = match tokio::task::spawn_blocking({
             let tmux = tmux.clone();
-            move || tmux.reap_stale(1)
+            move || tmux.reap_stale(1, &keep)
         })
         .await
         {
@@ -752,6 +788,27 @@ fn bootstrap_orphan_reaper(app: &mut tauri::App) {
     }
 }
 
+/// Focus-gated webview health check. macOS sometimes kills the WKWebView
+/// WebContent process while the screen is locked (suspension + memory/GPU
+/// pressure); wry receives `webViewWebContentProcessDidTerminate:` but
+/// Tauri never registers wry's handler, so the page stays black and dead.
+/// On every `Focused(true)` we ping the page and reload the webview if no
+/// pong arrives — see `commands::webview_health` for the full story.
+/// Registered as a second `on_window_event` handler; Tauri appends
+/// listeners, so this never disturbs the orphan reaper's focus hook.
+fn bootstrap_webview_health(app: &mut tauri::App) {
+    let Some(win) = app.get_webview_window("main") else {
+        warn!("bootstrap_webview_health: main window not found");
+        return;
+    };
+    let handle = app.handle().clone();
+    win.on_window_event(move |event| {
+        if let tauri::WindowEvent::Focused(true) = event {
+            commands::webview_health::on_focus_gained(&handle);
+        }
+    });
+}
+
 /// Run one pass of the orphan reaper. Quiet on the happy path so a
 /// 5-min timer doesn't pollute the log; only logs when sessions were
 /// actually reaped or when the call itself failed.
@@ -772,12 +829,43 @@ async fn run_orphan_reaper(handle: &tauri::AppHandle, trigger: &'static str) {
     }
 }
 
+/// Construct the backend worktree-status service and park it on managed
+/// state. Also registers the window-focus hook that (a) pauses the
+/// service's fallback ticks while the app is backgrounded and (b) triggers
+/// a catch-up recompute on focus gain. Registered as another
+/// `on_window_event` handler — Tauri appends listeners (same pattern as
+/// `bootstrap_orphan_reaper` / `bootstrap_webview_health`).
+fn bootstrap_status_service(app: &mut tauri::App) {
+    let svc = commands::worktree::WorktreeStatusService::new(app.handle().clone());
+    let state: tauri::State<'_, state::AppHandleState> = app.state();
+    if let Ok(mut slot) = state.status_service.lock() {
+        *slot = Some(svc.clone());
+    } else {
+        warn!("bootstrap_status_service: status_service mutex poisoned");
+    }
+
+    if let Some(win) = app.get_webview_window("main") {
+        win.on_window_event(move |event| {
+            if let tauri::WindowEvent::Focused(focused) = event {
+                svc.set_focused(*focused);
+            }
+        });
+    } else {
+        warn!("bootstrap_status_service: main window not found");
+    }
+}
+
 /// Start a `GitHeadWatcher` for every already-registered project so branch
 /// badges refresh automatically after startup. Failures per project are
 /// logged and skipped — a bad repo never blocks launch.
 fn bootstrap_git_watchers(app: &mut tauri::App) {
     let state: tauri::State<'_, state::AppHandleState> = app.state();
     let handle = app.handle().clone();
+    let status_pulse = state
+        .status_service
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|svc| svc.pulse_sender()));
 
     let slugs_and_roots: Vec<(String, std::path::PathBuf)> = {
         let Ok(store) = state.config_store.lock() else {
@@ -805,7 +893,12 @@ fn bootstrap_git_watchers(app: &mut tauri::App) {
         return;
     };
     for (slug, root) in slugs_and_roots {
-        match commands::git_watcher::GitHeadWatcher::start(slug.clone(), &root, handle.clone()) {
+        match commands::git_watcher::GitHeadWatcher::start(
+            slug.clone(),
+            &root,
+            handle.clone(),
+            status_pulse.clone(),
+        ) {
             Ok(w) => {
                 info!(slug = %slug, "git_watcher: started");
                 watchers.insert(slug, w);

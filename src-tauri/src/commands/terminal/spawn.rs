@@ -24,8 +24,8 @@ use super::entry::{
     SpawnArgs, emit_agent_session_removed, emit_terminal_session_removed, shutdown_removed_entry,
 };
 use super::helpers::{
-    clamp_pty_dims, generate_session_id, harness_session_env_pairs, reserve_localhost_port,
-    resolve_spawn_cwd, sanitize_initial_size,
+    clamp_pty_dims, generate_session_id, harness_session_env_pairs, now_unix_millis,
+    reserve_localhost_port, resolve_spawn_cwd, sanitize_initial_size,
 };
 
 /// §3.4 — spawn a new tmux session, wire its output through a PTY-attached
@@ -169,6 +169,32 @@ pub async fn terminal_spawn<R: Runtime>(
     .await
     .map_err(|e| format!("spawn_blocking join: {e}"))?
     .map_err(|e| format!("tmux new-session: {e}"))?;
+
+    // Track shell sessions in `state/sessions.toml` exactly like harness
+    // sessions (whose tracking happens inside the register path below).
+    // Without a tracked row, a shell session that survives an app restart
+    // looks like a leak to the orphan reaper — the window-focus reap fires
+    // the moment the relaunched window appears and kills it before the
+    // frontend can reattach, which is why shell panes came back black.
+    // Every kill path runs `cleanup_harness_session` → `forget_session`,
+    // so rows can't outlive their pane.
+    if args.kind == AgentKind::Shell
+        && let Ok(store) = state.config_store.lock()
+        && let Err(e) = store.upsert_tracked_session(
+            &session_id,
+            AgentKind::Shell,
+            args.project_slug.as_deref(),
+            args.worktree_id.as_deref(),
+            None,
+            now_unix_millis(),
+        )
+    {
+        tracing::warn!(
+            error = %e,
+            session_id = %session_id,
+            "terminal_spawn: tracking shell session failed"
+        );
+    }
 
     if let Some(report) = launch_report.as_ref() {
         let register_result = if opencode_port.is_some() {
