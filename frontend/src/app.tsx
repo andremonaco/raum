@@ -21,6 +21,8 @@ import { loadThemeFromConfig } from "./lib/theme/themeController";
 import { initHomeDir } from "./lib/pathDisplay";
 import { installFileDrop } from "./lib/fileDrop";
 import { installPaneFocusAcknowledger } from "./lib/paneFocusAcknowledger";
+import { installWebviewHealth } from "./lib/webviewHealth";
+import { installBackgroundRendererDemotion } from "./lib/rendererScheduler";
 import { previewOnboarding, setPreviewOnboarding } from "./lib/devOnboardingPreview";
 import { startShellContextPoller } from "./lib/shellContextPoller";
 import { hydrateActiveWorktreeScopes, prewarmAllWorktrees } from "./stores/worktreeStore";
@@ -188,11 +190,29 @@ const App: Component = () => {
         stopFileDrop = unlisten;
       })
       .catch((e) => console.warn("installFileDrop failed", e));
+    // Answer the backend's focus-gated liveness pings so a webview whose
+    // WebContent process died during screen lock gets auto-reloaded
+    // instead of staying black until the app is restarted.
+    let stopWebviewHealth: (() => void) | undefined;
+    void installWebviewHealth()
+      .then((unlisten) => {
+        if (disposed) {
+          unlisten();
+          return;
+        }
+        stopWebviewHealth = unlisten;
+      })
+      .catch((e) => console.warn("installWebviewHealth failed", e));
+    // Shed WebGL contexts while the page is hidden (screen lock) to make
+    // that WebContent kill less likely in the first place.
+    const stopBackgroundDemotion = installBackgroundRendererDemotion();
     const stopShellContextPoller = startShellContextPoller();
     installPaneFocusAcknowledger();
     onCleanup(() => {
       disposed = true;
       stopFileDrop?.();
+      stopWebviewHealth?.();
+      stopBackgroundDemotion();
       stopShellContextPoller();
     });
   });

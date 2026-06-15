@@ -460,6 +460,50 @@ body,
     box-shadow 180ms ease-out;
 }
 
+/* Unread-completed pane chrome — surfaced when the active tab's harness
+   session is in a terminal state (`completed` / `errored`) and the user
+   hasn't acknowledged it yet by focusing/clicking this pane. Mirrors the
+   "needs input" cue from the dock/tabs but at pane scope: a clearly
+   visible green ring with a gentle pulse, so a finished turn registers
+   even when the user is looking at a different pane or window.
+
+   The ring is painted via box-shadow on the chrome layer (which sits
+   above the surface), so xterm pixels aren't disturbed. We compound the
+   `.pane-selected` inset shadow (rather than override it) by also
+   matching `.pane-selected.pane-unread-completed` — focusing a pane
+   acknowledges, so in practice both classes only co-occur for the brief
+   moment before `markAcknowledged` runs; keeping the green wins on
+   precedence regardless. */
+.leaf-frame.pane-unread-completed {
+  box-shadow:
+    inset 0 0 0 2px var(--success),
+    0 0 0 1px color-mix(in oklab, var(--success) 55%, transparent),
+    0 0 18px -4px color-mix(in oklab, var(--success) 60%, transparent);
+  animation: pane-unread-pulse 2.4s ease-in-out infinite;
+}
+
+@keyframes pane-unread-pulse {
+  0%,
+  100% {
+    box-shadow:
+      inset 0 0 0 2px color-mix(in oklab, var(--success) 85%, transparent),
+      0 0 0 1px color-mix(in oklab, var(--success) 45%, transparent),
+      0 0 14px -4px color-mix(in oklab, var(--success) 50%, transparent);
+  }
+  50% {
+    box-shadow:
+      inset 0 0 0 2px var(--success),
+      0 0 0 1px color-mix(in oklab, var(--success) 70%, transparent),
+      0 0 22px -4px color-mix(in oklab, var(--success) 75%, transparent);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .leaf-frame.pane-unread-completed {
+    animation: none;
+  }
+}
+
 /* Cross-harness review linked-pane state. The structural signal lives
    in `<ReviewBracesLayer>` (an oval chip floating at the shared edge of
    adjacent linked panes); these rules add the supporting "they're one
