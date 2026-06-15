@@ -1,7 +1,7 @@
 /**
- * §9 — thin Tauri-command wrappers for git staging actions plus the
- * shell-quoting helpers that turn a multi-line commit draft into a
- * `git commit -m '…'` invocation.
+ * §9 — thin Tauri-command wrappers for git staging actions, commit history,
+ * and the worktree file browser, plus the shell-quoting helpers that turn a
+ * multi-line commit draft into a `git commit -m '…'` invocation.
  *
  * `shellQuote` and `buildCommitCommand` are exported for unit tests; the
  * sidebar barrel re-exports them from `./components/sidebar` so the test
@@ -9,6 +9,9 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
+
+import type { DirEntry } from "../../lib/fileTreeModel";
+import type { FileChangeKind } from "../../stores/worktreeStore";
 
 // ---- Tauri command wrappers -----------------------------------------------
 
@@ -26,6 +29,53 @@ export async function gitDiscard(worktreePath: string, files: string[]): Promise
 
 export async function gitDiscardAll(worktreePath: string): Promise<void> {
   await invoke<void>("git_discard_all", { worktreePath });
+}
+
+// ---- Commit history (read-only) -------------------------------------------
+
+/** One commit row from `git_log`. */
+export interface CommitInfo {
+  hash: string;
+  shortHash: string;
+  author: string;
+  /** Unix epoch seconds. */
+  timestamp: number;
+  subject: string;
+  /** Reachable from HEAD but not from upstream. Always false without an
+   *  upstream. */
+  unpushed: boolean;
+}
+
+/** One changed file of a commit — like `FileChange` minus `staged`. */
+export interface CommitFileChange {
+  path: string;
+  origPath: string | null;
+  kind: FileChangeKind;
+  insertions: number | null;
+  deletions: number | null;
+}
+
+export async function gitLog(
+  worktreePath: string,
+  skip: number,
+  limit: number,
+): Promise<CommitInfo[]> {
+  return invoke<CommitInfo[]>("git_log", { worktreePath, skip, limit });
+}
+
+export async function gitCommitFiles(
+  worktreePath: string,
+  hash: string,
+): Promise<CommitFileChange[]> {
+  return invoke<CommitFileChange[]>("git_commit_files", { worktreePath, hash });
+}
+
+// ---- File browser ----------------------------------------------------------
+
+/** List one directory level of a worktree (lazy tree expansion). Root is
+ *  `relPath: ""`. `.git` and OS noise are filtered backend-side. */
+export async function worktreeListDir(worktreePath: string, relPath: string): Promise<DirEntry[]> {
+  return invoke<DirEntry[]>("worktree_list_dir", { worktreePath, relPath });
 }
 
 /** Wrap a string in POSIX single quotes, escaping embedded single quotes.

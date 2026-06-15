@@ -10,7 +10,12 @@
 import { Component, For, Show, createEffect, createMemo, createSignal } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "solid-sonner";
-import { clearWorktreeListCache, type Worktree } from "../stores/worktreeStore";
+import {
+  EMPTY_WORKTREE_STATUS,
+  clearWorktreeListCache,
+  type Worktree,
+  type WorktreeStatus,
+} from "../stores/worktreeStore";
 import { idsByWorktreeId, terminalStore, type TerminalRecord } from "../stores/terminalStore";
 import { createOperationProgress } from "../lib/operationProgress";
 import {
@@ -33,19 +38,6 @@ import {
   DialogPortal,
   DialogTitle,
 } from "./ui/dialog";
-
-interface WorktreeStatus {
-  dirty: boolean;
-  untracked: string[];
-  modified: string[];
-  staged: string[];
-  insertions: number;
-  deletions: number;
-  upstream: string | null;
-  ahead: number;
-  behind: number;
-  stashCount: number;
-}
 
 interface BranchMergeStatus {
   mergedInto: string[];
@@ -99,21 +91,6 @@ const REMOVE_STEPS = [
   { id: "rescan", label: "Refreshing git status" },
 ] as const;
 
-function emptyStatus(): WorktreeStatus {
-  return {
-    dirty: false,
-    untracked: [],
-    modified: [],
-    staged: [],
-    insertions: 0,
-    deletions: 0,
-    upstream: null,
-    ahead: 0,
-    behind: 0,
-    stashCount: 0,
-  };
-}
-
 export const DeleteWorktreeModal: Component<DeleteWorktreeModalProps> = (props) => {
   const [status, setStatus] = createSignal<WorktreeStatus | null>(null);
   const [mergeStatus, setMergeStatus] = createSignal<BranchMergeStatus | null>(null);
@@ -133,8 +110,9 @@ export const DeleteWorktreeModal: Component<DeleteWorktreeModalProps> = (props) 
   const changedFileCount = () => {
     const s = status();
     if (!s) return 0;
-    const files = new Set<string>([...s.untracked, ...s.modified, ...s.staged]);
-    return files.size;
+    // A path with both staged and unstaged changes appears twice in
+    // `changes` — count unique paths.
+    return new Set(s.changes.map((c) => c.path)).size;
   };
 
   const upstream = () => status()?.upstream ?? null;
@@ -175,7 +153,7 @@ export const DeleteWorktreeModal: Component<DeleteWorktreeModalProps> = (props) 
         const s = await invoke<WorktreeStatus>("worktree_status", { path });
         setStatus(s);
       } catch {
-        setStatus(emptyStatus());
+        setStatus(EMPTY_WORKTREE_STATUS);
       }
     })();
 

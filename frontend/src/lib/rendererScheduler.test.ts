@@ -25,6 +25,8 @@ vi.mock("@xterm/addon-canvas", () => {
 
 import {
   MAX_WEBGL_PANES,
+  demoteAllForBackground,
+  endBackgroundDemotion,
   registerPane,
   requestWebgl,
   snapshot,
@@ -83,5 +85,51 @@ describe("rendererScheduler", () => {
     registerPane("x", fakeTerminal());
     unregisterPane("x");
     expect(snapshot().find((s) => s.paneId === "x")).toBeUndefined();
+  });
+
+  it("background demotion releases WebGL and re-promotes on return", async () => {
+    registerPane("a", fakeTerminal());
+    registerPane("b", fakeTerminal());
+    await requestWebgl("a");
+    await requestWebgl("b");
+
+    demoteAllForBackground();
+    expect(snapshot().every((s) => s.renderer === "canvas")).toBe(true);
+
+    await endBackgroundDemotion();
+    const byId = new Map(snapshot().map((s) => [s.paneId, s]));
+    expect(byId.get("a")?.renderer).toBe("webgl");
+    expect(byId.get("b")?.renderer).toBe("webgl");
+  });
+
+  it("background demotion is not a context loss — forbidWebgl stays clear", async () => {
+    registerPane("a", fakeTerminal());
+    await requestWebgl("a");
+    demoteAllForBackground();
+    await endBackgroundDemotion();
+    expect(snapshot().find((s) => s.paneId === "a")?.forbidWebgl).toBe(false);
+  });
+
+  it("requestWebgl is a no-op while backgrounded", async () => {
+    registerPane("a", fakeTerminal());
+    demoteAllForBackground();
+    await requestWebgl("a");
+    expect(snapshot().find((s) => s.paneId === "a")?.renderer).toBe("canvas");
+    await endBackgroundDemotion();
+    await requestWebgl("a");
+    expect(snapshot().find((s) => s.paneId === "a")?.renderer).toBe("webgl");
+  });
+
+  it("re-promotion skips canvas-only panes and untouched ones", async () => {
+    registerPane("webgl-pane", fakeTerminal());
+    registerPane("canvas-pane", fakeTerminal());
+    await requestWebgl("webgl-pane");
+
+    demoteAllForBackground();
+    await endBackgroundDemotion();
+
+    const byId = new Map(snapshot().map((s) => [s.paneId, s]));
+    expect(byId.get("webgl-pane")?.renderer).toBe("webgl");
+    expect(byId.get("canvas-pane")?.renderer).toBe("canvas");
   });
 });

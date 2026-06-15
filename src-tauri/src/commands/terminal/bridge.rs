@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use raum_core::AgentKind;
 use raum_core::harness::codex::{Osc9Parser, classify_osc9_payload};
 use raum_core::harness::{NotificationKind, Reliability};
-use raum_tmux::{PaneSnapshot, PtyBridgeHandle, TmuxManager, attach_via_pty};
+use raum_tmux::{PaneSnapshot, TerminalBridge, TmuxManager, attach_via_control, attach_via_pty};
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tokio::sync::mpsc;
@@ -177,7 +177,7 @@ pub(super) async fn open_bridge_and_monitor<R: Runtime>(
     session_activity: SessionActivityMap,
     channel_event_tx: Option<mpsc::Sender<raum_hooks::HookEvent>>,
     pane_context_dirty_tx: Option<tokio::sync::mpsc::Sender<()>>,
-) -> Result<(PtyBridgeHandle, Arc<AtomicBool>), String> {
+) -> Result<(TerminalBridge, Arc<AtomicBool>), String> {
     let bridge_output_cancelled = Arc::new(AtomicBool::new(false));
     let output_cancel_for_data = bridge_output_cancelled.clone();
     let channel_for_data = on_data.clone();
@@ -209,76 +209,95 @@ pub(super) async fn open_bridge_and_monitor<R: Runtime>(
     let mgr_for_attach = tmux.clone();
     let id_for_attach = session_id.clone();
     let bridge = tokio::task::spawn_blocking(move || {
-        attach_via_pty(
-            &mgr_for_attach,
-            &id_for_attach,
-            cols,
-            rows,
-            Box::new(move |bytes| {
-                if output_cancel_for_data.load(Ordering::SeqCst) {
-                    return false;
-                }
-                if let (Some(parser), Some(tx)) = (osc9_parser.as_mut(), channel_event_tx.as_ref())
-                {
-                    for payload in parser.feed(&bytes) {
-                        if let Some(kind) = classify_osc9_payload(&payload) {
-                            forward_codex_osc9_event(&activity_session_id, tx, kind, payload);
-                        }
+        let on_data: raum_tmux::DataSink = Box::new(move |bytes| {
+            if output_cancel_for_data.load(Ordering::SeqCst) {
+                return false;
+            }
+            if let (Some(parser), Some(tx)) = (osc9_parser.as_mut(), channel_event_tx.as_ref()) {
+                for payload in parser.feed(&bytes) {
+                    if let Some(kind) = classify_osc9_payload(&payload) {
+                        forward_codex_osc9_event(&activity_session_id, tx, kind, payload);
                     }
                 }
-                // Tap the output stream so the silence-heuristic tick
-                // (commands::agent::spawn_silence_tick) can flip a
-                // `Working` machine to `Waiting` after the coalesced
-                // stream goes quiet, even when hooks never fire.
-                if let Ok(mut map) = activity_for_data.lock() {
-                    map.insert(activity_session_id.clone(), Instant::now());
-                }
-                if let Some(tx) = pane_context_dirty_for_data.as_ref() {
-                    let _ = tx.try_send(());
-                }
-                // Fail-loud send: if the WebView's `Channel<Raw>` is gone
-                // (component unmount, page reload, app shutdown), the
-                // previous `.is_ok()` swallowed the byte and ground on
-                // silently — making "lost output" reports impossible to
-                // diagnose. Now we log + emit `terminal:bridge-lost`
-                // (mirroring the on_exit path) and return false so the
-                // PTY bridge tears down cleanly.
-                if let Err(err) = channel_for_data.send(InvokeResponseBody::Raw(bytes)) {
-                    tracing::warn!(
-                        session_id = %data_session_id_for_lost,
-                        error = %err,
-                        "pty bridge: channel send failed, terminating",
-                    );
-                    let _ = data_app.emit(
-                        "terminal:bridge-lost",
-                        serde_json::json!({
-                            "sessionId": &data_session_id_for_lost,
-                            "exitCode": serde_json::Value::Null,
-                        }),
-                    );
-                    return false;
-                }
-                true
-            }),
-            Box::new(move |exit_code| {
-                // Attached client exited unexpectedly — the bridge wasn't
-                // silenced via `shutdown_silent`, so this is an outer PTY /
-                // tmux-client failure, not proof that the inner shell or
-                // harness exited. Keep this distinct from
-                // `terminal:process-exited`; the frontend can reattach this
-                // pane in place when the tmux session is still alive.
-                let _ = exit_app.emit(
-                    "terminal:bridge-lost",
-                    serde_json::json!({ "sessionId": &exit_id, "exitCode": exit_code }),
+            }
+            // Tap the output stream so the silence-heuristic tick
+            // (commands::agent::spawn_silence_tick) can flip a
+            // `Working` machine to `Waiting` after the coalesced
+            // stream goes quiet, even when hooks never fire.
+            if let Ok(mut map) = activity_for_data.lock() {
+                map.insert(activity_session_id.clone(), Instant::now());
+            }
+            if let Some(tx) = pane_context_dirty_for_data.as_ref() {
+                let _ = tx.try_send(());
+            }
+            // Fail-loud send: if the WebView's `Channel<Raw>` is gone
+            // (component unmount, page reload, app shutdown), the
+            // previous `.is_ok()` swallowed the byte and ground on
+            // silently — making "lost output" reports impossible to
+            // diagnose. Now we log + emit `terminal:bridge-lost`
+            // (mirroring the on_exit path) and return false so the
+            // PTY bridge tears down cleanly.
+            if let Err(err) = channel_for_data.send(InvokeResponseBody::Raw(bytes)) {
+                tracing::warn!(
+                    session_id = %data_session_id_for_lost,
+                    error = %err,
+                    "terminal bridge: channel send failed, terminating",
                 );
-            }),
-        )
+                let _ = data_app.emit(
+                    "terminal:bridge-lost",
+                    serde_json::json!({
+                        "sessionId": &data_session_id_for_lost,
+                        "exitCode": serde_json::Value::Null,
+                    }),
+                );
+                return false;
+            }
+            true
+        });
+        let on_exit: raum_tmux::ExitSink = Box::new(move |exit_code| {
+            // Attached client exited unexpectedly — the bridge wasn't
+            // silenced via `shutdown_silent`, so this is an outer tmux-client
+            // failure, not proof that the inner shell or harness exited.
+            // Keep this distinct from `terminal:process-exited`; the
+            // frontend can reattach this pane in place when the tmux session
+            // is still alive.
+            let _ = exit_app.emit(
+                "terminal:bridge-lost",
+                serde_json::json!({ "sessionId": &exit_id, "exitCode": exit_code }),
+            );
+        });
+        if control_transport_enabled() {
+            attach_via_control(&mgr_for_attach, &id_for_attach, rows, on_data, on_exit)
+                .map(TerminalBridge::Control)
+                .map_err(|e| format!("control attach: {e}"))
+        } else {
+            attach_via_pty(
+                &mgr_for_attach,
+                &id_for_attach,
+                cols,
+                rows,
+                on_data,
+                on_exit,
+            )
+            .map(TerminalBridge::Pty)
+            .map_err(|e| format!("pty attach: {e}"))
+        }
     })
     .await
-    .map_err(|e| format!("spawn_blocking join: {e}"))?
-    .map_err(|e| format!("pty attach: {e}"))?;
+    .map_err(|e| format!("spawn_blocking join: {e}"))??;
 
     Ok((bridge, bridge_output_cancelled))
+}
+
+/// Whether new bridges use the lossless control-mode transport (the
+/// default). `RAUM_TERMINAL_TRANSPORT=pty` reverts to the legacy PTY-wrapped
+/// rendered client — kept as an escape hatch while control mode bakes.
+///
+/// The control transport paints its own initial frame in-band (an
+/// escape-preserving capture replayed before live output), so callers that
+/// would otherwise pre-send a snapshot replay must skip it when this is on.
+pub(super) fn control_transport_enabled() -> bool {
+    std::env::var("RAUM_TERMINAL_TRANSPORT").map_or(true, |v| !v.eq_ignore_ascii_case("pty"))
 }
 
 /// Pane-death monitor: polls tmux every 300 ms for natural process exit so we

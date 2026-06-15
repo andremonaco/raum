@@ -1,6 +1,7 @@
 import { Component, Show, createMemo, onCleanup, onMount } from "solid-js";
 
 import { type AgentKind } from "../../lib/agentKind";
+import { agentStore, isAcknowledgedReactive, markAcknowledged } from "../../stores/agentStore";
 import { dropPreviewPaths, dropTargetPaneId } from "../../lib/fileDrop";
 import { ROOT_TARGET, dragState } from "../../lib/paneDnD";
 import {
@@ -35,6 +36,17 @@ export const LeafFrame: Component<{ cell: RuntimeCell; maximizedPaneId: string |
 
   function onFocusCapture(): void {
     setFocusedPaneId(props.cell.id);
+    // Mirror of `claimFocus` in surfaces.tsx — covers clicks landing on
+    // the chrome layer (tabs, header chrome). Acknowledges any unread
+    // completion on the active tab so re-clicking the already-focused
+    // pane still clears the green chrome.
+    const activeTab = props.cell.tabs.find((t) => t.id === props.cell.activeTabId);
+    const sessionId = activeTab?.sessionId;
+    if (!sessionId) return;
+    const state = agentStore.sessions[sessionId]?.state;
+    if (state === "completed" || state === "errored") {
+      markAcknowledged(sessionId);
+    }
   }
 
   let cellRef: HTMLDivElement | undefined;
@@ -110,6 +122,20 @@ export const LeafFrame: Component<{ cell: RuntimeCell; maximizedPaneId: string |
       props.cell.activeTabId === dropTargetPaneId(),
   );
 
+  // Whether the *currently active* session in this pane has finished
+  // its turn without the user having acknowledged it yet. Drives the
+  // green `pane-unread-completed` chrome — a clearly visible green
+  // ring on the pane itself, mirroring the "needs input" pattern but
+  // for completed turns. Cleared by `onFocusCapture` (or the surface
+  // layer's `claimFocus`) the next time the user clicks/focuses here.
+  const isUnreadCompleted = createMemo(() => {
+    const sid = activeSession();
+    if (!sid) return false;
+    const state = agentStore.sessions[sid]?.state;
+    if (state !== "completed" && state !== "errored") return false;
+    return !isAcknowledgedReactive(sid);
+  });
+
   return (
     <div
       ref={(el) => {
@@ -129,6 +155,7 @@ export const LeafFrame: Component<{ cell: RuntimeCell; maximizedPaneId: string |
         "pane-max-anim-target": isMaxAnimTarget(),
         "pane-review-linked": isLinked(),
         "pane-review-snap-target": isReviewSnapTarget(),
+        "pane-unread-completed": isUnreadCompleted(),
         "file-drop-target": isFileDropTarget(),
       }}
       style={style()}

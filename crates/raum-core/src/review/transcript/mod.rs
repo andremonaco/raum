@@ -4,10 +4,10 @@
 //! form — Claude Code's `~/.claude/projects/<encoded-cwd>/<session>.jsonl`,
 //! Codex's `~/.codex/sessions/...` rollouts, OpenCode's HTTP-fronted store.
 //! This module is raum's single primitive for reading **user prompts** out
-//! of those files, used by both:
-//!
-//!   * the cross-harness review brief (full chronological list)
-//!   * the snap overlay (just the first prompt)
+//! of those files. It powers the prompt-overlay banner and the cross-harness
+//! review snap overlay (the original "Task" — just the first prompt). The
+//! review brief itself no longer replays prompts; it points the reviewer at
+//! the session log on disk instead (see [`discover_transcript_path`]).
 //!
 //! The primitive returns Vec<String> in chronological order. Anything we
 //! can't read (file missing, format changed, harness uses HTTP) is

@@ -1,14 +1,18 @@
-//! Per-project `.git/HEAD` watcher. Emits `worktree-branches-changed` so the
-//! UI refreshes branch badges without polling.
+//! Per-project `.git/HEAD` + index watcher. Emits `worktree-branches-changed`
+//! on HEAD touches so the UI refreshes branch badges without polling, and
+//! forwards both HEAD and index touches to the worktree status service so
+//! commits/stages typed into a pane terminal refresh the sidebar promptly.
 //!
 //! Watches `<root>/.git/` (main project) plus every
 //! `<root>/.git/worktrees/*/` (linked worktrees) non-recursively, filtering
-//! notify events by filename to only pulse on HEAD touches. We watch the
-//! *directory* rather than the HEAD file itself because git rewrites HEAD
-//! with an atomic rename — on macOS FSEvents this invalidates per-file
-//! watches after the first checkout, so subsequent branch switches were
-//! silent. Dir inodes stay stable across the rename. FS events are coalesced
-//! inside a debounce window before a single event is emitted to the webview.
+//! notify events by filename to only pulse on HEAD or `index` touches
+//! (`index.lock` is deliberately ignored — it churns while git is *working*;
+//! the rename onto `index` is the done signal). We watch the *directory*
+//! rather than the HEAD file itself because git rewrites HEAD with an atomic
+//! rename — on macOS FSEvents this invalidates per-file watches after the
+//! first checkout, so subsequent branch switches were silent. Dir inodes
+//! stay stable across the rename. FS events are coalesced inside a debounce
+//! window before a single event is emitted to the webview.
 //!
 //! The watcher self-heals under fd pressure. When the FSEvents stream starts
 //! returning errors (typically `EMFILE` once the rest of the app exhausts
@@ -36,6 +40,15 @@ use tracing::{debug, info, warn};
 /// Git checkout writes multiple files (HEAD, index, packed-refs) in quick
 /// succession. Coalesce the burst so we emit one frontend event per switch.
 const DEBOUNCE: Duration = Duration::from_millis(150);
+
+/// What a filtered notify event touched. `Head` identifies a branch switch
+/// (emits `worktree-branches-changed` + status pulse); `Index` is a
+/// commit/stage/reset from any git client (status pulse only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PulseKind {
+    Head,
+    Index,
+}
 
 /// Minimum time between identical-error WARN emissions per (slug, error)
 /// pair. Anything inside the window increments a `suppressed` counter that
@@ -117,7 +130,7 @@ pub struct GitHeadWatcher {
     /// Dropping this end closes the channel and shuts down the debounce
     /// task. The supervisor holds a clone for handing to rebuilt watchers;
     /// once the abort lands those clones are released too.
-    _pulse_tx: mpsc::UnboundedSender<()>,
+    _pulse_tx: mpsc::UnboundedSender<PulseKind>,
     inner: Arc<Mutex<Inner>>,
 }
 
@@ -132,8 +145,18 @@ impl GitHeadWatcher {
     /// the OS refuses to create a watcher at all; individual path watch
     /// failures are logged and skipped so a missing worktree HEAD never
     /// blocks startup.
-    pub fn start<R: Runtime>(slug: String, root: &Path, app: AppHandle<R>) -> notify::Result<Self> {
-        let (pulse_tx, mut pulse_rx) = mpsc::unbounded_channel::<()>();
+    ///
+    /// `status_pulse`: optional sender into the worktree status service
+    /// (payload: this watcher's slug). Both HEAD and index touches forward
+    /// there after the debounce; `None` (service bootstrap failed) degrades
+    /// to branch-badge events only.
+    pub fn start<R: Runtime>(
+        slug: String,
+        root: &Path,
+        app: AppHandle<R>,
+        status_pulse: Option<mpsc::UnboundedSender<String>>,
+    ) -> notify::Result<Self> {
+        let (pulse_tx, mut pulse_rx) = mpsc::unbounded_channel::<PulseKind>();
         let error_state = Arc::new(Mutex::new(ErrorRateMap::default()));
         let health = Arc::new(Mutex::new(HealthState::default()));
 
@@ -153,24 +176,34 @@ impl GitHeadWatcher {
 
         // Debounce + emit task. Coalesce a burst of git activity (HEAD,
         // index, packed-refs touched in rapid succession during a
-        // checkout) into a single frontend event per switch.
+        // checkout) into a single frontend event per switch. HEAD touches
+        // emit the branch event; both kinds forward one status pulse.
         let emit_slug = slug.clone();
         let emit_app = app.clone();
         tauri::async_runtime::spawn(async move {
-            while pulse_rx.recv().await.is_some() {
+            while let Some(first) = pulse_rx.recv().await {
+                let mut saw_head = first == PulseKind::Head;
                 let deadline = tokio::time::Instant::now() + DEBOUNCE;
                 loop {
                     tokio::select! {
                         maybe = pulse_rx.recv() => {
-                            if maybe.is_none() { return; }
+                            match maybe {
+                                Some(kind) => saw_head |= kind == PulseKind::Head,
+                                None => return,
+                            }
                         }
                         () = tokio::time::sleep_until(deadline) => break,
                     }
                 }
-                if let Err(e) =
-                    emit_app.emit("worktree-branches-changed", json!({ "slug": emit_slug }))
-                {
-                    warn!(slug = %emit_slug, error = %e, "worktree-branches-changed emit failed");
+                if saw_head {
+                    if let Err(e) =
+                        emit_app.emit("worktree-branches-changed", json!({ "slug": emit_slug }))
+                    {
+                        warn!(slug = %emit_slug, error = %e, "worktree-branches-changed emit failed");
+                    }
+                }
+                if let Some(tx) = &status_pulse {
+                    let _ = tx.send(emit_slug.clone());
                 }
             }
         });
@@ -239,14 +272,14 @@ impl GitHeadWatcher {
 }
 
 /// Build a `RecommendedWatcher` and watch every dir from
-/// `discover_watch_dirs(root)`. The closure forwards HEAD-touch pulses to
-/// the debounce task, updates `health` for the supervisor, and routes
-/// errors through the rate-limited reporter. Used by both initial start
-/// and the supervisor's rebuild path so the two paths can't drift.
+/// `discover_watch_dirs(root)`. The closure classifies HEAD/index touches
+/// into pulses for the debounce task, updates `health` for the supervisor,
+/// and routes errors through the rate-limited reporter. Used by both initial
+/// start and the supervisor's rebuild path so the two paths can't drift.
 fn build_watcher(
     slug: String,
     root: &Path,
-    pulse_tx: mpsc::UnboundedSender<()>,
+    pulse_tx: mpsc::UnboundedSender<PulseKind>,
     error_state: Arc<Mutex<ErrorRateMap>>,
     health: Arc<Mutex<HealthState>>,
 ) -> notify::Result<(RecommendedWatcher, HashSet<PathBuf>)> {
@@ -264,9 +297,12 @@ fn build_watcher(
                 if matches!(
                     ev.kind,
                     EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
-                ) && event_touches_head(&ev)
-                {
-                    let _ = cb_pulse.send(());
+                ) {
+                    if event_touches_head(&ev) {
+                        let _ = cb_pulse.send(PulseKind::Head);
+                    } else if event_touches_index(&ev) {
+                        let _ = cb_pulse.send(PulseKind::Index);
+                    }
                 }
             }
             Err(e) => {
@@ -344,7 +380,7 @@ fn emit_rate_limited_error(state: &Arc<Mutex<ErrorRateMap>>, slug: &str, err: &n
 async fn supervise_watcher(
     slug: String,
     inner: Arc<Mutex<Inner>>,
-    pulse_tx: mpsc::UnboundedSender<()>,
+    pulse_tx: mpsc::UnboundedSender<PulseKind>,
     error_state: Arc<Mutex<ErrorRateMap>>,
     health: Arc<Mutex<HealthState>>,
 ) {
@@ -471,6 +507,17 @@ fn event_touches_head(ev: &notify::Event) -> bool {
         .any(|p| p.file_name().is_some_and(|n| n == "HEAD"))
 }
 
+/// True when any of the event's paths points at a file named exactly
+/// `index` — a commit/stage/reset finished (git renames the new index into
+/// place). `index.lock` is deliberately excluded: it churns while git is
+/// still working, and our own status recomputes run with
+/// `GIT_OPTIONAL_LOCKS=0` so they never touch either file.
+fn event_touches_index(ev: &notify::Event) -> bool {
+    ev.paths
+        .iter()
+        .any(|p| p.file_name().is_some_and(|n| n == "index"))
+}
+
 /// Resolve `<root>/.git` to its actual directory. A plain `.git` directory is
 /// returned as-is; a `.git` file (submodule / linked worktree edge case) is
 /// parsed for its `gitdir:` pointer.
@@ -557,6 +604,15 @@ mod tests {
             notify::event::DataChange::Any,
         )))
         .add_path(PathBuf::from("/repo/.git/index"));
+        assert!(!event_touches_head(&ev));
+        assert!(event_touches_index(&ev));
+    }
+
+    #[test]
+    fn event_touches_index_ignores_lock_file() {
+        let ev = notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
+            .add_path(PathBuf::from("/repo/.git/index.lock"));
+        assert!(!event_touches_index(&ev));
         assert!(!event_touches_head(&ev));
     }
 

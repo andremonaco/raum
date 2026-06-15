@@ -254,6 +254,36 @@ pub async fn terminal_reattach<R: Runtime>(
             tracked_worktree_id.as_deref(),
         ),
     );
+    // Shell sessions are tracked in `state/sessions.toml` like harnesses so
+    // the orphan/stale reapers never mistake them for leaks (see
+    // `terminal_spawn`). Re-upserting here migrates shells spawned before
+    // tracking existed and self-heals a row lost to a partial cleanup —
+    // `upsert_tracked_session` is write-once on metadata, so repeat calls
+    // are harmless.
+    if matches!(args.kind, AgentKind::Shell) {
+        let created_at_unix_ms = existing_item
+            .as_ref()
+            .map(|item| item.created_unix)
+            .or_else(|| promoted_ghost.as_ref().map(|ghost| ghost.created_unix))
+            .map_or_else(now_unix_millis, |secs| secs * 1000);
+        if let Ok(store) = state.config_store.lock()
+            && let Err(e) = store.upsert_tracked_session(
+                &session_id,
+                AgentKind::Shell,
+                effective_project_slug.as_deref(),
+                effective_worktree_id.as_deref(),
+                None,
+                created_at_unix_ms,
+            )
+        {
+            tracing::warn!(
+                error = %e,
+                session_id = %session_id,
+                "terminal_reattach: tracking shell session failed"
+            );
+        }
+    }
+
     let (cols, rows) = match args.cols.zip(args.rows) {
         Some((c, r)) => clamp_pty_dims(c, r),
         None => (200, 50),
@@ -403,7 +433,12 @@ pub async fn terminal_reattach<R: Runtime>(
             ),
         }
 
-        if !resume_after_attach {
+        if !resume_after_attach && !super::bridge::control_transport_enabled() {
+            // PTY transport only — the control bridge paints its own initial
+            // frame in-band (escape-preserving capture, replayed exactly
+            // before live output starts), so a pre-attach replay here would
+            // double-paint the viewport.
+            //
             // View-only capture: only the recent visible viewport at the
             // current width. Full-history replay would ship tmux's
             // mixed-width scrollback into the fresh xterm.

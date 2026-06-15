@@ -28,11 +28,38 @@ export interface Worktree {
   baseBranch: string | null;
 }
 
+/** Classified status of one changed file (porcelain v2 XY codes). Mirrors
+ *  the backend `FileChangeKind` serde camelCase encoding. */
+export type FileChangeKind =
+  | "modified"
+  | "added"
+  | "deleted"
+  | "renamed"
+  | "untracked"
+  | "conflicted"
+  | "typeChange";
+
+/** One changed file in a worktree. A path with both index and worktree
+ *  changes appears twice — once `staged: true`, once `staged: false`. */
+export interface FileChange {
+  /** Worktree-relative path (the *new* path for renames). */
+  path: string;
+  /** Original path for renames/copies; null otherwise. */
+  origPath: string | null;
+  kind: FileChangeKind;
+  staged: boolean;
+  /** Lines added/removed vs HEAD; null for binary/untracked files. */
+  insertions: number | null;
+  deletions: number | null;
+}
+
 export interface WorktreeStatus {
   dirty: boolean;
-  untracked: string[];
-  modified: string[];
-  staged: string[];
+  /** Per-file entries, staged and unstaged interleaved (filter on `staged`).
+   *  Capped backend-side at 1000 — see `truncated`. */
+  changes: FileChange[];
+  /** True when `changes` was capped; `dirty` and the totals stay truthful. */
+  truncated: boolean;
   insertions: number;
   deletions: number;
   upstream: string | null;
@@ -43,9 +70,8 @@ export interface WorktreeStatus {
 
 export const EMPTY_WORKTREE_STATUS: WorktreeStatus = Object.freeze({
   dirty: false,
-  untracked: [],
-  modified: [],
-  staged: [],
+  changes: [],
+  truncated: false,
   insertions: 0,
   deletions: 0,
   upstream: null,
@@ -265,5 +291,74 @@ export async function subscribeWorktreeBranchEvents(): Promise<UnlistenFn> {
   return listen<{ slug: string }>("worktree-branches-changed", (ev) => {
     const { slug } = ev.payload;
     void refreshWorktreeList(slug);
+  });
+}
+
+/**
+ * Subscribe to backend `worktree-status-changed` pushes — the status
+ * service's per-worktree recomputes land here (seed on subscribe, then only
+ * actual diffs). One global listener feeds the same `worktreeStatusByPath`
+ * signal the one-shot fetches use, so consumers don't care where a status
+ * came from.
+ */
+export async function subscribeWorktreeStatusEvents(): Promise<UnlistenFn> {
+  return listen<{ path: string; status: WorktreeStatus }>("worktree-status-changed", (ev) => {
+    const { path, status } = ev.payload;
+    setWorktreeStatusByPath((prev) => ({ ...prev, [path]: status }));
+  });
+}
+
+/**
+ * Refcounted registry of worktree paths whose status should stream from the
+ * backend. Rows retain on mount and release on cleanup; every change pushes
+ * the FULL set via `worktree_status_subscribe` (declarative reconciliation —
+ * the backend spawns/aborts watch tasks to match, so a missed release can
+ * never leak a hidden polling task once the next push corrects the set).
+ */
+const statusStreamRefs = new Map<string, number>();
+let statusSubscribePushPending = false;
+
+function pushStatusSubscriptions(): void {
+  if (statusSubscribePushPending) return;
+  statusSubscribePushPending = true;
+  queueMicrotask(() => {
+    statusSubscribePushPending = false;
+    const paths = [...statusStreamRefs.keys()];
+    void invoke("worktree_status_subscribe", { paths }).catch(() => {
+      /* Tauri context unavailable (tests), or backend too old —
+         status then degrades to one-shot fetches. */
+    });
+  });
+}
+
+export function retainWorktreeStatusStream(path: string): void {
+  if (path.length === 0) return;
+  const refs = statusStreamRefs.get(path) ?? 0;
+  statusStreamRefs.set(path, refs + 1);
+  if (refs === 0) pushStatusSubscriptions();
+}
+
+export function releaseWorktreeStatusStream(path: string): void {
+  const refs = statusStreamRefs.get(path) ?? 0;
+  if (refs > 1) {
+    statusStreamRefs.set(path, refs - 1);
+    return;
+  }
+  if (statusStreamRefs.delete(path)) pushStatusSubscriptions();
+}
+
+/**
+ * Forget a worktree entirely — cache entry, loading flag, and any remaining
+ * stream refcount. Called after delete/unlink so the dead path neither
+ * lingers in memory nor keeps a backend watch task alive.
+ */
+export function pruneWorktreeStatus(path: string): void {
+  if (statusStreamRefs.delete(path)) pushStatusSubscriptions();
+  setStatusLoading([path], false);
+  setWorktreeStatusByPath((prev) => {
+    if (!(path in prev)) return prev;
+    const next = { ...prev };
+    delete next[path];
+    return next;
   });
 }

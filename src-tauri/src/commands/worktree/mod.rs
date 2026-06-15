@@ -15,9 +15,14 @@
 //! * `worktree_remove` — remove a worktree.
 //! * `worktree_config_write` — save a TOML fragment either into the project's
 //!   `.raum.toml` (if `in_repo`) or into the user-level `project.toml`.
-//! * `worktree_status` — §9.1 poll `git status --porcelain=v2` for a worktree
-//!   and return a classified `{dirty, untracked, modified, staged}` snapshot
-//!   used by the sidebar dirty indicator and the Open/Staged file groups.
+//! * `worktree_status` — §9.1 one-shot `git status --porcelain=v2 -z`
+//!   snapshot with per-file [`types::FileChange`] entries. Live updates flow
+//!   through `worktree_status_subscribe` + the `worktree-status-changed`
+//!   event instead (see `status_service`).
+//! * `git_log` / `git_commit_files` / `git_diff_commit` — read-only commit
+//!   history for the sidebar's History tab (see `history`).
+//! * `worktree_list_dir` — lazy directory listing for the sidebar's
+//!   per-worktree file browser (see `browse`).
 //! * `quickfire_history_get` / `quickfire_history_push` — §9.6 persist the
 //!   bounded ring of recent quick-fire commands in
 //!   `~/.config/raum/state/quickfire-history.toml`.
@@ -25,14 +30,18 @@
 //!   into `config.toml.sidebar.width_px` (debounced client-side).
 
 mod branches;
+mod browse;
 mod config_io;
 mod create;
 mod git_ops;
+mod git_parse;
+mod history;
 mod merge;
 mod preview;
 mod remove;
 mod sidebar_persist;
 mod status;
+mod status_service;
 mod types;
 
 #[cfg(test)]
@@ -44,14 +53,17 @@ mod tests;
 // be visible at this module's top level too. Globbing the submodules is the
 // simplest way to forward both halves.
 pub use branches::*;
+pub use browse::*;
 pub use config_io::*;
 pub use create::*;
 pub use git_ops::*;
+pub use history::*;
 pub use merge::*;
 pub use preview::*;
 pub use remove::*;
 pub use sidebar_persist::*;
 pub use status::*;
+pub use status_service::*;
 // Types are reachable via `commands::worktree::WorktreeStatus` etc., even
 // though nothing inside this crate names them directly — they live across
 // the Tauri IPC boundary.

@@ -14,6 +14,7 @@ import {
   setTabSessionId,
   toggleMaximize,
 } from "../../stores/runtimeLayoutStore";
+import { agentStore, isAcknowledgedReactive, markAcknowledged } from "../../stores/agentStore";
 import { TerminalPane } from "../terminal-pane";
 import { AutoLabelBinder } from "./auto-label-binder";
 import { consumeReviewSpawn } from "./review-spawn";
@@ -80,6 +81,17 @@ export const TerminalSurfaceHost: Component<{ surface: TerminalSurfaceDescriptor
   const fileDropActive = createMemo(
     () => props.surface.kind !== "shell" && dropTargetPaneId() === props.surface.key,
   );
+  // Mirrors `LeafFrame`'s `pane-unread-completed` so the green ring is
+  // robust to states where the chrome layer is translated/hidden (drag,
+  // maximize animation). The CSS rule targets `.leaf-frame.pane-unread-completed`
+  // which both chrome and surface frames share via their `.leaf-frame` class.
+  const isUnreadCompleted = createMemo(() => {
+    const sid = props.surface.sessionId;
+    if (!sid) return false;
+    const state = agentStore.sessions[sid]?.state;
+    if (state !== "completed" && state !== "errored") return false;
+    return !isAcknowledgedReactive(sid);
+  });
   // Mirrors LeafFrame's `.pane-max-anim-target` so the surface stays painted
   // while every other surface is hidden during a maximize/restore — without
   // the mirror the chrome would animate alone and the live xterm pixels
@@ -99,12 +111,22 @@ export const TerminalSurfaceHost: Component<{ surface: TerminalSurfaceDescriptor
   });
 
   function claimFocus(): void {
-    const { cellId, tabId } = props.surface;
+    const { cellId, tabId, sessionId } = props.surface;
     if (!cellId) return;
     if (tabId && runtimeLayoutStore.panes[cellId]?.activeTabId !== tabId) {
       setActiveTabId(cellId, tabId);
     }
     setFocusedPaneId(cellId);
+    // Acknowledge unread completion on this surface's session so the
+    // green pane chrome clears even when the click lands inside an
+    // already-focused pane — the focus signal stays equal in that
+    // case, so the paneFocusAcknowledger effect won't re-run.
+    if (sessionId) {
+      const state = agentStore.sessions[sessionId]?.state;
+      if (state === "completed" || state === "errored") {
+        markAcknowledged(sessionId);
+      }
+    }
   }
 
   function onSurfaceDoubleClick(e: MouseEvent): void {
@@ -131,6 +153,7 @@ export const TerminalSurfaceHost: Component<{ surface: TerminalSurfaceDescriptor
         "pane-max-anim-target": isMaxAnimTarget(),
         "surface-dragging-source": isDragSource(),
         "is-snapped": isSnappedSource(),
+        "pane-unread-completed": isUnreadCompleted(),
         "file-drop-target": fileDropActive(),
       }}
       data-surface-key={props.surface.key}

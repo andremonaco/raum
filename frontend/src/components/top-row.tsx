@@ -47,12 +47,14 @@ import {
   seedLastPromptsFromAgents,
   setTerminals,
   subscribeTerminalEvents,
+  terminalStore,
   unreadCompletedForProject,
   waitingCount,
   waitingTerminals,
   type TerminalListItem,
+  type TerminalRecord,
 } from "../stores/terminalStore";
-import { subscribePaneActivity } from "../stores/runtimeLayoutStore";
+import { placedSessionIds, subscribePaneActivity } from "../stores/runtimeLayoutStore";
 import { subscribeReviewLinkEvents } from "../stores/reviewLinkStore";
 import { useKeymap } from "../lib/keymapContext";
 import { PROJECT_COLOR_PALETTE } from "../lib/projectColors";
@@ -91,7 +93,11 @@ import {
   SearchIcon,
 } from "./icons";
 import { resolveSessionTabLabel } from "../lib/harnessTabLabel";
-import { branchForProject, subscribeWorktreeBranchEvents } from "../stores/worktreeStore";
+import {
+  branchForProject,
+  subscribeWorktreeBranchEvents,
+  subscribeWorktreeStatusEvents,
+} from "../stores/worktreeStore";
 import { resolveSpawnWorktree } from "../lib/resolveSpawnWorktree";
 import { ProjectSettingsDialog } from "./project-settings-dialog";
 
@@ -446,6 +452,58 @@ export const TopRow: Component = () => {
     | null
   >(null);
 
+  // Backend sessions with no on-screen home: live tmux sessions the reconcile
+  // pass adopted (or that outlived their pane) but which aren't bound to any
+  // grid tab. These are the "harnesses I can't see" — surfaced so the user can
+  // close them. Closing one calls `terminal_kill`, which kills the tmux
+  // session, prunes `sessions.toml`, and emits `terminal-session-removed`, so
+  // this list (and the counter) shrink live without a reload.
+  //
+  // A freshly-spawned session lands in `byId` (the backend emits the upsert
+  // mid-`terminal_spawn`) BEFORE the frontend resolves `terminal_spawn` and
+  // binds the new id to its tab — so for the spawn round-trip it is briefly
+  // "unplaced." Without a guard it would flash into this list and the user
+  // could close their own new session. The `ORPHAN_GRACE_SECS` floor on
+  // `created_unix` (seconds; set to spawn time) skips that window; a slow
+  // `nowSec` tick re-evaluates so a genuinely-old orphan still surfaces.
+  const ORPHAN_GRACE_SECS = 20;
+  const [nowSec, setNowSec] = createSignal(Math.floor(Date.now() / 1000));
+  onMount(() => {
+    const t = setInterval(() => setNowSec(Math.floor(Date.now() / 1000)), 5000);
+    onCleanup(() => clearInterval(t));
+  });
+  const orphanedSessions = createMemo<TerminalRecord[]>(() => {
+    const placed = placedSessionIds();
+    const cutoff = nowSec() - ORPHAN_GRACE_SECS;
+    return Object.values(terminalStore.byId)
+      .filter(
+        (t) => !placed.has(t.session_id) && (t.created_unix === 0 || t.created_unix <= cutoff),
+      )
+      .sort((a, b) => a.created_unix - b.created_unix);
+  });
+
+  async function closeOrphan(sessionId: string): Promise<void> {
+    try {
+      await invoke("terminal_kill", { sessionId });
+    } catch (e) {
+      console.warn("[top-row] terminal_kill (orphan) failed", e);
+    }
+  }
+
+  async function closeAllOrphans(): Promise<void> {
+    const ids = orphanedSessions().map((t) => t.session_id);
+    let killed = 0;
+    for (const id of ids) {
+      try {
+        await invoke("terminal_kill", { sessionId: id });
+        killed += 1;
+      } catch (e) {
+        console.warn("[top-row] terminal_kill (orphan) failed", e);
+      }
+    }
+    setOrphanSweepResult({ count: killed, ids });
+  }
+
   const [compactTabs, setCompactTabs] = createSignal(false);
   let tabsScrollRef: HTMLElement | undefined;
   let headerRef: HTMLElement | undefined;
@@ -478,6 +536,7 @@ export const TopRow: Component = () => {
     let unlistenAgent: UnlistenFn | undefined;
     let unlistenTerminal: UnlistenFn | undefined;
     let unlistenBranches: UnlistenFn | undefined;
+    let unlistenWorktreeStatus: UnlistenFn | undefined;
     let unlistenMenu: UnlistenFn | undefined;
     let unlistenPaneActivity: UnlistenFn | undefined;
     let unlistenReviewLinks: UnlistenFn | undefined;
@@ -557,9 +616,27 @@ export const TopRow: Component = () => {
             /* Tauri context unavailable (tests). */
           });
       });
+
+    // Reconcile the live tmux socket with raum's records on (re)mount. The
+    // Rust bootstrap reconciles once per process; a Cmd+R webview reload does
+    // NOT re-run it, so without this an orphan that appeared mid-session would
+    // never surface after a reload. `terminal_reconcile` adopts any unknown
+    // live session and emits upserts; refresh once after so the list settles.
+    void invoke("terminal_reconcile")
+      .then(() => refreshTerminals())
+      .catch(() => {
+        /* Tauri context unavailable (tests) / older backend. */
+      });
     subscribeWorktreeBranchEvents()
       .then((u) => {
         unlistenBranches = u;
+      })
+      .catch(() => {
+        /* Tauri context unavailable (tests). */
+      });
+    subscribeWorktreeStatusEvents()
+      .then((u) => {
+        unlistenWorktreeStatus = u;
       })
       .catch(() => {
         /* Tauri context unavailable (tests). */
@@ -570,6 +647,7 @@ export const TopRow: Component = () => {
       unlistenAgent?.();
       unlistenTerminal?.();
       unlistenBranches?.();
+      unlistenWorktreeStatus?.();
       unlistenMenu?.();
       unlistenPaneActivity?.();
       unlistenReviewLinks?.();
@@ -1173,40 +1251,64 @@ export const TopRow: Component = () => {
                     {idleCount()}
                   </HoverCardTrigger>
                   <HoverCardPortal>
-                    <HoverCardContent class="w-64 p-2 text-xs">
+                    <HoverCardContent class="w-72 p-2 text-xs">
                       <div class="text-foreground/90">
                         {idleCount()} completed harness{idleCount() === 1 ? "" : "es"}
                       </div>
-                      <Show when={idleCount() > 0}>
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="sm"
-                          class="mt-2 h-7 w-full justify-start text-[11px]"
-                          onClick={() => {
-                            void (async () => {
-                              try {
-                                const killed = await invoke<string[]>("terminal_kill_orphans");
-                                setOrphanSweepResult({
-                                  count: killed.length,
-                                  ids: killed,
-                                });
-                              } catch (e) {
-                                console.error("[top-row] terminal_kill_orphans failed", e);
-                                setOrphanSweepResult({
-                                  count: 0,
-                                  error: String(e),
-                                });
-                              }
-                            })();
-                          }}
-                        >
-                          Sweep orphan tmux sessions
-                        </Button>
+                      {/* Orphaned sessions: live tmux sessions raum tracks but
+                          which aren't placed in any pane — the "harnesses I
+                          can't see". Each row closes via `terminal_kill`. */}
+                      <Show when={orphanedSessions().length > 0}>
+                        <div class="mt-2 border-t border-border pt-2">
+                          <div class="mb-1 flex items-center justify-between gap-2">
+                            <span class="text-foreground/90">
+                              {orphanedSessions().length} orphaned session
+                              {orphanedSessions().length === 1 ? "" : "s"}
+                            </span>
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="sm"
+                              class="h-6 px-2 text-[11px]"
+                              onClick={() => void closeAllOrphans()}
+                            >
+                              Close all
+                            </Button>
+                          </div>
+                          <p class="mb-1.5 text-[10px] leading-snug text-muted-foreground">
+                            Live tmux sessions with no pane in your layout. Closing kills the tmux
+                            session and removes it.
+                          </p>
+                          <ul class="max-h-48 space-y-0.5 overflow-y-auto">
+                            <For each={orphanedSessions()}>
+                              {(t) => {
+                                const Icon =
+                                  HARNESS_ICONS[t.kind as HarnessIconKind] ??
+                                  HARNESS_ICONS["shell" as HarnessIconKind];
+                                return (
+                                  <li class="flex items-center gap-1.5 rounded px-1 py-0.5 hover:bg-selected/50">
+                                    <Icon class="size-3 shrink-0" />
+                                    <span class="min-w-0 flex-1 truncate font-mono text-[10px] text-muted-foreground">
+                                      {t.project_slug ?? "—"} · {t.session_id}
+                                    </span>
+                                    <button
+                                      type="button"
+                                      class="shrink-0 rounded px-1 text-[10px] text-muted-foreground transition-colors hover:text-destructive"
+                                      onClick={() => void closeOrphan(t.session_id)}
+                                      aria-label={`Close ${t.session_id}`}
+                                    >
+                                      Close
+                                    </button>
+                                  </li>
+                                );
+                              }}
+                            </For>
+                          </ul>
+                        </div>
+                      </Show>
+                      <Show when={idleCount() === 0 && orphanedSessions().length === 0}>
                         <p class="mt-1 text-[10px] leading-snug text-muted-foreground">
-                          Kills tmux sessions on the raum socket that aren&apos;t tracked by the
-                          app. Safety floor: ignores sessions newer than 30 s so it can&apos;t race
-                          a fresh spawn.
+                          No completed or orphaned sessions.
                         </p>
                       </Show>
                     </HoverCardContent>

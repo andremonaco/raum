@@ -1,11 +1,10 @@
 /**
  * §9 — sidebar tunables. Kept tiny and side-effect free so any module in the
  * folder can import these without pulling in JSX or stores.
+ *
+ * (The old `STATUS_POLL_MS` frontend poll is gone — git status streams from
+ * the backend status service via `worktree-status-changed` events.)
  */
-
-// §9.1 — polling cadence. Debounced per-worktree: each expanded row owns its
-// own interval so collapsing a row stops its poll immediately.
-export const STATUS_POLL_MS = 2_000;
 
 // §9.7 — clamp matches the backend (160..800). Duplicated here so the handle
 // snaps predictably during the drag without waiting for the invoke round-trip.

@@ -18,6 +18,7 @@ pub mod review;
 pub mod search;
 pub mod terminal;
 pub mod updater;
+pub mod webview_health;
 pub mod worktree;
 pub mod worktree_progress;
 

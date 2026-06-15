@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use raum_tmux::{TmuxManager, attach_via_pty};
+use raum_tmux::{TmuxManager, attach_via_control, attach_via_pty};
 
 fn tmux_available() -> bool {
     Command::new("tmux")
@@ -519,6 +519,227 @@ async fn apply_server_options_strips_attached_client_alt_screen() {
         "inner-pane alternate-screen must stay on, got {alt_out:?}"
     );
 
+    let _ = mgr.kill_session(&session_id);
+    let _ = mgr.kill_server();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn control_bridge_streams_every_burst_line_losslessly() {
+    if !tmux_available() {
+        eprintln!("control bridge burst test: tmux not on PATH, skipping");
+        return;
+    }
+
+    let socket = unique_socket();
+    let session_id = format!("ctl-burst-{}", std::process::id());
+
+    let mgr = TmuxManager::with_socket(socket.clone());
+    mgr.new_session(&session_id, &PathBuf::from("/tmp"), None, Some((100, 30)))
+        .expect("new-session");
+    let _ = mgr.apply_server_options();
+
+    let received: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let received_for_sink = received.clone();
+    let bridge = attach_via_control(
+        &mgr,
+        &session_id,
+        30,
+        Box::new(move |bytes| {
+            received_for_sink.lock().unwrap().extend_from_slice(&bytes);
+            true
+        }),
+        Box::new(|_| {}),
+    )
+    .expect("attach_via_control");
+
+    const LINES: usize = 2500;
+    mgr.respawn_with(
+        &session_id,
+        "sh -lc 'printf \"RAUM_CTL_START\\n\"; i=0; while [ \"$i\" -lt 2500 ]; do printf \"RAUM_CTL_LINE_%04d abcdefghijklmnopqrstuvwxyz 0123456789\\n\" \"$i\"; i=$((i + 1)); done; printf \"RAUM_CTL_END\\n\"; sleep 2'",
+    )
+    .expect("respawn_with");
+
+    // The control transport's whole point: the live byte stream itself is
+    // lossless. Unlike the PTY-attached client (which may collapse a rapid
+    // 2.5k-line scroll into redraw deltas — see
+    // `pty_bridge_preserves_large_burst_markers`), every single marker line
+    // must arrive verbatim in the bridge bytes.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        {
+            let buf = received.lock().unwrap();
+            if buf.windows(12).any(|w| w == b"RAUM_CTL_END") {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "control bridge never delivered the burst end marker"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let text = String::from_utf8_lossy(&received.lock().unwrap()).into_owned();
+    assert!(text.contains("RAUM_CTL_START"), "start marker missing");
+    let mut missing = Vec::new();
+    for i in 0..LINES {
+        let marker = format!("RAUM_CTL_LINE_{i:04}");
+        if !text.contains(&marker) {
+            missing.push(marker);
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "control transport must be lossless; {} of {LINES} lines missing (first: {:?})",
+        missing.len(),
+        missing.first()
+    );
+
+    drop(bridge);
+    let _ = mgr.kill_session(&session_id);
+    let _ = mgr.kill_server();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn control_bridge_round_trips_input_and_reports_exit() {
+    if !tmux_available() {
+        eprintln!("control bridge input test: tmux not on PATH, skipping");
+        return;
+    }
+
+    let socket = unique_socket();
+    let session_id = format!("ctl-io-{}", std::process::id());
+
+    let mgr = TmuxManager::with_socket(socket.clone());
+    mgr.new_session(&session_id, &PathBuf::from("/tmp"), None, Some((80, 24)))
+        .expect("new-session");
+    let _ = mgr.apply_server_options();
+
+    let received: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let exited: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
+    let received_for_sink = received.clone();
+    let exited_for_sink = exited.clone();
+    let bridge = attach_via_control(
+        &mgr,
+        &session_id,
+        24,
+        Box::new(move |bytes| {
+            received_for_sink.lock().unwrap().extend_from_slice(&bytes);
+            true
+        }),
+        Box::new(move |code| {
+            *exited_for_sink.lock().unwrap() = Some(code);
+        }),
+    )
+    .expect("attach_via_control");
+
+    // A bare `sh -i` gives a predictable reader for typed input.
+    mgr.respawn_with(&session_id, "sh -i")
+        .expect("respawn_with");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Keystrokes ride the control client's stdin as `send-keys -H` and the
+    // pane's echo + command output must come back through `%output`.
+    bridge
+        .write_input(b"printf 'RAUM_CTL_INPUT_OK\\n'\n")
+        .expect("write_input");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        {
+            let buf = received.lock().unwrap();
+            let text = String::from_utf8_lossy(&buf);
+            if text.contains("RAUM_CTL_INPUT_OK") {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "typed command output never arrived through the control stream"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // Killing the session ends the control client; the waiter must fire the
+    // exit sink (the bridge was not silenced).
+    let _ = mgr.kill_session(&session_id);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while exited.lock().unwrap().is_none() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        exited.lock().unwrap().is_some(),
+        "exit sink should fire when the tmux session dies"
+    );
+
+    drop(bridge);
+    let _ = mgr.kill_server();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn control_bridge_initial_sync_paints_preexisting_content() {
+    if !tmux_available() {
+        eprintln!("control bridge sync test: tmux not on PATH, skipping");
+        return;
+    }
+
+    let socket = unique_socket();
+    let session_id = format!("ctl-sync-{}", std::process::id());
+
+    let mgr = TmuxManager::with_socket(socket.clone());
+    mgr.new_session(&session_id, &PathBuf::from("/tmp"), None, Some((80, 24)))
+        .expect("new-session");
+    let _ = mgr.apply_server_options();
+
+    // Write content into the pane BEFORE any client attaches — this is the
+    // app-restart scenario where the session survived but raum was down.
+    mgr.respawn_with(
+        &session_id,
+        "sh -lc 'printf \"RAUM_PRE_ATTACH_CONTENT\\n\"; sleep 5'",
+    )
+    .expect("respawn_with");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let received: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let received_for_sink = received.clone();
+    let bridge = attach_via_control(
+        &mgr,
+        &session_id,
+        24,
+        Box::new(move |bytes| {
+            received_for_sink.lock().unwrap().extend_from_slice(&bytes);
+            true
+        }),
+        Box::new(|_| {}),
+    )
+    .expect("attach_via_control");
+
+    // Control attach produces no rendered repaint; the bridge's in-band
+    // capture replay must deliver the pre-attach content as the first
+    // frame — without it a reattached pane would sit black until the next
+    // live output, which is exactly the bug this transport removes.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        {
+            let buf = received.lock().unwrap();
+            let text = String::from_utf8_lossy(&buf);
+            if text.contains("RAUM_PRE_ATTACH_CONTENT") {
+                // The replay also restores the cursor with a CUP sequence.
+                assert!(
+                    text.contains("\u{1b}["),
+                    "replay should carry escape sequences (cursor/mode restore): {text:?}"
+                );
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "in-band sync never painted the pre-attach content"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    drop(bridge);
     let _ = mgr.kill_session(&session_id);
     let _ = mgr.kill_server();
 }

@@ -156,16 +156,52 @@ pub struct WorktreeMergePreview {
     pub error: Option<String>,
 }
 
-/// Output of `worktree_status`. `dirty` is `true` iff *any* of the three
-/// buckets is non-empty — the sidebar uses it for the bullet indicator and
-/// expands the file groups lazily on user request.
+/// Classified status of one changed file, parsed from porcelain v2 XY codes.
+/// `Renamed` covers copies too (both carry an original path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FileChangeKind {
+    Modified,
+    Added,
+    Deleted,
+    Renamed,
+    Untracked,
+    Conflicted,
+    TypeChange,
+}
+
+/// One changed file in a worktree. A path with both index and worktree
+/// changes (porcelain `MM`) appears **twice** — once with `staged: true`,
+/// once with `staged: false` — mirroring the sidebar's two buckets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileChange {
+    /// Worktree-relative path (the *new* path for renames).
+    pub path: String,
+    /// Original path for renames/copies; `None` otherwise.
+    pub orig_path: Option<String>,
+    pub kind: FileChangeKind,
+    /// True = index side (staged), false = worktree side (unstaged).
+    pub staged: bool,
+    /// Lines added vs HEAD from `git diff --numstat`. `None` for binary
+    /// files, untracked files, and unborn-HEAD repos.
+    pub insertions: Option<u32>,
+    pub deletions: Option<u32>,
+}
+
+/// Output of `worktree_status`. `dirty` is `true` iff `changes` was
+/// non-empty before the cap — the sidebar uses it for the bullet indicator
+/// and expands the file groups lazily on user request.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorktreeStatus {
     pub dirty: bool,
-    pub untracked: Vec<String>,
-    pub modified: Vec<String>,
-    pub staged: Vec<String>,
+    /// Per-file entries (staged and unstaged interleaved; filter on
+    /// `staged`). Capped at `MAX_FILE_CHANGES` — see `truncated`.
+    pub changes: Vec<FileChange>,
+    /// True when `changes` was truncated to the cap (untracked entries are
+    /// dropped first). `dirty` and the totals below are computed pre-cap.
+    pub truncated: bool,
     /// Total lines added vs HEAD (staged + unstaged). 0 when clean or no HEAD.
     pub insertions: u32,
     /// Total lines removed vs HEAD (staged + unstaged). 0 when clean or no HEAD.
@@ -184,4 +220,35 @@ pub struct WorktreeStatus {
     /// checked out. Stash entries are repo-wide but we filter to the ones
     /// whose `WIP on <branch>` message matches the current branch.
     pub stash_count: u32,
+}
+
+/// One commit row in the sidebar's History tab (`git_log`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitInfo {
+    pub hash: String,
+    pub short_hash: String,
+    pub author: String,
+    /// Unix epoch seconds (`%at`); the frontend renders relative time.
+    pub timestamp: i64,
+    pub subject: String,
+    /// True when the commit is reachable from HEAD but not from
+    /// `@{upstream}`. Always false when no upstream is configured — a
+    /// no-remote repo shouldn't render every commit as "unpushed" noise
+    /// (consistent with `WorktreeStatus.ahead == 0` in that case).
+    pub unpushed: bool,
+}
+
+/// One changed file of a specific commit (`git_commit_files`). Same shape as
+/// [`FileChange`] minus `staged` — a committed change has no stage split.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitFileChange {
+    pub path: String,
+    pub orig_path: Option<String>,
+    /// Never `Untracked` — commits only contain tracked files.
+    pub kind: FileChangeKind,
+    /// `None` for binary files.
+    pub insertions: Option<u32>,
+    pub deletions: Option<u32>,
 }

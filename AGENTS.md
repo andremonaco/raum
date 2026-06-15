@@ -113,7 +113,7 @@ Install hooks once with `task hooks:install` so the chain runs automatically on 
 ## Architecture: how the pieces connect
 
 1. **Config & Projects** (`raum-core`) — `ConfigStore` debounces TOML writes (500 ms) and performs atomic file swaps. Projects have worktrees defined in the TOML; config is reloaded by the file-watcher.
-2. **Terminals** (`raum-tmux`) — `TmuxManager` owns the tmux socket. Each PTY is a named tmux window. `StreamCoalescer` batches output (12 ms tick, 16 KB flush) before forwarding to the Tauri event bus.
+2. **Terminals** (`raum-tmux`) — `TmuxManager` owns the tmux socket. Each pane is a named tmux session. Pane I/O streams through a control-mode tmux client (`tmux -C attach`): tmux delivers the raw pane bytes losslessly (no redraw-compression) and xterm.js is the sole terminal emulator. `RAUM_TERMINAL_TRANSPORT=pty` falls back to the legacy PTY-rendered client. `StreamCoalescer` batches output (8 ms tick, 128 KB flush) before forwarding to the Tauri event bus.
 3. **Hook injection** (`raum-hooks`) — `HookScriptWriter` injects `<raum-managed>…</raum-managed>` JSON blocks into harness config files (Claude Code `settings.json`, Codex config, etc.) so hooks survive edits outside raum.
 4. **Worktree hydration** (`raum-hydration`) — copies or symlinks files into new git worktrees using a path-pattern DSL; branch slugs derived from a configurable prefix (none / username / custom).
 5. **Tauri IPC** (`src-tauri/commands/`) — thin handlers that delegate to the four crates via `AppHandleState`. Frontend talks exclusively through `invoke()` calls.
@@ -132,8 +132,8 @@ Install hooks once with `task hooks:install` so the chain runs automatically on 
 
 | Constant | Value | Location |
 |---|---|---|
-| Coalesce tick | 12 ms | `raum-tmux` |
-| Flush threshold | 16 384 bytes | `raum-tmux` |
+| Coalesce tick | 8 ms | `raum-tmux` |
+| Flush threshold | 131 072 bytes | `raum-tmux` |
 | Silence threshold | 500 ms | `raum-core` |
 | Config write debounce | 500 ms | `raum-core` |
 | xterm scrollback | 10 000 lines | frontend |

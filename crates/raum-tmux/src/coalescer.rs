@@ -21,7 +21,13 @@
 use std::time::{Duration, Instant};
 
 /// Size threshold: flush as soon as the buffer reaches this many bytes.
-pub const FLUSH_BYTES: usize = 32 * 1024;
+///
+/// Sized to halve the number of IPC events on heavy bursts (e.g. a shell
+/// pane running `pulumi up` or a tight `for` loop printing thousands of
+/// lines). The 8 ms time bound still drains small/interactive output
+/// promptly, so this threshold only kicks in when the producer is
+/// actually saturating the pipe.
+pub const FLUSH_BYTES: usize = 128 * 1024;
 
 /// Time threshold (ms): flush a non-empty buffer when this much wall time
 /// has elapsed since the last flush.
@@ -114,6 +120,43 @@ impl Default for StreamCoalescer {
     }
 }
 
+/// Drain a reader thread's bounded channel through a [`StreamCoalescer`]
+/// into `on_data` until the channel closes or the sink rejects. Shared by
+/// the PTY and control-mode bridges — both run this as the body of their
+/// coalescer thread. Force-flushes the tail on channel close so the last
+/// bytes of a final burst are never lost.
+pub fn drain_coalesced(
+    data_rx: &std::sync::mpsc::Receiver<Vec<u8>>,
+    mut on_data: Box<dyn FnMut(Vec<u8>) -> bool + Send>,
+) {
+    use std::sync::mpsc::RecvTimeoutError;
+
+    let mut sink = move |bytes: Vec<u8>| -> bool { on_data(bytes) };
+    let mut coalescer = StreamCoalescer::new();
+    let timeout = Duration::from_millis(FLUSH_MS);
+    loop {
+        match data_rx.recv_timeout(timeout) {
+            Ok(chunk) => {
+                if !coalescer.feed(&chunk, &mut sink) {
+                    break;
+                }
+                if !coalescer.flush_if_due(&mut sink) {
+                    break;
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if !coalescer.flush_if_due(&mut sink) {
+                    break;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                let _ = coalescer.force_flush(&mut sink);
+                break;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -195,6 +238,37 @@ mod tests {
         c.force_flush(&mut sink);
         let assembled: Vec<u8> = out.borrow().iter().flatten().copied().collect();
         assert_eq!(assembled, expected);
+    }
+
+    #[test]
+    fn one_mb_burst_in_16kb_chunks_produces_at_most_one_flush_per_window() {
+        // Regression: a 1 MB burst arriving as 16 KB reads (the PTY reader
+        // upper-bounded read size before we raised it to 64 KB) should
+        // coalesce into ⌈1 MB / FLUSH_BYTES⌉ size-triggered flushes — not
+        // 64 individual flushes. This is what protects xterm.js / the
+        // WebView from a parade of small writes during heavy bursts.
+        let out = RefCell::new(Vec::new());
+        let mut sink = collect_sink(&out);
+        let mut c = StreamCoalescer::new();
+        const CHUNK: usize = 16 * 1024;
+        const TOTAL: usize = 1024 * 1024;
+        let chunk = vec![0xCDu8; CHUNK];
+        for _ in 0..(TOTAL / CHUNK) {
+            assert!(c.feed(&chunk, &mut sink));
+        }
+        c.force_flush(&mut sink);
+        let frames = out.borrow();
+        let expected_max_flushes = TOTAL.div_ceil(FLUSH_BYTES);
+        assert!(
+            frames.len() <= expected_max_flushes,
+            "got {} flushes for a {}-byte burst with FLUSH_BYTES={}, expected ≤ {}",
+            frames.len(),
+            TOTAL,
+            FLUSH_BYTES,
+            expected_max_flushes
+        );
+        let assembled: usize = frames.iter().map(Vec::len).sum();
+        assert_eq!(assembled, TOTAL);
     }
 
     #[test]

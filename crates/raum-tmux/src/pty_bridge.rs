@@ -272,18 +272,63 @@ pub fn attach_via_pty(
     // Both detach. They exit cleanly on master EOF or on `on_data` returning
     // false. The coalescer force-flushes its tail buffer on shutdown so the
     // last bytes of a burst aren't dropped.
-    let (data_tx, data_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
+    // Channel sizing: previously 64 × 16 KB ≈ 1 MB of in-flight reads, which
+    // is tight for shell panes running heavy producers (e.g. `pulumi up`,
+    // tight `for` loops printing thousands of lines). When this fills, the
+    // reader thread blocks on `send`, the kernel PTY buffer for tmux's
+    // attached client fills, and tmux's server-side throttles updates and
+    // switches from byte-stream to redraw-compression — intermediate scroll
+    // lines never reach xterm. 512 × 64 KB ≈ 32 MB of headroom lets bursty
+    // shells finish before tmux ever notices the client falling behind.
+    let (data_tx, data_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(512);
     let reader_session = session_id.to_string();
+    // ≥50 ms blocked-send means the IPC pipeline (coalescer → WebView) was
+    // the bottleneck for that interval, not the kernel read. tmux's
+    // attached-client flow control kicks in when our reads stall, so this
+    // warning is the canonical "swallowed output is downstream's fault"
+    // signal — grep `raum.log` for it when investigating lost output.
+    const BLOCKED_SEND_WARN_MS: u128 = 50;
     std::thread::Builder::new()
         .name(format!("raum-pty-reader-{session_id}"))
         .spawn(move || {
-            let mut buf = vec![0u8; 16 * 1024];
+            // 64 KB reads (up from 16 KB) — fewer syscalls per burst and a
+            // larger chunk drains more of the kernel PTY buffer per
+            // iteration, which is exactly the signal tmux's flow control
+            // watches.
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut blocked_send_warned = false;
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        if data_tx.send(buf[..n].to_vec()).is_err() {
-                            break;
+                        let payload = buf[..n].to_vec();
+                        match data_tx.try_send(payload) {
+                            Ok(()) => {}
+                            Err(std::sync::mpsc::TrySendError::Full(payload)) => {
+                                // Channel full: the coalescer / IPC has
+                                // fallen behind. Time the blocking send so
+                                // we can quantify the stall on the first
+                                // occurrence (subsequent stalls are
+                                // suppressed to avoid log spam).
+                                let waited_at = std::time::Instant::now();
+                                if data_tx.send(payload).is_err() {
+                                    break;
+                                }
+                                if !blocked_send_warned {
+                                    let waited = waited_at.elapsed().as_millis();
+                                    if waited >= BLOCKED_SEND_WARN_MS {
+                                        tracing::warn!(
+                                            session_id = %reader_session,
+                                            waited_ms = waited as u64,
+                                            "pty bridge: reader blocked on send \
+                                             (IPC drain bottleneck — tmux may \
+                                              throttle this client)",
+                                        );
+                                        blocked_send_warned = true;
+                                    }
+                                }
+                            }
+                            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
@@ -311,36 +356,7 @@ pub fn attach_via_pty(
     std::thread::Builder::new()
         .name(format!("raum-pty-coalescer-{session_id}"))
         .spawn(move || {
-            use std::sync::mpsc::RecvTimeoutError;
-            use std::time::Duration;
-
-            use crate::coalescer::{FLUSH_MS, StreamCoalescer};
-
-            let mut on_data = on_data;
-            let mut sink = move |bytes: Vec<u8>| -> bool { on_data(bytes) };
-            let mut coalescer = StreamCoalescer::new();
-            let timeout = Duration::from_millis(FLUSH_MS);
-            loop {
-                match data_rx.recv_timeout(timeout) {
-                    Ok(chunk) => {
-                        if !coalescer.feed(&chunk, &mut sink) {
-                            break;
-                        }
-                        if !coalescer.flush_if_due(&mut sink) {
-                            break;
-                        }
-                    }
-                    Err(RecvTimeoutError::Timeout) => {
-                        if !coalescer.flush_if_due(&mut sink) {
-                            break;
-                        }
-                    }
-                    Err(RecvTimeoutError::Disconnected) => {
-                        let _ = coalescer.force_flush(&mut sink);
-                        break;
-                    }
-                }
-            }
+            crate::coalescer::drain_coalesced(&data_rx, on_data);
             tracing::debug!(
                 session_id = %coalescer_session,
                 "pty bridge: coalescer exited",
