@@ -22,19 +22,35 @@
  * stream that, when written into a fresh xterm of equal dimensions,
  * reproduces the buffer faithfully.
  *
- * Trim story: the Rust side hard-caps a single snapshot at 16 MiB. Truncating
- * a VT stream at an arbitrary byte boundary corrupts the parser (a partial
- * CSI/OSC eats the next few KB of input as parameters), so we never byte-trim.
- * On overflow we re-serialize with a smaller scrollback budget until the
- * stream fits. The frontend's xterm scrollback is bounded by `SCROLLBACK_MAX`
- * already, so this fallback rarely fires unless the user is producing very
- * dense full-screen color output.
+ * No compression: the bytes written here are the raw UTF-8 of SerializeAddon's
+ * VT stream — there is NO gzip on either side (the `.vtgz` extension on disk is
+ * legacy naming; nothing in the frontend or backend (de)compresses). The Rust
+ * side hard-caps a single snapshot at `SNAPSHOT_MAX_BYTES` against this
+ * *uncompressed* payload, so the cap is reached at the real byte size of the VT
+ * text, not an imagined compressed size.
+ *
+ * Trim story: truncating a VT stream at an arbitrary byte boundary corrupts the
+ * parser (a partial CSI/OSC eats the next few KB of input as parameters), so we
+ * never byte-trim. On overflow we re-serialize with a smaller scrollback budget
+ * until the stream fits. The frontend's xterm scrollback is bounded by
+ * `SCROLLBACK_MAX` already, so this fallback rarely fires unless the user is
+ * producing very dense full-screen color output.
  */
 import { SerializeAddon } from "@xterm/addon-serialize";
 import { invoke } from "@tauri-apps/api/core";
 import type { Terminal } from "@xterm/xterm";
 
 const SNAPSHOT_DEBOUNCE_MS = 2000;
+/**
+ * Hard ceiling on how long a continuously-emitting pane can defer its snapshot.
+ * The debounce below is leading-edge (the first write arms a single timer that
+ * survives the burst), so a pane that never goes quiet would otherwise only ever
+ * checkpoint once every `SNAPSHOT_DEBOUNCE_MS` from the burst start. For a pane
+ * under sustained output the freshest content can drift well past the debounce;
+ * this cap forces a re-arm at most this far behind the live buffer so a quit /
+ * reboot loses at most ~this much tail rather than an unbounded run.
+ */
+const SNAPSHOT_MAX_STALENESS_MS = 10_000;
 const SCROLLBACK_MAX = 100_000;
 /// Binary-search tries when re-serializing on backend overflow. The xterm
 /// buffer is bounded, so 8 halvings always reach `SCROLLBACK_MIN` or below.
@@ -43,6 +59,16 @@ const SCROLLBACK_MIN = 200;
 
 const timers = new Map<string, ReturnType<typeof setTimeout>>();
 const inflight = new Map<string, Promise<void>>();
+/**
+ * Live snapshot sources keyed by session id. Populated by
+ * `scheduleTerminalSnapshotPersist` so the quit-time flush can serialize every
+ * pending pane even if its debounce timer hasn't fired yet. Cleared by
+ * `cancelTerminalSnapshotPersist` on pane unmount (before `term.dispose()`), so
+ * a fired timer never serializes a disposed terminal.
+ */
+const sources = new Map<string, SnapshotSource>();
+/** Wall-clock ms when the still-armed debounce timer for a session was set. */
+const armedAt = new Map<string, number>();
 
 /**
  * SerializeAddon owner for a pane. The addon must be loaded into the same
@@ -55,19 +81,36 @@ export type SnapshotSource = {
   addon: SerializeAddon;
 };
 
-function serializeAt(addon: SerializeAddon, scrollback: number): Uint8Array | null {
-  const text = addon.serialize({ scrollback });
+function serializeAt(
+  addon: SerializeAddon,
+  scrollback: number,
+  excludeAltBuffer: boolean,
+): Uint8Array | null {
+  const text = addon.serialize({ scrollback, excludeAltBuffer });
   if (!text) return null;
   return new TextEncoder().encode(text);
 }
 
 /**
+ * Decide whether to exclude the alt buffer from the serialization. Alt-screen
+ * TUIs (Codex / OpenCode defaults, fullscreen Claude) repaint their frame from
+ * source on every SIGWINCH, so a serialized alt buffer is wasted disk and would
+ * corrupt scrollback if replayed into a normal-mode pane. Excluding it persists
+ * the durable normal-buffer scrollback that sits *behind* the alt screen, which
+ * is the content worth recovering when a provider `--resume` is impossible.
+ */
+function shouldExcludeAltBuffer(term: Terminal): boolean {
+  return term.buffer.active.type === "alternate";
+}
+
+/**
  * Produce a VT-encoded snapshot of the buffer. Returns `null` for empty
  * buffers (no scrollback, no visible content) so callers can skip the
- * persist round-trip entirely.
+ * persist round-trip entirely. When the pane is currently on the alt screen,
+ * the alt buffer is excluded so we capture the normal-buffer scrollback only.
  */
 export function serializeTerminalSnapshot(source: SnapshotSource): Uint8Array | null {
-  return serializeAt(source.addon, SCROLLBACK_MAX);
+  return serializeAt(source.addon, SCROLLBACK_MAX, shouldExcludeAltBuffer(source.term));
 }
 
 /**
@@ -83,9 +126,10 @@ export async function persistTerminalSnapshot(
   source: SnapshotSource,
 ): Promise<void> {
   if (!sessionId) return;
+  const excludeAltBuffer = shouldExcludeAltBuffer(source.term);
   let scrollback = SCROLLBACK_MAX;
   for (let attempt = 0; attempt < OVERFLOW_RETRIES; attempt += 1) {
-    const bytes = serializeAt(source.addon, scrollback);
+    const bytes = serializeAt(source.addon, scrollback, excludeAltBuffer);
     if (!bytes || bytes.byteLength === 0) return;
     try {
       const accepted = await invoke<boolean>("terminal_snapshot_persist", {
@@ -104,24 +148,106 @@ export async function persistTerminalSnapshot(
   }
 }
 
+/** Fire the persist for a session immediately and track it as inflight. */
+function persistNow(sessionId: string, source: SnapshotSource): void {
+  if (inflight.has(sessionId)) return;
+  const promise = persistTerminalSnapshot(sessionId, source).finally(() => {
+    inflight.delete(sessionId);
+  });
+  inflight.set(sessionId, promise);
+}
+
 /**
  * Debounced wrapper. Call this from the xterm `onWriteParsed` callback so
  * we coalesce bursty output into a single snapshot per silence window —
  * SerializeAddon scans the entire buffer (~200 ms for 5k rows in Chrome
  * benchmarks), so running it on every parsed write is a perceptible UI hitch.
+ *
+ * The debounce is leading-edge: the first write arms a single timer and
+ * subsequent writes during the window are absorbed (so a continuous burst would
+ * otherwise checkpoint only once, `SNAPSHOT_DEBOUNCE_MS` after the burst start).
+ * To bound staleness under sustained output, once the armed timer has been
+ * pending longer than `SNAPSHOT_MAX_STALENESS_MS` the next write flushes the
+ * current buffer immediately and re-arms a fresh window — so a long-running burst
+ * still checkpoints at least every ~`SNAPSHOT_MAX_STALENESS_MS` and a quit/reboot
+ * loses at most that much tail rather than the whole run.
  */
 export function scheduleTerminalSnapshotPersist(sessionId: string, source: SnapshotSource): void {
   if (!sessionId) return;
-  if (timers.has(sessionId)) return;
+  // Always keep the latest live source so the quit flush serializes current
+  // content (the source object is stable per pane, but tracking it here is what
+  // lets `flushAllTerminalSnapshotsNow` reach panes whose timer hasn't fired).
+  sources.set(sessionId, source);
+  const existing = timers.get(sessionId);
+  if (existing !== undefined) {
+    // A timer is already armed. If it has been pending longer than the
+    // max-staleness cap, flush right now and re-arm so a long burst still
+    // checkpoints periodically instead of only once per burst.
+    const since = Date.now() - (armedAt.get(sessionId) ?? 0);
+    if (since < SNAPSHOT_MAX_STALENESS_MS) return;
+    clearTimeout(existing);
+    timers.delete(sessionId);
+    persistNow(sessionId, source);
+    // fall through to re-arm a fresh debounce window for subsequent output.
+  }
+  armedAt.set(sessionId, Date.now());
   const timer = setTimeout(() => {
     timers.delete(sessionId);
-    if (inflight.has(sessionId)) return;
-    const promise = persistTerminalSnapshot(sessionId, source).finally(() => {
-      inflight.delete(sessionId);
-    });
-    inflight.set(sessionId, promise);
+    armedAt.delete(sessionId);
+    const current = sources.get(sessionId);
+    if (!current) return;
+    persistNow(sessionId, current);
   }, SNAPSHOT_DEBOUNCE_MS);
   timers.set(sessionId, timer);
+}
+
+/**
+ * Clear the pending debounce timer + tracked source for one session. Called
+ * from the pane's `onCleanup` BEFORE `term.dispose()` so a queued timer can
+ * never serialize a disposed terminal. Does not touch any inflight persist
+ * already in progress — that closes over its own source and completes safely.
+ */
+export function cancelTerminalSnapshotPersist(sessionId: string): void {
+  if (!sessionId) return;
+  const timer = timers.get(sessionId);
+  if (timer !== undefined) {
+    clearTimeout(timer);
+    timers.delete(sessionId);
+  }
+  armedAt.delete(sessionId);
+  sources.delete(sessionId);
+}
+
+/**
+ * Contract 1 (quit-flush): clear every pending debounce timer and persist every
+ * tracked live snapshot immediately. Called from `quitFlush.ts` (Agent A) on the
+ * `app-will-quit` event so the freshest scrollback lands before the window
+ * closes. SerializeAddon is synchronous, so each serialize completes here even
+ * though the underlying `terminal_snapshot_persist` invoke is awaited. Resolves
+ * once every flushed write settles.
+ */
+export async function flushAllTerminalSnapshotsNow(): Promise<void> {
+  const pending: Array<Promise<void>> = [];
+  // Snapshot the keys first — persistNow mutates `inflight` and we delete from
+  // `timers`/`sources` as we go.
+  for (const [sessionId, source] of Array.from(sources.entries())) {
+    const timer = timers.get(sessionId);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      timers.delete(sessionId);
+    }
+    armedAt.delete(sessionId);
+    // Drop the tracked source: a flush is a quit-time drain, so each session is
+    // checkpointed exactly once and a second flush call is a no-op.
+    sources.delete(sessionId);
+    // Persist directly (do not go through the inflight short-circuit dedupe —
+    // we want the freshest serialize, even if a write is mid-flight).
+    pending.push(persistTerminalSnapshot(sessionId, source));
+  }
+  // Also await anything already inflight so the caller's ack truly follows all
+  // writes.
+  for (const p of Array.from(inflight.values())) pending.push(p);
+  await Promise.allSettled(pending);
 }
 
 /**

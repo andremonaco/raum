@@ -492,7 +492,54 @@ fn read_toml_or_default<T: DeserializeOwned + Default>(path: &Path) -> Result<T,
     if raw.trim().is_empty() {
         return Ok(T::default());
     }
-    Ok(toml::from_str(&raw)?)
+    match toml::from_str(&raw) {
+        Ok(parsed) => Ok(parsed),
+        // A non-empty file that fails to parse is corrupt (interrupted
+        // write before the atomic rename window closed, a hand-edit, or a
+        // value a future/older schema can't deserialize). Returning the
+        // error here used to bubble all the way up — `config_get` /
+        // `active_layout_get` rejected, and the frontend's catch path then
+        // re-opened the save gate and clobbered the recoverable file with
+        // empty state. Mirror the graceful `read_raum_toml` pattern: move
+        // the bad file aside (best-effort) so the user can salvage it by
+        // hand, log a WARN, and fall back to `T::default()` so the read
+        // path NEVER turns a corrupt file into a hard failure.
+        Err(e) => {
+            quarantine_bad_toml(path, &e);
+            Ok(T::default())
+        }
+    }
+}
+
+/// Best-effort rename of a corrupt TOML to `<path>.bad-<unix_ms>` so the
+/// user keeps the recoverable bytes while the read path degrades to a
+/// default. Logs the parse error either way. Failures to rename are logged
+/// and swallowed — the caller still gets `T::default()`.
+fn quarantine_bad_toml(path: &Path, err: &toml::de::Error) {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    let backup = {
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("config.toml");
+        path.with_file_name(format!("{name}.bad-{stamp}"))
+    };
+    match std::fs::rename(path, &backup) {
+        Ok(()) => warn!(
+            path = %path.display(),
+            backup = %backup.display(),
+            error = %err,
+            "failed to parse TOML; quarantined corrupt file and fell back to default",
+        ),
+        Err(rename_err) => warn!(
+            path = %path.display(),
+            error = %err,
+            rename_error = %rename_err,
+            "failed to parse TOML; quarantine rename failed, falling back to default",
+        ),
+    }
 }
 
 fn write_toml<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreError> {
@@ -1048,6 +1095,64 @@ created_at_unix_ms = 1
             back.entries,
             vec!["git status".to_string(), "ls".to_string()]
         );
+    }
+
+    #[test]
+    fn read_config_quarantines_corrupt_file_and_returns_default() {
+        // A non-empty, unparsable config.toml must NOT propagate an error
+        // (which the frontend turns into a layout-clobbering save-gate open).
+        // Instead it degrades to the default and renames the bad file aside.
+        let dir = tempdir().unwrap();
+        let store = ConfigStore::new(dir.path());
+        store.ensure_layout().unwrap();
+
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(&cfg_path, "this = = not valid toml =").unwrap();
+
+        let cfg = store
+            .read_config()
+            .expect("corrupt config must degrade, not error");
+        // Defaulted, not the corrupt content.
+        assert!(!cfg.onboarded);
+
+        // The corrupt file was moved aside with a `.bad-<ts>` suffix, leaving
+        // a fresh default file absent (read_config does not rewrite it).
+        let salvaged: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("config.toml.bad-"))
+            })
+            .collect();
+        assert_eq!(salvaged.len(), 1, "expected exactly one quarantined file");
+    }
+
+    #[test]
+    fn read_active_layout_quarantines_corrupt_file_and_returns_default() {
+        let dir = tempdir().unwrap();
+        let store = ConfigStore::new(dir.path());
+        store.ensure_layout().unwrap();
+
+        let path = dir.path().join("state").join("active-layout.toml");
+        std::fs::write(&path, "cells = [ broken").unwrap();
+
+        let layout = store
+            .read_active_layout()
+            .expect("corrupt active-layout must degrade, not error");
+        assert!(layout.cells.is_empty());
+
+        let salvaged: Vec<_> = std::fs::read_dir(dir.path().join("state"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("active-layout.toml.bad-"))
+            })
+            .collect();
+        assert_eq!(salvaged.len(), 1, "expected exactly one quarantined layout");
     }
 
     #[test]

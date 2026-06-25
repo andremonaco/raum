@@ -54,6 +54,7 @@ import {
 import { dropTargetPaneId } from "../lib/fileDrop";
 import { SCROLLBACK_DEFAULT } from "../lib/scrollbackConfig";
 import {
+  cancelTerminalSnapshotPersist,
   loadTerminalSnapshotBytes,
   scheduleTerminalSnapshotPersist,
 } from "../lib/terminalSnapshotPersistence";
@@ -259,6 +260,13 @@ interface ReconnectResult {
   historyStatus: ReconnectHistoryStatus;
   replacedSessionId?: string;
   message?: string;
+  /** True only on the `"unavailable"` path when the session still carries a
+   *  tracked harness row (the conversation could be recovered later via the
+   *  Recover overlay) but this attempt could not bring it back right now. The
+   *  backend omits this field when false (Contract 3). When set we surface the
+   *  Recover overlay + replay the disk snapshot rather than abandoning the
+   *  `harness_session_id` by spawning a fresh empty chat. */
+  recoverable?: boolean;
 }
 
 export const TerminalPane: Component<TerminalPaneProps> = (props) => {
@@ -292,7 +300,30 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
     setBorderColor(props.borderColor ?? "transparent");
   });
 
-  const [sessionId, setSessionId] = createSignal<string | null>(props.sessionId ?? null);
+  const [sessionId, setSessionIdSignal] = createSignal<string | null>(props.sessionId ?? null);
+  // Every session id this pane has ever registered a snapshot source under.
+  // A pane's id rotates over its lifetime (provider-replace / self-heal /
+  // recover mint a fresh server id), and `scheduleTerminalSnapshotPersist`
+  // keys the live `sources` map by whatever id was current at frame time. The
+  // debounce-fire path never deletes that entry, so after a rotation A->B the
+  // map holds BOTH A and B pointing at the same live term/addon. We track every
+  // registered id here so onCleanup can cancel ALL of them (not just the current
+  // one) before `term.dispose()` — otherwise the quit-flush would serialize the
+  // disposed terminal under the dead id A. We also cancel the OLD id the instant
+  // the session rotates so a stale source never lingers past the rotation.
+  const registeredSnapshotIds = new Set<string>();
+  // Wrap the session-id setter so a rotation prunes the snapshot source/timer
+  // for the id we're leaving (its content is captured under the new id from the
+  // next frame on). cancelTerminalSnapshotPersist is a no-op for ids with no
+  // tracked source, so calling it on every rotation is safe.
+  const setSessionId = (next: string | null): string | null => {
+    const prev = sessionId();
+    if (prev && prev !== next && registeredSnapshotIds.has(prev)) {
+      cancelTerminalSnapshotPersist(prev);
+      registeredSnapshotIds.delete(prev);
+    }
+    return setSessionIdSignal(next);
+  };
   const [errorMsg, setErrorMsg] = createSignal<string | null>(null);
   const [copiedFlash, setCopiedFlash] = createSignal<boolean>(false);
   const [isScrolledUp, setIsScrolledUp] = createSignal<boolean>(false);
@@ -338,6 +369,12 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
   let manualReconnectRef: (() => void) | null = null;
   let reattachInFlightTimer: ReturnType<typeof setTimeout> | null = null;
   let outputPump: ReturnType<typeof createXtermWritePump> | null = null;
+  // Teardown for an in-flight rehydrate-ready gate (Contract 2). Set inside
+  // `awaitRehydrateReady` while the gate is pending; cleared once it settles.
+  // onCleanup invokes it so an unmount mid-gate stops the 100 ms poll, drops the
+  // `"rehydrate:complete"` listener immediately, and prevents the post-gate
+  // `decideInitialSurface()` from running against a disposed terminal.
+  let cancelRehydrateGate: (() => void) | null = null;
 
   // Tier 2 — tmux-history backfill for regular shell panes. tmux's attached
   // client can drop into redraw-compression mode when raum's drain pipeline
@@ -697,13 +734,14 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         // that drives tmux-history backfill. Cheap (just a setTimeout
         // reset); the heavy work only fires once output goes quiet.
         scheduleBackfill();
-        // Skip persistence while the buffer is in alt-screen mode. Alt-screen
-        // TUIs (Codex, OpenCode, fullscreen Claude) repaint from source on
-        // every SIGWINCH, so raum's reattach path uses a SIGWINCH bounce
-        // instead of byte replay — a serialized alt buffer is wasted disk
-        // and would corrupt scrollback if ever replayed into a normal-mode
-        // pane.
-        if (target.buffer.active.type === "alternate") return;
+        // Persist a snapshot on every parsed frame (debounced). For alt-screen
+        // panes (Codex / OpenCode defaults, fullscreen Claude) the persistence
+        // helper excludes the live alt buffer and serializes the durable
+        // normal-buffer scrollback that sits behind it — that's the content
+        // worth recovering when a provider `--resume` is impossible after a
+        // reboot. The alt frame itself is never persisted (it repaints from
+        // source on SIGWINCH and would corrupt a normal-mode replay).
+        registeredSnapshotIds.add(id);
         scheduleTerminalSnapshotPersist(id, { term: target, addon });
       },
       onWarn: (queuedFrames) => {
@@ -750,11 +788,20 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       channel = makeOutputChannel(generation);
       return channel;
     };
+    // Replay the persisted disk snapshot under the live viewport. The bytes are
+    // pinned to the generation live at call time, so a concurrent channel
+    // rotation discards this stale replay (the pump drops a stale-generation
+    // enqueue) instead of corrupting a freshly-reset buffer. Callers that need a
+    // STRICT ordering guarantee against a subsequent fresh spawn on the same
+    // generation (the reboot not-recoverable path) await the bytes inline and
+    // enqueue before releasing the spawn gate rather than going through this
+    // fire-and-forget helper.
     const writeLocalSnapshotFallback = (targetSessionId: string): void => {
+      const generation = pump.generation();
       void loadTerminalSnapshotBytes(targetSessionId)
         .then((snapshot) => {
           if (!snapshot) return;
-          pump.enqueue(pump.generation(), snapshot);
+          pump.enqueue(generation, snapshot);
         })
         .catch((err) => {
           if (import.meta.env.DEV) {
@@ -764,6 +811,38 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
             });
           }
         });
+    };
+    // Boundary sequence written between the replayed disk snapshot and the live
+    // viewport paint: home the cursor (ESC[H) then erase from the cursor to the
+    // end of the display (ESC[J / ESC[0J). The snapshot fills xterm's scrollback
+    // + viewport; the control-mode reattach replay (`capture-pane`) is raw text
+    // that paints from the current cursor with NO leading positioning and NO
+    // per-line erase, so without this:
+    //   - the live viewport would be appended BELOW the snapshot's own viewport
+    //     rows and double-paint the last screen (fixed by homing), and
+    //   - where a live line is shorter than the snapshot line beneath it, stale
+    //     snapshot characters would remain at the line tail (ghost characters),
+    //     because the live paint only overwrites up to each live line's length.
+    // Homing + erase-below clears the viewport region (the snapshot's last
+    // screen) so the live capture owns a clean viewport, while the older
+    // scrollback the snapshot pushed up stays preserved above it (ED does not
+    // touch scrollback).
+    const CURSOR_HOME_CLEAR_BELOW = new Uint8Array([0x1b, 0x5b, 0x48, 0x1b, 0x5b, 0x4a]); // ESC[H ESC[J
+    // Replay the disk snapshot UNDER the live viewport on a normal reattach.
+    // Only ever runs once, on the first reattach after mount when xterm is
+    // still empty (a bridge-recovery reattach mid-session must not repaint
+    // stale scrollback over the live buffer). Skipped for alt-screen panes:
+    // their durable scrollback lives in the normal buffer (persisted with the
+    // alt frame excluded) and the harness repaints its own alt frame on attach,
+    // so replaying here would fight that paint.
+    let snapshotReplayedOnReattach = false;
+    const replaySnapshotUnderViewport = (generation: number, snapshot: Uint8Array): void => {
+      if (snapshot.byteLength === 0) return;
+      // Enqueue at the pinned generation so a concurrent channel rotation
+      // (recover retry) discards this stale replay instead of corrupting the
+      // fresh buffer.
+      pump.enqueue(generation, snapshot);
+      pump.enqueue(generation, CURSOR_HOME_CLEAR_BELOW);
     };
     // §4.4 — throttled resize plumbing. ResizeObserver ticks can arrive at
     // display refresh rate while pane geometry is changing; every dispatched
@@ -862,7 +941,14 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
 
     const reattachSession = (
       targetSessionId: string,
-      options: { fallbackToSpawn: boolean; reason: "reattach" | "recover" },
+      options: {
+        fallbackToSpawn: boolean;
+        reason: "reattach" | "recover";
+        /** Disk snapshot bytes to replay UNDER the live viewport, preloaded by
+         *  the caller. Only set on the first normal reattach for a non-alt
+         *  pane (see `tryReattach`). */
+        replaySnapshot?: Uint8Array | null;
+      },
     ): void => {
       if (!targetSessionId) return;
       if (!term || !fit) return;
@@ -889,6 +975,19 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         setBridgeRecoveryUiState("reconnecting");
       }
       const attachChannel = rotateOutputChannel(options.reason === "recover");
+      // Replay the preloaded disk snapshot at the freshly-pinned generation
+      // BEFORE the bridge's live viewport bytes arrive, so older scrollback is
+      // restored beneath the live screen (finding: snapshot never replayed on
+      // the normal restart path). Enqueued synchronously here so it always
+      // precedes the bridge's first frame on the same generation.
+      if (
+        !snapshotReplayedOnReattach &&
+        options.replaySnapshot &&
+        options.replaySnapshot.byteLength > 0
+      ) {
+        snapshotReplayedOnReattach = true;
+        replaySnapshotUnderViewport(pump.generation(), options.replaySnapshot);
+      }
       logLifecycle(options.reason, paneId, targetSessionId);
       void invoke<ReconnectResult>("terminal_reattach", {
         args: {
@@ -913,7 +1012,18 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
           setExitState(null);
           props.onSpawned?.(id);
           if (result.historyStatus === "unavailable") {
+            // Replay the persisted scrollback beneath the (empty) live viewport
+            // so the pane shows prior content instead of going blank.
             writeLocalSnapshotFallback(targetSessionId);
+            if (result.recoverable) {
+              // Contract 3: the tracked harness row survives but the in-place
+              // resume couldn't commit right now. Surface the Recover overlay
+              // (its button drives `recoverDeadPaneRef` → terminal_respawn_dead)
+              // instead of abandoning the `harness_session_id`. Do NOT set
+              // `persistedSessionMissing` / fall through to a fresh spawn.
+              setSessionId(targetSessionId);
+              setExitState({ code: 0 });
+            }
             setErrorMsg(result.message ?? "History recovery is unavailable for this pane");
             return;
           }
@@ -976,7 +1086,43 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         trySpawn();
         return;
       }
-      reattachSession(persistedSessionId, { fallbackToSpawn: true, reason: "reattach" });
+      // Non-alt panes (shells / inline harnesses) preload their disk snapshot so
+      // `reattachSession` can replay older scrollback beneath the live viewport.
+      // Alt-screen panes skip this — their harness repaints its own frame and
+      // the normal-buffer snapshot is only a last-resort fallback. The async
+      // load can't gate the `hasSpawned` latch (the ResizeObserver would race
+      // into a second attempt), so latch synchronously here and resolve the
+      // bytes before invoking. If load fails or returns nothing, reattach still
+      // proceeds with no replay.
+      const wantsSnapshotReplay =
+        !snapshotReplayedOnReattach && term?.buffer.active.type !== "alternate";
+      if (!wantsSnapshotReplay) {
+        hasSpawned = true;
+        reattachSession(persistedSessionId, {
+          fallbackToSpawn: true,
+          reason: "reattach",
+        });
+        return;
+      }
+      hasSpawned = true;
+      const target = persistedSessionId;
+      void loadTerminalSnapshotBytes(target)
+        .catch(() => null)
+        .then((snapshot) => {
+          // Release the latch before delegating: reattachSession re-latches
+          // synchronously after its own viewport-size gate, and if it bailed
+          // early (too-small pane) we want the retry path open again.
+          hasSpawned = false;
+          if (persistedSessionMissing) {
+            trySpawn();
+            return;
+          }
+          reattachSession(target, {
+            fallbackToSpawn: true,
+            reason: "reattach",
+            replaySnapshot: snapshot,
+          });
+        });
     };
 
     function recoverBridge(targetSessionId: string): void {
@@ -1032,15 +1178,48 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         },
         onData: respawnChannel,
       })
-        .then((result) => {
+        .then(async (result) => {
           setRespawningDead(false);
           if (result.historyStatus === "unavailable") {
             setErrorMsg(result.message ?? "Provider recovery is unavailable for this pane");
-            // Drop back to the standard reattach/spawn flow so the user
-            // at least gets a working harness, even if the prior
-            // conversation is unrecoverable.
+            if (result.recoverable) {
+              // Contract 3: the in-place `--resume` couldn't commit right now,
+              // but the tracked harness row survives — the conversation can
+              // still be recovered later via the Recover overlay. Mirror the
+              // `tryReattach` branch: replay the disk snapshot under the current
+              // (rotated, empty) viewport, KEEP the recoverable ghost, and
+              // surface the Recover overlay (its button drives
+              // `recoverDeadPaneRef` -> terminal_respawn_dead) instead of
+              // abandoning the `harness_session_id` by falling through to a
+              // fresh empty chat. Do NOT set `persistedSessionMissing` / drop to
+              // trySpawn. The snapshot stays on the live generation because no
+              // fresh spawn will run on it.
+              writeLocalSnapshotFallback(targetSessionId);
+              setSessionId(targetSessionId);
+              setExitState({ code: 0 });
+              return;
+            }
+            // Not recoverable — fall back to the standard reattach/spawn flow so
+            // the user still gets a working harness. Order the disk snapshot
+            // BEFORE the fresh spawn on the shared write-pump generation: await
+            // the bytes and enqueue them synchronously on the current generation
+            // FIRST, then release the spawn gate so trySpawn's harness output
+            // lands AFTER the snapshot on the same generation. Without the await
+            // the async snapshot read raced the fresh harness's first frame and
+            // prior scrollback could render below the new prompt (order-racy
+            // fallback finding).
+            const generation = pump.generation();
+            const snapshot = await loadTerminalSnapshotBytes(targetSessionId).catch(() => null);
+            if (snapshot && snapshot.byteLength > 0) {
+              pump.enqueue(generation, snapshot);
+            }
             hasSpawned = false;
             persistedSessionMissing = true;
+            // Re-run the unified decision now that the gate is released so the
+            // fresh spawn fires deterministically after the snapshot (rather
+            // than waiting on the next resize tick, which would also work but
+            // leaves the pane blank under the snapshot until then).
+            runGatedInitialDecision();
             return;
           }
           setSessionId(result.sessionId);
@@ -1093,6 +1272,9 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
           setRespawningDead(false);
           if (result.historyStatus === "unavailable") {
             setErrorMsg(result.message ?? "Provider recovery is unavailable for this pane");
+            // Replay any persisted disk snapshot so the manual Recover attempt
+            // still surfaces prior pane content rather than leaving it blank.
+            writeLocalSnapshotFallback(id);
             return;
           }
           setSessionId(result.sessionId);
@@ -1170,8 +1352,19 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         });
     };
 
-    requestVisibleResize = (force = false): void => {
-      scheduleResize(force);
+    // Unified first-mount spawn/reattach decision. ALL three entry points (the
+    // post-fonts/stable-size gate, the ResizeObserver pre-spawn retry, and
+    // `requestVisibleResize`) route through here so the `recoverable_after_reboot`
+    // flag is honoured consistently. It is read fresh on every call (not
+    // captured), so a late-arriving recover ghost (see the rehydrate-race
+    // finding) still routes to recovery as long as `hasSpawned` hasn't latched.
+    //
+    // 4-way decision:
+    //   1. recoverable-after-reboot harness  -> tryRecoverAfterReboot (--resume)
+    //   2. persisted && !missing             -> tryReattach (+ snapshot replay)
+    //   3. (structured-unavailable is handled inside reattach -> Recover overlay)
+    //   4. else                              -> trySpawn (fresh session)
+    const decideInitialSurface = (): void => {
       if (hasSpawned) return;
       if (
         persistedSessionId &&
@@ -1185,6 +1378,108 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       } else {
         trySpawn();
       }
+    };
+
+    // Contract 2 (rehydrate-complete gate). A pane with a persisted session must
+    // not commit to spawn/reattach before the backend rehydrate has had a chance
+    // to mark recover sessions with `recoverable_after_reboot` — otherwise the
+    // ghost-upsert lands AFTER the pane already reattached -> not-found ->
+    // trySpawn (fresh harness, lost conversation). We race a bounded poll of
+    // `terminal_rehydrate_ready` / the `"rehydrate:complete"` event against a
+    // timeout so a stuck backend can never hang the pane. Resolves at most once.
+    const REHYDRATE_GATE_TIMEOUT_MS = 4000;
+    const REHYDRATE_POLL_MS = 100;
+    let rehydrateGateSettled = false;
+    // Resolves to `true` when the gate settled normally (ready / event / hard
+    // timeout) and the caller should run the decision, or `false` when the gate
+    // was cancelled by onCleanup (pane unmounted mid-gate) — in which case the
+    // caller must NOT run `decideInitialSurface()` on the torn-down pane.
+    const awaitRehydrateReady = (): Promise<boolean> => {
+      // Panes with no persisted session can't be recover candidates — spawn
+      // immediately, don't pay the gate latency.
+      if (!persistedSessionId) return Promise.resolve(true);
+      return new Promise<boolean>((resolve) => {
+        let done = false;
+        let pollTimer: ReturnType<typeof setTimeout> | null = null;
+        let hardTimer: ReturnType<typeof setTimeout> | null = null;
+        let unlistenReady: UnlistenFn | null = null;
+        const teardown = (): void => {
+          if (pollTimer !== null) clearTimeout(pollTimer);
+          if (hardTimer !== null) clearTimeout(hardTimer);
+          pollTimer = null;
+          hardTimer = null;
+          unlistenReady?.();
+          unlistenReady = null;
+          cancelRehydrateGate = null;
+        };
+        const finish = (): void => {
+          if (done) return;
+          done = true;
+          rehydrateGateSettled = true;
+          teardown();
+          resolve(true);
+        };
+        // Invoked from onCleanup: stop the poll + listener immediately and
+        // resolve `false` so the post-gate decision is skipped on the dead pane.
+        cancelRehydrateGate = (): void => {
+          if (done) return;
+          done = true;
+          teardown();
+          resolve(false);
+        };
+        const poll = (): void => {
+          if (done) return;
+          void invoke<boolean>("terminal_rehydrate_ready")
+            .then((ready) => {
+              if (ready) finish();
+              else if (!done) pollTimer = setTimeout(poll, REHYDRATE_POLL_MS);
+            })
+            .catch(() => {
+              // Older backend without the command — don't gate at all.
+              finish();
+            });
+        };
+        // Late-attaching listeners can miss the one-shot event, hence the poll;
+        // but the event still lets us proceed the instant rehydrate finishes.
+        void listen("rehydrate:complete", () => finish())
+          .then((u) => {
+            if (done) u();
+            else unlistenReady = u;
+          })
+          .catch(() => {
+            /* event bus unavailable (tests) — poll/timeout still cover it. */
+          });
+        hardTimer = setTimeout(finish, REHYDRATE_GATE_TIMEOUT_MS);
+        poll();
+      });
+    };
+
+    // Run the initial decision once rehydrate has settled (or timed out). Guards
+    // against re-entry so multiple resize/visibility triggers collapse to one
+    // gated decision; subsequent retries (post-gate) call decideInitialSurface
+    // directly because rehydrateGateSettled short-circuits the await.
+    let initialDecisionStarted = false;
+    const runGatedInitialDecision = (): void => {
+      if (hasSpawned) return;
+      if (rehydrateGateSettled || !persistedSessionId) {
+        decideInitialSurface();
+        return;
+      }
+      if (initialDecisionStarted) return;
+      initialDecisionStarted = true;
+      void awaitRehydrateReady().then((shouldDecide) => {
+        initialDecisionStarted = false;
+        // Skip the decision when the gate was cancelled by onCleanup — `term` is
+        // already null and the trySpawn/tryReattach/tryRecoverAfterReboot guards
+        // would early-return anyway, but not running at all avoids the stray
+        // late call entirely.
+        if (shouldDecide) decideInitialSurface();
+      });
+    };
+
+    requestVisibleResize = (force = false): void => {
+      scheduleResize(force);
+      runGatedInitialDecision();
     };
 
     let selfHealInFlight = false;
@@ -1229,6 +1524,9 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
           if (result.historyStatus === "unavailable") {
             setErrorMsg(result.message ?? "Provider recovery is unavailable for this pane");
             setBridgeRecoveryUiState("idle");
+            // Replay any persisted disk snapshot so a failed self-heal still
+            // shows prior pane content instead of a blank buffer.
+            writeLocalSnapshotFallback(id);
             return;
           }
           const nextId = result.sessionId;
@@ -1309,11 +1607,10 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
           return;
         }
         if (!initialSpawnGateOpen) return;
-        if (persistedSessionId) {
-          tryReattach();
-        } else {
-          trySpawn();
-        }
+        // Route through the unified gated decision so a host that was too small
+        // at gate-open (and only grew later) still honours the recover flag
+        // instead of falling straight into tryReattach/trySpawn.
+        runGatedInitialDecision();
       });
       resizeObserver.observe(host);
     }
@@ -1405,15 +1702,17 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         // retry on the next resize.
         initialSpawnGateOpen = true;
         if (!term) return;
+        // Unified gated decision: routes recover-after-reboot panes to
+        // tryRecoverAfterReboot (--resume), persisted panes to tryReattach
+        // (which opens a PTY-attached client against the existing tmux session
+        // and replays the disk snapshot under the live viewport), and otherwise
+        // trySpawn. The rehydrate gate inside ensures a Recover ghost that
+        // lands late still routes to recovery before hasSpawned latches.
+        runGatedInitialDecision();
         if (persistedSessionId) {
-          // Reattach path: open a new PTY-attached client against an
-          // existing tmux session. Post-reattach the ResizeObserver pushes
-          // a terminal_resize to match the current host dims if the
-          // viewport changed since the previous run.
-          tryReattach();
+          // Post-reattach the ResizeObserver pushes a terminal_resize to match
+          // the current host dims if the viewport changed since the prior run.
           scheduleResize();
-        } else {
-          trySpawn();
         }
       });
     });
@@ -1529,6 +1828,20 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
   onCleanup(() => {
     logLifecycle("cleanup", paneId, sessionId());
     requestVisibleResize = null;
+    // Clear any pending snapshot debounce timer for EVERY session id this pane
+    // ever registered BEFORE disposing xterm below, so a queued timer (or the
+    // quit-time flush) can never serialize a disposed terminal. A pane's id
+    // rotates over its lifetime (provider-replace / self-heal / recover), and
+    // each rotation leaves a stale `sources` entry under the old id pointing at
+    // this same live term/addon; cancelling only the CURRENT id would leave
+    // those stale ids to serialize the disposed addon at quit-flush. The
+    // freshest content is preserved by the quit-flush path
+    // (`flushAllTerminalSnapshotsNow`) on app close; an individual tab close is
+    // user-intentional teardown and its snapshot is GC'd when the session dies.
+    const cleanupSessionId = sessionId();
+    if (cleanupSessionId) registeredSnapshotIds.add(cleanupSessionId);
+    for (const id of registeredSnapshotIds) cancelTerminalSnapshotPersist(id);
+    registeredSnapshotIds.clear();
     unlistenProcessExited?.();
     unlistenBridgeLost?.();
     unsubscribeTheme?.();
@@ -1551,6 +1864,11 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       clearTimeout(reattachInFlightTimer);
       reattachInFlightTimer = null;
     }
+    // Tear down an in-flight rehydrate-ready gate (Contract 2): stops the 100 ms
+    // poll + drops the `"rehydrate:complete"` listener immediately and prevents
+    // the post-gate decision from running on this disposed pane.
+    cancelRehydrateGate?.();
+    cancelRehydrateGate = null;
     cancelBackfill();
     clearResizeRepin();
     try {

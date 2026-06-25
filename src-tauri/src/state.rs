@@ -114,7 +114,14 @@ pub struct AppHandleState {
     /// between launch and reattach — back when this was ungated, the focus
     /// reaper fired against an empty registry and destroyed live panes.
     /// A `watch` channel so waiters observe the already-`true` case without a
-    /// race; hand out receivers via `rehydrate_done_tx.subscribe()`.
+    /// race; hand out receivers via `rehydrate_done_tx.subscribe()`. The latch
+    /// is flipped with `send_replace(true)` (see `latch_rehydrate_done` in
+    /// `lib.rs`) rather than `send(true)`, because the boot rehydrate finishes
+    /// while no long-lived receiver is parked here — and `watch::Sender::send`
+    /// drops the new value when `receiver_count() == 0`. `send_replace` updates
+    /// the stored value unconditionally, so `terminal_rehydrate_ready` (which
+    /// reads `borrow()`) reflects the latch even for panes that poll after the
+    /// `rehydrate:complete` event already fired.
     pub rehydrate_done_tx: tokio::sync::watch::Sender<bool>,
     /// macOS-only: retained `UNUserNotificationCenterDelegate` instance.
     /// Stored here because Objective-C will deallocate the delegate the
@@ -161,5 +168,56 @@ impl Default for AppHandleState {
             #[cfg(target_os = "macos")]
             notification_delegate: Mutex::new(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Contract 2 backstop: `terminal_rehydrate_ready` reads
+    /// `rehydrate_done_tx.borrow()`. The boot rehydrate flips the latch while no
+    /// long-lived receiver is parked, so it must use `send_replace` — plain
+    /// `send` drops the value when `receiver_count() == 0`, leaving the poll
+    /// backstop permanently reading `false`. This pins the round-trip the dead
+    /// receiver previously broke.
+    #[test]
+    fn rehydrate_latch_send_replace_is_observable_without_receivers() {
+        let tx = tokio::sync::watch::channel(false).0;
+        // No `subscribe()` is alive — exactly the boot-launch case.
+        assert_eq!(tx.receiver_count(), 0);
+
+        // Plain `send` is silently dropped with zero receivers (the dead bug)…
+        let _ = tx.send(true);
+        assert!(
+            !*tx.borrow(),
+            "watch::send with no receivers must NOT update the value (regression guard)",
+        );
+
+        // …but `send_replace` (what `latch_rehydrate_done` now uses) updates it
+        // unconditionally, so the poll backstop sees `true`.
+        tx.send_replace(true);
+        assert!(
+            *tx.borrow(),
+            "after the latch, the value terminal_rehydrate_ready reads must be true",
+        );
+    }
+
+    /// A freshly constructed `AppHandleState` reports the rehydrate latch as
+    /// `false` (matches what `terminal_rehydrate_ready` returns before boot
+    /// rehydrate completes) and flips to `true` via the same `send_replace`
+    /// call `latch_rehydrate_done` makes.
+    #[test]
+    fn app_state_rehydrate_latch_defaults_false_then_latches_true() {
+        let state = AppHandleState::default();
+        assert!(
+            !*state.rehydrate_done_tx.borrow(),
+            "rehydrate latch must start false",
+        );
+        state.rehydrate_done_tx.send_replace(true);
+        assert!(
+            *state.rehydrate_done_tx.borrow(),
+            "rehydrate latch must read true after the boot latch flips it",
+        );
     }
 }

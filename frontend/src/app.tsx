@@ -9,11 +9,13 @@ import { SpotlightDock } from "./components/spotlight-dock";
 import { Toaster } from "./components/ui/sonner";
 import { KeymapProvider, useKeymapAction } from "./lib/keymapContext";
 import {
+  markActiveLayoutHydrated,
   openActiveLayoutSaveGate,
   setRuntimeLayout,
   type ActiveLayoutState,
   type CellKind,
 } from "./stores/runtimeLayoutStore";
+import { installQuitFlush } from "./lib/quitFlush";
 import { notifyBannerEnabled, startNotificationCenter } from "./lib/notificationCenter";
 import { installGlobalContextMenuSuppressor } from "./lib/suppressContextMenu";
 import { installDevtoolsShortcut } from "./lib/devtoolsShortcut";
@@ -93,6 +95,17 @@ async function scheduleBackgroundUpdateCheck(snapshot: RaumConfigSnapshot): Prom
   }, UPDATE_POLL_INTERVAL_MS);
 }
 
+/** Bound the `active_layout_get` IPC call so a wedged backend (a lock held by
+ *  a stalled command, a dropped IPC reply) can't leave hydration awaiting
+ *  forever — which would keep the save gate closed and silently park EVERY
+ *  layout mutation for the whole session. On timeout we open the gate (so this
+ *  session's saves still flush) but deliberately do NOT mark hydration
+ *  complete, so the empty-save guard in `runtimeLayoutStore` still protects a
+ *  layout we never managed to read. */
+const ACTIVE_LAYOUT_GET_TIMEOUT_MS = 4000;
+
+const HYDRATE_TIMEOUT = Symbol("active-layout-get-timeout");
+
 /** Rehydrate the runtime grid from the last-saved `active-layout.toml`.
  *
  *  Persisted `session_id`s are passed through verbatim — `TerminalPane`
@@ -108,7 +121,21 @@ async function scheduleBackgroundUpdateCheck(snapshot: RaumConfigSnapshot): Prom
  *  truth. No-ops when no snapshot exists. */
 async function hydrateActiveLayout(): Promise<void> {
   try {
-    const saved = await invoke<ActiveLayoutState>("active_layout_get");
+    const saved = await Promise.race([
+      invoke<ActiveLayoutState>("active_layout_get"),
+      new Promise<typeof HYDRATE_TIMEOUT>((resolve) =>
+        setTimeout(() => resolve(HYDRATE_TIMEOUT), ACTIVE_LAYOUT_GET_TIMEOUT_MS),
+      ),
+    ]);
+    if (saved === HYDRATE_TIMEOUT) {
+      console.warn("active_layout_get timed out; skipping layout hydration this launch");
+      return;
+    }
+
+    // A real layout (even an empty one) has now loaded — empty saves from here
+    // on are legitimate. The destructive-clobber guard stays armed on the
+    // failure paths below where this is never reached.
+    markActiveLayoutHydrated();
 
     // Restore the per-project sidebar scope FIRST, before any cell-level
     // setRuntimeLayout work. The grid's pruning pass keys on
@@ -150,7 +177,13 @@ async function hydrateActiveLayout(): Promise<void> {
 
     setRuntimeLayout(cells);
   } catch {
-    // Non-Tauri environment (browser dev) or missing file — silently skip.
+    // Non-Tauri environment (browser dev), missing file, or a corrupt/
+    // unparsable active-layout.toml whose `active_layout_get` rejected.
+    // We deliberately leave `markActiveLayoutHydrated()` UNCALLED here: the
+    // empty-save guard then refuses to overwrite a layout we failed to read
+    // (do-not-overwrite on read failure), so a recoverable-by-hand corrupt
+    // file isn't clobbered with `cells: []` by a stray boot save. The backend
+    // read path quarantines the bad file separately (Contract 5).
   } finally {
     // Open the persistence gate exactly once, after hydration has either
     // restored cells or confirmed there were none. Any save scheduled by
@@ -208,12 +241,27 @@ const App: Component = () => {
     const stopBackgroundDemotion = installBackgroundRendererDemotion();
     const stopShellContextPoller = startShellContextPoller();
     installPaneFocusAcknowledger();
+    // Contract 1 (quit-flush): listen for the backend's `app-will-quit` and
+    // flush every debounced writer (layout + terminal snapshots) before the
+    // process exits, so a quit landing inside the 500 ms save debounce doesn't
+    // lose the last layout mutation.
+    let stopQuitFlush: (() => void) | undefined;
+    void installQuitFlush()
+      .then((unlisten) => {
+        if (disposed) {
+          unlisten();
+          return;
+        }
+        stopQuitFlush = unlisten;
+      })
+      .catch((e) => console.warn("installQuitFlush failed", e));
     onCleanup(() => {
       disposed = true;
       stopFileDrop?.();
       stopWebviewHealth?.();
       stopBackgroundDemotion();
       stopShellContextPoller();
+      stopQuitFlush?.();
     });
   });
 
@@ -223,19 +271,29 @@ const App: Component = () => {
   // a Tauri host doesn't trap the UI behind the wizard.
   const [dismissed, setDismissed] = createSignal(false);
   const [cfg] = createResource<RaumConfigSnapshot>(async () => {
+    // Read the config, but treat its failure as orthogonal to layout
+    // hydration. `config_get` rejects whenever config.toml fails to parse or
+    // the config mutex is poisoned (both plausible after a hard reboot), yet
+    // `active_layout_get` is an independent command — coupling them meant a bad
+    // config skipped hydration entirely and then let an early empty save
+    // clobber the on-disk layout. Hydrate UNCONDITIONALLY below so the saved
+    // cells are always read (and the save gate opened by hydration's `finally`)
+    // regardless of whether the config read succeeded.
+    let c: RaumConfigSnapshot = { onboarded: true };
     try {
-      const c = await invoke<RaumConfigSnapshot>("config_get");
-      // Hydrate the grid after confirming we're inside a Tauri host.
-      await hydrateActiveLayout();
-      void prewarmAllWorktrees();
-      void scheduleBackgroundUpdateCheck(c);
-      return c;
-    } catch {
-      // No Tauri host (browser dev / vitest) — there is no layout to read,
-      // so unblock the save gate so future saves can proceed normally.
-      openActiveLayoutSaveGate();
-      return { onboarded: true };
+      c = await invoke<RaumConfigSnapshot>("config_get");
+    } catch (e) {
+      // No Tauri host (browser dev / vitest) or a corrupt/poisoned config —
+      // fall back to the onboarded default so the wizard isn't shown, but do
+      // NOT open the save gate here: hydrateActiveLayout owns the gate and
+      // opening it without first reading the layout is exactly the clobber we
+      // are fixing.
+      console.warn("config_get failed; continuing with defaults", e);
     }
+    await hydrateActiveLayout();
+    void prewarmAllWorktrees();
+    void scheduleBackgroundUpdateCheck(c);
+    return c;
   });
   const showWizard = (): boolean => {
     if (previewOnboarding()) return true;

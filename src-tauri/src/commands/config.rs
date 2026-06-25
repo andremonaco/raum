@@ -68,7 +68,17 @@ fn parse_os_release() -> (Option<String>, Vec<String>) {
 
 #[tauri::command]
 pub fn config_get(state: tauri::State<'_, AppHandleState>) -> Result<Config, String> {
-    let store = state.config_store.lock().map_err(|e| e.to_string())?;
+    // Recover a poisoned mutex instead of bubbling the lock error: a single
+    // panic in any prior `config_store` user would otherwise permanently
+    // brick `config_get`, and on boot a rejected `config_get` lets the
+    // frontend's catch path clobber `active-layout.toml` with empty cells.
+    // `read_config` itself already degrades a corrupt file to the default
+    // (see `read_toml_or_default`'s quarantine), so the only remaining
+    // failure modes are genuine IO errors, which we still surface.
+    let store = state
+        .config_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     store.read_config().map_err(|e| e.to_string())
 }
 
@@ -104,7 +114,14 @@ pub fn config_mark_onboarded(state: tauri::State<'_, AppHandleState>) -> Result<
 pub fn active_layout_get(
     state: tauri::State<'_, AppHandleState>,
 ) -> Result<ActiveLayoutState, String> {
-    let store = state.config_store.lock().map_err(|e| e.to_string())?;
+    // Same hardening as `config_get`: recover a poisoned lock so a corrupt
+    // read can never reject. `read_active_layout` now quarantines a corrupt
+    // file and returns the default, so a parse error no longer surfaces as
+    // `Err` (which the frontend `catch` would turn into a layout clobber).
+    let store = state
+        .config_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     store.read_active_layout().map_err(|e| e.to_string())
 }
 

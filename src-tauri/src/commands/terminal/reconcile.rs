@@ -126,10 +126,29 @@ pub(crate) async fn reconcile_inner<R: Runtime>(
             warn!(session_id=%job.session_id, "reconcile: config_store lock poisoned; skipping track");
         }
 
-        // 2. Insert a live ghost and tell the frontend, so the session shows
-        //    up in `terminal_list` (and thus the orphan tray) before any pane
-        //    mounts. `dead: false` — the tmux pane is alive; placing it mounts
-        //    a normal reattach.
+        // 2. Probe pane health before adopting. `remain-on-exit on`
+        //    (manager.rs) keeps a pane whose process has exited on the socket
+        //    as a zombie, and `list_sessions` reports it as live — exactly why
+        //    the rehydrate REGISTER path probes `check_pane_dead` too. Without
+        //    this probe a dead-but-listed pane is adopted as `dead: false`,
+        //    the dock shows it as a placeable orphan, and clicking it attaches
+        //    a fresh bridge to a corpse: a blank pane with no Recover overlay
+        //    (the overlay only renders for `dead: true` ghosts). Mark it
+        //    `dead: true` so the frontend routes through the Recover/Close
+        //    overlay instead. We do NOT set `recoverable_after_reboot` — an
+        //    adopted orphan has no surviving tracked metadata to resume
+        //    against, so the manual Recover affordance is the right surface.
+        let dead = state
+            .tmux
+            .check_pane_dead(&job.session_id)
+            .ok()
+            .flatten()
+            .is_some();
+
+        // 3. Insert the ghost and tell the frontend, so the session shows up
+        //    in `terminal_list` (and thus the orphan tray) before any pane
+        //    mounts. A live pane (`dead: false`) mounts a normal reattach; a
+        //    dead one surfaces the Recover/Close overlay.
         let inserted = state.terminals.lock().is_ok_and(|mut reg| {
             reg.upsert_ghost(GhostEntry {
                 session_id: job.session_id.clone(),
@@ -137,7 +156,7 @@ pub(crate) async fn reconcile_inner<R: Runtime>(
                 worktree_id: None,
                 kind: job.kind,
                 created_unix: job.created_unix,
-                dead: false,
+                dead,
                 recoverable_after_reboot: false,
             })
         });
@@ -150,7 +169,7 @@ pub(crate) async fn reconcile_inner<R: Runtime>(
                     worktree_id: None,
                     kind: job.kind,
                     created_unix: job.created_unix,
-                    dead: false,
+                    dead,
                     recoverable_after_reboot: false,
                 },
             );

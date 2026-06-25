@@ -476,6 +476,24 @@ let _saveTimer: ReturnType<typeof setTimeout> | null = null;
 let _saveGateOpen = false;
 let _savePendingWhileGated = false;
 
+/** True once this session has actually READ a layout off disk (even an empty
+ *  one) into the store. Stays false when the on-disk file failed to parse or
+ *  the read never settled — in that case we must never let an early save write
+ *  `cells: []` over a layout the user might still be able to salvage.
+ *
+ *  The boot sequence (`hydrateActiveLayout`) flips this via
+ *  `markActiveLayoutHydrated()` only on a clean read. Tests default it true
+ *  (see `__resetRuntimeLayoutForTests`) so save-path tests keep working. */
+let _didHydrate = false;
+
+/** Mark that a real layout read completed this session. Called by
+ *  `hydrateActiveLayout` after `active_layout_get` resolved (even with zero
+ *  cells) so subsequent empty saves are legitimate. Not called on a read
+ *  failure / timeout, which keeps the empty-save guard armed. */
+export function markActiveLayoutHydrated(): void {
+  _didHydrate = true;
+}
+
 /** Open the save gate. Called by `hydrateActiveLayout` once hydration has
  *  either restored the saved cells or confirmed there were none. Any save
  *  request that arrived while the gate was closed is honoured here. */
@@ -501,6 +519,92 @@ function collectWorktreeScopes(): Record<string, string> {
   return out;
 }
 
+/** Build the `ActiveLayoutState` payload from the current store. Pure read of
+ *  the store — extracted so both the debounced save and `flushActiveLayoutNow`
+ *  serialize the layout identically. */
+function buildActiveLayoutPayload(): ActiveLayoutState {
+  const inTreeCells = runtimeLayoutStore.cells;
+  const inTreeIds = new Set(inTreeCells.map((c) => c.id));
+  const mins = minimizedPaneIds();
+  const offTreePanes: PaneContent[] = [];
+  for (const pane of Object.values(runtimeLayoutStore.panes)) {
+    if (inTreeIds.has(pane.id)) continue;
+    // Only persist off-tree panes that are tracked as minimized; any other
+    // off-tree pane is in-flight (mid-mutation) and shouldn't ride along.
+    if (mins.has(pane.id)) offTreePanes.push(unwrap(pane) as PaneContent);
+  }
+  const serializeTabs = (tabs: CellTab[]): ActiveLayoutTab[] =>
+    tabs.map((t) => ({
+      id: t.id,
+      session_id: t.sessionId,
+      ...(t.label ? { label: t.label } : {}),
+      ...(t.projectSlug ? { project_slug: t.projectSlug } : {}),
+      ...(t.worktreeId ? { worktree_id: t.worktreeId } : {}),
+    }));
+  const scopes = collectWorktreeScopes();
+  return {
+    saved_at: Math.floor(Date.now() / 1000),
+    ...(activeProjectSlug() !== undefined ? { project_slug: activeProjectSlug() } : {}),
+    ...(Object.keys(scopes).length > 0 ? { worktree_scopes: scopes } : {}),
+    cells: [
+      ...inTreeCells.map((c) => ({
+        id: c.id,
+        x: c.x,
+        y: c.y,
+        w: c.w,
+        h: c.h,
+        kind: c.kind,
+        title: c.title,
+        project_slug: c.projectSlug,
+        worktree_id: c.worktreeId,
+        active_tab_id: c.activeTabId,
+        tabs: serializeTabs(c.tabs),
+      })),
+      ...offTreePanes.map((p) => ({
+        id: p.id,
+        x: 0,
+        y: 0,
+        w: 0,
+        h: 0,
+        kind: p.kind,
+        title: p.title,
+        project_slug: p.projectSlug,
+        worktree_id: p.worktreeId,
+        active_tab_id: p.activeTabId,
+        tabs: serializeTabs(p.tabs),
+        minimized: true,
+      })),
+    ],
+  };
+}
+
+/** Guard against the destructive clobber: never overwrite a (possibly
+ *  non-empty) on-disk layout with `cells: []` until this session has actually
+ *  read the saved layout back into the store. Without this, an early save fired
+ *  by the boot project-tab select (or fired after a corrupt/timed-out read that
+ *  left the gate handling deferred) could replace a recoverable layout with a
+ *  definitively empty one. Once a real layout has loaded, empty saves are
+ *  legitimate (the user closed every pane). */
+function isSavePayloadSafe(payload: ActiveLayoutState): boolean {
+  if (payload.cells.length > 0) return true;
+  return _didHydrate;
+}
+
+/** Record that a genuine non-empty layout has been written to disk THIS
+ *  session. After a corrupt/timed-out read `_didHydrate` stays false to block
+ *  the boot-time empty clobber — but once the user has built and persisted a
+ *  real layout, the on-disk file is known to be raum-owned and overwritable.
+ *  From that point a later legitimate empty save (the user closed every pane)
+ *  must persist `cells: []`; otherwise the next launch reloads the stale
+ *  non-empty layout instead of the empty grid the user actually left.
+ *
+ *  The boot-time anti-clobber guarantee is preserved: this only flips on a
+ *  NON-empty write, so an empty save fired before any read still hits the
+ *  `!_didHydrate` block. */
+function markLayoutOwnedAfterNonEmptySave(): void {
+  _didHydrate = true;
+}
+
 export function scheduleActiveSave(): void {
   if (!_saveGateOpen) {
     // Hydration hasn't finished yet — record that a save was requested and
@@ -511,61 +615,29 @@ export function scheduleActiveSave(): void {
   if (_saveTimer !== null) clearTimeout(_saveTimer);
   _saveTimer = setTimeout(() => {
     _saveTimer = null;
-    const inTreeCells = runtimeLayoutStore.cells;
-    const inTreeIds = new Set(inTreeCells.map((c) => c.id));
-    const mins = minimizedPaneIds();
-    const offTreePanes: PaneContent[] = [];
-    for (const pane of Object.values(runtimeLayoutStore.panes)) {
-      if (inTreeIds.has(pane.id)) continue;
-      // Only persist off-tree panes that are tracked as minimized; any other
-      // off-tree pane is in-flight (mid-mutation) and shouldn't ride along.
-      if (mins.has(pane.id)) offTreePanes.push(unwrap(pane) as PaneContent);
-    }
-    const serializeTabs = (tabs: CellTab[]): ActiveLayoutTab[] =>
-      tabs.map((t) => ({
-        id: t.id,
-        session_id: t.sessionId,
-        ...(t.label ? { label: t.label } : {}),
-        ...(t.projectSlug ? { project_slug: t.projectSlug } : {}),
-        ...(t.worktreeId ? { worktree_id: t.worktreeId } : {}),
-      }));
-    const scopes = collectWorktreeScopes();
-    const payload: ActiveLayoutState = {
-      saved_at: Math.floor(Date.now() / 1000),
-      ...(activeProjectSlug() !== undefined ? { project_slug: activeProjectSlug() } : {}),
-      ...(Object.keys(scopes).length > 0 ? { worktree_scopes: scopes } : {}),
-      cells: [
-        ...inTreeCells.map((c) => ({
-          id: c.id,
-          x: c.x,
-          y: c.y,
-          w: c.w,
-          h: c.h,
-          kind: c.kind,
-          title: c.title,
-          project_slug: c.projectSlug,
-          worktree_id: c.worktreeId,
-          active_tab_id: c.activeTabId,
-          tabs: serializeTabs(c.tabs),
-        })),
-        ...offTreePanes.map((p) => ({
-          id: p.id,
-          x: 0,
-          y: 0,
-          w: 0,
-          h: 0,
-          kind: p.kind,
-          title: p.title,
-          project_slug: p.projectSlug,
-          worktree_id: p.worktreeId,
-          active_tab_id: p.activeTabId,
-          tabs: serializeTabs(p.tabs),
-          minimized: true,
-        })),
-      ],
-    };
+    const payload = buildActiveLayoutPayload();
+    if (!isSavePayloadSafe(payload)) return;
+    if (payload.cells.length > 0) markLayoutOwnedAfterNonEmptySave();
     invoke("active_layout_save", { layout: payload }).catch(console.warn);
   }, 500);
+}
+
+/** Contract 1 (quit-flush): clear the debounce timer and persist the current
+ *  layout immediately, awaiting the backend write so a quit landing inside the
+ *  500 ms quiet window doesn't lose the last layout mutation. No-op when the
+ *  save gate is closed (hydration never opened it) or when the payload would
+ *  destructively blank a never-hydrated layout. Errors are swallowed by the
+ *  caller (`quitFlush.ts`) so one failing flush still acks the quit. */
+export async function flushActiveLayoutNow(): Promise<void> {
+  if (_saveTimer !== null) {
+    clearTimeout(_saveTimer);
+    _saveTimer = null;
+  }
+  if (!_saveGateOpen) return;
+  const payload = buildActiveLayoutPayload();
+  if (!isSavePayloadSafe(payload)) return;
+  if (payload.cells.length > 0) markLayoutOwnedAfterNonEmptySave();
+  await invoke("active_layout_save", { layout: payload });
 }
 
 // ---- layout replacement (back-compat entry point) -------------------------
@@ -1319,6 +1391,25 @@ export function __resetRuntimeLayoutForTests(): void {
   // tests that exercise `scheduleActiveSave` keep their previous behaviour.
   _saveGateOpen = true;
   _savePendingWhileGated = false;
+  // Likewise default the hydration flag true so save-path tests aren't blocked
+  // by the empty-save guard (which only fires on the never-hydrated boot path).
+  _didHydrate = true;
+  if (_saveTimer !== null) {
+    clearTimeout(_saveTimer);
+    _saveTimer = null;
+  }
+}
+
+/** Test helper: force the boot-time gate/hydration flags so tests can exercise
+ *  the launch path (gate closed until hydration, empty-save guard armed) that
+ *  `__resetRuntimeLayoutForTests` deliberately bypasses. */
+export function __setActiveLayoutBootStateForTests(state: {
+  gateOpen: boolean;
+  didHydrate: boolean;
+}): void {
+  _saveGateOpen = state.gateOpen;
+  _savePendingWhileGated = false;
+  _didHydrate = state.didHydrate;
   if (_saveTimer !== null) {
     clearTimeout(_saveTimer);
     _saveTimer = null;

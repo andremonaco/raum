@@ -7,6 +7,11 @@ vi.mock("@tauri-apps/api/core", () => ({
 
 import {
   __resetRuntimeLayoutForTests,
+  __setActiveLayoutBootStateForTests,
+  flushActiveLayoutNow,
+  markActiveLayoutHydrated,
+  openActiveLayoutSaveGate,
+  scheduleActiveSave,
   addCellTab,
   clearMaximize,
   compactTree,
@@ -735,5 +740,123 @@ describe("runtimeLayoutStore (BSP)", () => {
     // The pane left the tree but stays in `panes`, so its session is still
     // something the user can restore — it must not be treated as an orphan.
     expect(placedSessionIds().has("raum-claude-1-1")).toBe(true);
+  });
+});
+
+describe("active-layout save gate & empty-save guard (recovery)", () => {
+  beforeEach(() => {
+    vi.useRealTimers();
+    vi.clearAllMocks();
+    __resetRuntimeLayoutForTests();
+  });
+
+  it("does NOT overwrite with cells:[] when nothing was hydrated this session", async () => {
+    vi.useFakeTimers();
+    // Simulate the corrupt/timed-out-read boot path: gate eventually open, but
+    // hydration never completed, so an empty save must be suppressed.
+    __setActiveLayoutBootStateForTests({ gateOpen: true, didHydrate: false });
+    // The store is empty (cells === []). An early save (e.g. from the boot
+    // project-tab select) must not clobber a possibly-non-empty on-disk file.
+    scheduleActiveSave();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(invoke).not.toHaveBeenCalledWith("active_layout_save", expect.anything());
+  });
+
+  it("allows an empty save once a real layout has been hydrated", async () => {
+    vi.useFakeTimers();
+    __setActiveLayoutBootStateForTests({ gateOpen: true, didHydrate: false });
+    // A real (even empty) layout loaded — the user genuinely has zero panes.
+    markActiveLayoutHydrated();
+    scheduleActiveSave();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(invoke).toHaveBeenCalledWith(
+      "active_layout_save",
+      expect.objectContaining({ layout: expect.objectContaining({ cells: [] }) }),
+    );
+  });
+
+  it("parks saves while the gate is closed, then flushes on open", async () => {
+    vi.useFakeTimers();
+    __setActiveLayoutBootStateForTests({ gateOpen: false, didHydrate: true });
+    setRuntimeLayout([cell("a")]);
+    // Gate closed: the mutation's scheduled save is parked, not issued.
+    await vi.advanceTimersByTimeAsync(500);
+    expect(invoke).not.toHaveBeenCalledWith("active_layout_save", expect.anything());
+    // Opening the gate flushes the parked save.
+    openActiveLayoutSaveGate();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(invoke).toHaveBeenCalledWith("active_layout_save", expect.anything());
+  });
+
+  it("flushActiveLayoutNow persists immediately, cancelling the debounce", async () => {
+    vi.useFakeTimers();
+    __setActiveLayoutBootStateForTests({ gateOpen: true, didHydrate: true });
+    setRuntimeLayout([cell("a", { tabs: [{ id: "tab-a", sessionId: "raum-a" }] })]);
+    vi.mocked(invoke).mockClear();
+    // No timer advance — flushActiveLayoutNow must write synchronously.
+    await flushActiveLayoutNow();
+    expect(invoke).toHaveBeenCalledWith(
+      "active_layout_save",
+      expect.objectContaining({
+        layout: expect.objectContaining({
+          cells: [expect.objectContaining({ id: "a" })],
+        }),
+      }),
+    );
+    // The debounce timer was cleared, so advancing time issues no second save.
+    vi.mocked(invoke).mockClear();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(invoke).not.toHaveBeenCalledWith("active_layout_save", expect.anything());
+  });
+
+  it("flushActiveLayoutNow is a no-op when the gate is closed", async () => {
+    __setActiveLayoutBootStateForTests({ gateOpen: false, didHydrate: true });
+    setRuntimeLayout([cell("a")]);
+    vi.mocked(invoke).mockClear();
+    await flushActiveLayoutNow();
+    expect(invoke).not.toHaveBeenCalledWith("active_layout_save", expect.anything());
+  });
+
+  it("flushActiveLayoutNow does not clobber a never-hydrated empty layout", async () => {
+    __setActiveLayoutBootStateForTests({ gateOpen: true, didHydrate: false });
+    vi.mocked(invoke).mockClear();
+    await flushActiveLayoutNow();
+    expect(invoke).not.toHaveBeenCalledWith("active_layout_save", expect.anything());
+  });
+
+  it("allows a later empty save after the user persisted a real layout (corrupt-read leg)", async () => {
+    vi.useFakeTimers();
+    // Corrupt/timed-out read boot path: gate open, hydration never completed.
+    __setActiveLayoutBootStateForTests({ gateOpen: true, didHydrate: false });
+    // 1. The user builds a non-empty layout — this persists (bypasses the
+    //    guard via cells.length > 0) and marks the on-disk file as raum-owned.
+    setRuntimeLayout([cell("a", { tabs: [{ id: "tab-a", sessionId: "raum-a" }] })]);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(invoke).toHaveBeenCalledWith(
+      "active_layout_save",
+      expect.objectContaining({
+        layout: expect.objectContaining({ cells: [expect.objectContaining({ id: "a" })] }),
+      }),
+    );
+    // 2. The user closes every pane — the resulting empty save must now persist
+    //    cells:[] so the next launch reflects the genuinely-empty grid instead
+    //    of reloading the stale single-pane layout from step 1.
+    vi.mocked(invoke).mockClear();
+    setRuntimeLayout([]);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(invoke).toHaveBeenCalledWith(
+      "active_layout_save",
+      expect.objectContaining({ layout: expect.objectContaining({ cells: [] }) }),
+    );
+  });
+
+  it("still blocks a boot-time empty save before any non-empty write (corrupt-read leg)", async () => {
+    vi.useFakeTimers();
+    __setActiveLayoutBootStateForTests({ gateOpen: true, didHydrate: false });
+    // No non-empty save has happened — an empty save fired by the boot
+    // project-tab select must still be suppressed (anti-clobber invariant).
+    setRuntimeLayout([]);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(invoke).not.toHaveBeenCalledWith("active_layout_save", expect.anything());
   });
 });
