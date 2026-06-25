@@ -191,8 +191,8 @@ export function useWorktreeCreate(projectSlug: () => string): {
   ): Promise<WorktreeCreated> {
     setPending(true);
     setError(undefined);
+    const slug = projectSlug();
     try {
-      const slug = projectSlug();
       const out = await invoke<WorktreeCreated>("worktree_create", {
         projectSlug: slug,
         branch: args.branch,
@@ -207,6 +207,19 @@ export function useWorktreeCreate(projectSlug: () => string): {
         onProgress: channel,
       });
       setLastCreated(out);
+      return out;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(msg);
+      throw e;
+    } finally {
+      // Re-list regardless of outcome. A failed postCreate hook still leaves a
+      // fully-created worktree on disk, yet `worktree_create` returns Err in
+      // that case — refreshing only on success (the old behaviour) hid that
+      // worktree from the list until the next create re-listed everything.
+      // `worktree_list` reflects on-disk truth, so it's a no-op when nothing
+      // was created (validate/pre-hook/git-add failures). The hook failure is
+      // still surfaced via the re-thrown error + the progress panel. (#45)
       clearWorktreeListCache(slug);
       try {
         const items = await invoke<Worktree[]>("worktree_list", {
@@ -216,12 +229,6 @@ export function useWorktreeCreate(projectSlug: () => string): {
       } catch {
         // Non-fatal — caller can retry.
       }
-      return out;
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      setError(msg);
-      throw e;
-    } finally {
       setPending(false);
     }
   }

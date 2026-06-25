@@ -47,6 +47,7 @@ pub struct Config {
     pub keybindings: Keybindings,
     pub harnesses: HarnessesConfig,
     pub updater: UpdaterConfig,
+    pub projects: ProjectsConfig,
     /// Catch-all for forward-compatible keys so unknown user-added settings
     /// survive a round-trip. Logged at INFO by the store when populated.
     #[serde(flatten, skip_serializing_if = "BTreeMap::is_empty")]
@@ -66,6 +67,7 @@ impl Default for Config {
             keybindings: Keybindings::default(),
             harnesses: HarnessesConfig::default(),
             updater: UpdaterConfig::default(),
+            projects: ProjectsConfig::default(),
             unknown: BTreeMap::new(),
         }
     }
@@ -346,6 +348,34 @@ impl Default for AppearanceConfig {
     }
 }
 
+/// Top-bar project-tab behaviour. Session-less projects already auto-suspend
+/// (derived in the frontend); this adds an OPTIONAL time-based hide: collapse a
+/// project's tab when none of its harnesses have been *used* (a prompt typed +
+/// sent) within `auto_hide_inactive_days`. The active project, and any project
+/// with a harness needing attention, are never hidden. Disabled by default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProjectsConfig {
+    /// Hide project tabs with no harness-prompt activity in the threshold window.
+    pub auto_hide_inactive: bool,
+    /// Days of inactivity before a project's tab is hidden (min 1).
+    #[serde(default = "default_auto_hide_inactive_days")]
+    pub auto_hide_inactive_days: u32,
+}
+
+fn default_auto_hide_inactive_days() -> u32 {
+    14
+}
+
+impl Default for ProjectsConfig {
+    fn default() -> Self {
+        Self {
+            auto_hide_inactive: false,
+            auto_hide_inactive_days: default_auto_hide_inactive_days(),
+        }
+    }
+}
+
 /// Dock / taskbar badge verbosity. Independent of the OS-notification
 /// toggles — a user can silence notifications but still want the glance
 /// value of a badge, or vice versa.
@@ -472,6 +502,11 @@ pub struct ProjectConfig {
     /// Whether hydration/worktree edits should be written to `.raum.toml`
     /// (when a committed one is present) instead of this file.
     pub in_repo_settings: bool,
+    /// Manually shelved from the top-bar tab list (non-destructive). Auto-suspend
+    /// of session-less projects is derived in the frontend and never written
+    /// here. Persisted only when `true` so existing files round-trip unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
     // Nested tables follow.
     pub hydration: HydrationManifest,
     pub worktree: WorktreeConfig,
@@ -489,6 +524,7 @@ impl Default for ProjectConfig {
             color: "#7dd3fc".into(),
             sigil: None,
             in_repo_settings: false,
+            hidden: false,
             hydration: HydrationManifest::default(),
             worktree: WorktreeConfig::default(),
             agent_defaults: AgentDefaults::default(),
@@ -792,6 +828,34 @@ mod tests {
             ..ProjectConfig::default()
         };
         roundtrip(p);
+    }
+
+    #[test]
+    fn project_config_hidden_roundtrips_and_skips_when_false() {
+        // A visible project never gains a `hidden` line (no diff churn for
+        // existing users); a shelved one persists and round-trips.
+        let visible = ProjectConfig {
+            slug: "acme".into(),
+            name: "Acme".into(),
+            root_path: PathBuf::from("/tmp/acme"),
+            ..ProjectConfig::default()
+        };
+        let raw = toml::to_string_pretty(&visible).expect("serialize");
+        assert!(
+            !raw.contains("hidden"),
+            "default project should not serialize `hidden`, got:\n{raw}"
+        );
+
+        let shelved = ProjectConfig {
+            hidden: true,
+            ..visible
+        };
+        let raw = toml::to_string_pretty(&shelved).expect("serialize");
+        assert!(
+            raw.contains("hidden = true"),
+            "shelved project should serialize `hidden = true`, got:\n{raw}"
+        );
+        roundtrip(shelved);
     }
 
     #[test]

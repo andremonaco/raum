@@ -33,7 +33,9 @@ use super::helpers::{
     sanitize_initial_size, tracked_session_context,
 };
 use super::registry::{BridgeRuntime, TerminalRegistry};
-use super::respawn::{resolve_resume_target, respawn_harness_pane_in_place};
+use super::respawn::{
+    ResumePreference, ResumeTarget, resolve_resume_target, respawn_harness_pane_in_place,
+};
 
 pub(super) struct ReattachInFlightGuard<'a> {
     pub(super) terminals: &'a Mutex<TerminalRegistry>,
@@ -45,6 +47,113 @@ impl Drop for ReattachInFlightGuard<'_> {
         if let Ok(mut reg) = self.terminals.lock() {
             reg.finish_reattach(&self.session_id);
         }
+    }
+}
+
+/// Kills the lazily-created placeholder tmux session unless explicitly
+/// disarmed via [`PlaceholderKillGuard::disarm`]. The post-reboot lazy-create
+/// path (`!exists && resume_after_attach`) spins up a real `placeholder`
+/// tmux session BEFORE several fallible steps run (history limit, resize
+/// lock, harness runtime registration, the bridge open). Any of those can
+/// early-exit via `?` or a structured-unavailable return; without this guard
+/// the placeholder would linger on the `-L raum` socket as an invisible-but-
+/// live session that the user can't see or close — violating invariant 1
+/// (session visibility) and leaking one stuck session per failed lazy reboot
+/// recovery. The guard kills the placeholder on `Drop` so EVERY early-exit
+/// after creation is covered; the success path (and the explicit recoverable
+/// teardown, which decides for itself whether to kill) disarms it first.
+pub(super) struct PlaceholderKillGuard {
+    tmux: Arc<TmuxManager>,
+    session_id: String,
+    armed: bool,
+}
+
+impl PlaceholderKillGuard {
+    pub(super) fn new(tmux: Arc<TmuxManager>, session_id: String) -> Self {
+        Self {
+            tmux,
+            session_id,
+            armed: true,
+        }
+    }
+
+    /// Stop the guard from killing the placeholder on drop. Called once the
+    /// session has committed (resume succeeded / non-resume bridge landed) or
+    /// when an explicit teardown branch takes over responsibility for the
+    /// placeholder's fate.
+    pub(super) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PlaceholderKillGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Best-effort synchronous kill. We're on Drop (often inside an async
+        // fn's early return), so we can't await; `kill_session` is a short
+        // blocking tmux call and this only runs on the cold reboot recovery
+        // failure path, never on the hot happy path.
+        let session_id = self.session_id.clone();
+        let tmux = self.tmux.clone();
+        if let Err(e) = tmux.kill_session(&session_id) {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "terminal_reattach: failed to kill leaked placeholder session on early exit"
+            );
+        } else {
+            tracing::info!(
+                session_id = %session_id,
+                "terminal_reattach: killed leaked placeholder session on early exit"
+            );
+        }
+    }
+}
+
+/// Re-surface a recoverable harness pane as a `dead: true` recoverable ghost
+/// after an in-place resume failed. This is the NON-destructive teardown:
+/// unlike [`cleanup_harness_session`] it does NOT call `forget_session` and
+/// does NOT emit a session-removed event, so the tracked `sessions.toml` row
+/// stays intact (protecting the disk snapshot via the Contract 4 GC keep-set
+/// and letting a later Recover resolve the harness id) and the frontend keeps
+/// the recoverable ghost instead of dropping the pane to a fresh empty spawn.
+///
+/// We re-insert an identity-only ghost carrying `dead: true` +
+/// `recoverable_after_reboot: true` so `terminal_list` and the
+/// `terminal-session-upserted` event reflect the dead-but-recoverable state.
+fn resurface_recoverable_ghost<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &AppHandleState,
+    session_id: &str,
+    kind: AgentKind,
+    project_slug: Option<String>,
+    worktree_id: Option<String>,
+    created_unix: u64,
+) {
+    let ghost = super::registry::GhostEntry {
+        session_id: session_id.to_string(),
+        project_slug,
+        worktree_id,
+        kind,
+        created_unix,
+        dead: true,
+        recoverable_after_reboot: true,
+    };
+    let item = {
+        let Ok(mut reg) = state.terminals.lock() else {
+            tracing::warn!(
+                session_id = %session_id,
+                "terminal_reattach: could not lock registry to re-surface recoverable ghost"
+            );
+            return;
+        };
+        reg.upsert_ghost(ghost);
+        reg.item(session_id)
+    };
+    if let Some(item) = item {
+        emit_terminal_session_upserted(app, &item);
     }
 }
 
@@ -85,6 +194,26 @@ pub async fn terminal_reattach<R: Runtime>(
         .map_err(|e| format!("spawn_blocking join: {e}"))?
         .map_err(|e| format!("tmux list-sessions: {e}"))?
     };
+    // Resume target resolved exactly ONCE for the whole reattach. Threading
+    // this single value through the placeholder env wiring, the harness
+    // registration (`opencode_port`), and the eventual `respawn-pane`
+    // guarantees raum and the launched harness agree on the OpenCode port —
+    // previously the reboot path re-resolved up to three times and each
+    // `reserve_localhost_port()` bound a different ephemeral port (Theme 7).
+    let mut resolved_resume_target: Option<ResumeTarget> = None;
+    // True only when THIS call created the placeholder tmux session below (the
+    // post-reboot lazy-create path). Drives the failure teardown so we never
+    // leak a live `tail -f /dev/null` placeholder when the harness resume
+    // can't commit — and never tear down a session we merely reattached to.
+    let mut created_placeholder = false;
+    // Armed for the lifetime of a freshly-created placeholder so that ANY
+    // fallible early-exit between creation and commit (the `?` operators on
+    // `resize_lock_for` / `register_harness_session_runtime_opts`, the
+    // bridge-open failure block, the resume-failure teardown) reaps the
+    // placeholder instead of leaking it (invariant 1). Disarmed on success
+    // and wherever an explicit branch takes over the placeholder's fate.
+    let mut placeholder_guard: Option<PlaceholderKillGuard> = None;
+
     if !exists {
         if !args.resume_after_attach {
             return Err("not-found".to_string());
@@ -94,7 +223,7 @@ pub async fn terminal_reattach<R: Runtime>(
         }
 
         let extra_flags = resolve_harness_extra_flags(&state, args.kind);
-        if let Err(err) = resolve_resume_target(
+        let resume_target = match resolve_resume_target(
             &state,
             &tmux,
             &session_id,
@@ -103,8 +232,35 @@ pub async fn terminal_reattach<R: Runtime>(
         )
         .await
         {
-            return Ok(ReconnectResult::unavailable(session_id, err));
+            Ok(target) => target,
+            // The tracked row exists (this is a recover-after-reboot ghost) but
+            // we can't resolve a usable resume id/command — surface a STRUCTURED
+            // recoverable-unavailable so the frontend keeps the recoverable
+            // ghost + replays the disk snapshot instead of spawning fresh.
+            Err(err) => return Ok(ReconnectResult::unavailable_recoverable(session_id, err)),
+        };
+        // Persist the (possibly freshly reserved) OpenCode port so any later
+        // read via `tracked_session_opencode_port` short-circuits to the same
+        // value. `upsert_tracked_session` is write-once on `opencode_port`, so
+        // this never clobbers an existing persisted port.
+        if let Some(port) = resume_target.opencode_port
+            && let Ok(store) = state.config_store.lock()
+            && let Err(e) = store.upsert_tracked_session(
+                &session_id,
+                args.kind,
+                None,
+                None,
+                Some(port),
+                now_unix_millis(),
+            )
+        {
+            tracing::warn!(
+                error = %e,
+                session_id = %session_id,
+                "terminal_reattach: persisting resolved opencode port failed"
+            );
         }
+        resolved_resume_target = Some(resume_target);
 
         let (tracked_project_slug, tracked_worktree_id) =
             tracked_session_context(&state, &session_id);
@@ -153,13 +309,19 @@ pub async fn terminal_reattach<R: Runtime>(
         .await
         .map_err(|e| format!("spawn_blocking join: {e}"))?
         .map_err(|e| format!("tmux new-session: {e}"))?;
+        created_placeholder = true;
+        placeholder_guard = Some(PlaceholderKillGuard::new(tmux.clone(), session_id.clone()));
     }
 
     let provider_replay_requested =
         args.resume_after_attach && !matches!(args.kind, AgentKind::Shell);
-    if provider_replay_requested {
+    if provider_replay_requested && resolved_resume_target.is_none() {
+        // The `exists` path (dead-pane respawn / self-heal while the tmux
+        // server survived) hasn't resolved a target yet. Resolve it ONCE here
+        // and thread it through; a failure becomes a structured recoverable-
+        // unavailable instead of a bare Err so the frontend shows Recover.
         let extra_flags = resolve_harness_extra_flags(&state, args.kind);
-        if let Err(err) = resolve_resume_target(
+        match resolve_resume_target(
             &state,
             &tmux,
             &session_id,
@@ -168,7 +330,8 @@ pub async fn terminal_reattach<R: Runtime>(
         )
         .await
         {
-            return Ok(ReconnectResult::unavailable(session_id, err));
+            Ok(target) => resolved_resume_target = Some(target),
+            Err(err) => return Ok(ReconnectResult::unavailable_recoverable(session_id, err)),
         }
     }
 
@@ -254,6 +417,14 @@ pub async fn terminal_reattach<R: Runtime>(
             tracked_worktree_id.as_deref(),
         ),
     );
+    // Preserve the session's original creation timestamp for any recoverable
+    // re-surface below (resume / bridge-open failure). Prefer the existing
+    // registry entry, then the rehydrate ghost, falling back to "now".
+    let recover_created_unix = existing_item
+        .as_ref()
+        .map(|item| item.created_unix)
+        .or_else(|| promoted_ghost.as_ref().map(|ghost| ghost.created_unix))
+        .unwrap_or_else(now_unix_secs);
     // Shell sessions are tracked in `state/sessions.toml` like harnesses so
     // the orphan/stale reapers never mistake them for leaks (see
     // `terminal_spawn`). Re-upserting here migrates shells spawned before
@@ -323,7 +494,12 @@ pub async fn terminal_reattach<R: Runtime>(
             RegisterOptions {
                 skip_channels_if_present: true,
                 skip_seed_emit: true,
-                ..RegisterOptions::default()
+                // Thread the SAME OpenCode port the resume command will launch
+                // on so raum's out-of-band SSE/state channel targets the live
+                // server instead of the discover-port default (Theme 7).
+                opencode_port: resolved_resume_target
+                    .as_ref()
+                    .and_then(|t| t.opencode_port),
             },
         )?;
     }
@@ -493,6 +669,46 @@ pub async fn terminal_reattach<R: Runtime>(
             if let Some(task) = context_task.as_ref() {
                 task.abort();
             }
+            if resume_after_attach {
+                // Recoverable harness path (post-reboot lazy recreate or
+                // Cmd+R self-heal of a tracked harness). The bridge could not
+                // open, but the conversation is still recoverable: do NOT
+                // forget the tracked row and do NOT emit session-removed.
+                // Tear down only the in-registry bridge entry, re-surface a
+                // dead:true recoverable ghost so the frontend keeps the pane,
+                // and let `placeholder_guard` reap a freshly-created
+                // placeholder on return (it kills only when WE created it,
+                // never a pre-existing session). Returning the structured
+                // recoverable-unavailable keeps Contract 4's GC keep-set
+                // protecting the snapshot for a later Recover.
+                if let Ok(mut reg) = state.terminals.lock()
+                    && let Some(entry) = reg.remove(&session_id)
+                {
+                    shutdown_removed_entry(entry, true);
+                }
+                resurface_recoverable_ghost(
+                    &app_handle,
+                    &state,
+                    &session_id,
+                    args.kind,
+                    effective_project_slug.clone(),
+                    effective_worktree_id.clone(),
+                    recover_created_unix,
+                );
+                tracing::warn!(
+                    session_id = %session_id,
+                    kind = ?args.kind,
+                    error = %err,
+                    created_placeholder,
+                    "terminal_reattach: bridge open failed on recoverable path; kept recoverable ghost"
+                );
+                return Ok(ReconnectResult::unavailable_recoverable(session_id, err));
+            }
+            // Non-resume reattach (webview reload / live bridge). Here a bridge
+            // failure is a genuine teardown of a session we were merely
+            // re-bridging — preserve the legacy destructive cleanup. There is
+            // never a placeholder on this path (it is only created on the
+            // resume branch above), so nothing to disarm.
             cleanup_harness_session(&state, &session_id);
             if had_entry
                 && let Ok(mut reg) = state.terminals.lock()
@@ -568,35 +784,133 @@ pub async fn terminal_reattach<R: Runtime>(
         }
         reg.item(&session_id)
     };
-    if let Some(item) = item {
-        emit_terminal_session_upserted(&app_handle, &item);
+    // On the resume path the entry is in the registry (so resize/input work
+    // while the harness boots) but we intentionally DEFER the upserted emit
+    // until `respawn-pane` has committed. Emitting now would tell the frontend
+    // the pane is a healthy live bridge while it is still showing the silent
+    // placeholder; if the resume then fails we'd have to walk that back. On
+    // the non-resume path emit immediately as before.
+    if !resume_after_attach && let Some(item) = item.as_ref() {
+        emit_terminal_session_upserted(&app_handle, item);
     }
 
     if resume_after_attach {
+        // On the resume path `resolved_resume_target` is always Some (resolved
+        // once above). Thread it through pre-resolved so respawn does not bind
+        // a divergent OpenCode port (Theme 7); fall back to ResolveResume only
+        // for the defensive None case.
+        let resume_pref = match resolved_resume_target.take() {
+            Some(target) => ResumePreference::PreResolved(target),
+            None => ResumePreference::ResolveResume,
+        };
         let respawn_result =
-            respawn_harness_pane_in_place(&tmux, &state, &session_id, args.kind, true).await;
-        let monitor =
-            spawn_pane_death_monitor(app_handle.clone(), tmux.clone(), session_id.clone());
-        match state.terminals.lock() {
-            Ok(mut reg) => {
-                let _ = reg.set_monitor_task(&session_id, monitor);
-            }
-            Err(e) => {
-                monitor.abort();
-                tracing::warn!(
+            respawn_harness_pane_in_place(&tmux, &state, &session_id, args.kind, resume_pref).await;
+        match respawn_result {
+            Ok(cmd) => {
+                // Resume committed — the session is real and live. Disarm the
+                // placeholder reaper so we keep the now-committed session.
+                if let Some(mut guard) = placeholder_guard.take() {
+                    guard.disarm();
+                }
+                let monitor =
+                    spawn_pane_death_monitor(app_handle.clone(), tmux.clone(), session_id.clone());
+                match state.terminals.lock() {
+                    Ok(mut reg) => {
+                        let _ = reg.set_monitor_task(&session_id, monitor);
+                    }
+                    Err(e) => {
+                        monitor.abort();
+                        tracing::warn!(
+                            session_id = %session_id,
+                            error = %e,
+                            "terminal_reattach: failed to install post-resume pane monitor"
+                        );
+                    }
+                }
+                // Resume committed — NOW surface the live pane to the frontend.
+                if let Some(item) = item {
+                    emit_terminal_session_upserted(&app_handle, &item);
+                }
+                tracing::info!(
                     session_id = %session_id,
-                    error = %e,
-                    "terminal_reattach: failed to install post-resume pane monitor"
+                    kind = ?args.kind,
+                    cmd = %cmd,
+                    "terminal_reattach: resumed harness after bridge attach",
                 );
             }
+            Err(err) => {
+                // RECOVERABLE teardown. The harness resume could not commit
+                // (stale/pruned id, version prompt, MCP failure during the
+                // grace window) — but the conversation is still recoverable.
+                //
+                // We MUST keep the recoverable state the structured result
+                // promises:
+                //   * do NOT call `cleanup_harness_session` — its
+                //     `forget_session` permanently deletes the tracked
+                //     `sessions.toml` row that carries `harness_session_id` /
+                //     `last_prompt_text` / `opencode_port`. That row is what
+                //     Contract 4's GC keep-set uses to protect the disk
+                //     snapshot, and what a later Recover needs to resolve a
+                //     resume id. Forgetting it makes `recoverable: true` a lie
+                //     and dooms the snapshot on the next boot.
+                //   * do NOT emit `terminal-session-removed` /
+                //     `agent-session-removed` — that would drop the pane from
+                //     the grid. Instead re-surface a `dead: true` recoverable
+                //     ghost (an UPSERT, not a removal) so the frontend keeps
+                //     the pane and shows the Recover overlay.
+                //
+                // We still tear down the in-registry bridge entry (the bridge
+                // is dead) and handle the placeholder: kill it ONLY when WE
+                // created it on the lazy reboot path (`created_placeholder`);
+                // a pre-existing (`exists == true`) session — e.g. a Cmd+R
+                // self-heal of a live tracked pane — is NEVER killed here, it
+                // is re-surfaced as a recoverable ghost (invariant 1).
+                if let Ok(mut reg) = state.terminals.lock()
+                    && let Some(entry) = reg.remove(&session_id)
+                {
+                    shutdown_removed_entry(entry, true);
+                }
+                // `placeholder_guard` would kill the placeholder on drop; take
+                // it so we control the timing explicitly (await the kill) and
+                // never reap a pre-existing session.
+                let guard = placeholder_guard.take();
+                if let Some(mut guard) = guard {
+                    // We created the placeholder — disarm the drop-reaper and
+                    // kill it ourselves (awaited) so the lazy-create leaves no
+                    // invisible-but-live session behind.
+                    guard.disarm();
+                    let tmux_for_kill = tmux.clone();
+                    let id_for_kill = session_id.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        tmux_for_kill.kill_session(&id_for_kill)
+                    })
+                    .await;
+                }
+                resurface_recoverable_ghost(
+                    &app_handle,
+                    &state,
+                    &session_id,
+                    args.kind,
+                    effective_project_slug.clone(),
+                    effective_worktree_id.clone(),
+                    recover_created_unix,
+                );
+                tracing::warn!(
+                    session_id = %session_id,
+                    kind = ?args.kind,
+                    error = %err,
+                    created_placeholder,
+                    "terminal_reattach: harness resume failed; kept tracked row + recoverable ghost"
+                );
+                return Ok(ReconnectResult::unavailable_recoverable(session_id, err));
+            }
         }
-        let cmd = respawn_result?;
-        tracing::info!(
-            session_id = %session_id,
-            kind = ?args.kind,
-            cmd = %cmd,
-            "terminal_reattach: resumed harness after bridge attach",
-        );
+    }
+
+    // Committed via the non-resume / successful-resume happy path. Any
+    // placeholder is now a real session — disarm the reaper so we keep it.
+    if let Some(mut guard) = placeholder_guard.take() {
+        guard.disarm();
     }
 
     tracing::info!(

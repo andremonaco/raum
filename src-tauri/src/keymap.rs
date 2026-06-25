@@ -62,13 +62,13 @@ const DEFAULTS: &[(&str, &str, &str, bool)] = &[
     // ---- top-row navigation ----------------------------------------------
     (
         "cycle-tab-next",
-        "CmdOrCtrl+Alt+Right",
+        "CmdOrCtrl+Shift+]",
         "Cycle to next top-row tab",
         false,
     ),
     (
         "cycle-tab-prev",
-        "CmdOrCtrl+Alt+Left",
+        "CmdOrCtrl+Shift+[",
         "Cycle to previous top-row tab",
         false,
     ),
@@ -169,7 +169,7 @@ const DEFAULTS: &[(&str, &str, &str, bool)] = &[
     ),
     (
         "reset-harness",
-        "CmdOrCtrl+R",
+        "CmdOrCtrl+Shift+R",
         "Reset focused pane (new session, same harness)",
         false,
     ),
@@ -177,6 +177,111 @@ const DEFAULTS: &[(&str, &str, &str, bool)] = &[
         "new-tab-same-harness",
         "CmdOrCtrl+T",
         "New tab in focused pane (same harness)",
+        false,
+    ),
+    // ---- grid: split & layout management ----------------------------------
+    (
+        "split-pane-right",
+        "CmdOrCtrl+D",
+        "Split the focused pane to the right",
+        false,
+    ),
+    (
+        "split-pane-down",
+        "CmdOrCtrl+Shift+D",
+        "Split the focused pane downward",
+        false,
+    ),
+    (
+        "close-pane",
+        "CmdOrCtrl+Shift+W",
+        "Close the focused pane",
+        false,
+    ),
+    (
+        "minimize-pane",
+        "CmdOrCtrl+Shift+H",
+        "Minimize the focused pane",
+        false,
+    ),
+    (
+        "undo-layout",
+        "CmdOrCtrl+Shift+Z",
+        "Undo the last layout change",
+        false,
+    ),
+    // ---- grid: spatial focus & movement -----------------------------------
+    (
+        "focus-pane-left",
+        "CmdOrCtrl+Alt+Left",
+        "Focus the pane to the left",
+        false,
+    ),
+    (
+        "focus-pane-right",
+        "CmdOrCtrl+Alt+Right",
+        "Focus the pane to the right",
+        false,
+    ),
+    (
+        "focus-pane-up",
+        "CmdOrCtrl+Alt+Up",
+        "Focus the pane above",
+        false,
+    ),
+    (
+        "focus-pane-down",
+        "CmdOrCtrl+Alt+Down",
+        "Focus the pane below",
+        false,
+    ),
+    (
+        "move-pane-left",
+        "CmdOrCtrl+Alt+Shift+Left",
+        "Move the focused pane left",
+        false,
+    ),
+    (
+        "move-pane-right",
+        "CmdOrCtrl+Alt+Shift+Right",
+        "Move the focused pane right",
+        false,
+    ),
+    (
+        "move-pane-up",
+        "CmdOrCtrl+Alt+Shift+Up",
+        "Move the focused pane up",
+        false,
+    ),
+    (
+        "move-pane-down",
+        "CmdOrCtrl+Alt+Shift+Down",
+        "Move the focused pane down",
+        false,
+    ),
+    (
+        "grow-pane",
+        "CmdOrCtrl+Alt+Equal",
+        "Grow the focused pane (resize divider)",
+        false,
+    ),
+    (
+        "shrink-pane",
+        "CmdOrCtrl+Alt+Minus",
+        "Shrink the focused pane (resize divider)",
+        false,
+    ),
+    // ---- fleet / broadcast ------------------------------------------------
+    (
+        "toggle-broadcast",
+        "CmdOrCtrl+Shift+I",
+        "Toggle broadcast (type to all synced panes)",
+        false,
+    ),
+    (
+        "focus-next-waiting",
+        "CmdOrCtrl+Shift+J",
+        "Focus the next pane waiting for input",
         false,
     ),
     // ---- chrome -----------------------------------------------------------
@@ -206,7 +311,7 @@ const DEFAULTS: &[(&str, &str, &str, bool)] = &[
         false,
     ),
     ("spotlight", "CmdOrCtrl+.", "Open spotlight dock", false),
-    ("reload", "CmdOrCtrl+Shift+R", "Reload the app UI", false),
+    ("reload", "CmdOrCtrl+R", "Reload the app UI", false),
     // ---- worktrees --------------------------------------------------------
     (
         "new-worktree",
@@ -481,11 +586,69 @@ mod tests {
             "maximize-pane",
             "global-search",
             "spotlight",
+            "reload",
+            // grid: split, layout-management, spatial focus/move, resize
+            "split-pane-right",
+            "split-pane-down",
+            "close-pane",
+            "minimize-pane",
+            "undo-layout",
+            "focus-pane-left",
+            "focus-pane-right",
+            "focus-pane-up",
+            "focus-pane-down",
+            "move-pane-left",
+            "move-pane-right",
+            "move-pane-up",
+            "move-pane-down",
+            "grow-pane",
+            "shrink-pane",
+            // fleet / broadcast
+            "toggle-broadcast",
+            "focus-next-waiting",
             // design D8 global shortcuts
             "focus-raum",
             "spawn-shell-global",
         ] {
             assert!(actions.contains(&needed), "missing action `{needed}`");
+        }
+    }
+
+    /// The reset-harness binding is destructive (drops the running session),
+    /// so it must NOT sit on the universal reload chord; reload owns the bare
+    /// `CmdOrCtrl+R` and reset-harness lives on the shifted variant.
+    #[test]
+    fn reset_harness_and_reload_accelerators_are_swapped_safely() {
+        let map = default_keymap();
+        let by = |action: &str| {
+            map.iter()
+                .find(|e| e.action == action)
+                .unwrap_or_else(|| panic!("missing `{action}`"))
+                .accelerator
+                .as_str()
+        };
+        assert_eq!(by("reload"), "CmdOrCtrl+R");
+        assert_eq!(by("reset-harness"), "CmdOrCtrl+Shift+R");
+    }
+
+    /// No two app-level actions may share an accelerator, otherwise the
+    /// "last wins" conflict surfaces in the cheat-sheet. (Global OS-level
+    /// shortcuts live in a separate namespace and are excluded.)
+    #[test]
+    fn no_duplicate_app_level_accelerators() {
+        use std::collections::HashMap;
+        let mut seen: HashMap<&str, &str> = HashMap::new();
+        let map = default_keymap();
+        for entry in &map {
+            if entry.global {
+                continue;
+            }
+            if let Some(prev) = seen.insert(&entry.accelerator, &entry.action) {
+                panic!(
+                    "duplicate accelerator `{}` shared by `{}` and `{}`",
+                    entry.accelerator, prev, entry.action
+                );
+            }
         }
     }
 

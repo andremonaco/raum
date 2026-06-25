@@ -59,6 +59,7 @@ function seedProjects(): void {
       rootPath: "/tmp/alpha",
       inRepoSettings: false,
       hasRaumToml: false,
+      hidden: false,
     },
     {
       slug: "beta",
@@ -68,6 +69,7 @@ function seedProjects(): void {
       rootPath: "/tmp/beta",
       inRepoSettings: false,
       hasRaumToml: false,
+      hidden: false,
     },
   ]);
   setActiveProjectSlug("alpha");
@@ -298,7 +300,9 @@ describe("TerminalGrid persistent surfaces", () => {
     // Drive a drag from `cell-source` toward the sibling's `right` edge.
     // Pure preview-tree replay: source removed → sibling collapses to full
     // width → source re-inserted to the right of sibling. Net effect:
-    // sibling x goes 50% → 0%, occupying the left half.
+    // sibling x goes 50% → 0%, occupying the left half. `armed: true` because
+    // the edge-split preview reflow only engages after the dwell elapses (the
+    // dwell gate itself is covered in paneDnD.test.ts).
     __setDragStateForTests({
       sourceId: "cell-source",
       sourceKind: "codex",
@@ -312,7 +316,7 @@ describe("TerminalGrid persistent surfaces", () => {
       targetRect: null,
       snapped: false,
       snapHystRect: null,
-      armed: false,
+      armed: true,
       armStartedAtMs: null,
       armDelayMs: 0,
       escapedTargetId: null,
@@ -326,10 +330,11 @@ describe("TerminalGrid persistent surfaces", () => {
     // Sibling has reflowed to its preview rect, in lockstep with the chrome.
     expect(siblingFrame.style.getPropertyValue("--x-pct")).toBe("0%");
 
-    // Source surface stays anchored to its committed rect (the CSS transform
-    // moves it visually). Without this pin, the surface would snap to the
-    // hover-target slot mid-drag and the ghost would teleport.
-    expect(sourceFrame.style.getPropertyValue("--x-pct")).toBe("0%");
+    // Once latched, the dragged source ALSO settles into its slot (the dragged
+    // pane is its own landing preview) — it takes the right half, marked
+    // `is-edge-snapped` so its chrome drops the cursor transform.
+    expect(sourceFrame.classList.contains("is-edge-snapped")).toBe(true);
+    expect(sourceFrame.style.getPropertyValue("--x-pct")).toBe("50%");
     expect(sourceFrame.style.getPropertyValue("--w-pct")).toBe("50%");
 
     __setDragStateForTests(null);

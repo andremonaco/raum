@@ -13,7 +13,7 @@
  *   4. Upsert the returned `ProjectListItem` into `projectStore`.
  */
 
-import { Component, For, Show, createSignal } from "solid-js";
+import { Component, For, Show, createEffect, createSignal, on } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { upsertProject, type ProjectListItem } from "../stores/projectStore";
@@ -32,6 +32,9 @@ export interface AddProjectModalProps {
   open: boolean;
   onClose: () => void;
   onRegistered?: (project: ProjectListItem) => void;
+  /** Pre-fill the root directory (skips the Browse step). Used by the terminal
+   *  launcher (`raum <dir>`) to open the add flow already pointed at the path. */
+  initialRootPath?: string;
 }
 
 function baseFolder(rootPath: string): string {
@@ -65,6 +68,31 @@ export const AddProjectModal: Component<AddProjectModalProps> = (props) => {
   const [hexInput, setHexInput] = createSignal("");
   const [error, setError] = createSignal<string | undefined>(undefined);
   const [busy, setBusy] = createSignal(false);
+
+  // Seed/reset transient fields on each open<->close transition, keyed on
+  // `open` ONLY (initialRootPath is read untracked). On open: pre-fill from the
+  // terminal launcher's path, or start blank for a manual `+` add. On close:
+  // clear everything so a stale path/name can't leak into the next open. Keying
+  // on the edge (not on initialRootPath) means a live `cli-open-project` that
+  // arrives while the user is mid-entry won't clobber their in-progress fields.
+  createEffect(
+    on(
+      () => props.open,
+      (open) => {
+        if (open) {
+          const path = props.initialRootPath ?? "";
+          setRootPath(path);
+          setName(path ? prettyName(path) : "");
+        } else {
+          setRootPath("");
+          setName("");
+          setColor(PROJECT_COLOR_PALETTE[0]!);
+          setHexInput("");
+          setError(undefined);
+        }
+      },
+    ),
+  );
 
   async function pickDirectory() {
     setError(undefined);

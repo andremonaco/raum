@@ -1,6 +1,8 @@
 import { Component, Show, createMemo, onCleanup, onMount } from "solid-js";
+import { Dynamic } from "solid-js/web";
 
 import { type AgentKind } from "../../lib/agentKind";
+import { HARNESS_ICONS, type HarnessIconKind } from "../icons";
 import { agentStore, isAcknowledgedReactive, markAcknowledged } from "../../stores/agentStore";
 import { dropPreviewPaths, dropTargetPaneId } from "../../lib/fileDrop";
 import { ROOT_TARGET, dragState } from "../../lib/paneDnD";
@@ -33,6 +35,8 @@ export const LeafFrame: Component<{ cell: RuntimeCell; maximizedPaneId: string |
   // this for every leaf. Only the source leaf toggles its .pane-dragging class.
   const dragSourceId = createMemo(() => dragState()?.sourceId ?? null);
   const isDragSource = () => dragSourceId() === props.cell.id;
+  // Harness icon shown in the body while this pane is dragged.
+  const dragBodyIcon = createMemo(() => HARNESS_ICONS[props.cell.kind as HarnessIconKind]);
 
   function onFocusCapture(): void {
     setFocusedPaneId(props.cell.id);
@@ -115,6 +119,17 @@ export const LeafFrame: Component<{ cell: RuntimeCell; maximizedPaneId: string |
     const s = dragState();
     return s?.snapped === true && s.targetId !== null && s.targetId !== ROOT_TARGET;
   });
+
+  /** Source pane latched onto an edge / root drop zone (dwell armed). Docks the
+   *  pane into its landing slot via `.is-edge-snapped` — the split equivalent
+   *  of the review snap's magnetic dock. */
+  const isEdgeSnappedSource = createMemo(() => {
+    if (!isDragSource()) return false;
+    const s = dragState();
+    return (
+      !!s && s.armed && !s.snapped && s.zone !== null && s.zone !== "center" && s.targetId !== null
+    );
+  });
   const isFileDropTarget = createMemo(
     () =>
       props.cell.kind !== "empty" &&
@@ -151,6 +166,7 @@ export const LeafFrame: Component<{ cell: RuntimeCell; maximizedPaneId: string |
         "pane-selected": isFocused(),
         "pane-dragging": isDragSource(),
         "is-snapped": isSnappedSource(),
+        "is-edge-snapped": isEdgeSnappedSource(),
         "pane-maximized": isMaximized(),
         "pane-max-anim-target": isMaxAnimTarget(),
         "pane-review-linked": isLinked(),
@@ -171,6 +187,18 @@ export const LeafFrame: Component<{ cell: RuntimeCell; maximizedPaneId: string |
         isMaximized={isMaximized()}
       />
       <div class="terminal-chrome-body relative min-h-0 min-w-0 flex-1 overflow-hidden">
+        {/* While this pane is being dragged, blank the live terminal to just
+            the harness icon (the header stays) — so we never carry a
+            distortable screenshot around. Once latched, this same pane settles
+            into its slot still wearing this look, so the dragged window and its
+            landing spot are literally the same element. */}
+        <Show when={isDragSource()}>
+          <div class="pane-drag-body" aria-hidden="true">
+            <Show when={dragBodyIcon()}>
+              {(I) => <Dynamic component={I()} class="pane-drag-body-icon" />}
+            </Show>
+          </div>
+        </Show>
         <Show
           when={props.cell.kind !== "empty"}
           fallback={

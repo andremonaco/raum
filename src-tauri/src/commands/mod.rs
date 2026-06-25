@@ -4,6 +4,7 @@
 
 pub mod agent;
 pub mod agent_hydrate;
+pub mod cli;
 pub mod config;
 pub mod devtools;
 pub mod files;
@@ -11,6 +12,7 @@ pub mod git_watcher;
 pub mod harness;
 pub mod harness_runtime;
 pub mod hotkeys;
+pub mod lifecycle;
 pub mod notifications;
 pub mod permission;
 pub mod project;

@@ -30,6 +30,9 @@ export interface ProjectListItem {
   rootPath: string;
   inRepoSettings: boolean;
   hasRaumToml: boolean;
+  /** Manually shelved from the top-bar tab list. Auto-suspend of session-less
+   *  projects is derived (see `projectVisibility.ts`) and not stored here. */
+  hidden: boolean;
 }
 
 interface ProjectState {
@@ -162,6 +165,46 @@ function patchProjectField<K extends keyof ProjectListItem>(
   });
 }
 
+/** Pick the project to select after the active one leaves the tab strip.
+ *  Prefers a non-shelved sibling; falls back to any other project (which, as
+ *  the selected tab, is always shown regardless of its `hidden` flag). */
+function pickNextActiveSlug(excludeSlug: string): string | undefined {
+  const items = projectStore.items;
+  const preferred = items.find((p) => p.slug !== excludeSlug && !p.hidden);
+  return (preferred ?? items.find((p) => p.slug !== excludeSlug))?.slug;
+}
+
+/**
+ * Manually shelve (`hidden=true`) or un-shelve (`false`) a project. Optimistic:
+ * the store patches immediately so the tab strip updates without waiting on the
+ * backend, then rolls back if the persist fails. When shelving the *active*
+ * project the selection moves to a sibling first, so the grid never renders a
+ * project that just left the bar.
+ */
+export async function setProjectHidden(slug: string, hidden: boolean): Promise<void> {
+  const existing = projectBySlug().get(slug);
+  if (!existing || existing.hidden === hidden) return;
+  patchProjectField(slug, "hidden", hidden);
+  if (hidden && activeProjectSlug() === slug) {
+    setActiveProjectSlug(pickNextActiveSlug(slug));
+  }
+  try {
+    await invoke("project_update", { update: { slug, hidden } });
+  } catch (e) {
+    console.warn("project_update hidden failed", e);
+    patchProjectField(slug, "hidden", !hidden);
+  }
+}
+
+/** Bring a suspended/shelved project back and make it the active tab. Clears
+ *  the manual `hidden` flag if set — the active project is never shelved. */
+export function reopenProject(slug: string): void {
+  const existing = projectBySlug().get(slug);
+  if (!existing) return;
+  setActiveProjectSlug(slug);
+  if (existing.hidden) void setProjectHidden(slug, false);
+}
+
 /**
  * Subscribe to backend events that mutate the project store.
  *
@@ -182,9 +225,19 @@ export async function subscribeProjectEvents(): Promise<UnlistenFn> {
       patchProjectField(ev.payload.slug, "sigil", ev.payload.sigil);
     },
   );
+  const unlistenVisibility = await listen<{ slug: string; hidden: boolean }>(
+    "project-visibility-changed",
+    (ev) => {
+      patchProjectField(ev.payload.slug, "hidden", ev.payload.hidden);
+      if (ev.payload.hidden && activeProjectSlug() === ev.payload.slug) {
+        setActiveProjectSlug(pickNextActiveSlug(ev.payload.slug));
+      }
+    },
+  );
   return () => {
     unlistenColor();
     unlistenSigil();
+    unlistenVisibility();
   };
 }
 

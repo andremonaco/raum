@@ -489,6 +489,15 @@ fn apply_register_job<R: Runtime>(
 /// fields survive into the eventual `terminal_respawn_dead` call —
 /// without them, the frontend's auto-fire-on-mount would have nothing
 /// to resume against.
+///
+/// It also deliberately keeps the persisted **disk scrollback snapshot**
+/// (`raum_core::snapshot_store`) for this session id: the boot GC keep-set
+/// preserves snapshots for every still-tracked id (see Contract 4 in
+/// `lib.rs` / `snapshot_store::gc_orphans`), and the Recover path never
+/// spawns a pane-death monitor for a placeholder that would delete it. That
+/// snapshot is the last-resort fallback the frontend replays when the
+/// harness's native `--resume` is impossible (stale/pruned transcript) —
+/// without it the user would get a permanently blank pane after a reboot.
 fn apply_recover_job<R: Runtime>(
     app: &AppHandle<R>,
     state: &AppHandleState,

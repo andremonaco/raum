@@ -3,14 +3,39 @@
 use std::env;
 use std::path::PathBuf;
 
-/// Root directory: `$XDG_CONFIG_HOME/raum` or `~/.config/raum`.
-pub fn config_root() -> PathBuf {
-    if let Ok(xdg) = env::var("XDG_CONFIG_HOME") {
-        if !xdg.is_empty() {
-            return PathBuf::from(xdg).join("raum");
-        }
+/// Instance namespace for every per-instance resource.
+///
+/// raum supports running several fully isolated instances side by side — most
+/// importantly a `task dev` build next to a release install — by deriving the
+/// config tree, the state dir, the event socket and the tmux socket name from
+/// a single `RAUM_INSTANCE` env var:
+///
+/// * unset / empty → the default `"raum"` instance
+/// * `RAUM_INSTANCE=dev` → `"raum-dev"`
+///
+/// `task dev` sets `RAUM_INSTANCE=dev`, so the dev app never touches the
+/// release app's agents, `sessions.toml`, hook scripts, or event socket.
+#[must_use]
+pub fn instance_name() -> String {
+    instance_name_from(env::var("RAUM_INSTANCE").ok().as_deref())
+}
+
+fn instance_name_from(instance: Option<&str>) -> String {
+    match instance {
+        Some(s) if !s.trim().is_empty() => format!("raum-{}", s.trim()),
+        _ => "raum".to_string(),
     }
-    home_dir().join(".config").join("raum")
+}
+
+/// Root directory: `$XDG_CONFIG_HOME/<instance>` or `~/.config/<instance>`,
+/// where `<instance>` is [`instance_name`] (`raum` by default, `raum-dev` for
+/// the dev build).
+pub fn config_root() -> PathBuf {
+    let base = match env::var("XDG_CONFIG_HOME") {
+        Ok(xdg) if !xdg.is_empty() => PathBuf::from(xdg),
+        _ => home_dir().join(".config"),
+    };
+    base.join(instance_name())
 }
 
 pub fn projects_dir() -> PathBuf {
@@ -71,4 +96,22 @@ fn home_dir() -> PathBuf {
         }
     }
     PathBuf::from("/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::instance_name_from;
+
+    #[test]
+    fn unset_or_empty_instance_is_the_default_namespace() {
+        assert_eq!(instance_name_from(None), "raum");
+        assert_eq!(instance_name_from(Some("")), "raum");
+        assert_eq!(instance_name_from(Some("   ")), "raum");
+    }
+
+    #[test]
+    fn named_instance_is_suffixed() {
+        assert_eq!(instance_name_from(Some("dev")), "raum-dev");
+        assert_eq!(instance_name_from(Some(" dev ")), "raum-dev");
+    }
 }

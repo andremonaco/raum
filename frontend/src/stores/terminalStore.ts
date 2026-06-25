@@ -125,6 +125,12 @@ export {
   closingTerminalIds,
 };
 
+/** Flips true once the first `setTerminals` snapshot has applied. Consumers
+ *  (project auto-suspend) gate on this so they don't treat every project as
+ *  session-less during the brief window before the snapshot loads. */
+const [terminalsReady, setTerminalsReady] = createSignal(false);
+export { terminalsReady };
+
 const pendingWorkingStateById: Record<string, TerminalWorkingState> = {};
 
 export function isHarnessKind(kind: AgentKind): boolean {
@@ -386,6 +392,7 @@ export function setTerminals(items: TerminalListItem[]): void {
       delete pendingWorkingStateById[item.session_id];
     }
   });
+  setTerminalsReady(true);
 }
 
 export function upsertTerminal(item: TerminalListItem | TerminalRecord): void {
@@ -872,6 +879,7 @@ export function __resetTerminalStoreForTests(): void {
   setIdsByProjectSlug(new Map());
   setIdsByWorktreeId(new Map());
   setLastOutputBySession(new Map());
+  setTerminalsReady(false);
   for (const key of Object.keys(pendingWorkingStateById)) {
     delete pendingWorkingStateById[key];
   }

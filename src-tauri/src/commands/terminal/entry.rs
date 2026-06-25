@@ -139,6 +139,16 @@ pub struct ReconnectResult {
     pub replaced_session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// True only on the `Unavailable` path when the session still has a
+    /// tracked row carrying harness resume state (i.e. the conversation
+    /// could be recovered later via the Recover overlay), but this attempt
+    /// could not bring it back right now. The frontend uses this to render
+    /// the Recover overlay + replay the disk snapshot instead of falling
+    /// through to a fresh spawn that would abandon the `harness_session_id`.
+    /// Skipped from the wire when false to keep the shape stable for the
+    /// common live-bridge / provider-replay cases.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub recoverable: bool,
 }
 
 impl ReconnectResult {
@@ -148,6 +158,7 @@ impl ReconnectResult {
             history_status: ReconnectHistoryStatus::LiveBridge,
             replaced_session_id: None,
             message: None,
+            recoverable: false,
         }
     }
 
@@ -157,6 +168,7 @@ impl ReconnectResult {
             history_status: ReconnectHistoryStatus::ProviderReplay,
             replaced_session_id: None,
             message: None,
+            recoverable: false,
         }
     }
 
@@ -166,6 +178,26 @@ impl ReconnectResult {
             history_status: ReconnectHistoryStatus::Unavailable,
             replaced_session_id: None,
             message: Some(message.into()),
+            recoverable: false,
+        }
+    }
+
+    /// Structured "unavailable, but the conversation is still recoverable"
+    /// result. Returned instead of a bare `Err` when a tracked session's
+    /// in-place resume could not commit (stale/pruned harness id, resume
+    /// command exited during the grace window) so the frontend keeps the
+    /// recoverable ghost + replays the disk snapshot rather than spawning a
+    /// fresh empty chat that abandons the persisted `harness_session_id`.
+    pub(super) fn unavailable_recoverable(
+        session_id: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            history_status: ReconnectHistoryStatus::Unavailable,
+            replaced_session_id: None,
+            message: Some(message.into()),
+            recoverable: true,
         }
     }
 
@@ -178,6 +210,7 @@ impl ReconnectResult {
             history_status: ReconnectHistoryStatus::ProviderReplay,
             replaced_session_id: Some(replaced_session_id.into()),
             message: None,
+            recoverable: false,
         }
     }
 }

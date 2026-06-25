@@ -50,7 +50,8 @@
       "minimumSystemVersion": "11.0",
       "signingIdentity": null,
       "files": {
-        "Resources/Assets.car": "icons/icon-compiled/Assets.car"
+        "Resources/Assets.car": "icons/icon-compiled/Assets.car",
+        "Resources/raum-cli": "../packaging/bin/raum-cli"
       },
       "infoPlist": "Info.plist"
     },

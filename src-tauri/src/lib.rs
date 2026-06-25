@@ -26,6 +26,13 @@ use tracing::{info, warn};
 #[cfg(target_os = "macos")]
 const MENU_ID_OPEN_SETTINGS: &str = "open-settings";
 
+/// ID of the "Install 'raum' Command in PATH" item in the macOS app submenu.
+/// Clicking it emits `menu-action` with this payload; the frontend routes it to
+/// the `cli_install_shim` command so users who drag the `.app` out of the DMG
+/// get the `raum <dir>` terminal command (Homebrew users get it via the cask).
+#[cfg(target_os = "macos")]
+const MENU_ID_INSTALL_CLI: &str = "install-cli";
+
 /// Bump `RLIMIT_NOFILE` to the hard cap on macOS.
 ///
 /// GUI apps launched by Finder/Dock inherit launchd's soft limit (256 by
@@ -100,9 +107,23 @@ pub fn run() {
     // login shell once here, before any `which::which()` call runs.
     path_env::augment_process_path();
 
+    // Capture an optional `raum <dir>` argument for a *cold* launch and seed it
+    // into shared state; the frontend drains it on boot via
+    // `cli_take_pending_open`. The already-running case is handled separately by
+    // the single-instance callback below (it emits `cli-open-project`).
+    let app_state = state::AppHandleState::default();
+    if let Some(path) = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| cli::parse_open_path(std::env::args().skip(1), &cwd))
+    {
+        if let Ok(mut guard) = app_state.pending_cli_open.lock() {
+            *guard = Some(path);
+        }
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_decorum::init())
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
             // §2.5 — duplicate launch focuses the existing window instead of
             // opening a new one. The callback fires on the already-running
             // instance; the duplicate process exits with status 0 after.
@@ -114,6 +135,17 @@ pub fn run() {
                 }
             } else {
                 warn!("single-instance: main window not found");
+            }
+            // `raum <dir>` from a second invocation: resolve the directory
+            // against the *second* process's CWD and hand the absolute path to
+            // the frontend, which focuses an existing project or starts the add
+            // flow for a new one.
+            if let Some(path) =
+                cli::parse_open_path(argv.iter().skip(1), std::path::Path::new(&cwd))
+            {
+                if let Err(e) = app.emit("cli-open-project", path.to_string_lossy().into_owned()) {
+                    warn!(error = %e, "single-instance: cli-open-project emit failed");
+                }
             }
         }))
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -136,13 +168,21 @@ pub fn run() {
                 warn!(menu_id = %id, error = %e, "menu-action emit failed");
             }
         })
-        .manage(state::AppHandleState::default())
+        .manage(app_state)
         .invoke_handler(tauri::generate_handler![
             commands::ping,
+            // Terminal-launch bridge (`raum <dir>`): cold-start drain + the
+            // "Install 'raum' Command in PATH" action.
+            commands::cli::cli_take_pending_open,
+            commands::cli::cli_install_shim,
             commands::config_get,
             commands::config_mark_onboarded,
             commands::active_layout_get,
             commands::active_layout_save,
+            // App-lifecycle: quit-flush ack (Contract 1) + rehydrate-ready
+            // poll (Contract 2).
+            commands::lifecycle::app_quit_flush_done,
+            commands::lifecycle::terminal_rehydrate_ready,
             commands::os_info,
             commands::keymap_get_defaults,
             commands::keymap_get_effective,
@@ -199,6 +239,7 @@ pub fn run() {
             commands::permission::reply_permission,
             // §5.4 — project command surface (Wave 3B).
             commands::project::project_register,
+            commands::project::project_find_by_path,
             commands::project::project_list,
             commands::project::project_update,
             commands::project::project_remove,
@@ -251,6 +292,7 @@ pub fn run() {
             commands::config_set_worktree_path_pattern,
             commands::config_set_appearance_theme,
             commands::config_set_appearance_show_prompt_overlay,
+            commands::config_set_projects_auto_hide,
             // Global search — file search over a project's root or arbitrary path.
             commands::search::project_find_files,
             commands::search::search_files_in_path,
@@ -310,6 +352,23 @@ pub fn run() {
             // Show after all titlebar setup to avoid flashing native chrome.
             main_window.show().unwrap();
 
+            // A terminal cold-launch (`raum <dir>`) execs the bundled binary
+            // directly — the macOS `raum-cli` wrapper uses `nohup … &`, not
+            // LaunchServices — so the process is not made frontmost
+            // automatically and `show()` alone doesn't activate the app. When a
+            // CLI directory is pending, activate the window the same way the
+            // already-running path does, otherwise the requested project opens
+            // *behind* the terminal the user typed into. Peek (don't drain) the
+            // pending slot; the frontend drains it via `cli_take_pending_open`.
+            if app
+                .state::<state::AppHandleState>()
+                .pending_cli_open
+                .lock()
+                .is_ok_and(|g| g.is_some())
+            {
+                let _ = main_window.set_focus();
+            }
+
             // §12.3 — register the three OS-level global shortcuts. Their
             // accelerators can be overridden via keybindings.toml; we look them
             // up through `merged_keymap` so user overrides take effect.
@@ -340,12 +399,12 @@ pub fn run() {
             bootstrap_apply_server_options(app);
 
             // Rehydrate harness state for tmux sessions that survived the
-            // previous app run. Absorbs the boot-time reap (stale tmux
-            // sessions older than one day are killed first, their tracked
-            // rows are then forgotten in `sessions.toml`, and the remaining
-            // live sessions are re-registered with a seeded state machine
-            // + terminal-registry ghost so top-row counters and hook-driven
-            // transitions work from the first frame of the webview).
+            // previous app run: live sessions are re-registered with a seeded
+            // state machine + terminal-registry ghost so top-row counters and
+            // hook-driven transitions work from the first frame of the webview,
+            // live-but-untracked sessions are adopted as closable orphans, and
+            // only then are day-old untracked leftovers age-reaped (the reap
+            // runs AFTER adoption so it can never destroy recoverable work).
             bootstrap_rehydrate_sessions(app);
 
             // Reconcile the live tmux socket with the tracked-session set on a
@@ -361,6 +420,12 @@ pub fn run() {
             // screen lock (wry never surfaces the termination to Tauri)
             // and reload it instead of leaving a black, dead window.
             bootstrap_webview_health(app);
+
+            // Intercept window close so the frontend can flush its debounced
+            // writers (active-layout 500 ms, terminal snapshots 2 s) before the
+            // webview is torn down — otherwise the last layout mutation and the
+            // freshest scrollback are lost on quit (Contract 1).
+            bootstrap_quit_flush(app);
 
             // 5-min fd-count probe. Existence of this line in the log
             // turns the next leak repro into "read one number" instead
@@ -401,8 +466,25 @@ pub fn run() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("failed while running raum");
+        .build(tauri::generate_context!())
+        .expect("failed to build raum")
+        .run(|app, event| {
+            // Fallback quit-flush for non-window exits (e.g. Cmd+Q routed
+            // through the app menu's Quit, or `tauri-plugin-process` exit).
+            // The window `CloseRequested` path (see `bootstrap_quit_flush`)
+            // handles the common close-button / Cmd+W case; this catches the
+            // rest. Re-entrancy is guarded inside `begin_quit_flush_for_exit`,
+            // and the dance's own `app.exit(0)` re-fires `ExitRequested`, which
+            // we must NOT prevent the second time around.
+            if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
+                // A non-`None` code means `app.exit(code)` was called
+                // deliberately (including by our own quit task) — let it
+                // proceed rather than re-intercepting.
+                if code.is_none() && commands::lifecycle::begin_quit_flush_for_exit(app) {
+                    api.prevent_exit();
+                }
+            }
+        });
 }
 
 /// §7.6 — start the hook-event UDS socket, export `RAUM_EVENT_SOCK` so
@@ -536,62 +618,44 @@ const REHYDRATE_EVENT_SOCKET_POLL: std::time::Duration = std::time::Duration::fr
 ///
 /// Sequence (all on the tokio runtime, non-blocking for setup):
 ///
-/// 1. `tmux.reap_stale(1)` — kill any session older than one day on
-///    the `-L raum` socket. Absorbs the previous `bootstrap_reap_stale`
-///    so reap happens BEFORE we classify live vs. dead tracked rows.
-/// 2. Bounded wait (≤ `REHYDRATE_EVENT_SOCKET_WAIT`) for the event
+/// 1. Bounded wait (≤ `REHYDRATE_EVENT_SOCKET_WAIT`) for the event
 ///    socket bootstrap to publish `channel_event_tx`. When it's live,
 ///    `infer_reattach_hook_fallback` can tell hook-installed sessions
 ///    apart from silence-only ones; when it isn't, every session gets
 ///    the silence fallback (matches the pre-rehydrate behaviour).
-/// 3. List live tmux sessions, read `state/sessions.toml`, feed both
-///    into the pure `rehydrate_plan`, then hand the plan to
-///    `apply_rehydrate_plan`. Per-session failures are logged but
-///    don't abort the rest of the rehydrate.
+/// 2. List live tmux sessions, read `state/sessions.toml`, GC orphan
+///    snapshots (keep = live ∪ tracked; skipped entirely whenever the
+///    live set is empty — a cold server is never a wipe trigger —
+///    Contract 4), feed live + tracked into the
+///    pure `rehydrate_plan`, then hand the plan to `apply_rehydrate_plan`.
+///    Per-session failures are logged but don't abort the rest.
+///    3/4. Apply the plan, then reconcile the other direction — adopt every
+///    live-but-untracked session so it surfaces as a closable orphan.
+/// 5. ONLY THEN age-reap (`reap_stale(1)`) any tmux leftover still
+///    untracked after adoption. The reap deliberately runs AFTER adopt so
+///    a live session whose tracking row was lost is never age-reaped out
+///    from under recoverable work (Theme 8 — session-visibility invariant).
+/// 6. Latch the rehydrate-done watch + emit `rehydrate:complete`
+///    (Contract 2). Done on every exit path so a gated pane never hangs.
 fn bootstrap_rehydrate_sessions(app: &mut tauri::App) {
     let app_handle = app.handle().clone();
     let state: tauri::State<'_, state::AppHandleState> = app.state();
     let tmux = state.tmux.clone();
 
     tauri::async_runtime::spawn(async move {
-        // 1. Reap stale tmux sessions first so they disappear from
-        // `list_sessions()` before we build the plan. Protected sessions
-        // (registry, `state/sessions.toml`, persisted active layout —
-        // harnesses AND shells) are exempt: they belong to panes the user
-        // still has in their layout, so age alone must never kill them.
-        // Only untracked leftovers are age-reaped.
-        let keep = {
-            let state: tauri::State<'_, state::AppHandleState> = app_handle.state();
-            match commands::terminal::protected_session_ids(&state) {
-                Ok(ids) => ids,
-                Err(e) => {
-                    warn!(error = %e, "rehydrate: protected-session read failed; skipping reap");
-                    let _ = state.rehydrate_done_tx.send(true);
-                    return;
-                }
-            }
-        };
-        let killed = match tokio::task::spawn_blocking({
-            let tmux = tmux.clone();
-            move || tmux.reap_stale(1, &keep)
-        })
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(error = %e, "rehydrate: reap_stale join failed");
-                Vec::new()
-            }
-        };
-        if !killed.is_empty() {
-            info!(
-                count = killed.len(),
-                ids = ?killed,
-                "rehydrate: killed orphan tmux sessions",
-            );
-        }
+        // NOTE on ordering: the boot age-reap used to run FIRST, against a
+        // `keep` set that — at boot — was only `state/sessions.toml` rows
+        // (the in-memory registry is still empty here). A live session whose
+        // tracked row was lost (a spawn that crashed before its tracking
+        // write, a forgotten-while-alive row, leftovers from an older build,
+        // a partial `sessions.toml`) was therefore age-reaped BEFORE step-5
+        // reconcile could adopt it — destroying live, recoverable work and
+        // violating the session-visibility invariant. The reap is now moved
+        // AFTER reconcile (step 6) so every live tmux session is first adopted
+        // (tracked row + ghost) and thus protected; age alone can no longer
+        // kill a live session at boot.
 
-        // 2. Wait (bounded) for the event-socket bootstrap to publish
+        // 1. Wait (bounded) for the event-socket bootstrap to publish
         // `channel_event_tx`.
         let deadline = std::time::Instant::now() + REHYDRATE_EVENT_SOCKET_WAIT;
         loop {
@@ -610,7 +674,7 @@ fn bootstrap_rehydrate_sessions(app: &mut tauri::App) {
             tokio::time::sleep(REHYDRATE_EVENT_SOCKET_POLL).await;
         }
 
-        // 3. Build the plan.
+        // 2. Build the plan.
         let live_ids: std::collections::HashSet<String> = match tokio::task::spawn_blocking({
             let tmux = tmux.clone();
             move || tmux.list_sessions()
@@ -620,57 +684,92 @@ fn bootstrap_rehydrate_sessions(app: &mut tauri::App) {
             Ok(Ok(sessions)) => sessions.into_iter().map(|s| s.id).collect(),
             Ok(Err(e)) => {
                 warn!(error = %e, "rehydrate: tmux list_sessions failed; skipping");
-                let state: tauri::State<'_, state::AppHandleState> = app_handle.state();
-                let _ = state.rehydrate_done_tx.send(true);
+                latch_rehydrate_done(&app_handle);
                 return;
             }
             Err(e) => {
                 warn!(error = %e, "rehydrate: list_sessions join failed");
-                let state: tauri::State<'_, state::AppHandleState> = app_handle.state();
-                let _ = state.rehydrate_done_tx.send(true);
+                latch_rehydrate_done(&app_handle);
                 return;
             }
         };
 
-        // GC orphaned terminal snapshots. A snapshot whose session id is no
-        // longer in `live_ids` belongs to a tmux session killed while raum
-        // was down (or to a one-shot `terminal_kill` we missed during a
-        // crash). Run on the rehydrate task so it overlaps with the rest of
-        // recovery and never blocks the UI.
-        let snapshot_live_ids: Vec<String> = live_ids.iter().cloned().collect();
-        match tokio::task::spawn_blocking(move || {
-            raum_core::snapshot_store::gc_orphans(&snapshot_live_ids)
-        })
-        .await
-        {
-            Ok(Ok(removed)) if removed > 0 => {
-                info!(
-                    count = removed,
-                    "rehydrate: reaped orphan terminal snapshots"
-                );
-            }
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => {
-                warn!(error = %e, "rehydrate: snapshot gc_orphans failed");
-            }
-            Err(e) => {
-                warn!(error = %e, "rehydrate: snapshot gc_orphans join failed");
-            }
-        }
-
+        // Read the tracked-session set BEFORE the snapshot GC so the GC keep
+        // set can union it in (Contract 4). On a computer restart the `-L raum`
+        // tmux server is gone, `list_sessions()` returns Ok(empty), and
+        // `live_ids` is empty — GCing against the live set alone would wipe
+        // EVERY snapshot, destroying the only cross-restart scrollback fallback
+        // for exactly the rows we are about to classify as Recover. (Poisoned
+        // lock: recover it rather than abort — read_sessions degrades to
+        // default on a corrupt file, so the only loss is the tracked set.)
         let tracked = {
             let state: tauri::State<'_, state::AppHandleState> = app_handle.state();
-            let Ok(store) = state.config_store.lock() else {
-                warn!("rehydrate: config_store lock poisoned");
-                let _ = state.rehydrate_done_tx.send(true);
-                return;
-            };
+            let store = state
+                .config_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             store.read_sessions().unwrap_or_default().sessions
         };
 
+        // GC orphaned terminal snapshots. A snapshot whose session id is in
+        // NEITHER the live tmux set NOR the still-tracked `sessions.toml` set
+        // belongs to a session killed while raum was down (or a one-shot
+        // `terminal_kill` we missed during a crash). Run on the rehydrate task
+        // so it overlaps with the rest of recovery and never blocks the UI.
+        //
+        // Skip the GC entirely whenever there are no live tmux sessions — the
+        // classic post-reboot signature (the `-L raum` server is cold) — so a
+        // cold socket can never be mistaken for "every session ended" and
+        // trigger a total snapshot wipe. This must NOT depend on `tracked`:
+        // after the Contract 5 quarantine change a torn/corrupt `sessions.toml`
+        // degrades to `Ok(default)` => `tracked` empty (no error), so gating on
+        // `!tracked.is_empty()` would let a torn-write reboot fall into the GC
+        // with an empty keep set and wipe every snapshot (invariant 2). An
+        // empty live set is never a legitimate reason to delete all snapshots;
+        // there is nothing to reclaim against on a cold server anyway.
+        // Forgotten (untracked) snapshots are simply left for the next WARM
+        // boot — when `live_ids` is non-empty the GC runs with
+        // keep = live ∪ tracked and reaps them then. That deferral is
+        // acceptable; preserving recoverable scrollback wins over reclaiming a
+        // few orphan blobs one boot late. (`list_sessions()` errors already
+        // early-returned above without reaching the GC.)
+        if live_ids.is_empty() {
+            info!(
+                tracked = tracked.len(),
+                "rehydrate: tmux server cold (no live sessions); skipping snapshot \
+                 gc to preserve cross-restart scrollback (orphans reclaimed on next \
+                 warm boot)",
+            );
+        } else {
+            let keep_ids: Vec<String> = live_ids
+                .iter()
+                .cloned()
+                .chain(tracked.iter().map(|row| row.session_id.clone()))
+                .collect();
+            match tokio::task::spawn_blocking(move || {
+                raum_core::snapshot_store::gc_orphans(&keep_ids)
+            })
+            .await
+            {
+                Ok(Ok(removed)) if removed > 0 => {
+                    info!(
+                        count = removed,
+                        "rehydrate: reaped orphan terminal snapshots"
+                    );
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    warn!(error = %e, "rehydrate: snapshot gc_orphans failed");
+                }
+                Err(e) => {
+                    warn!(error = %e, "rehydrate: snapshot gc_orphans join failed");
+                }
+            }
+        }
+
         let plan = commands::agent_hydrate::rehydrate_plan(&tracked, &live_ids);
 
-        // 4. Apply. The applier spawns inside the same task; it runs
+        // 3. Apply. The applier spawns inside the same task; it runs
         // quickly because all per-session work is in-memory registry
         // mutation + a couple of Tauri emits. An empty plan (no tracked
         // rows to replay) still falls through to the reconcile below so
@@ -682,7 +781,7 @@ fn bootstrap_rehydrate_sessions(app: &mut tauri::App) {
             let _report = commands::agent_hydrate::apply_rehydrate_plan(&app_handle, &state, plan);
         }
 
-        // 5. Reconcile the other direction: adopt every live tmux session that
+        // 4. Reconcile the other direction: adopt every live tmux session that
         // rehydrate did NOT account for (no `sessions.toml` row — a spawn that
         // crashed before tracking, a forgotten-while-alive row, leftovers from
         // an older build). Without this they stay invisible to the frontend
@@ -696,12 +795,72 @@ fn bootstrap_rehydrate_sessions(app: &mut tauri::App) {
             Err(e) => warn!(error = %e, "rehydrate: reconcile failed"),
         }
 
+        // 5. Backstop age-reap, now that reconcile has adopted every live
+        // session. `protected_session_ids` reflects the freshly-populated
+        // registry + tracked set, so this only ever targets sessions that are
+        // STILL untracked after adoption (effectively none on the boot path) —
+        // it can no longer kill a live, recoverable session purely on age. We
+        // keep it as a cheap guard against a leftover that appears in the
+        // narrow window between adoption and this call. A protected-read or
+        // reap failure is logged and skipped: a missing reap never blocks
+        // launch, and never destroys data.
+        let keep = match commands::terminal::protected_session_ids(&state) {
+            Ok(ids) => Some(ids),
+            Err(e) => {
+                warn!(error = %e, "rehydrate: protected-session read failed; skipping boot reap");
+                None
+            }
+        };
+        if let Some(keep) = keep {
+            match tokio::task::spawn_blocking({
+                let tmux = tmux.clone();
+                move || tmux.reap_stale(1, &keep)
+            })
+            .await
+            {
+                Ok(killed) if !killed.is_empty() => {
+                    info!(
+                        count = killed.len(),
+                        ids = ?killed,
+                        "rehydrate: age-reaped untracked tmux leftovers (post-adopt)",
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => warn!(error = %e, "rehydrate: reap_stale join failed"),
+            }
+        }
+
         // 6. Latch the rehydrate-complete signal. The reconciler's focus/timer
         // triggers wait on this so they can't race the boot pass, and the
         // (now backstop-only) orphan reaper stays gated behind a fully
-        // populated registry + tracked set.
-        let _ = state.rehydrate_done_tx.send(true);
+        // populated registry + tracked set. `latch_rehydrate_done` also emits
+        // `rehydrate:complete` so a late-mounting pane that missed the watch
+        // flip can still observe it (Contract 2); panes also poll
+        // `terminal_rehydrate_ready`.
+        latch_rehydrate_done(&app_handle);
     });
+}
+
+/// Flip the rehydrate-done watch to `true` and emit the `rehydrate:complete`
+/// event (Contract 2). The watch is the authority a pane polls via
+/// `terminal_rehydrate_ready`; the event lets an already-listening pane react
+/// without polling. Called on the happy path AND on every early-return failure
+/// path inside `bootstrap_rehydrate_sessions` so a pane gated on rehydrate
+/// never hangs waiting for a signal that never fires.
+fn latch_rehydrate_done<R: Runtime>(app: &tauri::AppHandle<R>) {
+    let state: tauri::State<'_, state::AppHandleState> = app.state();
+    // `send_replace` (not `send`): `watch::Sender::send` short-circuits with
+    // `Err(SendError)` WITHOUT updating the stored value when there are zero
+    // live receivers, which is the normal boot case here (the only long-lived
+    // receiver lives inside `run_reconcile`, which usually isn't parked at this
+    // instant). `send_replace` updates the latched value unconditionally, so a
+    // pane that later polls `terminal_rehydrate_ready` actually observes `true`.
+    // The separate `app.emit` below still drives the one-shot event path for
+    // already-listening panes.
+    state.rehydrate_done_tx.send_replace(true);
+    if let Err(e) = app.emit("rehydrate:complete", true) {
+        warn!(error = %e, "rehydrate: failed to emit rehydrate:complete");
+    }
 }
 
 /// Spawn a long-lived task that reports the process's open-fd count
@@ -832,6 +991,31 @@ fn bootstrap_webview_health(app: &mut tauri::App) {
     win.on_window_event(move |event| {
         if let tauri::WindowEvent::Focused(true) = event {
             commands::webview_health::on_focus_gained(&handle);
+        }
+    });
+}
+
+/// Quit-flush interceptor (Contract 1). Registers a `CloseRequested` handler on
+/// the main window that prevents the immediate close, hands off to
+/// `commands::lifecycle::begin_quit_flush` (which asks the frontend to flush its
+/// debounced writers, waits for the ack with a bounded timeout, then exits), and
+/// is re-entrancy-safe so the post-`app.exit` re-fire of `CloseRequested` falls
+/// through. Registered as another `on_window_event` handler — Tauri appends
+/// listeners (same pattern as `bootstrap_reconciler` / `bootstrap_webview_health`).
+fn bootstrap_quit_flush(app: &mut tauri::App) {
+    let Some(win) = app.get_webview_window("main") else {
+        warn!("bootstrap_quit_flush: main window not found");
+        return;
+    };
+    let handle = app.handle().clone();
+    win.on_window_event(move |event| {
+        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+            if commands::lifecycle::begin_quit_flush(&handle) {
+                // We took ownership: keep the window alive until the flush
+                // task calls `app.exit(0)`. A second `CloseRequested` (Tauri
+                // re-fires after exit) returns `false` and is NOT prevented.
+                api.prevent_close();
+            }
         }
     });
 }
@@ -982,6 +1166,10 @@ fn build_app_menu<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<Menu<R
             .accelerator("Cmd+,")
             .build(app)?;
 
+        let install_cli_item =
+            MenuItemBuilder::with_id(MENU_ID_INSTALL_CLI, "Install 'raum' Command in PATH")
+                .build(app)?;
+
         let app_submenu = SubmenuBuilder::new(app, "raum")
             .item(&PredefinedMenuItem::about(
                 app,
@@ -990,6 +1178,7 @@ fn build_app_menu<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<Menu<R
             )?)
             .separator()
             .item(&settings_item)
+            .item(&install_cli_item)
             .separator()
             .services()
             .separator()

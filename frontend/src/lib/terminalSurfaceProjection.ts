@@ -60,6 +60,14 @@ export interface ProjectTerminalSurfacesArgs {
    * transform).
    */
   dragSourceId?: string | null;
+  /**
+   * Once the drag latches an edge/root zone (dwell armed), route the SOURCE to
+   * its preview rect too — so the dragged pane (chrome + this surface) settles
+   * into the exact slot it will occupy, rather than being faked by a separate
+   * placeholder. The chrome's `.is-edge-snapped` rule drops its cursor
+   * transform so both layers sit at that slot.
+   */
+  routeDragSource?: boolean;
 }
 
 function isAgentKind(kind: RuntimeCell["kind"]): kind is AgentKind {
@@ -106,9 +114,11 @@ export function projectTerminalSurfaces(
     if (!isAgentKind(cell.kind)) continue;
     const committedRect = args.activeRectMap.get(cell.id) ?? null;
     // Sibling cells reflow to their preview rect; the drag source stays
-    // anchored to its committed rect (CSS ghost-translate moves it visually).
+    // anchored to its committed rect (CSS ghost-translate moves it visually) —
+    // UNLESS the drag has latched (`routeDragSource`), in which case the source
+    // also routes to its slot so the dragged pane settles into place.
     const previewRect =
-      args.previewRectMap && cell.id !== args.dragSourceId
+      args.previewRectMap && (cell.id !== args.dragSourceId || args.routeDragSource)
         ? (args.previewRectMap.get(cell.id) ?? null)
         : null;
     const activeRect = previewRect ?? committedRect;

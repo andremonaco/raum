@@ -76,6 +76,75 @@ mod ghost_tests {
         assert!(reg.remove("raum-a").is_none());
         assert!(reg.list().is_empty());
     }
+
+    // Models the recoverable resume-failure teardown (R1 critical fix): instead
+    // of forgetting the row + emitting a removal, `terminal_reattach`
+    // re-surfaces the pane as a `dead: true` recoverable ghost UPSERT. The
+    // observable on the registry side is a ghost carrying both flags that
+    // `item`/`list` expose, so the frontend keeps the pane + shows Recover.
+    #[test]
+    fn resurfaced_dead_recoverable_ghost_is_listed_with_flags() {
+        let mut reg = TerminalRegistry::default();
+        let inserted = reg.upsert_ghost(GhostEntry {
+            session_id: "raum-a".to_string(),
+            project_slug: Some("acme".to_string()),
+            worktree_id: None,
+            kind: AgentKind::ClaudeCode,
+            created_unix: 99,
+            dead: true,
+            recoverable_after_reboot: true,
+        });
+        assert!(inserted, "re-surfaced ghost is newly inserted");
+        let item = reg.item("raum-a").expect("ghost is queryable");
+        assert!(item.dead, "re-surface marks the pane dead");
+        assert!(
+            item.recoverable_after_reboot,
+            "re-surface keeps the pane recoverable (not removed)"
+        );
+        assert_eq!(item.created_unix, 99, "original creation time preserved");
+        let listed = reg.list();
+        assert_eq!(listed.len(), 1, "the pane stays in the list, not removed");
+        assert!(listed[0].dead && listed[0].recoverable_after_reboot);
+    }
+}
+
+mod placeholder_kill_guard_tests {
+    use super::super::reattach::PlaceholderKillGuard;
+    use raum_tmux::TmuxManager;
+    use std::sync::Arc;
+
+    fn unique_socket() -> String {
+        format!(
+            "raum-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    }
+
+    // A disarmed guard must NOT attempt to kill anything on drop — this is the
+    // success / self-heal path where the session is committed (or pre-existing
+    // and must stay visible). Dropping a disarmed guard is a clean no-op.
+    #[test]
+    fn disarmed_guard_drops_without_killing() {
+        let tmux = Arc::new(TmuxManager::with_socket(unique_socket()));
+        let mut guard = PlaceholderKillGuard::new(tmux, "raum-placeholder".to_string());
+        guard.disarm();
+        drop(guard); // must not panic and must not start a tmux server
+    }
+
+    // An armed guard reaps on drop. We can't assert the tmux call landed
+    // without a live server, but dropping it against an ephemeral socket with
+    // no session must swallow the resulting error (best-effort) and never
+    // panic — covering the early-exit leak-reap path (invariant 1).
+    #[test]
+    fn armed_guard_drop_is_best_effort_and_never_panics() {
+        let tmux = Arc::new(TmuxManager::with_socket(unique_socket()));
+        let guard = PlaceholderKillGuard::new(tmux, "raum-nonexistent".to_string());
+        drop(guard); // armed: attempts kill_session, swallows the Err, no panic
+    }
 }
 
 mod misc_tests {
@@ -272,5 +341,45 @@ mod paste_payload_tests {
         let paths = vec!["/tmp/a.txt".to_string()];
         let got = format_paste_payload(&paths, "wat");
         assert_eq!(got, "'/tmp/a.txt' ");
+    }
+}
+
+mod reconnect_result_tests {
+    use super::super::entry::ReconnectResult;
+
+    // The frontend (Agent B) keys the recover-overlay-instead-of-fresh-spawn
+    // decision off `recoverable: true` on an `unavailable` ReconnectResult
+    // (Contract 3). Lock the wire shape so an accidental rename/removal of the
+    // field is caught at the boundary.
+    #[test]
+    fn unavailable_recoverable_serializes_recoverable_true() {
+        let result = ReconnectResult::unavailable_recoverable("raum-a", "stale resume id");
+        let json = serde_json::to_value(&result).expect("serialize ReconnectResult");
+        assert_eq!(json["historyStatus"], "unavailable");
+        assert_eq!(json["recoverable"], true);
+        assert_eq!(json["message"], "stale resume id");
+        assert_eq!(json["sessionId"], "raum-a");
+    }
+
+    // The plain `unavailable` (and the happy-path live-bridge) variants must
+    // NOT carry `recoverable: true`, and the field is skipped when false to
+    // keep the common-case shape stable.
+    #[test]
+    fn plain_unavailable_omits_recoverable_flag() {
+        let result = ReconnectResult::unavailable("raum-a", "binary missing");
+        let json = serde_json::to_value(&result).expect("serialize ReconnectResult");
+        assert_eq!(json["historyStatus"], "unavailable");
+        assert!(
+            json.get("recoverable").is_none(),
+            "recoverable must be omitted when false, got {json:?}"
+        );
+    }
+
+    #[test]
+    fn live_bridge_omits_recoverable_flag() {
+        let result = ReconnectResult::live_bridge("raum-a");
+        let json = serde_json::to_value(&result).expect("serialize ReconnectResult");
+        assert_eq!(json["historyStatus"], "live-bridge");
+        assert!(json.get("recoverable").is_none());
     }
 }

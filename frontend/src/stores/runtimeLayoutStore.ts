@@ -173,6 +173,88 @@ const [runtimeLayoutStore, setRuntimeLayoutStore] = createStore<RuntimeLayoutSta
   cells: [],
 });
 
+// ---- bounded layout-undo history ------------------------------------------
+//
+// Contract B (undo): every *structural* mutation (split / move / swap / remove)
+// snapshots the prior tree + focus into a capped LIFO stack BEFORE applying its
+// change. `undoLayout()` pops the newest snapshot and restores it. We snapshot
+// only topology-changing ops — not ratio nudges or tab edits — so a single undo
+// reverses one meaningful layout gesture rather than a sub-pixel divider drag.
+//
+// The tree is deep-cloned on capture (via `currentTree()`, which already
+// JSON-round-trips out of the Solid proxy) so a later in-place mutation can't
+// retroactively corrupt a stored snapshot.
+
+interface LayoutSnapshot {
+  tree: LayoutNode | null;
+  focusedPaneId: string | null;
+  /** Off-tree visibility flags captured alongside the tree. Without these,
+   *  undoing a minimize/restore (or a reshape done while a pane was
+   *  minimized/maximized) would leave the dock and the tree disagreeing —
+   *  e.g. a pane both present in the restored tree AND still flagged
+   *  minimized, i.e. an invisible-in-grid live session. */
+  minimized: ReadonlySet<string>;
+  maximized: string | null;
+}
+
+const LAYOUT_HISTORY_LIMIT = 50;
+const layoutHistory: LayoutSnapshot[] = [];
+const [layoutHistoryDepth, setLayoutHistoryDepth] = createSignal(0);
+
+/** Capture the current tree + focus onto the undo stack. Called at the START of
+ *  every structural mutation, before the tree is replaced. Caps the stack at
+ *  `LAYOUT_HISTORY_LIMIT` by dropping the oldest entry. */
+export function pushLayoutHistory(): void {
+  layoutHistory.push({
+    tree: currentTree(),
+    focusedPaneId: focusedPaneId(),
+    minimized: new Set(minimizedPaneIds()),
+    maximized: maximizedPaneId(),
+  });
+  if (layoutHistory.length > LAYOUT_HISTORY_LIMIT) layoutHistory.shift();
+  setLayoutHistoryDepth(layoutHistory.length);
+}
+
+/** True when there is at least one layout snapshot to restore. Reactive. */
+export function canUndoLayout(): boolean {
+  return layoutHistoryDepth() > 0;
+}
+
+/** Restore the most recent layout snapshot (Contract B). Pops one entry, swaps
+ *  the tree back, and re-points focus at the snapshot's focused pane when it
+ *  still exists (else clears focus so we never highlight a vanished pane).
+ *  Schedules a save so the restored layout persists. No-op when the stack is
+ *  empty. Does NOT itself push history — undo is not undoable. Returns `true`
+ *  when a snapshot was actually restored, `false` when the stack was empty —
+ *  callers use this to keep the "Undid…" toast honest. */
+export function undoLayout(): boolean {
+  const snap = layoutHistory.pop();
+  setLayoutHistoryDepth(layoutHistory.length);
+  if (!snap) return false;
+  setRuntimeLayoutStore("tree", snap.tree);
+  // Restore the off-tree visibility flags captured with the tree, then
+  // reconcile against the restored tree so the dock and grid can never
+  // disagree: a pane that is back in the tree must NOT remain flagged
+  // minimized, and a maximized id that isn't in the tree must be cleared.
+  const restoredMin = new Set<string>();
+  for (const id of snap.minimized) {
+    if (!snap.tree || !treeContains(snap.tree, id)) restoredMin.add(id);
+  }
+  setMinimizedPaneIds(restoredMin);
+  setMaximizedPaneId(
+    snap.maximized && snap.tree && treeContains(snap.tree, snap.maximized) ? snap.maximized : null,
+  );
+  // Restore focus only if that pane is still part of the restored tree.
+  if (snap.focusedPaneId && snap.tree && treeContains(snap.tree, snap.focusedPaneId)) {
+    setFocusedPaneId(snap.focusedPaneId);
+  } else if (focusedPaneId() && (!snap.tree || !treeContains(snap.tree, focusedPaneId()!))) {
+    setFocusedPaneId(null);
+  }
+  rebuildCells();
+  scheduleActiveSave();
+  return true;
+}
+
 const [maximizedPaneId, setMaximizedPaneId] = createSignal<string | null>(null);
 // True for the duration of a maximize/restore transition. Drives the
 // `.maximize-anim` class on the grid root, which extends the chrome's
@@ -278,6 +360,9 @@ export function minimizePane(paneId: string): void {
   if (!runtimeLayoutStore.panes[paneId]) return;
   const mins = minimizedPaneIds();
   if (mins.has(paneId)) return;
+  // Snapshot pre-minimize (pane in tree, not minimized) so Cmd+Z brings it
+  // back into the grid — minimize is a reversible visibility change.
+  pushLayoutHistory();
 
   const tree = currentTree();
   if (tree && treeContains(tree, paneId)) {
@@ -303,6 +388,9 @@ export function minimizePane(paneId: string): void {
 export function restorePane(paneId: string): void {
   const mins = minimizedPaneIds();
   if (!mins.has(paneId)) return;
+  // Snapshot pre-restore (pane in dock, not in tree) so Cmd+Z re-minimizes
+  // it. Safe single push: insertExistingPaneFocused does not record history.
+  pushLayoutHistory();
   const nextSet = new Set(mins);
   nextSet.delete(paneId);
   setMinimizedPaneIds(nextSet);
@@ -476,6 +564,50 @@ let _saveTimer: ReturnType<typeof setTimeout> | null = null;
 let _saveGateOpen = false;
 let _savePendingWhileGated = false;
 
+/** True once this session has actually READ a layout off disk (even an empty
+ *  one) into the store. Stays false when the on-disk file failed to parse or
+ *  the read never settled — in that case we must never let an early save write
+ *  `cells: []` over a layout the user might still be able to salvage.
+ *
+ *  Signal-backed (Contract B) so reactive consumers — the rehydrate-ready gate
+ *  in `app.tsx`, the recovery banner, the palette — can subscribe to
+ *  `didActiveLayoutHydrate()` and re-run the instant hydration lands. The
+ *  internal save-path reads (`isSavePayloadSafe`, the empty-save guard) go
+ *  through the same accessor so the plain-`let` semantics are preserved.
+ *
+ *  The boot sequence (`hydrateActiveLayout`) flips this via
+ *  `markActiveLayoutHydrated()` only on a clean read. Tests default it true
+ *  (see `__resetRuntimeLayoutForTests`) so save-path tests keep working. */
+const [didActiveLayoutHydrate, setDidActiveLayoutHydrate] = createSignal(false);
+
+export { didActiveLayoutHydrate };
+
+/** Mark that a real layout read completed this session. Called by
+ *  `hydrateActiveLayout` after `active_layout_get` resolved (even with zero
+ *  cells) so subsequent empty saves are legitimate. Not called on a read
+ *  failure / timeout, which keeps the empty-save guard armed. Flips the
+ *  reactive `didActiveLayoutHydrate()` signal true (Contract B). */
+export function markActiveLayoutHydrated(): void {
+  setDidActiveLayoutHydrate(true);
+}
+
+/** Distinct from {@link didActiveLayoutHydrate}: this flips true once the
+ *  hydration ATTEMPT has finished, on EVERY exit path — clean read, zero
+ *  cells, timeout, OR corrupt/quarantined TOML. The skeleton/empty-state UI
+ *  gates on this so it always resolves (to the saved grid, the first-run CTA,
+ *  or the spawn picker) and never hangs forever on a failed read; meanwhile
+ *  `didActiveLayoutHydrate` stays unset on failures so the empty-save
+ *  anti-clobber guard remains armed. */
+const [activeLayoutHydrationSettled, setActiveLayoutHydrationSettled] = createSignal(false);
+
+export { activeLayoutHydrationSettled };
+
+/** Mark the hydration attempt as finished (any outcome). Call from
+ *  `hydrateActiveLayout`'s `finally` so the skeleton can resolve. */
+export function markActiveLayoutHydrationSettled(): void {
+  setActiveLayoutHydrationSettled(true);
+}
+
 /** Open the save gate. Called by `hydrateActiveLayout` once hydration has
  *  either restored the saved cells or confirmed there were none. Any save
  *  request that arrived while the gate was closed is honoured here. */
@@ -501,6 +633,92 @@ function collectWorktreeScopes(): Record<string, string> {
   return out;
 }
 
+/** Build the `ActiveLayoutState` payload from the current store. Pure read of
+ *  the store — extracted so both the debounced save and `flushActiveLayoutNow`
+ *  serialize the layout identically. */
+function buildActiveLayoutPayload(): ActiveLayoutState {
+  const inTreeCells = runtimeLayoutStore.cells;
+  const inTreeIds = new Set(inTreeCells.map((c) => c.id));
+  const mins = minimizedPaneIds();
+  const offTreePanes: PaneContent[] = [];
+  for (const pane of Object.values(runtimeLayoutStore.panes)) {
+    if (inTreeIds.has(pane.id)) continue;
+    // Only persist off-tree panes that are tracked as minimized; any other
+    // off-tree pane is in-flight (mid-mutation) and shouldn't ride along.
+    if (mins.has(pane.id)) offTreePanes.push(unwrap(pane) as PaneContent);
+  }
+  const serializeTabs = (tabs: CellTab[]): ActiveLayoutTab[] =>
+    tabs.map((t) => ({
+      id: t.id,
+      session_id: t.sessionId,
+      ...(t.label ? { label: t.label } : {}),
+      ...(t.projectSlug ? { project_slug: t.projectSlug } : {}),
+      ...(t.worktreeId ? { worktree_id: t.worktreeId } : {}),
+    }));
+  const scopes = collectWorktreeScopes();
+  return {
+    saved_at: Math.floor(Date.now() / 1000),
+    ...(activeProjectSlug() !== undefined ? { project_slug: activeProjectSlug() } : {}),
+    ...(Object.keys(scopes).length > 0 ? { worktree_scopes: scopes } : {}),
+    cells: [
+      ...inTreeCells.map((c) => ({
+        id: c.id,
+        x: c.x,
+        y: c.y,
+        w: c.w,
+        h: c.h,
+        kind: c.kind,
+        title: c.title,
+        project_slug: c.projectSlug,
+        worktree_id: c.worktreeId,
+        active_tab_id: c.activeTabId,
+        tabs: serializeTabs(c.tabs),
+      })),
+      ...offTreePanes.map((p) => ({
+        id: p.id,
+        x: 0,
+        y: 0,
+        w: 0,
+        h: 0,
+        kind: p.kind,
+        title: p.title,
+        project_slug: p.projectSlug,
+        worktree_id: p.worktreeId,
+        active_tab_id: p.activeTabId,
+        tabs: serializeTabs(p.tabs),
+        minimized: true,
+      })),
+    ],
+  };
+}
+
+/** Guard against the destructive clobber: never overwrite a (possibly
+ *  non-empty) on-disk layout with `cells: []` until this session has actually
+ *  read the saved layout back into the store. Without this, an early save fired
+ *  by the boot project-tab select (or fired after a corrupt/timed-out read that
+ *  left the gate handling deferred) could replace a recoverable layout with a
+ *  definitively empty one. Once a real layout has loaded, empty saves are
+ *  legitimate (the user closed every pane). */
+function isSavePayloadSafe(payload: ActiveLayoutState): boolean {
+  if (payload.cells.length > 0) return true;
+  return didActiveLayoutHydrate();
+}
+
+/** Record that a genuine non-empty layout has been written to disk THIS
+ *  session. After a corrupt/timed-out read `didActiveLayoutHydrate()` stays
+ *  false to block the boot-time empty clobber — but once the user has built and
+ *  persisted a real layout, the on-disk file is known to be raum-owned and
+ *  overwritable. From that point a later legitimate empty save (the user closed
+ *  every pane) must persist `cells: []`; otherwise the next launch reloads the
+ *  stale non-empty layout instead of the empty grid the user actually left.
+ *
+ *  The boot-time anti-clobber guarantee is preserved: this only flips on a
+ *  NON-empty write, so an empty save fired before any read still hits the
+ *  `!didActiveLayoutHydrate()` block. */
+function markLayoutOwnedAfterNonEmptySave(): void {
+  setDidActiveLayoutHydrate(true);
+}
+
 export function scheduleActiveSave(): void {
   if (!_saveGateOpen) {
     // Hydration hasn't finished yet — record that a save was requested and
@@ -511,61 +729,29 @@ export function scheduleActiveSave(): void {
   if (_saveTimer !== null) clearTimeout(_saveTimer);
   _saveTimer = setTimeout(() => {
     _saveTimer = null;
-    const inTreeCells = runtimeLayoutStore.cells;
-    const inTreeIds = new Set(inTreeCells.map((c) => c.id));
-    const mins = minimizedPaneIds();
-    const offTreePanes: PaneContent[] = [];
-    for (const pane of Object.values(runtimeLayoutStore.panes)) {
-      if (inTreeIds.has(pane.id)) continue;
-      // Only persist off-tree panes that are tracked as minimized; any other
-      // off-tree pane is in-flight (mid-mutation) and shouldn't ride along.
-      if (mins.has(pane.id)) offTreePanes.push(unwrap(pane) as PaneContent);
-    }
-    const serializeTabs = (tabs: CellTab[]): ActiveLayoutTab[] =>
-      tabs.map((t) => ({
-        id: t.id,
-        session_id: t.sessionId,
-        ...(t.label ? { label: t.label } : {}),
-        ...(t.projectSlug ? { project_slug: t.projectSlug } : {}),
-        ...(t.worktreeId ? { worktree_id: t.worktreeId } : {}),
-      }));
-    const scopes = collectWorktreeScopes();
-    const payload: ActiveLayoutState = {
-      saved_at: Math.floor(Date.now() / 1000),
-      ...(activeProjectSlug() !== undefined ? { project_slug: activeProjectSlug() } : {}),
-      ...(Object.keys(scopes).length > 0 ? { worktree_scopes: scopes } : {}),
-      cells: [
-        ...inTreeCells.map((c) => ({
-          id: c.id,
-          x: c.x,
-          y: c.y,
-          w: c.w,
-          h: c.h,
-          kind: c.kind,
-          title: c.title,
-          project_slug: c.projectSlug,
-          worktree_id: c.worktreeId,
-          active_tab_id: c.activeTabId,
-          tabs: serializeTabs(c.tabs),
-        })),
-        ...offTreePanes.map((p) => ({
-          id: p.id,
-          x: 0,
-          y: 0,
-          w: 0,
-          h: 0,
-          kind: p.kind,
-          title: p.title,
-          project_slug: p.projectSlug,
-          worktree_id: p.worktreeId,
-          active_tab_id: p.activeTabId,
-          tabs: serializeTabs(p.tabs),
-          minimized: true,
-        })),
-      ],
-    };
+    const payload = buildActiveLayoutPayload();
+    if (!isSavePayloadSafe(payload)) return;
+    if (payload.cells.length > 0) markLayoutOwnedAfterNonEmptySave();
     invoke("active_layout_save", { layout: payload }).catch(console.warn);
   }, 500);
+}
+
+/** Contract 1 (quit-flush): clear the debounce timer and persist the current
+ *  layout immediately, awaiting the backend write so a quit landing inside the
+ *  500 ms quiet window doesn't lose the last layout mutation. No-op when the
+ *  save gate is closed (hydration never opened it) or when the payload would
+ *  destructively blank a never-hydrated layout. Errors are swallowed by the
+ *  caller (`quitFlush.ts`) so one failing flush still acks the quit. */
+export async function flushActiveLayoutNow(): Promise<void> {
+  if (_saveTimer !== null) {
+    clearTimeout(_saveTimer);
+    _saveTimer = null;
+  }
+  if (!_saveGateOpen) return;
+  const payload = buildActiveLayoutPayload();
+  if (!isSavePayloadSafe(payload)) return;
+  if (payload.cells.length > 0) markLayoutOwnedAfterNonEmptySave();
+  await invoke("active_layout_save", { layout: payload });
 }
 
 // ---- layout replacement (back-compat entry point) -------------------------
@@ -671,17 +857,25 @@ export function splitPane(
 }
 
 /** Split the focused pane (if any) along its longer axis, or at the root
- *  otherwise. Returns nothing; this is the "new terminal" gesture. */
-export function splitFocusedOrRoot(newPane: PaneContent): void {
+ *  otherwise. Returns nothing; this is the "new terminal" gesture. When
+ *  `directionHint` is given (keyboard split-right / split-down), it forces the
+ *  split orientation instead of the aspect-ratio heuristic. */
+export function splitFocusedOrRoot(newPane: PaneContent, directionHint?: Direction): void {
+  // Snapshot the pre-split tree so `undoLayout()` can reverse this spawn.
+  // Registering pane *content* below doesn't touch the tree, so capturing
+  // here still records the layout exactly as it was before the new leaf lands.
+  pushLayoutHistory();
   setRuntimeLayoutStore("panes", newPane.id, newPane);
-  insertExistingPaneFocused(newPane.id);
+  insertExistingPaneFocused(newPane.id, directionHint);
 }
 
 /** Insert an already-registered pane (must already exist in
  *  `runtimeLayoutStore.panes`) into the tree using the same focused-or-root
  *  auto-placement rule as `splitFocusedOrRoot`. Used by both spawn
- *  (`splitFocusedOrRoot`) and `restorePane`. */
-function insertExistingPaneFocused(paneId: string): void {
+ *  (`splitFocusedOrRoot`) and `restorePane`. `directionHint`, when supplied,
+ *  forces the split orientation (keyboard directional splits) instead of the
+ *  aspect-ratio heuristic. */
+function insertExistingPaneFocused(paneId: string, directionHint?: Direction): void {
   const focus = focusedPaneId();
   const tree = currentTree();
   const newLeaf = leaf(paneId);
@@ -689,15 +883,17 @@ function insertExistingPaneFocused(paneId: string): void {
   if (!tree) {
     nextTree = newLeaf;
   } else if (focus && focus !== paneId && treeContains(tree, focus)) {
-    // Bias toward bottom splits so the grid grows row-first: only split
-    // right when the focused pane is substantially wider than tall. On a
-    // typical 16:9 viewport this still produces a first 2-column split
-    // (w/h ≈ 1.78), but once columns exist further splits stack rows.
+    // Honor an explicit direction (keyboard split-right/down); otherwise bias
+    // toward bottom splits so the grid grows row-first: only split right when
+    // the focused pane is substantially wider than tall. On a typical 16:9
+    // viewport this still produces a first 2-column split (w/h ≈ 1.78), but
+    // once columns exist further splits stack rows.
     const cell = runtimeLayoutStore.cells.find((c) => c.id === focus);
-    const direction: Direction = cell && cell.w > cell.h * 1.6 ? "right" : "bottom";
+    const direction: Direction =
+      directionHint ?? (cell && cell.w > cell.h * 1.6 ? "right" : "bottom");
     nextTree = splitAtLeaf(tree, focus, direction, newLeaf);
   } else {
-    nextTree = splitAtRoot(tree, "right", newLeaf);
+    nextTree = splitAtRoot(tree, directionHint ?? "right", newLeaf);
   }
   setRuntimeLayoutStore("tree", nextTree);
   rebuildCells();
@@ -741,7 +937,12 @@ export function removePane(id: string): void {
     for (const t of pane.tabs) pendingResetKeys.delete(tabResetKey(id, t.id));
   }
   const tree = currentTree();
-  if (tree) {
+  if (tree && treeContains(tree, id)) {
+    // Deliberately NOT snapshotted for undo: closing a pane kills its
+    // tmux session AND drops `panes[id]` below, so a restored leaf would
+    // point at a dead session with no content. Close is final; layout-undo
+    // covers reversible rearrangement (split/move/swap/minimize/reshape),
+    // not destructive teardown.
     const next = removeLeaf(tree, id);
     setRuntimeLayoutStore("tree", next);
   }
@@ -768,6 +969,7 @@ export function removePane(id: string): void {
 export function swapPanes(a: string, b: string): void {
   const tree = currentTree();
   if (!tree) return;
+  pushLayoutHistory();
   const next = swapLeaves(tree, a, b);
   setRuntimeLayoutStore("tree", next);
   rebuildCells();
@@ -790,6 +992,7 @@ export function movePaneToEdge(
     // Source was the only leaf — nothing to do.
     return;
   }
+  pushLayoutHistory();
   const reinserted = splitAtLeaf(stripped, targetPaneId, direction, leaf(sourcePaneId));
   setRuntimeLayoutStore("tree", compact(reinserted));
   rebuildCells();
@@ -804,6 +1007,7 @@ export function movePaneToRootEdge(sourcePaneId: string, direction: Direction): 
   if (!treeContains(tree, sourcePaneId)) return;
   const stripped = removeLeaf(tree, sourcePaneId);
   if (!stripped) return;
+  pushLayoutHistory();
   const reinserted = splitAtRoot(stripped, direction, leaf(sourcePaneId));
   setRuntimeLayoutStore("tree", compact(reinserted));
   rebuildCells();
@@ -903,6 +1107,7 @@ function subtreeContainsAny(node: LayoutNode, ids: ReadonlySet<string>): boolean
 export function equalizeAllRatios(): void {
   const tree = currentTree();
   if (!tree || tree.kind === "leaf") return;
+  pushLayoutHistory();
   setRuntimeLayoutStore("tree", equalizeRatios(tree));
   rebuildCells();
   scheduleActiveSave();
@@ -918,6 +1123,7 @@ export function tileAll(): void {
   if (ids.length < 2) return;
   const next = tileLeaves(ids);
   if (!next) return;
+  pushLayoutHistory();
   setRuntimeLayoutStore("tree", next);
   rebuildCells();
   scheduleActiveSave();
@@ -928,6 +1134,7 @@ export function tileAll(): void {
 export function compactTree(): void {
   const tree = currentTree();
   if (!tree) return;
+  pushLayoutHistory();
   setRuntimeLayoutStore("tree", compact(tree));
   rebuildCells();
   scheduleActiveSave();
@@ -1293,6 +1500,222 @@ export function cycleFocus(direction: "forward" | "back"): void {
   setFocusedPaneId(ids[next]);
 }
 
+// ---- spatial keyboard primitives (Contract B) -----------------------------
+//
+// These drive the "navigate / move / resize panes from the keyboard" keymap
+// actions registered by the GRID lane. All geometry is computed against the
+// pixel-space projection of the *current* runtime tree (`projectToRects` on
+// the LAYOUT_UNIT grid) so the spatial reasoning matches what the user sees.
+
+type KeyDirection = "left" | "right" | "up" | "down";
+
+/** Map a keyboard direction onto the BSP `Direction`/`Axis` vocabulary.
+ *  up/down → vertical (col axis); left/right → horizontal (row axis). */
+function keyDirToBsp(dir: KeyDirection): { direction: Direction; axis: Axis } {
+  switch (dir) {
+    case "left":
+      return { direction: "left", axis: "row" };
+    case "right":
+      return { direction: "right", axis: "row" };
+    case "up":
+      return { direction: "top", axis: "col" };
+    case "down":
+      return { direction: "bottom", axis: "col" };
+  }
+}
+
+/** Center point of a projected rect. */
+function rectCenter(r: Rect): { cx: number; cy: number } {
+  return { cx: r.x + r.w / 2, cy: r.y + r.h / 2 };
+}
+
+/**
+ * Pick the pane spatially nearest the focused pane in `dir`. A candidate
+ * qualifies only when its center lies on the correct side of the focused
+ * pane's center along the primary axis (e.g. for "right", its cx must be
+ * greater). Among qualifying candidates we minimize a weighted distance that
+ * favours small cross-axis (perpendicular) offset, so a pane directly to the
+ * right beats one that's both to the right and far up/down — the same heuristic
+ * tmux/i3 use for directional focus.
+ */
+function nearestPaneInDirection(dir: KeyDirection): string | null {
+  const tree = currentTree();
+  if (!tree) return null;
+  const current = focusedPaneId();
+  if (!current) return null;
+  const rects = projectToRects(tree, LAYOUT_UNIT);
+  const from = rects.find((r) => r.id === current);
+  if (!from) return null;
+  const { cx, cy } = rectCenter(from);
+
+  let best: { id: string; score: number } | null = null;
+  for (const r of rects) {
+    if (r.id === current) continue;
+    const { cx: ox, cy: oy } = rectCenter(r);
+    // Primary delta (must be positive in the travel direction) and the
+    // perpendicular offset we penalize.
+    let primary: number;
+    let perp: number;
+    switch (dir) {
+      case "left":
+        primary = cx - ox;
+        perp = Math.abs(oy - cy);
+        break;
+      case "right":
+        primary = ox - cx;
+        perp = Math.abs(oy - cy);
+        break;
+      case "up":
+        primary = cy - oy;
+        perp = Math.abs(ox - cx);
+        break;
+      case "down":
+        primary = oy - cy;
+        perp = Math.abs(ox - cx);
+        break;
+    }
+    if (primary <= 0) continue; // wrong side — skip
+    // Weight perpendicular offset heavily so we prefer the pane that's most
+    // directly in line. Primary distance breaks ties between equally-aligned
+    // candidates.
+    const score = primary + perp * 2;
+    if (!best || score < best.score) best = { id: r.id, score };
+  }
+  return best ? best.id : null;
+}
+
+/** Move focus to the spatially-nearest pane in `dir`. No-op when there is no
+ *  focused pane or no neighbour in that direction. */
+export function focusByDirection(dir: KeyDirection): void {
+  const next = nearestPaneInDirection(dir);
+  if (next) setFocusedPaneId(next);
+}
+
+/**
+ * Reposition the focused pane spatially: detach it and re-insert it adjacent to
+ * its current neighbour in `dir`, via the same `movePaneToEdge` semantics that
+ * back DnD edge-drops. When there is no neighbour in that direction (the pane is
+ * already at the grid edge) we instead wrap the whole layout's outer edge with
+ * `movePaneToRootEdge`, so e.g. "move-left" on the leftmost pane pushes it to
+ * span the new far-left column. Both paths snapshot history for undo.
+ */
+export function movePaneDirectional(dir: KeyDirection): void {
+  const current = focusedPaneId();
+  if (!current) return;
+  const { direction } = keyDirToBsp(dir);
+  const neighbour = nearestPaneInDirection(dir);
+  if (neighbour) {
+    movePaneToEdge(current, neighbour, direction);
+  } else {
+    movePaneToRootEdge(current, direction);
+  }
+  // movePaneToEdge/RootEdge rebuild + save; keep focus on the moved pane so a
+  // chain of moves stays anchored to the same pane.
+  setFocusedPaneId(current);
+}
+
+/**
+ * Keyboard divider resize. `dir` reads as "grow the focused pane toward `dir`":
+ * "right" widens it by pushing its right divider rightward, "left" narrows it by
+ * pulling that same divider back (or, on a left-edge pane, pulling its left
+ * divider). The two concerns are deliberately separated:
+ *
+ *   1. WHICH divider — the boundary adjacent to the focused pane on the active
+ *      axis. We prefer the neighbour on the `dir` side; when the pane sits at
+ *      that grid edge (no neighbour there) we fall back to the divider on the
+ *      opposite side so an edge pane can still resize.
+ *   2. GROW vs SHRINK — set purely by `dir` relative to the focused pane, not by
+ *      which side the chosen divider happens to be on.
+ *
+ * The actual ratio mutation is delegated to `setSplitRatiosByBoundary`, so the
+ * hidden-sibling rescaling (when the scope filter hides panes between the two
+ * visible neighbours) lives in exactly one place.
+ */
+export function nudgeFocusedDivider(dir: KeyDirection, stepFrac = 0.03): void {
+  const current = focusedPaneId();
+  if (!current) return;
+  const tree = currentTree();
+  if (!tree || tree.kind === "leaf") return;
+  const opposite: Record<KeyDirection, KeyDirection> = {
+    left: "right",
+    right: "left",
+    up: "down",
+    down: "up",
+  };
+  // Grow/shrink INTENT comes from the direction: right/down grow the focused
+  // pane, left/up shrink it (matches the Cmd+Alt+= / Cmd+Alt+- bindings). The
+  // intent is independent of which physical divider we move, so it stays
+  // correct whether the focused pane is on the low OR high side of its split
+  // (the old dir-side heuristic inverted grow/shrink for high-side panes).
+  const growIntent = dir === "right" || dir === "down";
+
+  // Find ANY divider the focused pane borders. Prefer the requested axis
+  // (dir + its opposite); if the pane has no neighbour on that axis — e.g. a
+  // grow/shrink key pressed on a vertically-stacked pane, where left/right
+  // both return null — fall back to the perpendicular axis so the keys never
+  // silently no-op.
+  const perpendicular: Record<KeyDirection, [KeyDirection, KeyDirection]> = {
+    left: ["up", "down"],
+    right: ["up", "down"],
+    up: ["left", "right"],
+    down: ["left", "right"],
+  };
+  let neighbour = nearestPaneInDirection(dir) ?? nearestPaneInDirection(opposite[dir]);
+  let axis = keyDirToBsp(dir).axis;
+  if (!neighbour) {
+    const [pa, pb] = perpendicular[dir];
+    neighbour = nearestPaneInDirection(pa) ?? nearestPaneInDirection(pb);
+    axis = keyDirToBsp(pa).axis;
+  }
+  if (!neighbour) return;
+
+  // Determine low/high ordering of the pair along the axis from their actual
+  // projected positions — robust regardless of which side the neighbour is on.
+  const rects = projectToRects(tree, LAYOUT_UNIT);
+  const curRect = rects.find((r) => r.id === current);
+  const nbrRect = rects.find((r) => r.id === neighbour);
+  if (!curRect || !nbrRect) return;
+  const curStart = axis === "row" ? curRect.x : curRect.y;
+  const nbrStart = axis === "row" ? nbrRect.x : nbrRect.y;
+  const focusedIsLow = curStart < nbrStart;
+  const lowId = focusedIsLow ? current : neighbour;
+  const highId = focusedIsLow ? neighbour : current;
+
+  const lowRect = focusedIsLow ? curRect : nbrRect;
+  const highRect = focusedIsLow ? nbrRect : curRect;
+  const lowExtent = axis === "row" ? lowRect.w : lowRect.h;
+  const highExtent = axis === "row" ? highRect.w : highRect.h;
+  const combined = lowExtent + highExtent;
+  if (combined <= 0) return;
+  let lowFrac = lowExtent / combined;
+  let highFrac = highExtent / combined;
+
+  // Apply the grow/shrink intent to the FOCUSED pane's fraction (grow =
+  // bigger), whichever side of the divider it sits on.
+  const focusedDelta = growIntent ? stepFrac : -stepFrac;
+  if (focusedIsLow) {
+    lowFrac += focusedDelta;
+    highFrac -= focusedDelta;
+  } else {
+    highFrac += focusedDelta;
+    lowFrac -= focusedDelta;
+  }
+  // Clamp into [MIN_RATIO, 1 - MIN_RATIO]; setSplitRatiosByBoundary re-floors
+  // anyway, but clamping here keeps the pair summing to ~1 so the divider lands
+  // where we intend.
+  lowFrac = Math.min(Math.max(lowFrac, MIN_RATIO), 1 - MIN_RATIO);
+  highFrac = Math.min(Math.max(highFrac, MIN_RATIO), 1 - MIN_RATIO);
+
+  setSplitRatiosByBoundary({
+    axis,
+    leftLeafIds: [lowId],
+    rightLeafIds: [highId],
+    visibleLeafIds: [lowId, highId],
+    prunedLeftRatio: lowFrac,
+    prunedRightRatio: highFrac,
+  });
+}
+
 // ---- test helper ----------------------------------------------------------
 
 export function __resetRuntimeLayoutForTests(): void {
@@ -1319,6 +1742,28 @@ export function __resetRuntimeLayoutForTests(): void {
   // tests that exercise `scheduleActiveSave` keep their previous behaviour.
   _saveGateOpen = true;
   _savePendingWhileGated = false;
+  // Likewise default the hydration flag true so save-path tests aren't blocked
+  // by the empty-save guard (which only fires on the never-hydrated boot path).
+  setDidActiveLayoutHydrate(true);
+  setActiveLayoutHydrationSettled(true);
+  layoutHistory.length = 0;
+  setLayoutHistoryDepth(0);
+  if (_saveTimer !== null) {
+    clearTimeout(_saveTimer);
+    _saveTimer = null;
+  }
+}
+
+/** Test helper: force the boot-time gate/hydration flags so tests can exercise
+ *  the launch path (gate closed until hydration, empty-save guard armed) that
+ *  `__resetRuntimeLayoutForTests` deliberately bypasses. */
+export function __setActiveLayoutBootStateForTests(state: {
+  gateOpen: boolean;
+  didHydrate: boolean;
+}): void {
+  _saveGateOpen = state.gateOpen;
+  _savePendingWhileGated = false;
+  setDidActiveLayoutHydrate(state.didHydrate);
   if (_saveTimer !== null) {
     clearTimeout(_saveTimer);
     _saveTimer = null;

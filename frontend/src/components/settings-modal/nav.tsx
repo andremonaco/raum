@@ -26,6 +26,27 @@ export const SECTIONS: Section[] = [
     ),
   },
   {
+    id: "projects",
+    label: "Projects",
+    icon: () => (
+      <svg
+        xmlns="http://www.w3.org/2000/svg"
+        class="size-3 shrink-0"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        {/* A window with a tab strip — reads as project tabs. */}
+        <rect x="3" y="5" width="18" height="15" rx="2" />
+        <path d="M3 9h18" />
+        <path d="M8 5v4M13 5v4" />
+      </svg>
+    ),
+  },
+  {
     id: "notifications",
     label: "Notifications",
     icon: () => (

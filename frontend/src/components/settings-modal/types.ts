@@ -4,7 +4,13 @@ import type { Update } from "@tauri-apps/plugin-updater";
 import type { BadgeMode } from "../../lib/notificationCenter";
 import type { HarnessIconKind } from "../icons";
 
-export type SectionId = "appearance" | "notifications" | "harnesses" | "worktrees" | "updates";
+export type SectionId =
+  | "appearance"
+  | "projects"
+  | "notifications"
+  | "harnesses"
+  | "worktrees"
+  | "updates";
 
 export interface Section {
   id: SectionId;

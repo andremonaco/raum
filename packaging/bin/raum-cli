@@ -1,0 +1,27 @@
+#!/bin/sh
+# raum CLI launcher — open raum in a directory from the terminal (`raum <dir>`).
+#
+# Shipped inside the macOS app bundle at Contents/Resources/raum-cli and put on
+# PATH either by the Homebrew cask (`binary` stanza, symlinked as `raum`) or by
+# the in-app "Install 'raum' Command in PATH" action. The GUI binary itself is
+# not on PATH and would block the terminal if run in the foreground, so this
+# wrapper resolves its own real location (through any symlink), then launches
+# the binary detached — the shell prompt returns immediately while the app keeps
+# running. The directory argument and CWD are inherited by the app.
+#
+# Linux .deb users already get the GUI binary on PATH as `raum`; this wrapper is
+# macOS-only.
+
+# Resolve symlinks to find this script's real location (BSD readlink has no -f).
+src="$0"
+while [ -h "$src" ]; do
+  dir=$(cd -P "$(dirname "$src")" && pwd)
+  src=$(readlink "$src")
+  case "$src" in
+    /*) ;;
+    *) src="$dir/$src" ;;
+  esac
+done
+dir=$(cd -P "$(dirname "$src")" && pwd)
+
+nohup "$dir/../MacOS/raum" "$@" >/dev/null 2>&1 &

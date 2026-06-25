@@ -59,6 +59,7 @@ import {
   type Rect,
 } from "../../lib/layoutTree";
 import { ROOT_TARGET, dragState } from "../../lib/paneDnD";
+import { installWindowResizeClass } from "../../lib/gridResizeClass";
 import { timeMemoSettle } from "../../lib/perf";
 import {
   prewarmProjectionCache,
@@ -79,38 +80,48 @@ import {
 import {
   LAYOUT_UNIT,
   addCellTab,
+  activeLayoutHydrationSettled,
   clearMaximize,
   cycleFocus,
   focusPaneByIndex,
+  focusByDirection,
   focusedPaneId,
   layoutRev,
   maximizeAnim,
   maximizedPaneId,
+  minimizePane,
   minimizedPaneIds,
+  movePaneDirectional,
   nextCellId,
   nextTabId,
+  nudgeFocusedDivider,
+  removeCell,
   restorePane,
   runtimeLayoutStore,
   setActiveTabId,
   setFocusedPaneId,
   splitFocusedOrRoot,
   toggleMaximize,
+  undoLayout,
   type CellKind,
   type PaneContent,
   type RuntimeCell,
 } from "../../stores/runtimeLayoutStore";
+import { toast } from "solid-sonner";
 import { listCrossProjectHarnessSessions, terminalStore } from "../../stores/terminalStore";
 import { ALL_WORKTREES_SCOPE, activeWorktreeStore } from "../../stores/worktreeStore";
 import { DividerLayer } from "../divider-layer";
 import { Dock } from "../dock";
-import { HARNESS_ICONS } from "../icons";
+import { FolderIcon, HARNESS_ICONS } from "../icons";
 import { crossProjectViewMode, setCrossProjectViewMode } from "../top-row";
+import { DropZoneGuides } from "./drop-zone-guides";
+import { PlusGlyph } from "./glyphs";
 import { LeafFrame } from "./leaf-frame";
 import { ProjectedSessionFrame } from "./projected-frame";
 import { ReviewBracesLayer } from "./review-overlay";
 import { TerminalSurfaceLayer } from "./surfaces";
 import { KIND_LABELS } from "./constants";
-import { getScopedProjection, zoneToDirection } from "./utils";
+import { getScopedProjection, requestTerminalKill, zoneToDirection } from "./utils";
 
 // Re-export the cross-harness review helpers so external imports of
 // `./components/terminal-grid` (which now resolves to `index.tsx`) continue
@@ -186,6 +197,11 @@ export const TerminalGrid: Component = () => {
 
     const direction = zoneToDirection(s.zone);
     if (!direction) return null;
+    // Dwell gate: hovering a zone lights up its guide immediately (see
+    // <DropZoneGuides>), but the grid only reflows the gap open once the short
+    // hold has elapsed and paneDnD flips `armed`. Until then the guides are
+    // the only feedback, so sweeping across zones doesn't thrash the layout.
+    if (!s.armed) return null;
     const removed = removeLeaf(base, s.sourceId);
     if (!removed) return null;
     const newLeaf: LayoutNode = { kind: "leaf", id: s.sourceId };
@@ -262,6 +278,16 @@ export const TerminalGrid: Component = () => {
     return out;
   });
 
+  // True once the drag latches an edge/root zone (dwell armed, not a review
+  // snap): the dragged pane then settles into the exact slot it will occupy,
+  // so it IS its own landing preview instead of a separate placeholder.
+  const dragFitsSlot = createMemo(() => {
+    const s = dragState();
+    return (
+      !!s && s.armed && !s.snapped && s.zone !== null && s.zone !== "center" && s.targetId !== null
+    );
+  });
+
   const terminalSurfaces = createMemo<TerminalSurfaceDescriptor[]>(() =>
     projectTerminalSurfaces({
       cells: runtimeLayoutStore.cells,
@@ -280,6 +306,9 @@ export const TerminalGrid: Component = () => {
       // `surface-dragging-source` class translates it to follow the cursor.
       previewRectMap: previewCellMap(),
       dragSourceId: dragState()?.sourceId ?? null,
+      // Once latched, the dragged pane settles into its slot — route its
+      // surface there too (the chrome routes via the render loop below).
+      routeDragSource: dragFitsSlot(),
     }),
   );
 
@@ -347,6 +376,91 @@ export const TerminalGrid: Component = () => {
       }),
     );
 
+    // ---- Pane management via keyboard (Contract A action-ids) ----------
+    //
+    // Splits dispatch the SAME `raum:spawn-requested` event the top-row and
+    // drag-spawn use, inheriting the focused pane's kind/project/worktree so
+    // the new pane is a sibling of the same harness. The store's
+    // `splitFocusedOrRoot` chooses the axis (longer side); the explicit
+    // right/down ids exist for muscle-memory parity with tmux/VSCode even
+    // though the resulting axis is the store's call. Focus/move/resize route
+    // straight to the STORE directional helpers (Contract B).
+
+    /** Re-spawn a sibling of the focused pane in an explicit direction. The
+     *  `splitDirection` rides the spawn event so `splitFocusedOrRoot` forces a
+     *  genuine horizontal ("right") vs. vertical ("bottom") split rather than
+     *  the balanced aspect-ratio heuristic. Shell panes (no project) still
+     *  split fine. */
+    function spawnSiblingOfFocused(splitDirection: "right" | "bottom"): void {
+      const paneId = focusedPaneId();
+      if (!paneId) return;
+      const pane = runtimeLayoutStore.panes[paneId];
+      if (!pane || pane.kind === "empty") return;
+      const activeTab = pane.tabs.find((t) => t.id === pane.activeTabId);
+      window.dispatchEvent(
+        new CustomEvent("raum:spawn-requested", {
+          detail: {
+            kind: pane.kind,
+            projectSlug: activeTab?.projectSlug ?? pane.projectSlug,
+            worktreeId: activeTab?.worktreeId ?? pane.worktreeId,
+            splitDirection,
+          },
+        }),
+      );
+    }
+
+    unregs.push(keymap.register("split-pane-right", () => spawnSiblingOfFocused("right")));
+    unregs.push(keymap.register("split-pane-down", () => spawnSiblingOfFocused("bottom")));
+
+    unregs.push(
+      keymap.register("close-pane", () => {
+        const paneId = focusedPaneId();
+        if (!paneId) return;
+        const pane = runtimeLayoutStore.panes[paneId];
+        // Mirror the header close: kill the live sessions before collapsing
+        // the tree so we don't orphan tmux sessions (session-visibility
+        // invariant — every live session must stay user-closable).
+        if (pane) {
+          for (const tab of pane.tabs) requestTerminalKill(tab.sessionId, "close-pane");
+        }
+        removeCell(paneId);
+      }),
+    );
+
+    unregs.push(
+      keymap.register("minimize-pane", () => {
+        const paneId = focusedPaneId();
+        if (paneId) minimizePane(paneId);
+      }),
+    );
+
+    unregs.push(keymap.register("focus-pane-left", () => focusByDirection("left")));
+    unregs.push(keymap.register("focus-pane-right", () => focusByDirection("right")));
+    unregs.push(keymap.register("focus-pane-up", () => focusByDirection("up")));
+    unregs.push(keymap.register("focus-pane-down", () => focusByDirection("down")));
+
+    unregs.push(keymap.register("move-pane-left", () => movePaneDirectional("left")));
+    unregs.push(keymap.register("move-pane-right", () => movePaneDirectional("right")));
+    unregs.push(keymap.register("move-pane-up", () => movePaneDirectional("up")));
+    unregs.push(keymap.register("move-pane-down", () => movePaneDirectional("down")));
+
+    // Grow/shrink nudge the focused pane's divider. "grow" pushes the
+    // trailing edge outward (right/down); "shrink" pulls it inward. The
+    // STORE helper resolves which divider belongs to the focused pane.
+    unregs.push(keymap.register("grow-pane", () => nudgeFocusedDivider("right")));
+    unregs.push(keymap.register("shrink-pane", () => nudgeFocusedDivider("left")));
+
+    unregs.push(
+      keymap.register("undo-layout", () => {
+        // Gate the toast on the actual result so it never lies: undoLayout()
+        // returns false when the history stack is empty (nothing was
+        // restored). The change is otherwise silent (panes just reflow), so
+        // the toast anchors the gesture. Matches the worktree/merge pattern.
+        if (!undoLayout()) return;
+        toast("Layout restored", { description: "Undid the last pane change." });
+      }),
+    );
+
     onCleanup(() => {
       for (const fn of unregs) fn();
     });
@@ -372,6 +486,7 @@ export const TerminalGrid: Component = () => {
           kind: CellKind;
           projectSlug?: string;
           worktreeId?: string;
+          splitDirection?: "right" | "bottom";
         }>
       ).detail;
       if (!detail || !detail.kind || detail.kind === "empty") return;
@@ -387,7 +502,9 @@ export const TerminalGrid: Component = () => {
         projectSlug: detail.projectSlug,
         worktreeId: detail.worktreeId,
       };
-      splitFocusedOrRoot(newPane);
+      // `splitDirection` (set by the keyboard split-right/split-down actions)
+      // forces the orientation; spawns without it keep the balanced heuristic.
+      splitFocusedOrRoot(newPane, detail.splitDirection);
       setFocusedPaneId(id);
       // Drop maximize when a new pane appears — the user just asked for a new
       // terminal to type in, so they want to see (and reach) it.
@@ -395,6 +512,14 @@ export const TerminalGrid: Component = () => {
     }
     window.addEventListener("raum:spawn-requested", onSpawn);
     onCleanup(() => window.removeEventListener("raum:spawn-requested", onSpawn));
+  });
+
+  // Window-resize 1:1: stamp `window-resize-active` on the grid root while
+  // the OS window is mid-resize so styles.css zeroes the `.leaf-frame`
+  // position transition (panes track the new geometry instead of lagging it).
+  onMount(() => {
+    const teardown = installWindowResizeClass(() => rootEl());
+    onCleanup(teardown);
   });
 
   function focusRegisteredSession(sessionId: string): void {
@@ -498,6 +623,9 @@ export const TerminalGrid: Component = () => {
         return;
       }
     }
+
+    // Edge / root latch is handled by routing the source to its slot rect
+    // (see `dragFitsSlot`), not a transform — so no `--snap-*` vars here.
     root.style.removeProperty("--snap-dx");
     root.style.removeProperty("--snap-dy");
   });
@@ -508,6 +636,34 @@ export const TerminalGrid: Component = () => {
   // (`previewTree` and `previewCellMap` are defined above so the surface
   // projection memo can read them.)
   const renderTree = createMemo<LayoutNode | null>(() => previewTree() ?? activeTree());
+
+  // Empty-state branching for the active-project view (cross-project mode has
+  // its own "no matching sessions" message and is excluded here).
+  //
+  //   1. Hydration attempt NOT settled → skeleton. A saved layout rehydrates
+  //      from TOML on cold boot; until the attempt finishes we don't yet know
+  //      if there are panes, so showing the "spawn a harness" empty-state would
+  //      flash "no terminals" for a frame and then snap to the restored grid.
+  //      A faint skeleton holds the space instead. We gate on
+  //      `activeLayoutHydrationSettled()` (flips on EVERY exit — success,
+  //      empty, timeout, corrupt) rather than `didActiveLayoutHydrate()`
+  //      (which stays false on failed reads), so the skeleton always resolves
+  //      instead of hanging forever after a corrupt/timed-out boot (Contract B).
+  //   2. Settled, zero cells, ZERO projects → first-run CTA ("Add a project").
+  //      The disabled harness buttons are useless with no project to spawn into.
+  //   3. Settled, zero cells, projects EXIST → the harness spawn grid (some
+  //      buttons may be disabled if no project is active, but the user has a
+  //      project to activate).
+  const isEmptyActiveView = createMemo(
+    () => crossProjectMode() === null && activeCells().length === 0,
+  );
+  const showSkeleton = createMemo(() => isEmptyActiveView() && !activeLayoutHydrationSettled());
+  const showFirstRunCta = createMemo(
+    () => isEmptyActiveView() && activeLayoutHydrationSettled() && projectStore.items.length === 0,
+  );
+  const showSpawnGrid = createMemo(
+    () => isEmptyActiveView() && activeLayoutHydrationSettled() && projectStore.items.length > 0,
+  );
 
   return (
     <div class="flex h-full w-full flex-col">
@@ -526,7 +682,53 @@ export const TerminalGrid: Component = () => {
           ref={setRootEl}
           data-dnd-root="true"
         >
-          <Show when={crossProjectMode() === null && activeCells().length === 0}>
+          {/* HYDRATION SKELETON — faint pane outlines while the saved layout
+              is still rehydrating, so a restored grid never flashes the
+              "spawn a harness" empty-state on cold boot. */}
+          <Show when={showSkeleton()}>
+            <div
+              class="absolute inset-2 z-10 grid grid-cols-2 grid-rows-2 gap-2"
+              aria-hidden="true"
+            >
+              <div class="grid-skeleton-pane" />
+              <div class="grid-skeleton-pane" />
+              <div class="grid-skeleton-pane" />
+              <div class="grid-skeleton-pane" />
+            </div>
+          </Show>
+
+          {/* FIRST-RUN CTA — no projects exist yet, so disabled harness
+              buttons would be a dead end. Offer the one action that unblocks
+              everything: add a project. */}
+          <Show when={showFirstRunCta()}>
+            <div class="absolute inset-0 z-10 grid place-items-center bg-surface-sunken">
+              <div class="flex max-w-sm flex-col items-center gap-4 px-6 text-center">
+                <FolderIcon class="size-9 text-foreground-subtle" />
+                <div class="flex flex-col gap-1">
+                  <span class="text-sm font-medium text-foreground">No projects yet</span>
+                  <span class="text-xs text-foreground-subtle">
+                    Add a git repository to start spawning agent harnesses.
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  class="focus-ring flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors duration-[var(--motion-base)] ease-[var(--motion-ease)] hover:bg-primary/90"
+                  onClick={() => {
+                    // top-row owns the Add-Project modal and listens for this
+                    // event to open it (see top-row's onMount handler).
+                    window.dispatchEvent(new CustomEvent("raum:add-project-requested"));
+                  }}
+                >
+                  <PlusGlyph />
+                  Add a project
+                </button>
+              </div>
+            </div>
+          </Show>
+
+          {/* HARNESS SPAWN GRID — projects exist but no panes in this view.
+              Buttons that need a project are disabled until one is active. */}
+          <Show when={showSpawnGrid()}>
             <div
               class="absolute inset-0 z-10 grid h-full w-full gap-px bg-border-subtle"
               style={{
@@ -590,7 +792,13 @@ export const TerminalGrid: Component = () => {
                       // terminal body, especially under an active worktree
                       // scope where global vs. scoped rects diverge.
                       const isSource = dragState()?.sourceId === cell.id;
-                      const preview = !isSource ? (previewCellMap()?.get(cell.id) ?? null) : null;
+                      // Siblings route to their preview rect; the source stays
+                      // at its committed rect (and follows the cursor) UNTIL the
+                      // drag latches, when it too settles into its slot.
+                      const preview =
+                        !isSource || dragFitsSlot()
+                          ? (previewCellMap()?.get(cell.id) ?? null)
+                          : null;
                       const rect = preview ?? activeRectMap().get(cell.id) ?? null;
                       if (!rect) return cell;
                       return {
@@ -631,11 +839,16 @@ export const TerminalGrid: Component = () => {
             </div>
           </Show>
 
-          {/* No drop-zone overlay layer here — the cross-harness review
-          "snap" state is rendered inside the target's `LeafFrame` (see
-          `ReviewSnapOverlay` below) so it inherits the pane's bounds and
-          can blur its own body without a global overlay. Edge drops
-          continue to rely on layout reflow as the only feedback. */}
+          {/* DnD chrome layer — ABOVE the panes, pointer-events: none. Holds
+              the drop-zone grip handles (the "where can it land" menu). The
+              dragged pane is its own landing preview: once latched it settles
+              into its slot, so there's no placeholder rect or drag chip.
+              Active-project view only; DropZoneGuides gates on dragState(). */}
+          <Show when={crossProjectMode() === null}>
+            <div class="pointer-events-none absolute inset-0 z-[55]">
+              <DropZoneGuides tree={activeTree()} />
+            </div>
+          </Show>
         </div>
       </div>
       <Dock minimizedPanes={offTreePanes()} onRestore={onRestoreFromDock} />

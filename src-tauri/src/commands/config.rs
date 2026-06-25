@@ -68,7 +68,17 @@ fn parse_os_release() -> (Option<String>, Vec<String>) {
 
 #[tauri::command]
 pub fn config_get(state: tauri::State<'_, AppHandleState>) -> Result<Config, String> {
-    let store = state.config_store.lock().map_err(|e| e.to_string())?;
+    // Recover a poisoned mutex instead of bubbling the lock error: a single
+    // panic in any prior `config_store` user would otherwise permanently
+    // brick `config_get`, and on boot a rejected `config_get` lets the
+    // frontend's catch path clobber `active-layout.toml` with empty cells.
+    // `read_config` itself already degrades a corrupt file to the default
+    // (see `read_toml_or_default`'s quarantine), so the only remaining
+    // failure modes are genuine IO errors, which we still surface.
+    let store = state
+        .config_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     store.read_config().map_err(|e| e.to_string())
 }
 
@@ -100,12 +110,38 @@ pub fn config_mark_onboarded(state: tauri::State<'_, AppHandleState>) -> Result<
 /// Read the last-saved active layout snapshot from `state/active-layout.toml`.
 /// Returns an empty `ActiveLayoutState` (with `cells: []`) when no snapshot
 /// exists yet (first launch or user cleared the grid and the file is absent).
+/// Wire shape of [`active_layout_get`]. `#[serde(flatten)]` keeps the
+/// `ActiveLayoutState` fields (`cells`, …) at the top level so the frontend's
+/// existing `saved.cells` access is unchanged; `quarantined` is added
+/// alongside so the UI can toast when a corrupt active-layout.toml was set
+/// aside on this read (otherwise the graceful degrade-to-default is silent).
+#[derive(serde::Serialize)]
+pub struct ActiveLayoutGetResult {
+    #[serde(flatten)]
+    pub layout: ActiveLayoutState,
+    pub quarantined: bool,
+}
+
 #[tauri::command]
 pub fn active_layout_get(
     state: tauri::State<'_, AppHandleState>,
-) -> Result<ActiveLayoutState, String> {
-    let store = state.config_store.lock().map_err(|e| e.to_string())?;
-    store.read_active_layout().map_err(|e| e.to_string())
+) -> Result<ActiveLayoutGetResult, String> {
+    // Same hardening as `config_get`: recover a poisoned lock so a corrupt
+    // read can never reject. `read_active_layout_checked` quarantines a corrupt
+    // file and returns the default plus a `quarantined` flag, so a parse error
+    // no longer surfaces as `Err` (which the frontend `catch` would turn into a
+    // layout clobber) — instead the frontend toasts on the success path.
+    let store = state
+        .config_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    store
+        .read_active_layout_checked()
+        .map(|(layout, quarantined)| ActiveLayoutGetResult {
+            layout,
+            quarantined,
+        })
+        .map_err(|e| e.to_string())
 }
 
 /// Persist the current runtime grid state (geometry + session IDs) to
@@ -208,6 +244,28 @@ pub fn config_set_appearance_show_prompt_overlay(
         return Ok(());
     }
     cfg.appearance.show_prompt_overlay = enabled;
+    store.write_config(&cfg).map_err(|e| e.to_string())
+}
+
+/// Persist the top-bar "auto-hide inactive projects" toggle + day threshold.
+/// A project whose harnesses haven't been prompted within `days` collapses into
+/// the "Other projects" list. The staleness check itself is derived in the
+/// frontend (it has the per-session prompt timestamps); this only stores the
+/// preference. `days` is clamped to a minimum of 1.
+#[tauri::command]
+pub fn config_set_projects_auto_hide(
+    state: tauri::State<'_, AppHandleState>,
+    enabled: bool,
+    days: u32,
+) -> Result<(), String> {
+    let days = days.max(1);
+    let store = state.config_store.lock().map_err(|e| e.to_string())?;
+    let mut cfg: Config = store.read_config().map_err(|e| e.to_string())?;
+    if cfg.projects.auto_hide_inactive == enabled && cfg.projects.auto_hide_inactive_days == days {
+        return Ok(());
+    }
+    cfg.projects.auto_hide_inactive = enabled;
+    cfg.projects.auto_hide_inactive_days = days;
     store.write_config(&cfg).map_err(|e| e.to_string())
 }
 

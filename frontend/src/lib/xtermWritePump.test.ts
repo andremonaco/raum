@@ -70,4 +70,70 @@ describe("createXtermWritePump", () => {
     expect(terminal.resets).toBe(0);
     expect(terminal.parsed).toEqual(["reattach-history"]);
   });
+
+  // The snapshot replay-under-viewport ordering used by `reattachSession`
+  // (terminal-pane.tsx): the disk snapshot, the cursor-home + erase-below
+  // boundary (ESC[H ESC[J), and the live bridge frame must all land on the SAME
+  // pinned generation, in that order, so older scrollback restores beneath a
+  // clean viewport and the live capture cannot render below the snapshot's
+  // last screen (and leaves no ghost trailing characters).
+  it("preserves snapshot -> ESC[H ESC[J -> live-frame ordering on one generation", () => {
+    const terminal = new FakeTerminal();
+    const pump = createXtermWritePump({ getTerminal: () => terminal });
+    const generation = pump.generation();
+    const CURSOR_HOME_CLEAR_BELOW = new Uint8Array([0x1b, 0x5b, 0x48, 0x1b, 0x5b, 0x4a]);
+
+    // Replay order as terminal-pane enqueues it.
+    pump.enqueue(generation, new TextEncoder().encode("SNAPSHOT-SCROLLBACK"));
+    pump.enqueue(generation, CURSOR_HOME_CLEAR_BELOW);
+    pump.enqueue(generation, new TextEncoder().encode("LIVE-FRAME"));
+
+    // First frame writes immediately; the rest coalesce behind it.
+    terminal.flushOne();
+    terminal.flushOne();
+    const joined = terminal.parsed.join("");
+    // The boundary must sit between the snapshot and the live frame.
+    const home = "\x1b[H\x1b[J";
+    expect(joined.indexOf("SNAPSHOT-SCROLLBACK")).toBeLessThan(joined.indexOf(home));
+    expect(joined.indexOf(home)).toBeLessThan(joined.indexOf("LIVE-FRAME"));
+  });
+
+  // The not-recoverable reboot fallback (terminal-pane.tsx) awaits the disk
+  // snapshot and enqueues it on the current generation BEFORE releasing the
+  // spawn gate, so the fresh harness output lands AFTER it on the same
+  // generation. This pins the invariant that a snapshot enqueued first is
+  // written before later same-generation output (no scrollback below new
+  // output).
+  it("orders an awaited snapshot before later same-generation spawn output", () => {
+    const terminal = new FakeTerminal();
+    const pump = createXtermWritePump({ getTerminal: () => terminal });
+    const generation = pump.generation();
+
+    pump.enqueue(generation, new TextEncoder().encode("PRIOR-SCROLLBACK"));
+    // Fresh harness output arrives later on the same generation.
+    pump.enqueue(generation, new TextEncoder().encode("NEW-HARNESS-PROMPT"));
+
+    terminal.flushOne();
+    const joined = terminal.parsed.join("");
+    expect(joined.indexOf("PRIOR-SCROLLBACK")).toBeLessThan(joined.indexOf("NEW-HARNESS-PROMPT"));
+  });
+
+  // A snapshot fallback pinned to a generation that has since rotated must be
+  // dropped, never appended after the new generation's output — the guarantee
+  // that protects the recoverable reboot path from misordering a stale replay.
+  it("drops a snapshot enqueued at a stale generation after rotation", () => {
+    const terminal = new FakeTerminal();
+    const pump = createXtermWritePump({ getTerminal: () => terminal });
+    const staleGeneration = pump.generation();
+
+    const freshGeneration = pump.rotate(true);
+    pump.enqueue(freshGeneration, new TextEncoder().encode("FRESH"));
+    // Late-resolving snapshot read pinned to the now-stale generation.
+    pump.enqueue(staleGeneration, new TextEncoder().encode("STALE-SNAPSHOT"));
+
+    terminal.flushOne();
+    const joined = terminal.parsed.join("");
+    expect(joined).toContain("FRESH");
+    expect(joined).not.toContain("STALE-SNAPSHOT");
+  });
 });

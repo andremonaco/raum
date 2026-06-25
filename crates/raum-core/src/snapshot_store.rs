@@ -7,10 +7,13 @@
 //! policy — so the bytes round-trip through Tauri commands and land in
 //! `state/terminal-snapshots/<session_id>.vtgz`.
 //!
-//! Bytes are written as-is; the frontend gzips before sending. We do not
-//! interpret the VT stream here. `delete_for_session` clears a pane's
-//! snapshot when the harness is killed; `gc_orphans` reaps any blobs whose
-//! tmux session is no longer alive at startup.
+//! The payload is NOT compressed on either side — it is raw UTF-8 VT text
+//! straight out of xterm.js's `SerializeAddon`. The `.vtgz` extension is a
+//! legacy name (an earlier design gzipped the blob); the `gz` no longer means
+//! anything. Bytes are written exactly as received; we do not interpret the VT
+//! stream here. `delete_for_session` clears a pane's snapshot when the harness
+//! is killed; `gc_orphans` reaps any blobs whose tmux session is no longer
+//! alive at startup.
 //!
 //! Atomic-write semantics: the same `path.<pid>.tmp` + `rename` pattern used
 //! by `ConfigStore` so a crash mid-write never leaves a torn file.
@@ -35,16 +38,20 @@ fn snapshots_dir() -> PathBuf {
         .unwrap_or_else(terminal_snapshots_dir)
 }
 
-/// File extension for serialized snapshots. `.vtgz` because the frontend
-/// gzip-compresses the SerializeAddon output before sending it down — saves
-/// disk for full-color buffers without us needing to decompress to render.
+/// File extension for serialized snapshots. The `.vtgz` name is legacy — an
+/// earlier design gzipped the `SerializeAddon` output. There is no compression
+/// today on either side; the file is raw UTF-8 VT text. Kept as-is so existing
+/// on-disk snapshots from prior builds still load.
 const SNAPSHOT_EXT: &str = "vtgz";
 
-/// Hard cap on a single snapshot file. SerializeAddon output for a 100k-line
-/// full-color xterm buffer compresses to roughly 2–8 MiB; the 16 MiB ceiling
-/// is twice the worst observed case so the frontend's
-/// re-serialize-with-smaller-scrollback fallback fires only when something
-/// pathological is going on (full-screen ASCII art for hours).
+/// Hard cap on a single snapshot file, measured against the UNCOMPRESSED VT
+/// text (the bytes are not compressed). Dense full-color scrollback runs
+/// roughly a few hundred bytes per cell-run, so a 10k-line buffer typically
+/// lands well under a megabyte; 16 MiB leaves generous headroom for pathological
+/// full-screen-color content. When a snapshot exceeds this, [`persist`] returns
+/// `Ok(false)` and the frontend re-serializes with a smaller scrollback
+/// (down to its `SCROLLBACK_MIN`), so the overflow degrades gracefully rather
+/// than failing.
 pub const SNAPSHOT_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 /// Sanitize a session id for use as a filename. raum's session ids are
@@ -121,20 +128,31 @@ pub fn delete_for_session(session_id: &str) -> io::Result<()> {
     }
 }
 
-/// Reap snapshot files whose session ids are not in `live_session_ids`.
-/// Called once at raum startup against the live tmux session list so blobs
-/// from sessions killed while raum was down do not linger.
+/// Reap snapshot files whose session ids are not in `keep_session_ids`.
+/// Called once at raum startup with the KEEP set = live tmux sessions ∪ the
+/// sessions still tracked in `state/sessions.toml`, so blobs from sessions
+/// killed while raum was down do not linger.
+///
+/// IMPORTANT: this deletes every snapshot whose stem is absent from the keep
+/// set, so passing an empty slice wipes ALL snapshots. After a computer
+/// restart the `-L raum` tmux server is gone and `list_sessions()` returns an
+/// empty Vec — the caller MUST skip the GC entirely whenever the live set is
+/// empty (regardless of the tracked set, which a torn/corrupt sessions.toml
+/// quarantines down to empty) so the cross-restart scrollback fallback is not
+/// destroyed. For the warm case (live set non-empty) the caller unions the
+/// tracked-session ids into the keep set. See the call site in
+/// `bootstrap_rehydrate_sessions` (`src-tauri/src/lib.rs`).
 ///
 /// Returns the number of files removed.
-pub fn gc_orphans<S: AsRef<str>>(live_session_ids: &[S]) -> io::Result<usize> {
+pub fn gc_orphans<S: AsRef<str>>(keep_session_ids: &[S]) -> io::Result<usize> {
     let dir = snapshots_dir();
     let entries = match fs::read_dir(&dir) {
         Ok(e) => e,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
         Err(e) => return Err(e),
     };
-    let live: std::collections::HashSet<&str> =
-        live_session_ids.iter().map(AsRef::as_ref).collect();
+    let keep: std::collections::HashSet<&str> =
+        keep_session_ids.iter().map(AsRef::as_ref).collect();
     let mut removed = 0;
     for entry in entries.flatten() {
         let path = entry.path();
@@ -148,7 +166,7 @@ pub fn gc_orphans<S: AsRef<str>>(live_session_ids: &[S]) -> io::Result<usize> {
         else {
             continue;
         };
-        if !live.contains(stem) {
+        if !keep.contains(stem) {
             if let Err(e) = fs::remove_file(&path) {
                 tracing::warn!(
                     path = %path.display(),
@@ -258,6 +276,46 @@ mod tests {
             assert!(load("sess-alive").expect("load alive").is_some());
             assert!(load("sess-dead-1").expect("load dead1").is_none());
             assert!(load("sess-dead-2").expect("load dead2").is_none());
+        });
+    }
+
+    #[test]
+    fn gc_orphans_keeps_tracked_when_unioned_with_live() {
+        // Contract 4: the boot caller passes live_ids ∪ tracked_session_ids
+        // as the keep set, so a session that is dead in tmux but still tracked
+        // in sessions.toml (the post-reboot Recover case) keeps its snapshot.
+        with_temp_dir(|_| {
+            persist("sess-live", b"live").expect("persist live");
+            persist("sess-tracked", b"tracked").expect("persist tracked");
+            persist("sess-forgotten", b"gone").expect("persist forgotten");
+
+            // keep = live ("sess-live") ∪ tracked ("sess-tracked").
+            let keep = ["sess-live".to_string(), "sess-tracked".to_string()];
+            let removed = gc_orphans(&keep).expect("gc");
+            assert_eq!(removed, 1);
+
+            assert!(load("sess-live").expect("load live").is_some());
+            assert!(load("sess-tracked").expect("load tracked").is_some());
+            assert!(load("sess-forgotten").expect("load forgotten").is_none());
+        });
+    }
+
+    #[test]
+    fn gc_orphans_empty_keep_wipes_everything() {
+        // Documents the destructive edge the boot caller must guard against:
+        // an empty keep set (the post-reboot signature: no live sessions)
+        // deletes ALL snapshots. The protection lives in the caller, which
+        // skips the GC entirely whenever the live set is empty — regardless of
+        // the tracked set, since a torn/corrupt sessions.toml now quarantines to
+        // an EMPTY tracked set (not an error). A cold tmux server is never a
+        // valid trigger for a total snapshot wipe.
+        with_temp_dir(|_| {
+            persist("sess-a", b"a").expect("persist a");
+            persist("sess-b", b"b").expect("persist b");
+            let removed = gc_orphans::<String>(&[]).expect("gc empty");
+            assert_eq!(removed, 2);
+            assert!(load("sess-a").expect("load a").is_none());
+            assert!(load("sess-b").expect("load b").is_none());
         });
     }
 

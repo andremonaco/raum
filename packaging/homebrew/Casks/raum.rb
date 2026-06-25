@@ -19,6 +19,10 @@ cask "raum" do
   depends_on formula: "tmux"
 
   app "raum.app"
+  # `raum <dir>` opens a directory as a project from the terminal. The wrapper
+  # (bundled at Contents/Resources/raum-cli) launches the GUI detached so the
+  # shell returns immediately.
+  binary "#{appdir}/raum.app/Contents/Resources/raum-cli", target: "raum"
 
   zap trash: [
     "~/Library/Application Support/de.raum.desktop",

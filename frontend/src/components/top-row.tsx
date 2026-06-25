@@ -22,16 +22,20 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { toast } from "solid-sonner";
 import {
   activeProjectSlug,
   projectBySlug,
-  projectStore,
   refreshProjects,
+  reopenProject,
   setActiveProjectSlug,
+  setProjectHidden,
   subscribeProjectEvents,
   upsertProject,
   type ProjectListItem,
 } from "../stores/projectStore";
+import { otherProjects, visibleProjects } from "../stores/projectVisibility";
+import { clearPendingAddProject, openProjectFromCli, pendingAddProjectPath } from "../lib/cliOpen";
 import { markStart } from "../lib/perf";
 import {
   refreshAgents,
@@ -49,13 +53,20 @@ import {
   subscribeTerminalEvents,
   terminalStore,
   unreadCompletedForProject,
-  waitingCount,
-  waitingTerminals,
   type TerminalListItem,
   type TerminalRecord,
 } from "../stores/terminalStore";
 import { placedSessionIds, subscribePaneActivity } from "../stores/runtimeLayoutStore";
 import { subscribeReviewLinkEvents } from "../stores/reviewLinkStore";
+import { attentionQueue, waitingByBlockedLongest } from "../stores/agentStore";
+import {
+  broadcastActive,
+  broadcastMemberIds,
+  broadcastScope,
+  setBroadcastScope,
+  toggleBroadcast,
+  type BroadcastScope,
+} from "../lib/broadcastStore";
 import { useKeymap } from "../lib/keymapContext";
 import { PROJECT_COLOR_PALETTE } from "../lib/projectColors";
 import { PROJECT_SIGIL_PALETTE, SIGIL_RESET, deriveSigilFromSlug } from "../lib/projectSigils";
@@ -77,12 +88,22 @@ import {
 } from "./ui/dialog";
 import { HoverCard, HoverCardContent, HoverCardPortal, HoverCardTrigger } from "./ui/hover-card";
 import { Popover, PopoverContent, PopoverPortal, PopoverTrigger } from "./ui/popover";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuPortal,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "./ui/dropdown-menu";
+import { CloseGlyph } from "./terminal-grid/glyphs";
 import { Scrollable } from "./ui/scrollable";
 import { Tooltip, TooltipContent, TooltipPortal, TooltipTrigger } from "./ui/tooltip";
 import {
   ActivityIcon,
   AlertCircleIcon,
   CheckIcon,
+  ChevronDownIcon,
   GitBranchIcon,
   HARNESS_ICONS,
   type HarnessIconKind,
@@ -92,7 +113,6 @@ import {
   RaumLogo,
   SearchIcon,
 } from "./icons";
-import { resolveSessionTabLabel } from "../lib/harnessTabLabel";
 import {
   branchForProject,
   subscribeWorktreeBranchEvents,
@@ -100,6 +120,7 @@ import {
 } from "../stores/worktreeStore";
 import { resolveSpawnWorktree } from "../lib/resolveSpawnWorktree";
 import { ProjectSettingsDialog } from "./project-settings-dialog";
+import { AttentionRail } from "./attention-rail";
 
 // Internal value kept as "needs-input" so the keymap wiring (§8.5) and the
 // grid-side consumer don't have to rename. UI surfaces the label "Waiting".
@@ -121,6 +142,19 @@ const [crossProjectViewMode, setCrossProjectViewMode] = createSignal<CrossProjec
 );
 export { crossProjectViewMode, setCrossProjectViewMode };
 
+/** Drive a terminal-launch (`raum <dir>`) open and reconcile the surrounding
+ *  view: when an existing project is focused, leave any cross-project view and
+ *  reset the filter (mirroring a manual tab click); surface a toast on error. */
+async function handleCliOpen(path: string): Promise<void> {
+  const result = await openProjectFromCli(path);
+  if (result === "focused") {
+    setSelectedFilter("active");
+    setCrossProjectViewMode(null);
+  } else if (result === "error") {
+    toast.error("Couldn't open directory", { description: path });
+  }
+}
+
 // On macOS decorum sets TitleBarStyle::Overlay — native traffic lights, drag,
 // and zoom animation are all handled by the OS. On Linux/Windows we use our
 // own buttons and startDragging().
@@ -138,6 +172,13 @@ const SPAWN_DEFS: SpawnDef[] = [
   { kind: "codex", label: "Codex", action: "spawn-codex" },
   { kind: "opencode", label: "OpenCode", action: "spawn-opencode" },
 ];
+
+// Broadcast scope choices, in the order the scope picker lists them. "manual"
+// is intentionally omitted: there is no per-pane "add to broadcast" UI yet, so
+// the manual member set can never be populated — selecting it would arm
+// broadcast with zero members (every keystroke goes nowhere). Re-add once a
+// membership affordance exists (broadcastStore already has the setters).
+const BROADCAST_SCOPES: BroadcastScope[] = ["all-visible", "active-project"];
 
 function prettifyAccel(accel: string | undefined): string {
   if (!accel) return "";
@@ -159,6 +200,9 @@ interface ProjectTabProps {
   compact: boolean;
   onSelect: () => void;
   onRemove: () => void;
+  /** Non-destructive shelve — drops the tab from the bar; sessions keep
+   *  running and the project moves to the "+" → "Other projects" list. */
+  onHide: () => void;
 }
 
 const ProjectTab: Component<ProjectTabProps> = (props) => {
@@ -361,6 +405,22 @@ const ProjectTab: Component<ProjectTabProps> = (props) => {
                 </span>
               </Show>
             </button>
+
+            {/* Hover-reveal shelve button. Non-destructive: hides the tab and
+                moves the project to the "+" → "Other projects" list; any
+                running sessions keep going. */}
+            <button
+              type="button"
+              aria-label={`Hide ${props.project.name || props.project.slug}`}
+              data-testid={`hide-project-${props.project.slug}`}
+              class="mr-1 hidden shrink-0 items-center self-center rounded-sm p-0.5 text-muted-foreground hover:bg-hover hover:text-foreground group-hover:flex"
+              onClick={(e) => {
+                e.stopPropagation();
+                props.onHide();
+              }}
+            >
+              <CloseGlyph />
+            </button>
           </>
         }
       >
@@ -420,6 +480,17 @@ const ProjectTab: Component<ProjectTabProps> = (props) => {
         >
           <button
             type="button"
+            class="block w-full rounded px-2 py-1 text-left hover:bg-hover"
+            onClick={() => {
+              setMenuOpen(false);
+              props.onHide();
+            }}
+          >
+            Hide project
+          </button>
+          <div aria-hidden="true" class="my-1 h-px bg-border" />
+          <button
+            type="button"
             class="block w-full rounded px-2 py-1 text-left text-destructive hover:bg-destructive/10"
             onClick={() => {
               setMenuOpen(false);
@@ -443,6 +514,11 @@ const ProjectTab: Component<ProjectTabProps> = (props) => {
 export const TopRow: Component = () => {
   const keymap = useKeymap();
   const [modalOpen, setModalOpen] = createSignal(false);
+  // Terminal launcher (`raum <dir>`) for an unregistered directory: open the
+  // Add-Project modal pre-filled with the requested path.
+  createEffect(() => {
+    if (pendingAddProjectPath()) setModalOpen(true);
+  });
   const [appSettingsOpen, setAppSettingsOpen] = createSignal(false);
   const [keymapSettingsOpen, setKeymapSettingsOpen] = createSignal(false);
   const [confirmRemove, setConfirmRemove] = createSignal<ProjectListItem | undefined>(undefined);
@@ -504,6 +580,43 @@ export const TopRow: Component = () => {
     setOrphanSweepResult({ count: killed, ids });
   }
 
+  // Attention rail pin: the rail anchors off the awaiting counter as a
+  // click-to-open Popover. Default-open whenever something is waiting so the
+  // user lands in mission-control without a click; they can dismiss it and it
+  // stays closed until the next time `waitingCount` rises from zero.
+  const [railOpen, setRailOpen] = createSignal(false);
+  // Drive the pin off the FULL attention queue (waiting + errored +
+  // completed-unread), not just `waitingCount` — otherwise an agent that
+  // ERRORS populates the rail but never auto-surfaces it, and a failed agent
+  // sits unseen behind a "0" badge, undercutting the who-needs-me promise.
+  const attentionCount = createMemo(() => attentionQueue().length);
+  let prevAttention = 0;
+  createEffect(() => {
+    const n = attentionCount();
+    if (n > 0 && prevAttention === 0) setRailOpen(true);
+    if (n === 0) setRailOpen(false);
+    prevAttention = n;
+  });
+
+  // Round-robin cursor for "focus-next-waiting": each press advances through
+  // the wait-duration-sorted queue (oldest-blocked first). Stored as the last
+  // focused session id rather than an index so list churn between presses
+  // doesn't skip or repeat an entry.
+  const [lastFocusedWaitingId, setLastFocusedWaitingId] = createSignal<string | null>(null);
+  function focusNextWaiting(): void {
+    const queue = waitingByBlockedLongest();
+    if (queue.length === 0) return;
+    const last = lastFocusedWaitingId();
+    const lastIdx = last ? queue.findIndex((s) => s.session_id === last) : -1;
+    const next = queue[(lastIdx + 1) % queue.length]!;
+    const id = next.session_id;
+    if (!id) return;
+    setLastFocusedWaitingId(id);
+    window.dispatchEvent(
+      new CustomEvent("terminal-focus-requested", { detail: { sessionId: id } }),
+    );
+  }
+
   const [compactTabs, setCompactTabs] = createSignal(false);
   let tabsScrollRef: HTMLElement | undefined;
   let headerRef: HTMLElement | undefined;
@@ -540,10 +653,29 @@ export const TopRow: Component = () => {
     let unlistenMenu: UnlistenFn | undefined;
     let unlistenPaneActivity: UnlistenFn | undefined;
     let unlistenReviewLinks: UnlistenFn | undefined;
+    let unlistenCliOpen: UnlistenFn | undefined;
 
     listen<string>("menu-action", (ev) => {
       if (ev.payload === "open-settings") {
         setAppSettingsOpen(true);
+      } else if (ev.payload === "install-cli") {
+        void invoke<{ path: string; onPath: boolean }>("cli_install_shim")
+          .then((res) => {
+            if (res.onPath) {
+              toast.success("Installed 'raum' command", {
+                description: `${res.path} — run \`raum <dir>\` to open a project from the terminal.`,
+              });
+            } else {
+              toast.warning("Installed 'raum' — add it to your PATH", {
+                description: `${res.path} is not on your PATH. Add its directory to PATH, then run \`raum <dir>\`.`,
+              });
+            }
+          })
+          .catch((e) => {
+            toast.error("Couldn't install 'raum' command", {
+              description: e instanceof Error ? e.message : String(e),
+            });
+          });
       }
     })
       .then((u) => {
@@ -589,7 +721,30 @@ export const TopRow: Component = () => {
         /* Tauri context unavailable (tests). */
       });
 
-    void refreshProjects();
+    // Terminal launcher (`raum <dir>`), already-running case: a second
+    // invocation emits this with the resolved absolute directory path.
+    listen<string>("cli-open-project", (ev) => {
+      void handleCliOpen(ev.payload);
+    })
+      .then((u) => {
+        unlistenCliOpen = u;
+      })
+      .catch(() => {
+        /* Tauri context unavailable (tests). */
+      });
+
+    void refreshProjects().then(() => {
+      // Cold-start case: drain the directory captured before the window
+      // mounted. After the project list is loaded so an existing project is
+      // recognised rather than re-prompted.
+      void invoke<string | null>("cli_take_pending_open")
+        .then((path) => {
+          if (path) void handleCliOpen(path);
+        })
+        .catch(() => {
+          /* Tauri context unavailable (tests). */
+        });
+    });
     // Atomic rehydration: seed both stores from a single snapshot so
     // memos don't render `0 0 0` for the window between `refreshAgents`
     // and `refreshTerminals` settling. Subscriptions above attach
@@ -651,6 +806,7 @@ export const TopRow: Component = () => {
       unlistenMenu?.();
       unlistenPaneActivity?.();
       unlistenReviewLinks?.();
+      unlistenCliOpen?.();
     });
   });
 
@@ -664,19 +820,20 @@ export const TopRow: Component = () => {
     // Estimates per-tab width from the actual project name length: sigil (28)
     // + padding/gap (~44) + name text at monospace ~8px/char + branch badge (~48).
     let total = 0;
-    for (const p of projectStore.items) {
+    const shown = visibleProjects();
+    for (const p of shown) {
       const nameLen = (p.name || p.slug).length;
       total += 28 + 44 + nameLen * 8 + 48;
     }
     // inter-tab gap-0.5 (2px) + trailing "+" add-project button (~28px)
-    return total + Math.max(0, projectStore.items.length - 1) * 2 + 28;
+    return total + Math.max(0, shown.length - 1) * 2 + 28;
   };
 
   const evaluateCompact = () => {
     if (!headerRef || !leftSectionRef || !rightSectionRef || !tabsScrollRef) {
       return;
     }
-    const tabCount = projectStore.items.length;
+    const tabCount = visibleProjects().length;
     if (tabCount === 0) return;
     const headerWidth = headerRef.clientWidth;
     const leftWidth = leftSectionRef.scrollWidth;
@@ -709,10 +866,10 @@ export const TopRow: Component = () => {
     onCleanup(() => obs.disconnect());
   });
 
-  // Re-evaluate when projects are added/removed — ResizeObserver won't fire
+  // Re-evaluate when the visible tab set changes — ResizeObserver won't fire
   // since the center section's width doesn't change with tab count.
   createEffect(() => {
-    projectStore.items.length;
+    void visibleProjects().length;
     if (typeof requestAnimationFrame !== "undefined") {
       requestAnimationFrame(evaluateCompact);
     } else {
@@ -748,7 +905,7 @@ export const TopRow: Component = () => {
       const idx = i - 1;
       unregs.push(
         keymap.register(`select-project-${i}`, () => {
-          const target = projectStore.items[idx];
+          const target = visibleProjects()[idx];
           if (target) {
             setActiveProjectSlug(target.slug);
             setSelectedFilter("active");
@@ -759,6 +916,19 @@ export const TopRow: Component = () => {
     for (const def of SPAWN_DEFS) {
       unregs.push(keymap.register(def.action, () => void spawn(def.kind)));
     }
+    // FLEET mission-control hotkeys.
+    unregs.push(keymap.register("focus-next-waiting", () => focusNextWaiting()));
+    unregs.push(keymap.register("toggle-broadcast", () => toggleBroadcast()));
+    // First-run CTA: the empty grid's "Add a project" button (TerminalGrid)
+    // dispatches this event; open the Add-Project modal in response so the
+    // button is functional from a zero-project cold start.
+    const onAddProjectRequested = (): void => {
+      setModalOpen(true);
+    };
+    window.addEventListener("raum:add-project-requested", onAddProjectRequested);
+    unregs.push(() =>
+      window.removeEventListener("raum:add-project-requested", onAddProjectRequested),
+    );
     onCleanup(() => {
       for (const fn of unregs) fn();
     });
@@ -766,7 +936,7 @@ export const TopRow: Component = () => {
 
   function cycleTab(dir: 1 | -1): () => void {
     return () => {
-      const items = projectStore.items;
+      const items = visibleProjects();
       if (items.length === 0) return;
       const current = activeProjectSlug();
       const idx = items.findIndex((p) => p.slug === current);
@@ -809,6 +979,17 @@ export const TopRow: Component = () => {
     } catch (e) {
       console.warn("project_remove failed", e);
     }
+  }
+
+  // Bring a suspended/shelved (or freshly-registered) project into the
+  // foreground: make it active AND drop any cross-project spotlight / non-active
+  // filter, mirroring a normal tab click. Without the filter+spotlight reset the
+  // grid would keep painting the previous (cross-project) view and the project
+  // the user just reopened would never actually surface.
+  function reopenAndFocus(slug: string): void {
+    reopenProject(slug);
+    setSelectedFilter("active");
+    setCrossProjectViewMode(null);
   }
 
   // Toggle a cross-project view from a clickable counter on the right side of
@@ -1033,7 +1214,7 @@ export const TopRow: Component = () => {
               aria-label="Projects"
               data-testid="project-tabs"
             >
-              <For each={projectStore.items}>
+              <For each={visibleProjects()}>
                 {(project) => (
                   <ProjectTab
                     project={project}
@@ -1046,26 +1227,47 @@ export const TopRow: Component = () => {
                       setCrossProjectViewMode(null);
                     }}
                     onRemove={() => setConfirmRemove(project)}
+                    onHide={() => void setProjectHidden(project.slug, true)}
                   />
                 )}
               </For>
-              <Tooltip>
-                <TooltipTrigger
+              <DropdownMenu>
+                <DropdownMenuTrigger
                   as={Button}
                   type="button"
                   variant="ghost"
                   size="icon-sm"
                   class="h-7 w-7 text-muted-foreground hover:text-foreground"
-                  onClick={() => setModalOpen(true)}
-                  aria-label="Add project"
+                  aria-label="Add or reopen projects"
                   data-testid="add-project-button"
                 >
                   <PlusIcon class="size-3.5" />
-                </TooltipTrigger>
-                <TooltipPortal>
-                  <TooltipContent>Add project</TooltipContent>
-                </TooltipPortal>
-              </Tooltip>
+                </DropdownMenuTrigger>
+                <DropdownMenuPortal>
+                  <DropdownMenuContent class="min-w-52">
+                    <DropdownMenuItem onSelect={() => setModalOpen(true)}>
+                      <PlusIcon class="size-3.5" />
+                      New project…
+                    </DropdownMenuItem>
+                    <Show when={otherProjects().length > 0}>
+                      <DropdownMenuSeparator />
+                      <div class="px-2 py-1 text-[10px] uppercase tracking-wider text-muted-foreground">
+                        Other projects
+                      </div>
+                      <For each={otherProjects()}>
+                        {(project) => (
+                          <DropdownMenuItem onSelect={() => reopenAndFocus(project.slug)}>
+                            <span class="font-mono" style={{ color: project.color }}>
+                              {project.sigil}
+                            </span>
+                            <span class="truncate">{project.name || project.slug}</span>
+                          </DropdownMenuItem>
+                        )}
+                      </For>
+                    </Show>
+                  </DropdownMenuContent>
+                </DropdownMenuPortal>
+              </DropdownMenu>
             </nav>
           </Scrollable>
         </div>
@@ -1149,82 +1351,167 @@ export const TopRow: Component = () => {
               );
             })()}
 
-            {/* Awaiting — toggles the cross-project awaiting view; hover-card
-                still previews the list of waiting harnesses. */}
+            {/* Awaiting — the trigger doubles as the attention-rail anchor.
+                Left-click pins the rail (mission control); the small caret
+                toggles the cross-project awaiting view so both affordances
+                stay reachable from one compact control. */}
             {(() => {
               const active = () => crossProjectViewMode() === "awaiting";
-              const has = () => waitingCount() > 0;
+              const has = () => attentionCount() > 0;
               return (
-                <HoverCard>
-                  <HoverCardTrigger
-                    as="button"
-                    type="button"
-                    class="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] font-medium transition-colors"
+                <Popover open={railOpen()} onOpenChange={setRailOpen}>
+                  <div
+                    class="inline-flex items-center gap-0.5 rounded-md transition-colors"
                     classList={{
-                      "bg-selected text-foreground": active(),
-                      "bg-warning/15 text-warning animate-pulse": !active() && has(),
-                      "text-muted-foreground hover:text-foreground font-mono": !active() && !has(),
+                      "bg-selected": active(),
+                      "bg-warning/15": !active() && has(),
                     }}
-                    onClick={() => toggleCrossProjectView("awaiting")}
-                    aria-pressed={active()}
-                    aria-label="Show awaiting across projects"
-                    data-testid="waiting-count"
                   >
-                    <AlertCircleIcon class={has() ? "size-3.5 shrink-0" : "size-3 shrink-0"} />
-                    <Show when={has()} fallback={<>0</>}>
-                      {waitingCount()} need input
-                    </Show>
-                  </HoverCardTrigger>
-                  <Show when={has()}>
-                    <HoverCardPortal>
-                      <HoverCardContent class="w-80 p-1" data-testid="waiting-list">
-                        <div class="flex flex-col">
-                          <For each={waitingTerminals()}>
-                            {(t) => {
-                              const project = () =>
-                                t.project_slug
-                                  ? (projectBySlug().get(t.project_slug) ?? null)
-                                  : null;
-                              const Icon =
-                                HARNESS_ICONS[t.kind as HarnessIconKind] ??
-                                HARNESS_ICONS["shell" as HarnessIconKind];
-                              return (
-                                <button
-                                  type="button"
-                                  class="group flex items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs hover:bg-hover focus:bg-hover focus:outline-none"
-                                  onClick={() => {
-                                    window.dispatchEvent(
-                                      new CustomEvent("terminal-focus-requested", {
-                                        detail: { sessionId: t.session_id },
-                                      }),
-                                    );
-                                  }}
-                                >
-                                  <Icon class="size-3.5 shrink-0 text-warning" />
-                                  <span class="flex-1 truncate text-foreground/90">
-                                    {resolveSessionTabLabel(t.session_id)}
-                                  </span>
-                                  <Show when={project()}>
-                                    {(p) => (
-                                      <span class="flex shrink-0 items-center gap-1 text-[10px] text-muted-foreground/70">
-                                        <Show when={p().sigil}>
-                                          <span class="font-mono text-muted-foreground/60">
-                                            {p().sigil}
-                                          </span>
-                                        </Show>
-                                        <span class="truncate">{p().name}</span>
-                                      </span>
-                                    )}
-                                  </Show>
-                                </button>
-                              );
-                            }}
-                          </For>
-                        </div>
-                      </HoverCardContent>
-                    </HoverCardPortal>
-                  </Show>
-                </HoverCard>
+                    <PopoverTrigger
+                      as="button"
+                      type="button"
+                      class="inline-flex items-center gap-1 rounded-l-md px-1.5 py-0.5 text-[10px] font-medium transition-colors"
+                      classList={{
+                        "text-foreground": active(),
+                        "text-warning animate-pulse": !active() && has(),
+                        "text-muted-foreground hover:text-foreground font-mono":
+                          !active() && !has(),
+                      }}
+                      aria-label="Open attention rail"
+                      data-testid="waiting-count"
+                    >
+                      <AlertCircleIcon class={has() ? "size-3.5 shrink-0" : "size-3 shrink-0"} />
+                      <Show when={has()} fallback={<>0</>}>
+                        {attentionCount()} need attention
+                      </Show>
+                    </PopoverTrigger>
+                    {/* Caret: cross-project awaiting view toggle (the legacy
+                        behaviour). Kept distinct from the rail trigger. */}
+                    <button
+                      type="button"
+                      class="rounded-r-md px-0.5 py-0.5 text-[10px] transition-colors"
+                      classList={{
+                        "text-foreground": active(),
+                        "text-warning": !active() && has(),
+                        "text-muted-foreground hover:text-foreground": !active() && !has(),
+                      }}
+                      onClick={() => toggleCrossProjectView("awaiting")}
+                      aria-pressed={active()}
+                      aria-label="Show awaiting across projects"
+                      data-testid="awaiting-view-toggle"
+                    >
+                      <ActivityIcon class="size-2.5" />
+                    </button>
+                  </div>
+                  <PopoverPortal>
+                    <PopoverContent class="w-80 p-1" data-testid="attention-rail-popover">
+                      <AttentionRail onClose={() => setRailOpen(false)} />
+                    </PopoverContent>
+                  </PopoverPortal>
+                </Popover>
+              );
+            })()}
+
+            {/* Synchronize input (broadcast) — mirror keystrokes from the
+                focused pane to the synced set. The toggle exposes the scope
+                picker on its caret so the user can target all-visible /
+                active-project / manual sets. The visible synced-set count
+                doubles as the obviousness affordance the contract calls for. */}
+            {(() => {
+              const on = () => broadcastActive();
+              const count = () => (on() ? broadcastMemberIds().length : 0);
+              const scopeLabel = (s: BroadcastScope): string =>
+                s === "all-visible"
+                  ? "All visible"
+                  : s === "active-project"
+                    ? "Active project"
+                    : "Manual";
+              return (
+                <Popover>
+                  <div
+                    class="inline-flex items-center gap-0.5 rounded-md transition-colors"
+                    classList={{ "bg-primary/15": on() }}
+                    data-broadcast-active={on() ? "true" : undefined}
+                  >
+                    <Tooltip>
+                      <TooltipTrigger
+                        as="button"
+                        type="button"
+                        class="inline-flex items-center gap-1 rounded-l-md px-1.5 py-0.5 font-mono text-[10px] transition-colors"
+                        classList={{
+                          "text-primary": on(),
+                          "text-muted-foreground hover:text-foreground": !on(),
+                        }}
+                        onClick={() => toggleBroadcast()}
+                        aria-pressed={on()}
+                        aria-label="Toggle synchronize input"
+                        data-testid="broadcast-toggle"
+                      >
+                        {/* Concentric-ring "broadcast" glyph. */}
+                        <svg
+                          xmlns="http://www.w3.org/2000/svg"
+                          class="size-3 shrink-0"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          stroke-width="2"
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                        >
+                          <circle cx="12" cy="12" r="2" />
+                          <path d="M16.24 7.76a6 6 0 0 1 0 8.49M7.76 16.24a6 6 0 0 1 0-8.49M19.07 4.93a10 10 0 0 1 0 14.14M4.93 19.07a10 10 0 0 1 0-14.14" />
+                        </svg>
+                        <Show when={on()}>
+                          <span class="tabular-nums">{count()}</span>
+                        </Show>
+                      </TooltipTrigger>
+                      <TooltipPortal>
+                        <TooltipContent>
+                          {on() ? `Synchronizing input → ${count()} panes` : "Synchronize input"}
+                          <Show when={keymap.accelerator("toggle-broadcast")}>
+                            <span class="ml-1 opacity-70">
+                              ({prettifyAccel(keymap.accelerator("toggle-broadcast"))})
+                            </span>
+                          </Show>
+                        </TooltipContent>
+                      </TooltipPortal>
+                    </Tooltip>
+                    <PopoverTrigger
+                      as="button"
+                      type="button"
+                      class="rounded-r-md px-0.5 py-0.5 text-[10px] transition-colors"
+                      classList={{
+                        "text-primary": on(),
+                        "text-muted-foreground hover:text-foreground": !on(),
+                      }}
+                      aria-label="Broadcast scope"
+                      data-testid="broadcast-scope"
+                    >
+                      <ChevronDownIcon class="size-2.5" />
+                    </PopoverTrigger>
+                  </div>
+                  <PopoverPortal>
+                    <PopoverContent class="w-48 p-1 text-xs">
+                      <div class="mb-1 px-2 py-1 text-[10px] uppercase tracking-wider text-muted-foreground">
+                        Synchronize scope
+                      </div>
+                      <For each={BROADCAST_SCOPES}>
+                        {(s) => (
+                          <button
+                            type="button"
+                            class="flex w-full items-center justify-between rounded px-2 py-1 text-left hover:bg-hover"
+                            onClick={() => setBroadcastScope(s)}
+                          >
+                            <span>{scopeLabel(s)}</span>
+                            <Show when={broadcastScope() === s}>
+                              <CheckIcon class="size-3 text-primary" />
+                            </Show>
+                          </button>
+                        )}
+                      </For>
+                    </PopoverContent>
+                  </PopoverPortal>
+                </Popover>
               );
             })()}
 
@@ -1320,7 +1607,15 @@ export const TopRow: Component = () => {
         </div>
       </header>
 
-      <AddProjectModal open={modalOpen()} onClose={() => setModalOpen(false)} />
+      <AddProjectModal
+        open={modalOpen()}
+        initialRootPath={pendingAddProjectPath()}
+        onRegistered={(p) => reopenAndFocus(p.slug)}
+        onClose={() => {
+          setModalOpen(false);
+          clearPendingAddProject();
+        }}
+      />
 
       <Dialog
         open={!!confirmRemove()}

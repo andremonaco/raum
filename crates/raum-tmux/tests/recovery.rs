@@ -112,6 +112,139 @@ async fn recovers_session_across_manager_drops() {
     let _ = mgr_b.kill_server();
 }
 
+/// Computer-restart recovery, end-to-end at the tmux-crate layer.
+///
+/// `recovers_session_across_manager_drops` only drops the Rust
+/// `TmuxManager` and recreates one on the SAME live socket — the tmux server
+/// survives, so that exercises the app-close/reopen case. The genuinely
+/// dangerous case is a machine reboot: the `-L raum` server is GONE, every
+/// session is dead, and the tracked `sessions.toml` rows are now stale. This
+/// test simulates exactly that with `kill_server()` and then asserts the full
+/// cold-socket recovery sequence the boot path depends on:
+///
+/// 1. `list_sessions()` returns `Ok(empty)` (NOT `Err`) on a cold socket, so
+///    the boot rehydrate classifies rows as Recover rather than blowing up.
+/// 2. `reap_stale()` and `check_pane_dead()` tolerate the cold socket without
+///    erroring — the reaper no-ops and the dead-pane probe reports "gone".
+/// 3. The lazy recreate that `terminal_reattach` performs on the reboot path —
+///    `new_session_with_env` under the SAME session id — succeeds, and a fresh
+///    bridge attached to it streams live output. That is "the pane comes back".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovers_session_after_server_killed_simulating_reboot() {
+    if !tmux_available() {
+        eprintln!("reboot recovery test: tmux not on PATH, skipping");
+        return;
+    }
+
+    let socket = unique_socket();
+    let session_id = format!("reboot-{}", std::process::id());
+    let mgr = TmuxManager::with_socket(socket.clone());
+
+    // Phase 1 — a session is alive before the "reboot".
+    mgr.new_session(&session_id, &PathBuf::from("/tmp"), None, Some((80, 24)))
+        .expect("new-session (pre-reboot)");
+    assert!(
+        mgr.list_sessions()
+            .expect("list-sessions (pre-reboot)")
+            .iter()
+            .any(|s| s.id == session_id),
+        "session should be live before the simulated reboot"
+    );
+
+    // Phase 2 — simulate the OS reboot: the whole tmux server is gone.
+    mgr.kill_server().expect("kill_server (simulated reboot)");
+
+    // 2a. list_sessions must return Ok(empty), not Err — the boot path keys
+    //     "server gone, fall back to Recover" off an empty list.
+    let listed = mgr
+        .list_sessions()
+        .expect("list-sessions on a cold socket must be Ok, not Err");
+    assert!(
+        listed.is_empty(),
+        "cold socket must report zero live sessions, got {listed:?}"
+    );
+
+    // 2b. reap_stale must not error / panic on the cold socket; with nothing
+    //     live it reaps nothing. (keep-set is irrelevant when the list is
+    //     empty, but pass the stale id anyway to mirror the boot call.)
+    let keep: std::collections::HashSet<String> = std::iter::once(session_id.clone()).collect();
+    let reaped = mgr.reap_stale(0, &keep);
+    assert!(
+        reaped.is_empty(),
+        "reap_stale on a cold socket must no-op, got {reaped:?}"
+    );
+
+    // 2c. check_pane_dead on a session that no longer exists must not panic.
+    //     The reboot recovery path calls this and treats Err/None as "gone".
+    let probe = mgr.check_pane_dead(&session_id);
+    assert!(
+        probe.is_err() || matches!(probe, Ok(None)),
+        "dead-pane probe on a gone session should Err or report None, got {probe:?}"
+    );
+
+    // Phase 3 — the lazy recreate `terminal_reattach` does on the reboot path:
+    //     re-create the SAME session id (this is what makes the persisted disk
+    //     snapshot id still match) and stream a fresh bridge against it. We use
+    //     `new_session_with_env` with no extra env, mirroring the production
+    //     lazy-create call, then a `respawn_with` to put live output in the
+    //     pane (the production path runs the harness `--resume` command here).
+    mgr.new_session_with_env(
+        &session_id,
+        &PathBuf::from("/tmp"),
+        None,
+        Some((80, 24)),
+        &[],
+    )
+    .expect("lazy recreate under the same session id after reboot");
+    assert!(
+        mgr.list_sessions()
+            .expect("list-sessions (post-recreate)")
+            .iter()
+            .any(|s| s.id == session_id),
+        "recreated session should be live again under the same id"
+    );
+    let _ = mgr.apply_server_options();
+
+    let received: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let received_for_sink = received.clone();
+    let bridge = attach_via_control(
+        &mgr,
+        &session_id,
+        24,
+        Box::new(move |bytes| {
+            received_for_sink.lock().unwrap().extend_from_slice(&bytes);
+            true
+        }),
+        Box::new(|_| {}),
+    )
+    .expect("attach_via_control after reboot recreate");
+
+    mgr.respawn_with(
+        &session_id,
+        "sh -lc 'printf \"RAUM_REBOOT_RECOVERED\\n\"; sleep 2'",
+    )
+    .expect("respawn_with (post-reboot resume stand-in)");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        {
+            let buf = received.lock().unwrap();
+            if String::from_utf8_lossy(&buf).contains("RAUM_REBOOT_RECOVERED") {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "recovered pane never streamed its post-reboot output"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    drop(bridge);
+    let _ = mgr.kill_session(&session_id);
+    let _ = mgr.kill_server();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pty_bridge_streams_attached_client_output() {
     if !tmux_available() {

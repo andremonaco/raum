@@ -34,6 +34,8 @@ import { Terminal, type IDisposable } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
 import { SerializeAddon } from "@xterm/addon-serialize";
+import { WebLinksAddon } from "@xterm/addon-web-links";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import "@xterm/xterm/css/xterm.css";
 
 import type { AgentKind } from "../lib/agentKind";
@@ -54,6 +56,7 @@ import {
 import { dropTargetPaneId } from "../lib/fileDrop";
 import { SCROLLBACK_DEFAULT } from "../lib/scrollbackConfig";
 import {
+  cancelTerminalSnapshotPersist,
   loadTerminalSnapshotBytes,
   scheduleTerminalSnapshotPersist,
 } from "../lib/terminalSnapshotPersistence";
@@ -64,13 +67,22 @@ import {
 } from "../lib/terminalResize";
 import { createXtermWritePump } from "../lib/xtermWritePump";
 import { findSplicePoint, renderRecoveryPayload, SPLICE_TAIL_LINES } from "../lib/tmuxBackfill";
-import { getXtermOptions } from "../lib/xtermConfig";
+import {
+  getXtermOptions,
+  nudgeTerminalFontSize,
+  resetTerminalFontSize,
+  terminalFontSize,
+} from "../lib/xtermConfig";
 import { getCurrentXtermTheme, subscribeThemeChange } from "../lib/theme/themeController";
 import { FALLBACK_XTERM_THEME } from "../lib/theme/toXtermTheme";
 import { ChevronDownIcon, CopyIcon } from "./icons";
+import { PaneFindOverlay } from "./terminal-grid/pane-find-overlay";
 import PromptOverlay from "./prompt-overlay";
 import { mouseIdle } from "../lib/globalMouseIdle";
 import { showPromptOverlay } from "../lib/appearancePrefs";
+// CONTRACT C — read-only broadcast membership, created by the FLEET lane. Imported
+// by exact name even though the module may not exist until that lane lands.
+import { isBroadcastActive, isBroadcastMember, broadcastMemberIds } from "../lib/broadcastStore";
 
 export interface TerminalPaneProps {
   /** Stable identity for a persistent surface. Defaults to a component-local id. */
@@ -242,6 +254,31 @@ interface HistoryOverlayState {
   highlightRow: number | null;
 }
 
+/** Friendly summary of a process exit code for the exit overlay (Task 6).
+ *  `clean` drives the overlay color (neutral vs. destructive). The raw code is
+ *  still shown alongside `label` for users who want the exact number. */
+interface ExitSummary {
+  label: string;
+  clean: boolean;
+}
+function summarizeExitCode(code: number): ExitSummary {
+  switch (code) {
+    case 0:
+      return { label: "Exited cleanly", clean: true };
+    case 130:
+      // SIGINT (128 + 2) — Ctrl-C / user cancellation.
+      return { label: "Cancelled", clean: true };
+    case 137:
+      // SIGKILL (128 + 9) — usually the OOM killer or a hard kill.
+      return { label: "Killed (out of memory?)", clean: false };
+    case 143:
+      // SIGTERM (128 + 15) — graceful termination request.
+      return { label: "Terminated", clean: true };
+    default:
+      return { label: `Crashed (exit ${code})`, clean: false };
+  }
+}
+
 interface TerminalSelfHealEventDetail {
   cellId?: string;
   tabId?: string;
@@ -259,6 +296,13 @@ interface ReconnectResult {
   historyStatus: ReconnectHistoryStatus;
   replacedSessionId?: string;
   message?: string;
+  /** True only on the `"unavailable"` path when the session still carries a
+   *  tracked harness row (the conversation could be recovered later via the
+   *  Recover overlay) but this attempt could not bring it back right now. The
+   *  backend omits this field when false (Contract 3). When set we surface the
+   *  Recover overlay + replay the disk snapshot rather than abandoning the
+   *  `harness_session_id` by spawning a fresh empty chat. */
+  recoverable?: boolean;
 }
 
 export const TerminalPane: Component<TerminalPaneProps> = (props) => {
@@ -292,16 +336,59 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
     setBorderColor(props.borderColor ?? "transparent");
   });
 
-  const [sessionId, setSessionId] = createSignal<string | null>(props.sessionId ?? null);
+  const [sessionId, setSessionIdSignal] = createSignal<string | null>(props.sessionId ?? null);
+  // Every session id this pane has ever registered a snapshot source under.
+  // A pane's id rotates over its lifetime (provider-replace / self-heal /
+  // recover mint a fresh server id), and `scheduleTerminalSnapshotPersist`
+  // keys the live `sources` map by whatever id was current at frame time. The
+  // debounce-fire path never deletes that entry, so after a rotation A->B the
+  // map holds BOTH A and B pointing at the same live term/addon. We track every
+  // registered id here so onCleanup can cancel ALL of them (not just the current
+  // one) before `term.dispose()` — otherwise the quit-flush would serialize the
+  // disposed terminal under the dead id A. We also cancel the OLD id the instant
+  // the session rotates so a stale source never lingers past the rotation.
+  const registeredSnapshotIds = new Set<string>();
+  // Wrap the session-id setter so a rotation prunes the snapshot source/timer
+  // for the id we're leaving (its content is captured under the new id from the
+  // next frame on). cancelTerminalSnapshotPersist is a no-op for ids with no
+  // tracked source, so calling it on every rotation is safe.
+  const setSessionId = (next: string | null): string | null => {
+    const prev = sessionId();
+    if (prev && prev !== next && registeredSnapshotIds.has(prev)) {
+      cancelTerminalSnapshotPersist(prev);
+      registeredSnapshotIds.delete(prev);
+    }
+    return setSessionIdSignal(next);
+  };
   const [errorMsg, setErrorMsg] = createSignal<string | null>(null);
   const [copiedFlash, setCopiedFlash] = createSignal<boolean>(false);
   const [isScrolledUp, setIsScrolledUp] = createSignal<boolean>(false);
   const [historyOverlay, setHistoryOverlay] = createSignal<HistoryOverlayState | null>(null);
+  // In-pane find box (⌘F while this pane's terminal is focused). The box drives
+  // the loaded SearchAddon directly; the global cross-pane dock is suppressed
+  // for the keystroke while a terminal has focus (see the ⌘F handler in onMount).
+  const [findOpen, setFindOpen] = createSignal<boolean>(false);
+  // Search addon exposed reactively so the find overlay (mounted in JSX) can bind
+  // to it once xterm finishes initialising. Mirrors the `search` ref below.
+  const [searchAddon, setSearchAddon] = createSignal<SearchAddon | null>(null);
+  // Right-click menu anchored at the click point. `null` when closed.
+  const [contextMenu, setContextMenu] = createSignal<{ x: number; y: number } | null>(null);
+  // The URL under the cursor at right-click time, if the pointer was over a
+  // detected web link; drives the menu's "Open Link" item.
+  const [contextMenuLink, setContextMenuLink] = createSignal<string | null>(null);
 
   let term: Terminal | null = null;
   let fit: FitAddon | null = null;
   let search: SearchAddon | null = null;
   let serializeAddon: SerializeAddon | null = null;
+  let webLinks: WebLinksAddon | null = null;
+  // URL currently under the pointer (tracked by the web-links hover callback)
+  // so the right-click menu can offer "Open Link". Plain mutable ref — read once
+  // at context-menu time, never reactive.
+  let hoveredLink: string | null = null;
+  const setHoveredLink = (uri: string | null): void => {
+    hoveredLink = uri;
+  };
   let resizeObserver: ResizeObserver | null = null;
   let resizeTimer: ReturnType<typeof setTimeout> | null = null;
   let copyFlashTimer: ReturnType<typeof setTimeout> | null = null;
@@ -336,8 +423,30 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
   // closure structure intact.
   let recoverDeadPaneRef: (() => void) | null = null;
   let manualReconnectRef: (() => void) | null = null;
+  // Relaunch a crashed SHELL pane in place (Task 6): kills the dead session and
+  // spawns a fresh one on the same surface. Populated in `onMount`; only wired
+  // up for non-harness kinds (harnesses use `recoverDeadPaneRef` / `--resume`).
+  let relaunchShellRef: (() => void) | null = null;
+  // Right-click menu action handlers, populated in `onMount` (they close over
+  // the live `term` / addon refs). The JSX menu reads them through this ref.
+  let contextActionsRef: {
+    copySelection: () => Promise<void> | void;
+    copyAll: () => Promise<void> | void;
+    paste: () => Promise<void> | void;
+    selectAll: () => void;
+    clear: () => void;
+    scrollToTop: () => void;
+    openFind: () => void;
+    openLink: (uri: string) => void;
+  } | null = null;
   let reattachInFlightTimer: ReturnType<typeof setTimeout> | null = null;
   let outputPump: ReturnType<typeof createXtermWritePump> | null = null;
+  // Teardown for an in-flight rehydrate-ready gate (Contract 2). Set inside
+  // `awaitRehydrateReady` while the gate is pending; cleared once it settles.
+  // onCleanup invokes it so an unmount mid-gate stops the 100 ms poll, drops the
+  // `"rehydrate:complete"` listener immediately, and prevents the post-gate
+  // `decideInitialSurface()` from running against a disposed terminal.
+  let cancelRehydrateGate: (() => void) | null = null;
 
   // Tier 2 — tmux-history backfill for regular shell panes. tmux's attached
   // client can drop into redraw-compression mode when raum's drain pipeline
@@ -543,7 +652,10 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
     try {
       term = new Terminal(
         getXtermOptions({
-          fontSize: 13,
+          // App-wide font-zoom level (⌘+ / ⌘- / ⌘0). Read untracked here so the
+          // initial construction doesn't subscribe the whole onMount; a
+          // dedicated effect below pushes later changes into `term.options`.
+          fontSize: terminalFontSize(),
           fontFamily: '"JetBrains Mono", Menlo, "DejaVu Sans Mono", monospace',
           scrollback: SCROLLBACK_DEFAULT,
           theme: getCurrentXtermTheme() ?? FALLBACK_XTERM_THEME,
@@ -552,9 +664,28 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       fit = new FitAddon();
       search = new SearchAddon();
       serializeAddon = new SerializeAddon();
+      // Clickable links — route activation through the Tauri opener so URLs
+      // open in the OS default browser (the webview itself must never navigate).
+      // The `hover`/`leave` callbacks track the URL currently under the pointer
+      // so the right-click menu can offer "Open Link" for it.
+      webLinks = new WebLinksAddon(
+        (event, uri) => {
+          event.preventDefault();
+          void openUrl(uri).catch((e) => {
+            console.warn("[TerminalPane] openUrl failed", e);
+          });
+        },
+        {
+          hover: (_event, uri) => setHoveredLink(uri),
+          leave: () => setHoveredLink(null),
+        },
+      );
       term.loadAddon(fit);
       term.loadAddon(search);
       term.loadAddon(serializeAddon);
+      term.loadAddon(webLinks);
+      // Expose the addon to the JSX-mounted find overlay.
+      setSearchAddon(search);
 
       // Shift+Enter newline. xterm.js sends a bare `\r` for both Enter and
       // Shift+Enter, so without re-encoding the harness can't tell them
@@ -640,6 +771,25 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         if (!term) return;
         term.options.theme = next.xterm;
       });
+
+      // Live font-zoom — push the app-wide font size into this instance when the
+      // user hits ⌘+ / ⌘- / ⌘0 in any pane. Skip the very first run (the term
+      // was already constructed at the current size) so this only fires on real
+      // changes, then refit so cols/rows + the tmux PTY track the new metrics.
+      let fontZoomPrimed = false;
+      createEffect(() => {
+        const size = terminalFontSize();
+        if (!fontZoomPrimed) {
+          fontZoomPrimed = true;
+          return;
+        }
+        if (!term) return;
+        term.options.fontSize = size;
+        // Route through the shared resize pump (fit + throttled terminal_resize).
+        // `requestVisibleResize` is assigned later in onMount; by the time a zoom
+        // change fires (post-setup) it is always set.
+        requestVisibleResize?.(true);
+      });
     } catch (err) {
       // jsdom lacks `matchMedia` and a real canvas context, so xterm.js
       // can't fully initialize during unit tests. Swallow the error so the
@@ -697,13 +847,14 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         // that drives tmux-history backfill. Cheap (just a setTimeout
         // reset); the heavy work only fires once output goes quiet.
         scheduleBackfill();
-        // Skip persistence while the buffer is in alt-screen mode. Alt-screen
-        // TUIs (Codex, OpenCode, fullscreen Claude) repaint from source on
-        // every SIGWINCH, so raum's reattach path uses a SIGWINCH bounce
-        // instead of byte replay — a serialized alt buffer is wasted disk
-        // and would corrupt scrollback if ever replayed into a normal-mode
-        // pane.
-        if (target.buffer.active.type === "alternate") return;
+        // Persist a snapshot on every parsed frame (debounced). For alt-screen
+        // panes (Codex / OpenCode defaults, fullscreen Claude) the persistence
+        // helper excludes the live alt buffer and serializes the durable
+        // normal-buffer scrollback that sits behind it — that's the content
+        // worth recovering when a provider `--resume` is impossible after a
+        // reboot. The alt frame itself is never persisted (it repaints from
+        // source on SIGWINCH and would corrupt a normal-mode replay).
+        registeredSnapshotIds.add(id);
         scheduleTerminalSnapshotPersist(id, { term: target, addon });
       },
       onWarn: (queuedFrames) => {
@@ -750,11 +901,20 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       channel = makeOutputChannel(generation);
       return channel;
     };
+    // Replay the persisted disk snapshot under the live viewport. The bytes are
+    // pinned to the generation live at call time, so a concurrent channel
+    // rotation discards this stale replay (the pump drops a stale-generation
+    // enqueue) instead of corrupting a freshly-reset buffer. Callers that need a
+    // STRICT ordering guarantee against a subsequent fresh spawn on the same
+    // generation (the reboot not-recoverable path) await the bytes inline and
+    // enqueue before releasing the spawn gate rather than going through this
+    // fire-and-forget helper.
     const writeLocalSnapshotFallback = (targetSessionId: string): void => {
+      const generation = pump.generation();
       void loadTerminalSnapshotBytes(targetSessionId)
         .then((snapshot) => {
           if (!snapshot) return;
-          pump.enqueue(pump.generation(), snapshot);
+          pump.enqueue(generation, snapshot);
         })
         .catch((err) => {
           if (import.meta.env.DEV) {
@@ -764,6 +924,38 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
             });
           }
         });
+    };
+    // Boundary sequence written between the replayed disk snapshot and the live
+    // viewport paint: home the cursor (ESC[H) then erase from the cursor to the
+    // end of the display (ESC[J / ESC[0J). The snapshot fills xterm's scrollback
+    // + viewport; the control-mode reattach replay (`capture-pane`) is raw text
+    // that paints from the current cursor with NO leading positioning and NO
+    // per-line erase, so without this:
+    //   - the live viewport would be appended BELOW the snapshot's own viewport
+    //     rows and double-paint the last screen (fixed by homing), and
+    //   - where a live line is shorter than the snapshot line beneath it, stale
+    //     snapshot characters would remain at the line tail (ghost characters),
+    //     because the live paint only overwrites up to each live line's length.
+    // Homing + erase-below clears the viewport region (the snapshot's last
+    // screen) so the live capture owns a clean viewport, while the older
+    // scrollback the snapshot pushed up stays preserved above it (ED does not
+    // touch scrollback).
+    const CURSOR_HOME_CLEAR_BELOW = new Uint8Array([0x1b, 0x5b, 0x48, 0x1b, 0x5b, 0x4a]); // ESC[H ESC[J
+    // Replay the disk snapshot UNDER the live viewport on a normal reattach.
+    // Only ever runs once, on the first reattach after mount when xterm is
+    // still empty (a bridge-recovery reattach mid-session must not repaint
+    // stale scrollback over the live buffer). Skipped for alt-screen panes:
+    // their durable scrollback lives in the normal buffer (persisted with the
+    // alt frame excluded) and the harness repaints its own alt frame on attach,
+    // so replaying here would fight that paint.
+    let snapshotReplayedOnReattach = false;
+    const replaySnapshotUnderViewport = (generation: number, snapshot: Uint8Array): void => {
+      if (snapshot.byteLength === 0) return;
+      // Enqueue at the pinned generation so a concurrent channel rotation
+      // (recover retry) discards this stale replay instead of corrupting the
+      // fresh buffer.
+      pump.enqueue(generation, snapshot);
+      pump.enqueue(generation, CURSOR_HOME_CLEAR_BELOW);
     };
     // §4.4 — throttled resize plumbing. ResizeObserver ticks can arrive at
     // display refresh rate while pane geometry is changing; every dispatched
@@ -862,7 +1054,14 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
 
     const reattachSession = (
       targetSessionId: string,
-      options: { fallbackToSpawn: boolean; reason: "reattach" | "recover" },
+      options: {
+        fallbackToSpawn: boolean;
+        reason: "reattach" | "recover";
+        /** Disk snapshot bytes to replay UNDER the live viewport, preloaded by
+         *  the caller. Only set on the first normal reattach for a non-alt
+         *  pane (see `tryReattach`). */
+        replaySnapshot?: Uint8Array | null;
+      },
     ): void => {
       if (!targetSessionId) return;
       if (!term || !fit) return;
@@ -889,6 +1088,19 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         setBridgeRecoveryUiState("reconnecting");
       }
       const attachChannel = rotateOutputChannel(options.reason === "recover");
+      // Replay the preloaded disk snapshot at the freshly-pinned generation
+      // BEFORE the bridge's live viewport bytes arrive, so older scrollback is
+      // restored beneath the live screen (finding: snapshot never replayed on
+      // the normal restart path). Enqueued synchronously here so it always
+      // precedes the bridge's first frame on the same generation.
+      if (
+        !snapshotReplayedOnReattach &&
+        options.replaySnapshot &&
+        options.replaySnapshot.byteLength > 0
+      ) {
+        snapshotReplayedOnReattach = true;
+        replaySnapshotUnderViewport(pump.generation(), options.replaySnapshot);
+      }
       logLifecycle(options.reason, paneId, targetSessionId);
       void invoke<ReconnectResult>("terminal_reattach", {
         args: {
@@ -913,7 +1125,18 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
           setExitState(null);
           props.onSpawned?.(id);
           if (result.historyStatus === "unavailable") {
+            // Replay the persisted scrollback beneath the (empty) live viewport
+            // so the pane shows prior content instead of going blank.
             writeLocalSnapshotFallback(targetSessionId);
+            if (result.recoverable) {
+              // Contract 3: the tracked harness row survives but the in-place
+              // resume couldn't commit right now. Surface the Recover overlay
+              // (its button drives `recoverDeadPaneRef` → terminal_respawn_dead)
+              // instead of abandoning the `harness_session_id`. Do NOT set
+              // `persistedSessionMissing` / fall through to a fresh spawn.
+              setSessionId(targetSessionId);
+              setExitState({ code: 0 });
+            }
             setErrorMsg(result.message ?? "History recovery is unavailable for this pane");
             return;
           }
@@ -976,7 +1199,43 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         trySpawn();
         return;
       }
-      reattachSession(persistedSessionId, { fallbackToSpawn: true, reason: "reattach" });
+      // Non-alt panes (shells / inline harnesses) preload their disk snapshot so
+      // `reattachSession` can replay older scrollback beneath the live viewport.
+      // Alt-screen panes skip this — their harness repaints its own frame and
+      // the normal-buffer snapshot is only a last-resort fallback. The async
+      // load can't gate the `hasSpawned` latch (the ResizeObserver would race
+      // into a second attempt), so latch synchronously here and resolve the
+      // bytes before invoking. If load fails or returns nothing, reattach still
+      // proceeds with no replay.
+      const wantsSnapshotReplay =
+        !snapshotReplayedOnReattach && term?.buffer.active.type !== "alternate";
+      if (!wantsSnapshotReplay) {
+        hasSpawned = true;
+        reattachSession(persistedSessionId, {
+          fallbackToSpawn: true,
+          reason: "reattach",
+        });
+        return;
+      }
+      hasSpawned = true;
+      const target = persistedSessionId;
+      void loadTerminalSnapshotBytes(target)
+        .catch(() => null)
+        .then((snapshot) => {
+          // Release the latch before delegating: reattachSession re-latches
+          // synchronously after its own viewport-size gate, and if it bailed
+          // early (too-small pane) we want the retry path open again.
+          hasSpawned = false;
+          if (persistedSessionMissing) {
+            trySpawn();
+            return;
+          }
+          reattachSession(target, {
+            fallbackToSpawn: true,
+            reason: "reattach",
+            replaySnapshot: snapshot,
+          });
+        });
     };
 
     function recoverBridge(targetSessionId: string): void {
@@ -1032,15 +1291,48 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         },
         onData: respawnChannel,
       })
-        .then((result) => {
+        .then(async (result) => {
           setRespawningDead(false);
           if (result.historyStatus === "unavailable") {
             setErrorMsg(result.message ?? "Provider recovery is unavailable for this pane");
-            // Drop back to the standard reattach/spawn flow so the user
-            // at least gets a working harness, even if the prior
-            // conversation is unrecoverable.
+            if (result.recoverable) {
+              // Contract 3: the in-place `--resume` couldn't commit right now,
+              // but the tracked harness row survives — the conversation can
+              // still be recovered later via the Recover overlay. Mirror the
+              // `tryReattach` branch: replay the disk snapshot under the current
+              // (rotated, empty) viewport, KEEP the recoverable ghost, and
+              // surface the Recover overlay (its button drives
+              // `recoverDeadPaneRef` -> terminal_respawn_dead) instead of
+              // abandoning the `harness_session_id` by falling through to a
+              // fresh empty chat. Do NOT set `persistedSessionMissing` / drop to
+              // trySpawn. The snapshot stays on the live generation because no
+              // fresh spawn will run on it.
+              writeLocalSnapshotFallback(targetSessionId);
+              setSessionId(targetSessionId);
+              setExitState({ code: 0 });
+              return;
+            }
+            // Not recoverable — fall back to the standard reattach/spawn flow so
+            // the user still gets a working harness. Order the disk snapshot
+            // BEFORE the fresh spawn on the shared write-pump generation: await
+            // the bytes and enqueue them synchronously on the current generation
+            // FIRST, then release the spawn gate so trySpawn's harness output
+            // lands AFTER the snapshot on the same generation. Without the await
+            // the async snapshot read raced the fresh harness's first frame and
+            // prior scrollback could render below the new prompt (order-racy
+            // fallback finding).
+            const generation = pump.generation();
+            const snapshot = await loadTerminalSnapshotBytes(targetSessionId).catch(() => null);
+            if (snapshot && snapshot.byteLength > 0) {
+              pump.enqueue(generation, snapshot);
+            }
             hasSpawned = false;
             persistedSessionMissing = true;
+            // Re-run the unified decision now that the gate is released so the
+            // fresh spawn fires deterministically after the snapshot (rather
+            // than waiting on the next resize tick, which would also work but
+            // leaves the pane blank under the snapshot until then).
+            runGatedInitialDecision();
             return;
           }
           setSessionId(result.sessionId);
@@ -1093,6 +1385,9 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
           setRespawningDead(false);
           if (result.historyStatus === "unavailable") {
             setErrorMsg(result.message ?? "Provider recovery is unavailable for this pane");
+            // Replay any persisted disk snapshot so the manual Recover attempt
+            // still surfaces prior pane content rather than leaving it blank.
+            writeLocalSnapshotFallback(id);
             return;
           }
           setSessionId(result.sessionId);
@@ -1170,8 +1465,41 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         });
     };
 
-    requestVisibleResize = (force = false): void => {
-      scheduleResize(force);
+    // Relaunch a crashed SHELL in place (Task 6). Harnesses get `--resume` via
+    // `recoverDeadPaneRef`; a plain shell has no conversation to resume, so the
+    // "relaunch" is simply: drop the dead session id, clear the exit overlay,
+    // reset the spawn gate, and run a fresh `trySpawn` on the same surface (a
+    // rotated channel so any late bytes from the dead PTY fall on the floor).
+    relaunchShellRef = (): void => {
+      if (isHarnessKind(props.kind)) return;
+      const dead = sessionId();
+      if (dead) {
+        void invoke("terminal_kill", { sessionId: dead }).catch((e: unknown) => {
+          console.warn("[TerminalPane] relaunch kill failed", e);
+        });
+      }
+      setExitState(null);
+      setErrorMsg(null);
+      setSessionId(null);
+      persistedSessionMissing = true;
+      hasSpawned = false;
+      rotateOutputChannel(true);
+      trySpawn();
+    };
+
+    // Unified first-mount spawn/reattach decision. ALL three entry points (the
+    // post-fonts/stable-size gate, the ResizeObserver pre-spawn retry, and
+    // `requestVisibleResize`) route through here so the `recoverable_after_reboot`
+    // flag is honoured consistently. It is read fresh on every call (not
+    // captured), so a late-arriving recover ghost (see the rehydrate-race
+    // finding) still routes to recovery as long as `hasSpawned` hasn't latched.
+    //
+    // 4-way decision:
+    //   1. recoverable-after-reboot harness  -> tryRecoverAfterReboot (--resume)
+    //   2. persisted && !missing             -> tryReattach (+ snapshot replay)
+    //   3. (structured-unavailable is handled inside reattach -> Recover overlay)
+    //   4. else                              -> trySpawn (fresh session)
+    const decideInitialSurface = (): void => {
       if (hasSpawned) return;
       if (
         persistedSessionId &&
@@ -1185,6 +1513,108 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       } else {
         trySpawn();
       }
+    };
+
+    // Contract 2 (rehydrate-complete gate). A pane with a persisted session must
+    // not commit to spawn/reattach before the backend rehydrate has had a chance
+    // to mark recover sessions with `recoverable_after_reboot` — otherwise the
+    // ghost-upsert lands AFTER the pane already reattached -> not-found ->
+    // trySpawn (fresh harness, lost conversation). We race a bounded poll of
+    // `terminal_rehydrate_ready` / the `"rehydrate:complete"` event against a
+    // timeout so a stuck backend can never hang the pane. Resolves at most once.
+    const REHYDRATE_GATE_TIMEOUT_MS = 4000;
+    const REHYDRATE_POLL_MS = 100;
+    let rehydrateGateSettled = false;
+    // Resolves to `true` when the gate settled normally (ready / event / hard
+    // timeout) and the caller should run the decision, or `false` when the gate
+    // was cancelled by onCleanup (pane unmounted mid-gate) — in which case the
+    // caller must NOT run `decideInitialSurface()` on the torn-down pane.
+    const awaitRehydrateReady = (): Promise<boolean> => {
+      // Panes with no persisted session can't be recover candidates — spawn
+      // immediately, don't pay the gate latency.
+      if (!persistedSessionId) return Promise.resolve(true);
+      return new Promise<boolean>((resolve) => {
+        let done = false;
+        let pollTimer: ReturnType<typeof setTimeout> | null = null;
+        let hardTimer: ReturnType<typeof setTimeout> | null = null;
+        let unlistenReady: UnlistenFn | null = null;
+        const teardown = (): void => {
+          if (pollTimer !== null) clearTimeout(pollTimer);
+          if (hardTimer !== null) clearTimeout(hardTimer);
+          pollTimer = null;
+          hardTimer = null;
+          unlistenReady?.();
+          unlistenReady = null;
+          cancelRehydrateGate = null;
+        };
+        const finish = (): void => {
+          if (done) return;
+          done = true;
+          rehydrateGateSettled = true;
+          teardown();
+          resolve(true);
+        };
+        // Invoked from onCleanup: stop the poll + listener immediately and
+        // resolve `false` so the post-gate decision is skipped on the dead pane.
+        cancelRehydrateGate = (): void => {
+          if (done) return;
+          done = true;
+          teardown();
+          resolve(false);
+        };
+        const poll = (): void => {
+          if (done) return;
+          void invoke<boolean>("terminal_rehydrate_ready")
+            .then((ready) => {
+              if (ready) finish();
+              else if (!done) pollTimer = setTimeout(poll, REHYDRATE_POLL_MS);
+            })
+            .catch(() => {
+              // Older backend without the command — don't gate at all.
+              finish();
+            });
+        };
+        // Late-attaching listeners can miss the one-shot event, hence the poll;
+        // but the event still lets us proceed the instant rehydrate finishes.
+        void listen("rehydrate:complete", () => finish())
+          .then((u) => {
+            if (done) u();
+            else unlistenReady = u;
+          })
+          .catch(() => {
+            /* event bus unavailable (tests) — poll/timeout still cover it. */
+          });
+        hardTimer = setTimeout(finish, REHYDRATE_GATE_TIMEOUT_MS);
+        poll();
+      });
+    };
+
+    // Run the initial decision once rehydrate has settled (or timed out). Guards
+    // against re-entry so multiple resize/visibility triggers collapse to one
+    // gated decision; subsequent retries (post-gate) call decideInitialSurface
+    // directly because rehydrateGateSettled short-circuits the await.
+    let initialDecisionStarted = false;
+    const runGatedInitialDecision = (): void => {
+      if (hasSpawned) return;
+      if (rehydrateGateSettled || !persistedSessionId) {
+        decideInitialSurface();
+        return;
+      }
+      if (initialDecisionStarted) return;
+      initialDecisionStarted = true;
+      void awaitRehydrateReady().then((shouldDecide) => {
+        initialDecisionStarted = false;
+        // Skip the decision when the gate was cancelled by onCleanup — `term` is
+        // already null and the trySpawn/tryReattach/tryRecoverAfterReboot guards
+        // would early-return anyway, but not running at all avoids the stray
+        // late call entirely.
+        if (shouldDecide) decideInitialSurface();
+      });
+    };
+
+    requestVisibleResize = (force = false): void => {
+      scheduleResize(force);
+      runGatedInitialDecision();
     };
 
     let selfHealInFlight = false;
@@ -1229,6 +1659,9 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
           if (result.historyStatus === "unavailable") {
             setErrorMsg(result.message ?? "Provider recovery is unavailable for this pane");
             setBridgeRecoveryUiState("idle");
+            // Replay any persisted disk snapshot so a failed self-heal still
+            // shows prior pane content instead of a blank buffer.
+            writeLocalSnapshotFallback(id);
             return;
           }
           const nextId = result.sessionId;
@@ -1257,6 +1690,19 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       selfHeal();
     }
     window.addEventListener("raum:terminal-self-heal", onTerminalSelfHeal);
+
+    // Recover a dead/errored session in place, driven from outside the pane
+    // (e.g. the attention-rail's batch "Restart"). Routes through
+    // `recoverDeadPaneRef`, which builds the full ReattachArgs + onData channel
+    // and resumes the conversation — the rail can't call `terminal_respawn_dead`
+    // directly because that command streams pane I/O over a Channel it has no
+    // surface for. Matched to this pane by its current session id.
+    function onTerminalRecoverRequested(ev: Event): void {
+      const sid = (ev as CustomEvent<{ sessionId?: string }>).detail?.sessionId;
+      if (!sid || sid !== sessionId()) return;
+      recoverDeadPaneRef?.();
+    }
+    window.addEventListener("raum:terminal-recover-requested", onTerminalRecoverRequested);
 
     void (async () => {
       unlistenBridgeLost = await listen<{ sessionId: string; exitCode: number }>(
@@ -1309,11 +1755,10 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
           return;
         }
         if (!initialSpawnGateOpen) return;
-        if (persistedSessionId) {
-          tryReattach();
-        } else {
-          trySpawn();
-        }
+        // Route through the unified gated decision so a host that was too small
+        // at gate-open (and only grew later) still honours the recover flag
+        // instead of falling straight into tryReattach/trySpawn.
+        runGatedInitialDecision();
       });
       resizeObserver.observe(host);
     }
@@ -1405,15 +1850,17 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         // retry on the next resize.
         initialSpawnGateOpen = true;
         if (!term) return;
+        // Unified gated decision: routes recover-after-reboot panes to
+        // tryRecoverAfterReboot (--resume), persisted panes to tryReattach
+        // (which opens a PTY-attached client against the existing tmux session
+        // and replays the disk snapshot under the live viewport), and otherwise
+        // trySpawn. The rehydrate gate inside ensures a Recover ghost that
+        // lands late still routes to recovery before hasSpawned latches.
+        runGatedInitialDecision();
         if (persistedSessionId) {
-          // Reattach path: open a new PTY-attached client against an
-          // existing tmux session. Post-reattach the ResizeObserver pushes
-          // a terminal_resize to match the current host dims if the
-          // viewport changed since the previous run.
-          tryReattach();
+          // Post-reattach the ResizeObserver pushes a terminal_resize to match
+          // the current host dims if the viewport changed since the prior run.
           scheduleResize();
-        } else {
-          trySpawn();
         }
       });
     });
@@ -1430,6 +1877,22 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       }).catch((e) => {
         console.error("[TerminalPane] terminal_send_keys failed", e);
       });
+      // CONTRACT C — broadcast fan-out. When the synced-input "fleet" mode is on
+      // and this pane is a member, mirror the keystroke to every OTHER member so
+      // the user can drive several harnesses at once. Guarded to never echo back
+      // to `id` itself. Cheap: the membership checks are O(1)/O(n-small) and only
+      // run when broadcast is active.
+      if (isBroadcastActive() && isBroadcastMember(id)) {
+        for (const memberId of broadcastMemberIds()) {
+          if (memberId === id) continue;
+          void invoke("terminal_send_keys", {
+            sessionId: memberId,
+            keys: chunk,
+          }).catch((e) => {
+            console.error("[TerminalPane] broadcast terminal_send_keys failed", e);
+          });
+        }
+      }
     });
 
     // §4.2 — focus promotes to WebGL.
@@ -1437,15 +1900,84 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       if (props.visible !== false) requestWebgl(paneId);
     });
 
-    // Auto-copy on selection release (Zellij-style). Fires on mouseup so a
-    // mid-drag selection doesn't clobber the clipboard, and on Shift keyup so
-    // keyboard-driven selections are covered too.
-    //
-    // We listen for mouseup on `window`, not `host`, because a selection that
-    // starts inside the pane often ends outside it — e.g. dragging bottom-to-top
-    // the cursor crosses the top edge of the pane before release. A flag set on
-    // mousedown-inside-host scopes the window listener to drags owned by this
-    // pane so other panes' mouseups don't trigger a spurious copy here.
+    // True when this pane's xterm textarea owns keyboard focus. Used to scope
+    // the focus-local shortcuts (⌘F find, ⌘+/⌘-/⌘0 zoom) so they only fire for
+    // the terminal the user is actually typing in.
+    const terminalHasFocus = (): boolean => {
+      const ta = term?.textarea;
+      return !!ta && document.activeElement === ta;
+    };
+    // True when keyboard focus is anywhere inside THIS pane's chrome (the
+    // terminal textarea or the find box input). Used to keep ⌘F owned locally
+    // even while the find box itself has focus, so a second ⌘F never escapes to
+    // the global spotlight dock. The find box is a sibling of `host` under the
+    // pane shell, so we match on the shell's `data-pane-id` rather than `host`.
+    const paneOwnsFocus = (): boolean => {
+      const active = document.activeElement;
+      if (!(active instanceof HTMLElement)) return false;
+      return active.closest("[data-pane-id]")?.getAttribute("data-pane-id") === paneId;
+    };
+
+    // ⌘F (in-pane find) is routed through the SINGLE keymap `global-search`
+    // handler instead of a capture-phase listener: the previous approach bet
+    // on this pane's listener being registered before the spotlight dock's,
+    // but panes mount AFTER <KeymapProvider> at the app root, so the bet was
+    // backwards and ⌘F opened BOTH the dock and the find box. Now the dock's
+    // global-search handler checks whether a terminal owns focus and, if so,
+    // dispatches `raum:pane-find-requested`; the focused pane (matched by
+    // `paneOwnsFocus`) opens its find box and nothing else fires.
+    const onPaneFindRequested = (): void => {
+      if (paneOwnsFocus()) setFindOpen(true);
+    };
+    window.addEventListener("raum:pane-find-requested", onPaneFindRequested);
+    onCleanup(() => window.removeEventListener("raum:pane-find-requested", onPaneFindRequested));
+
+    // Font-zoom shortcuts (⌘=/⌘+ in, ⌘-/⌘_ out, ⌘0 reset) stay on a capture
+    // listener — they aren't bound in the keymap, so there's no handler to
+    // race. They only fire while the TERMINAL itself has focus (not the find
+    // input), so typing in the find box reaches the input.
+    const onPaneShortcut = (e: KeyboardEvent): void => {
+      const mod = e.metaKey || e.ctrlKey;
+      if (!mod || e.altKey) return;
+      if (!terminalHasFocus()) return;
+      // Font zoom: ⌘=/⌘+ in, ⌘-/⌘_ out, ⌘0 reset. `=` and `+` share a physical
+      // key; accept both code and key forms so layouts without Shift still hit.
+      if (e.key === "=" || e.key === "+") {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        nudgeTerminalFontSize(1);
+        return;
+      }
+      if (e.key === "-" || e.key === "_") {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        nudgeTerminalFontSize(-1);
+        return;
+      }
+      if (e.key === "0") {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        resetTerminalFontSize();
+        return;
+      }
+    };
+    window.addEventListener("keydown", onPaneShortcut, { capture: true });
+    onCleanup(() => {
+      window.removeEventListener("keydown", onPaneShortcut, { capture: true });
+    });
+
+    // Shared "Copied" flash used by the auto-copy-on-selection path and the
+    // right-click Copy / Copy All actions.
+    const flashCopied = (): void => {
+      setCopiedFlash(true);
+      if (copyFlashTimer !== null) clearTimeout(copyFlashTimer);
+      copyFlashTimer = setTimeout(() => {
+        copyFlashTimer = null;
+        setCopiedFlash(false);
+      }, COPY_FLASH_MS);
+    };
+    // Copy the current selection (auto-fired on selection release, and the
+    // menu's Copy item). No-op when nothing is selected.
     const copySelection = async (): Promise<void> => {
       if (!term || !term.hasSelection()) return;
       const text = term.getSelection();
@@ -1456,13 +1988,80 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       } catch {
         return;
       }
-      setCopiedFlash(true);
-      if (copyFlashTimer !== null) clearTimeout(copyFlashTimer);
-      copyFlashTimer = setTimeout(() => {
-        copyFlashTimer = null;
-        setCopiedFlash(false);
-      }, COPY_FLASH_MS);
+      flashCopied();
     };
+
+    // Right-click menu actions. Defined here so they close over the live `term`
+    // / `serializeAddon` refs; the JSX menu below calls into them.
+    const copyAllBuffer = async (): Promise<void> => {
+      if (!serializeAddon || !navigator.clipboard?.writeText) return;
+      let text: string;
+      try {
+        // Serialize the full scrollback + viewport as plain text.
+        text = serializeAddon.serialize();
+      } catch {
+        return;
+      }
+      if (!text) return;
+      try {
+        await navigator.clipboard.writeText(text);
+      } catch {
+        return;
+      }
+      flashCopied();
+    };
+    const clearBuffer = (): void => {
+      try {
+        term?.clear();
+      } catch {
+        /* best-effort */
+      }
+    };
+    const pasteFromClipboard = async (): Promise<void> => {
+      const id = sessionId();
+      if (!id) return;
+      let text = "";
+      try {
+        text = (await navigator.clipboard?.readText?.()) ?? "";
+      } catch {
+        return;
+      }
+      if (!text) return;
+      void invoke("terminal_paste_text", { sessionId: id, text }).catch((err) => {
+        console.error("[TerminalPane] terminal_paste_text failed", err);
+      });
+    };
+    contextActionsRef = {
+      copySelection,
+      copyAll: copyAllBuffer,
+      paste: pasteFromClipboard,
+      selectAll: () => term?.selectAll(),
+      clear: clearBuffer,
+      scrollToTop: () => {
+        try {
+          term?.scrollToTop();
+        } catch {
+          /* best-effort */
+        }
+        syncScrollState();
+      },
+      openFind: () => setFindOpen(true),
+      openLink: (uri: string) => {
+        void openUrl(uri).catch((e) => console.warn("[TerminalPane] openUrl failed", e));
+      },
+    };
+
+    // Auto-copy on selection release (Zellij-style). Fires on mouseup so a
+    // mid-drag selection doesn't clobber the clipboard, and on Shift keyup so
+    // keyboard-driven selections are covered too.
+    //
+    // We listen for mouseup on `window`, not `host`, because a selection that
+    // starts inside the pane often ends outside it — e.g. dragging bottom-to-top
+    // the cursor crosses the top edge of the pane before release. A flag set on
+    // mousedown-inside-host scopes the window listener to drags owned by this
+    // pane so other panes' mouseups don't trigger a spurious copy here.
+    // (`copySelection` + the "Copied" flash are defined above, near the
+    // right-click menu actions that reuse them.)
     let dragActive = false;
     const onMouseDown = (ev: MouseEvent): void => {
       // A double-click's second mousedown triggers xterm's native
@@ -1492,6 +2091,7 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       host?.removeEventListener("mousedown", onMouseDown);
       window.removeEventListener("mouseup", onWindowMouseUp);
       window.removeEventListener("raum:terminal-self-heal", onTerminalSelfHeal);
+      window.removeEventListener("raum:terminal-recover-requested", onTerminalRecoverRequested);
     });
 
     // §4.7 — register with the global search registry.
@@ -1529,6 +2129,20 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
   onCleanup(() => {
     logLifecycle("cleanup", paneId, sessionId());
     requestVisibleResize = null;
+    // Clear any pending snapshot debounce timer for EVERY session id this pane
+    // ever registered BEFORE disposing xterm below, so a queued timer (or the
+    // quit-time flush) can never serialize a disposed terminal. A pane's id
+    // rotates over its lifetime (provider-replace / self-heal / recover), and
+    // each rotation leaves a stale `sources` entry under the old id pointing at
+    // this same live term/addon; cancelling only the CURRENT id would leave
+    // those stale ids to serialize the disposed addon at quit-flush. The
+    // freshest content is preserved by the quit-flush path
+    // (`flushAllTerminalSnapshotsNow`) on app close; an individual tab close is
+    // user-intentional teardown and its snapshot is GC'd when the session dies.
+    const cleanupSessionId = sessionId();
+    if (cleanupSessionId) registeredSnapshotIds.add(cleanupSessionId);
+    for (const id of registeredSnapshotIds) cancelTerminalSnapshotPersist(id);
+    registeredSnapshotIds.clear();
     unlistenProcessExited?.();
     unlistenBridgeLost?.();
     unsubscribeTheme?.();
@@ -1551,6 +2165,11 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       clearTimeout(reattachInFlightTimer);
       reattachInFlightTimer = null;
     }
+    // Tear down an in-flight rehydrate-ready gate (Contract 2): stops the 100 ms
+    // poll + drops the `"rehydrate:complete"` listener immediately and prevents
+    // the post-gate decision from running on this disposed pane.
+    cancelRehydrateGate?.();
+    cancelRehydrateGate = null;
     cancelBackfill();
     clearResizeRepin();
     try {
@@ -1574,6 +2193,11 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       /* best-effort */
     }
     try {
+      webLinks?.dispose();
+    } catch {
+      /* best-effort */
+    }
+    try {
       scrollDisposable?.dispose();
     } catch {
       /* best-effort */
@@ -1588,6 +2212,10 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
     term = null;
     fit = null;
     search = null;
+    webLinks = null;
+    setSearchAddon(null);
+    contextActionsRef = null;
+    relaunchShellRef = null;
     scrollDisposable = null;
   });
 
@@ -1599,6 +2227,14 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       data-pane-id={paneId}
       data-session-id={sessionId() ?? ""}
       data-testid="terminal-pane"
+      onContextMenu={(e) => {
+        // The global suppressor already kills the native menu; we just open our
+        // own at the click point. Snapshot the hovered link (if any) so the
+        // menu can offer "Open Link" for it.
+        e.preventDefault();
+        setContextMenuLink(hoveredLink);
+        setContextMenu({ x: e.clientX, y: e.clientY });
+      }}
     >
       <div
         ref={(el) => {
@@ -1606,6 +2242,27 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         }}
         class="min-h-0 min-w-0 flex-1 overflow-hidden"
       />
+      <Show when={findOpen()}>
+        <PaneFindOverlay
+          search={searchAddon()}
+          // Decorations must be enabled for the addon's `onDidChangeResults`
+          // (and thus the match count) to fire. A muted amber highlight reads
+          // against both light and dark terminal backgrounds; the active match
+          // gets a brighter fill + border so the current hit stands out.
+          decorations={{
+            matchBackground: "#5c4a1f",
+            matchOverviewRuler: "#d9a441",
+            activeMatchBackground: "#d9a441",
+            activeMatchBorder: "#f0c869",
+            activeMatchColorOverviewRuler: "#f0c869",
+          }}
+          onClose={() => {
+            setFindOpen(false);
+            // Hand keyboard focus back to the terminal so typing resumes.
+            term?.focus();
+          }}
+        />
+      </Show>
       <Show
         when={
           showPromptOverlay() &&
@@ -1643,7 +2300,7 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
             term?.scrollToBottom();
             setIsScrolledUp(false);
           }}
-          class="group absolute right-3 bottom-3 z-20 flex h-9 w-9 items-center justify-center rounded-full bg-popover text-foreground shadow-[var(--shadow-md)] transition-[transform,box-shadow,background-color] duration-200 ease-out hover:-translate-y-0.5 hover:bg-hover hover:shadow-[var(--shadow-lg),0_0_18px_-4px_color-mix(in_oklab,var(--project-accent,var(--foreground))_45%,transparent)] focus:outline-none focus-visible:shadow-[var(--shadow-lg),0_0_0_2px_color-mix(in_oklab,var(--project-accent,var(--foreground))_70%,transparent)]"
+          class="focus-ring group absolute right-3 bottom-3 z-20 flex h-9 w-9 items-center justify-center rounded-full bg-popover text-foreground shadow-[var(--shadow-md)] transition-[transform,box-shadow,background-color] duration-200 ease-out hover:-translate-y-0.5 hover:bg-hover hover:shadow-[var(--shadow-lg),0_0_18px_-4px_color-mix(in_oklab,var(--project-accent,var(--foreground))_45%,transparent)]"
           aria-label="Scroll to bottom"
           title="Scroll to bottom"
         >
@@ -1705,31 +2362,62 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
           </div>
         )}
       </Show>
-      <Show when={exitState() && bridgeRecoveryUiState() !== "lost"}>
-        <div class="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-scrim">
-          <span class="select-none font-mono text-sm text-muted-foreground">
-            exited: {exitState()!.code}
-          </span>
-          <div class="flex items-center gap-2">
-            <Show when={isHarnessKind(props.kind)}>
-              <button
-                type="button"
-                class="rounded border border-border bg-surface-2 px-3 py-1 font-mono text-xs text-foreground hover:bg-surface-3 disabled:opacity-50"
-                disabled={respawningDead()}
-                onClick={() => recoverDeadPaneRef?.()}
-              >
-                {respawningDead() ? "Recovering…" : "Recover"}
-              </button>
-            </Show>
-            <button
-              type="button"
-              class="rounded border border-border bg-surface-2 px-3 py-1 font-mono text-xs text-muted-foreground hover:bg-surface-3"
-              onClick={() => props.onRequestClose?.()}
-            >
-              Close
-            </button>
-          </div>
-        </div>
+      <Show when={bridgeRecoveryUiState() !== "lost" && exitState()}>
+        {(exit) => {
+          const summary = () => summarizeExitCode(exit().code);
+          return (
+            <div class="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-scrim">
+              <div class="flex flex-col items-center gap-1">
+                <span
+                  class="select-none font-mono text-sm font-medium"
+                  classList={{
+                    "text-foreground": summary().clean,
+                    "text-destructive": !summary().clean,
+                  }}
+                >
+                  {summary().label}
+                </span>
+                {/* Raw code kept for users who want the exact number. */}
+                <span class="select-none font-mono text-[11px] text-muted-foreground">
+                  exit code {exit().code}
+                </span>
+              </div>
+              <div class="flex items-center gap-2">
+                {/* Harnesses resume their conversation via `--resume`; shells
+                    relaunch a fresh process in place. Both live OUTSIDE the
+                    harness-only gate so a crashed shell can recover too. */}
+                <Show
+                  when={isHarnessKind(props.kind)}
+                  fallback={
+                    <button
+                      type="button"
+                      class="rounded border border-border bg-surface-2 px-3 py-1 font-mono text-xs text-foreground hover:bg-surface-3"
+                      onClick={() => relaunchShellRef?.()}
+                    >
+                      Relaunch
+                    </button>
+                  }
+                >
+                  <button
+                    type="button"
+                    class="rounded border border-border bg-surface-2 px-3 py-1 font-mono text-xs text-foreground hover:bg-surface-3 disabled:opacity-50"
+                    disabled={respawningDead()}
+                    onClick={() => recoverDeadPaneRef?.()}
+                  >
+                    {respawningDead() ? "Recovering…" : "Recover"}
+                  </button>
+                </Show>
+                <button
+                  type="button"
+                  class="rounded border border-border bg-surface-2 px-3 py-1 font-mono text-xs text-muted-foreground hover:bg-surface-3"
+                  onClick={() => props.onRequestClose?.()}
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+          );
+        }}
       </Show>
       <Show when={bridgeRecoveryUiState() === "reconnecting"}>
         <div class="pointer-events-none absolute right-2 top-2 z-10 select-none rounded border border-border bg-surface-2/90 px-2 py-1 font-mono text-[11px] text-muted-foreground">
@@ -1756,6 +2444,108 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
             </button>
           </div>
         </div>
+      </Show>
+      <Show when={contextMenu()}>
+        {(pos) => {
+          const close = (): void => {
+            setContextMenu(null);
+            setContextMenuLink(null);
+          };
+          // Run an action then dismiss. Re-focus the terminal afterwards so
+          // keyboard input resumes (except for Find, which steals focus).
+          const run = (fn: () => void | Promise<void>, keepFocus = false): void => {
+            void Promise.resolve(fn());
+            close();
+            if (!keepFocus) term?.focus();
+          };
+          return (
+            <>
+              {/* Full-pane backdrop: a click/right-click anywhere dismisses. */}
+              <div
+                class="absolute inset-0 z-40"
+                onMouseDown={close}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  close();
+                }}
+              />
+              <div
+                class="floating-surface absolute z-50 min-w-[10rem] rounded-lg border border-border-subtle bg-popover p-1 text-popover-foreground shadow-[var(--shadow-md)]"
+                style={{
+                  // Clamp into the pane so the menu never overflows the edge.
+                  left: `${Math.min(pos().x, (host?.getBoundingClientRect().right ?? pos().x) - 168)}px`,
+                  top: `${pos().y}px`,
+                }}
+                onMouseDown={(e) => e.stopPropagation()}
+              >
+                <Show when={contextMenuLink()}>
+                  {(uri) => (
+                    <>
+                      <button
+                        type="button"
+                        class="focus-ring flex w-full items-center rounded-md px-2 py-1.5 text-left font-mono text-[12px] text-foreground hover:bg-hover"
+                        onClick={() => run(() => contextActionsRef?.openLink(uri()))}
+                      >
+                        Open Link
+                      </button>
+                      <div class="my-1 h-px bg-border-subtle" />
+                    </>
+                  )}
+                </Show>
+                <button
+                  type="button"
+                  class="focus-ring flex w-full items-center rounded-md px-2 py-1.5 text-left font-mono text-[12px] text-foreground hover:bg-hover"
+                  onClick={() => run(() => contextActionsRef?.copySelection())}
+                >
+                  Copy
+                </button>
+                <button
+                  type="button"
+                  class="focus-ring flex w-full items-center rounded-md px-2 py-1.5 text-left font-mono text-[12px] text-foreground hover:bg-hover"
+                  onClick={() => run(() => contextActionsRef?.paste())}
+                >
+                  Paste
+                </button>
+                <button
+                  type="button"
+                  class="focus-ring flex w-full items-center rounded-md px-2 py-1.5 text-left font-mono text-[12px] text-foreground hover:bg-hover"
+                  onClick={() => run(() => contextActionsRef?.copyAll())}
+                >
+                  Copy All
+                </button>
+                <button
+                  type="button"
+                  class="focus-ring flex w-full items-center rounded-md px-2 py-1.5 text-left font-mono text-[12px] text-foreground hover:bg-hover"
+                  onClick={() => run(() => contextActionsRef?.selectAll())}
+                >
+                  Select All
+                </button>
+                <button
+                  type="button"
+                  class="focus-ring flex w-full items-center rounded-md px-2 py-1.5 text-left font-mono text-[12px] text-foreground hover:bg-hover"
+                  onClick={() => run(() => contextActionsRef?.scrollToTop())}
+                >
+                  Scroll to Top
+                </button>
+                <div class="my-1 h-px bg-border-subtle" />
+                <button
+                  type="button"
+                  class="focus-ring flex w-full items-center rounded-md px-2 py-1.5 text-left font-mono text-[12px] text-foreground hover:bg-hover"
+                  onClick={() => run(() => contextActionsRef?.openFind(), true)}
+                >
+                  Find…
+                </button>
+                <button
+                  type="button"
+                  class="focus-ring flex w-full items-center rounded-md px-2 py-1.5 text-left font-mono text-[12px] text-foreground hover:bg-hover"
+                  onClick={() => run(() => contextActionsRef?.clear())}
+                >
+                  Clear
+                </button>
+              </div>
+            </>
+          );
+        }}
       </Show>
     </div>
   );

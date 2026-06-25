@@ -36,6 +36,18 @@ pub(super) struct ResumeTarget {
     pub(super) opencode_port: Option<u16>,
 }
 
+/// How [`respawn_harness_pane_in_place`] should pick the command it runs.
+/// (Every current caller prefers provider resume; a fresh launch is still
+/// reached internally as the fallback when `--resume` fails its grace window.)
+pub(super) enum ResumePreference {
+    /// Prefer provider resume; resolve the [`ResumeTarget`] internally.
+    ResolveResume,
+    /// Prefer provider resume using this **pre-resolved** target — the caller
+    /// already reserved/persisted any OpenCode port, so do NOT re-resolve and
+    /// risk binding a divergent ephemeral port (Theme 7).
+    PreResolved(ResumeTarget),
+}
+
 /// Resolve the directory to pass to `tmux respawn-pane -c` for harness
 /// resume/recovery. Prefer tmux's foreground process cwd because harnesses
 /// like Claude key their local session storage by cwd; fall back to the
@@ -180,21 +192,29 @@ pub(super) async fn resolve_resume_target(
 /// return an explicit error and keep the pane identity for retry. We only use
 /// the fresh-launch branch when the caller did not request provider resume.
 ///
+/// `prefer_resume` ([`ResumePreference`]) selects fresh-launch vs provider
+/// resume. `PreResolved` threads a [`ResumeTarget`] the caller (the reboot
+/// path in `terminal_reattach`) already resolved — including reserving and
+/// persisting the OpenCode port — so we do NOT re-`resolve_resume_target` and
+/// bind yet another ephemeral port that diverges from the one raum registered
+/// (Theme 7).
+///
 /// Returns the command that was actually used, for logging.
 pub(super) async fn respawn_harness_pane_in_place(
     tmux: &Arc<TmuxManager>,
     state: &tauri::State<'_, AppHandleState>,
     session_id: &str,
     kind: AgentKind,
-    prefer_resume: bool,
+    prefer_resume: ResumePreference,
 ) -> Result<String, String> {
     let extra_flags = resolve_harness_extra_flags(state, kind);
     let fresh_cmd = harness_launch_command(kind, extra_flags.as_deref(), None)
         .ok_or_else(|| "no launch command derivable for this kind".to_string())?;
-    let resume_target = if prefer_resume {
-        Some(resolve_resume_target(state, tmux, session_id, kind, extra_flags.as_deref()).await?)
-    } else {
-        None
+    let resume_target = match prefer_resume {
+        ResumePreference::PreResolved(pre_resolved) => Some(pre_resolved),
+        ResumePreference::ResolveResume => Some(
+            resolve_resume_target(state, tmux, session_id, kind, extra_flags.as_deref()).await?,
+        ),
     };
 
     // Try --resume first if available; verify the pane survives a brief

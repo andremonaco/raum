@@ -32,6 +32,16 @@ export interface AgentListItem {
   /** Latest `reliability` seen for this session, or `null` until a transition arrives. */
   reliability?: Reliability | null;
   /**
+   * Wall-clock (`Date.now()`) of the most recent *actual* state change for
+   * this session. Stamped by {@link updateSessionState} only when `state`
+   * differs from the previous reading, so it measures "time blocked in the
+   * current state" — the triage signal the attention rail ranks on. Unlike
+   * `created_unix` (immutable spawn time) this advances every transition, so
+   * a harness that just re-entered `waiting` sorts *after* one that's been
+   * stuck waiting for minutes. Absent until the first transition lands.
+   */
+  enteredStateAt?: number;
+  /**
    * Most recent user-submitted prompt for this session, surfaced on the
    * snapshot so a freshly-launched raum can repopulate the per-tab
    * subtitle without waiting for a fresh `pane:prompt-updated` emit.
@@ -113,14 +123,27 @@ export function updateSessionState(
   reliability?: Reliability | null,
 ): void {
   const existing = agentStore.sessions[sessionId];
+  // Stamp `enteredStateAt` only when the state actually transitions, so it
+  // tracks "blocked-since" rather than "last touched". A redundant
+  // same-state update (e.g. a duplicate `waiting` emit) preserves the
+  // original timestamp so the rail's age keeps climbing.
+  const stateChanged = existing?.state !== state;
+  const enteredStateAt =
+    stateChanged || existing?.enteredStateAt == null ? Date.now() : existing.enteredStateAt;
   const next: AgentListItem = existing
-    ? { ...existing, state, reliability: reliability ?? existing.reliability ?? null }
+    ? {
+        ...existing,
+        state,
+        reliability: reliability ?? existing.reliability ?? null,
+        enteredStateAt,
+      }
     : {
         session_id: sessionId,
         harness,
         state,
         supports_native_events: false,
         reliability: reliability ?? null,
+        enteredStateAt,
       };
   setAgentStore("sessions", sessionId, next);
 
@@ -175,6 +198,85 @@ const agentSelectors: AgentSelectors = createRoot(() => {
  * Drives the "All unread" dock-badge mode.
  */
 export const unreadAgentCount = agentSelectors.unreadAgentCount;
+
+// ---- attention ranking (FLEET) -------------------------------------------
+//
+// Mission-control triage helpers. The attention rail ranks agents needing a
+// human in three priority tiers — `waiting` (blocked on input) above
+// `errored` above `completed`-but-unread — and within the `waiting` tier the
+// *longest-blocked* agent sorts first. These are plain functions (not memos)
+// so callers can compose them inside their own tracking contexts; reading
+// `agentStore.sessions` / `acknowledgedTick` inside a Solid scope subscribes
+// the caller the usual way.
+
+/** Relative priority of an attention state — lower sorts first. States not
+ *  demanding attention return `Infinity` so they never enter the queue. */
+function attentionRank(state: AgentState): number {
+  switch (state) {
+    case "waiting":
+      return 0;
+    case "errored":
+      return 1;
+    case "completed":
+      return 2;
+    default:
+      return Number.POSITIVE_INFINITY;
+  }
+}
+
+/**
+ * A single attention-queue entry: the session plus the moment it entered its
+ * current state, so the UI can render an age ("waiting 8m") without re-reading
+ * the store.
+ */
+export interface AttentionItem {
+  session: AgentListItem;
+  /** `enteredStateAt`, or `0` when no transition has been recorded yet. */
+  blockedSince: number;
+}
+
+/**
+ * Agents that want a human, in triage order: waiting (oldest-blocked first)
+ * then errored then completed-unread. `completed`/`errored` entries the user
+ * has implicitly acknowledged (by activating their project tab) are excluded;
+ * `waiting` is sticky and never acknowledged-away (mirrors {@link unreadAgentCount}).
+ *
+ * Reactive: reading inside a Solid scope subscribes to `agentStore.sessions`
+ * and the acknowledged tick.
+ */
+export function attentionQueue(): AttentionItem[] {
+  acknowledgedTick();
+  const out: AttentionItem[] = [];
+  for (const session of Object.values(agentStore.sessions)) {
+    const rank = attentionRank(session.state);
+    if (!Number.isFinite(rank)) continue;
+    // Completed/errored clear on tab-activation; waiting stays sticky.
+    if (session.state !== "waiting" && session.session_id) {
+      if (acknowledgedSessions.has(session.session_id)) continue;
+    }
+    out.push({ session, blockedSince: session.enteredStateAt ?? 0 });
+  }
+  out.sort((a, b) => {
+    const ra = attentionRank(a.session.state);
+    const rb = attentionRank(b.session.state);
+    if (ra !== rb) return ra - rb;
+    // Within a tier, the agent blocked longest (smallest timestamp) first.
+    return a.blockedSince - b.blockedSince;
+  });
+  return out;
+}
+
+/**
+ * The waiting tier on its own, oldest-blocked first — the queue
+ * "focus-next-waiting" steps through. Distinct from terminalStore's
+ * `waitingTerminals` (which sorts by immutable `created_unix`): this ranks by
+ * `enteredStateAt`, so a freshly-re-blocked agent goes to the back.
+ */
+export function waitingByBlockedLongest(): AgentListItem[] {
+  return Object.values(agentStore.sessions)
+    .filter((s) => s.state === "waiting")
+    .sort((a, b) => (a.enteredStateAt ?? 0) - (b.enteredStateAt ?? 0));
+}
 
 /** Fetch the full adapter + session list from the backend. */
 export async function refreshAgents(): Promise<void> {

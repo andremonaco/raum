@@ -4,6 +4,8 @@
  * with identical options.
  */
 
+import { createSignal } from "solid-js";
+
 import type { ITerminalOptions, ITheme } from "@xterm/xterm";
 
 export interface TerminalAppearanceConfig {
@@ -12,6 +14,73 @@ export interface TerminalAppearanceConfig {
   scrollback: number;
   theme?: ITheme;
   screenReaderMode?: boolean;
+}
+
+/** Default pane font size (px). Single source of truth for the per-pane font
+ *  zoom (⌘+ / ⌘- / ⌘0) — `⌘0` resets back to this. */
+export const DEFAULT_FONT_SIZE = 13;
+/** Zoom bounds. Below ~8px xterm's cell metrics collapse; above ~32px a single
+ *  pane eats the whole grid — both extremes are deliberately unreachable. */
+export const MIN_FONT_SIZE = 8;
+export const MAX_FONT_SIZE = 32;
+
+/** Clamp a (possibly user-nudged) font size into the supported zoom range. */
+export function clampFontSize(size: number): number {
+  if (!Number.isFinite(size)) return DEFAULT_FONT_SIZE;
+  return Math.max(MIN_FONT_SIZE, Math.min(MAX_FONT_SIZE, Math.round(size)));
+}
+
+/**
+ * App-wide terminal font-zoom level (⌘+ / ⌘- / ⌘0). Kept app-wide (not
+ * per-session) as the simplest model: every pane reads the same reactive
+ * signal, so a zoom change in one focused pane immediately refits all of them.
+ * Persisted to `localStorage` so the level survives reloads — this is a pure
+ * appearance preference, not session state, so it intentionally lives outside
+ * the recoverable `sessions.toml`/snapshot machinery.
+ */
+const FONT_SIZE_STORAGE_KEY = "raum.terminal.fontSize";
+
+function readPersistedFontSize(): number {
+  if (typeof localStorage === "undefined") return DEFAULT_FONT_SIZE;
+  try {
+    const raw = localStorage.getItem(FONT_SIZE_STORAGE_KEY);
+    if (raw === null) return DEFAULT_FONT_SIZE;
+    return clampFontSize(Number.parseInt(raw, 10));
+  } catch {
+    return DEFAULT_FONT_SIZE;
+  }
+}
+
+const [terminalFontSize, setTerminalFontSizeInternal] = createSignal(readPersistedFontSize());
+
+/** Reactive accessor — every live pane subscribes so a zoom change refits all. */
+export { terminalFontSize };
+
+function persistFontSize(size: number): void {
+  if (typeof localStorage === "undefined") return;
+  try {
+    localStorage.setItem(FONT_SIZE_STORAGE_KEY, String(size));
+  } catch {
+    /* private-mode / quota — zoom still works in-memory for this session. */
+  }
+}
+
+/** Set the app-wide terminal font size, clamped + persisted. */
+export function setTerminalFontSize(size: number): number {
+  const next = clampFontSize(size);
+  setTerminalFontSizeInternal(next);
+  persistFontSize(next);
+  return next;
+}
+
+/** Nudge the font size by `delta` px (⌘+ / ⌘-). Returns the applied size. */
+export function nudgeTerminalFontSize(delta: number): number {
+  return setTerminalFontSize(terminalFontSize() + delta);
+}
+
+/** Reset to the default font size (⌘0). */
+export function resetTerminalFontSize(): number {
+  return setTerminalFontSize(DEFAULT_FONT_SIZE);
 }
 
 /**

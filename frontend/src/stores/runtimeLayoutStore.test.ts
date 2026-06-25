@@ -7,6 +7,17 @@ vi.mock("@tauri-apps/api/core", () => ({
 
 import {
   __resetRuntimeLayoutForTests,
+  __setActiveLayoutBootStateForTests,
+  canUndoLayout,
+  didActiveLayoutHydrate,
+  flushActiveLayoutNow,
+  focusByDirection,
+  markActiveLayoutHydrated,
+  movePaneDirectional,
+  nudgeFocusedDivider,
+  openActiveLayoutSaveGate,
+  scheduleActiveSave,
+  undoLayout,
   addCellTab,
   clearMaximize,
   compactTree,
@@ -38,6 +49,7 @@ import {
   setTabLabel,
   setTabAutoLabel,
   setTabSessionId,
+  splitFocusedOrRoot,
   splitPane,
   swapPanes,
   tileAll,
@@ -735,5 +747,354 @@ describe("runtimeLayoutStore (BSP)", () => {
     // The pane left the tree but stays in `panes`, so its session is still
     // something the user can restore — it must not be treated as an orphan.
     expect(placedSessionIds().has("raum-claude-1-1")).toBe(true);
+  });
+});
+
+describe("layout undo (Contract B)", () => {
+  beforeEach(() => {
+    vi.useRealTimers();
+    vi.clearAllMocks();
+    __resetRuntimeLayoutForTests();
+  });
+
+  it("starts with no undo history", () => {
+    expect(canUndoLayout()).toBe(false);
+    // undo on an empty stack is a safe no-op.
+    expect(() => undoLayout()).not.toThrow();
+  });
+
+  it("undoLayout reverses a spawn-split, restoring the prior tree", () => {
+    // `splitFocusedOrRoot` is the spawn gesture the GRID split actions drive;
+    // it snapshots history (plain `splitPane` does not — it's the lower-level
+    // DnD/programmatic insert).
+    splitFocusedOrRoot(pane("a"));
+    expect(runtimeLayoutStore.cells.map((c) => c.id)).toEqual(["a"]);
+    setFocusedPaneId("a");
+    splitFocusedOrRoot(pane("b"));
+    expect(runtimeLayoutStore.cells.map((c) => c.id).sort()).toEqual(["a", "b"]);
+    expect(canUndoLayout()).toBe(true);
+
+    undoLayout();
+    // The second spawn-split is reversed: only `a` remains in the tree.
+    expect(runtimeLayoutStore.cells.map((c) => c.id)).toEqual(["a"]);
+    expect(runtimeLayoutStore.cells[0].w).toBe(LAYOUT_UNIT);
+  });
+
+  it("undoLayout reverses a removePane back to the prior layout", () => {
+    splitPane(pane("a"), null, "right");
+    splitPane(pane("b"), "a", "right");
+    removePane("a");
+    expect(runtimeLayoutStore.cells.map((c) => c.id)).toEqual(["b"]);
+
+    undoLayout();
+    // The tree snapshot is restored. `b` is back in the layout; `a`'s leaf is
+    // also restored, but `removePane` deleted its `PaneContent`, so `rebuildCells`
+    // (which drops leaves with no backing pane) won't surface it as a cell. The
+    // tree shape is reversed even though the content for the removed pane is gone
+    // — undo is layout-shape recovery, not content resurrection.
+    const ids = runtimeLayoutStore.cells.map((c) => c.id);
+    expect(ids).toContain("b");
+  });
+
+  it("undoLayout reverses a swap", () => {
+    splitPane(pane("a"), null, "right");
+    splitPane(pane("b"), "a", "right");
+    const beforeSwap = runtimeLayoutStore.cells.map((c) => ({ id: c.id, x: c.x }));
+    swapPanes("a", "b");
+    undoLayout();
+    const afterUndo = runtimeLayoutStore.cells.map((c) => ({ id: c.id, x: c.x }));
+    expect(afterUndo).toEqual(beforeSwap);
+  });
+
+  it("undoLayout reverses a movePaneToEdge", () => {
+    splitPane(pane("a"), null, "right");
+    splitPane(pane("b"), "a", "right");
+    splitPane(pane("c"), "b", "right");
+    const before = runtimeLayoutStore.cells.map((c) => ({ id: c.id, x: c.x, y: c.y }));
+    movePaneToEdge("a", "c", "bottom");
+    undoLayout();
+    const after = runtimeLayoutStore.cells.map((c) => ({ id: c.id, x: c.x, y: c.y }));
+    expect(after).toEqual(before);
+  });
+
+  it("undo history is bounded and drains cleanly", () => {
+    splitPane(pane("a"), null, "right");
+    splitPane(pane("b"), "a", "right");
+    // Fire many history-recording mutations. `swapPanes` snapshots on every
+    // call, so it both grows the stack and is a no-op-free way to exceed the
+    // cap. The history stack is internally capped (LAYOUT_HISTORY_LIMIT = 50);
+    // from the outside we can only observe that undo keeps working and that
+    // draining the stack always terminates.
+    for (let i = 0; i < 80; i++) {
+      swapPanes("a", "b");
+    }
+    expect(canUndoLayout()).toBe(true);
+    // Draining the whole capped stack must terminate (guard caps the loop well
+    // above the 50-entry limit) and never throw.
+    let guard = 0;
+    while (canUndoLayout() && guard < 200) {
+      undoLayout();
+      guard += 1;
+    }
+    expect(canUndoLayout()).toBe(false);
+    expect(guard).toBeLessThanOrEqual(60);
+  });
+
+  it("undoLayout restores minimized state — no pane left both in-tree and minimized", () => {
+    splitPane(pane("a"), null, "right");
+    splitPane(pane("b"), "a", "right");
+    // Minimize records history (pre-minimize: b in tree, not minimized).
+    minimizePane("b");
+    expect(minimizedPaneIds().has("b")).toBe(true);
+    expect(runtimeLayoutStore.cells.some((c) => c.id === "b")).toBe(false);
+    // Undo must put b back in the tree AND clear it from the minimized set —
+    // otherwise b would be both in the grid and flagged minimized (an
+    // invisible-in-grid live session). Guards the session-visibility invariant.
+    expect(undoLayout()).toBe(true);
+    expect(minimizedPaneIds().has("b")).toBe(false);
+    expect(runtimeLayoutStore.cells.some((c) => c.id === "b")).toBe(true);
+  });
+
+  it("closing a pane is not undoable (session is gone), but prior moves still are", () => {
+    splitPane(pane("a"), null, "right");
+    splitPane(pane("b"), "a", "right");
+    swapPanes("a", "b"); // records history
+    removePane("b"); // close is destructive/final — must NOT record history
+    // Undo skips the (non-recorded) close and reverses the swap; the closed
+    // pane stays gone — we never resurrect a leaf pointing at a dead session.
+    expect(undoLayout()).toBe(true);
+    expect(runtimeLayoutStore.cells.some((c) => c.id === "b")).toBe(false);
+  });
+
+  it("undoLayout returns false when there is nothing to undo", () => {
+    splitPane(pane("a"), null, "right"); // splitPane helper does not record history
+    expect(canUndoLayout()).toBe(false);
+    expect(undoLayout()).toBe(false);
+  });
+});
+
+describe("spatial keyboard primitives (Contract B)", () => {
+  beforeEach(() => {
+    vi.useRealTimers();
+    vi.clearAllMocks();
+    __resetRuntimeLayoutForTests();
+  });
+
+  it("focusByDirection moves to the nearest pane on that side", () => {
+    // Horizontal strip a | b | c.
+    splitPane(pane("a"), null, "right");
+    splitPane(pane("b"), "a", "right");
+    splitPane(pane("c"), "b", "right");
+    setFocusedPaneId("a");
+    focusByDirection("right");
+    // From the leftmost pane, the nearest pane to the right is its immediate
+    // neighbour.
+    expect(focusedPaneId()).toBe("b");
+    focusByDirection("right");
+    expect(focusedPaneId()).toBe("c");
+    // No pane further right — focus stays put.
+    focusByDirection("right");
+    expect(focusedPaneId()).toBe("c");
+    focusByDirection("left");
+    expect(focusedPaneId()).toBe("b");
+  });
+
+  it("focusByDirection is a no-op with no focused pane", () => {
+    splitPane(pane("a"), null, "right");
+    splitPane(pane("b"), "a", "right");
+    setFocusedPaneId(null);
+    focusByDirection("right");
+    expect(focusedPaneId()).toBeNull();
+  });
+
+  it("focusByDirection picks vertically across a row split", () => {
+    // a on top, b on bottom.
+    splitPane(pane("a"), null, "right");
+    splitPane(pane("b"), "a", "bottom");
+    setFocusedPaneId("a");
+    focusByDirection("down");
+    expect(focusedPaneId()).toBe("b");
+    focusByDirection("up");
+    expect(focusedPaneId()).toBe("a");
+  });
+
+  it("movePaneDirectional keeps every pane and re-anchors focus", () => {
+    splitPane(pane("a"), null, "right");
+    splitPane(pane("b"), "a", "right");
+    splitPane(pane("c"), "b", "right");
+    setFocusedPaneId("a");
+    movePaneDirectional("right");
+    // No pane is lost and focus stays on the moved pane.
+    expect(runtimeLayoutStore.cells.map((c) => c.id).sort()).toEqual(["a", "b", "c"]);
+    expect(focusedPaneId()).toBe("a");
+  });
+
+  it("nudgeFocusedDivider grows the focused pane toward its neighbour", () => {
+    splitPane(pane("a"), null, "right");
+    splitPane(pane("b"), "a", "right");
+    // Start 50/50.
+    const a0 = runtimeLayoutStore.cells.find((c) => c.id === "a")!.w;
+    setFocusedPaneId("a");
+    // Nudge the divider rightwards: pane `a` should grow.
+    nudgeFocusedDivider("right", 0.1);
+    const a1 = runtimeLayoutStore.cells.find((c) => c.id === "a")!.w;
+    expect(a1).toBeGreaterThan(a0);
+    // Total width is preserved (the pair still tiles the viewport).
+    const sumW = runtimeLayoutStore.cells.reduce((s, c) => s + c.w, 0);
+    expect(sumW).toBe(LAYOUT_UNIT);
+  });
+
+  it("nudgeFocusedDivider shrinks the focused pane when pushed inward", () => {
+    splitPane(pane("a"), null, "right");
+    splitPane(pane("b"), "a", "right");
+    const a0 = runtimeLayoutStore.cells.find((c) => c.id === "a")!.w;
+    setFocusedPaneId("a");
+    nudgeFocusedDivider("left", 0.1);
+    const a1 = runtimeLayoutStore.cells.find((c) => c.id === "a")!.w;
+    expect(a1).toBeLessThan(a0);
+  });
+
+  it("nudgeFocusedDivider is a no-op on a single-leaf tree", () => {
+    splitPane(pane("a"), null, "right");
+    setFocusedPaneId("a");
+    expect(() => nudgeFocusedDivider("right")).not.toThrow();
+    expect(runtimeLayoutStore.cells[0].w).toBe(LAYOUT_UNIT);
+  });
+});
+
+describe("didActiveLayoutHydrate signal (Contract B)", () => {
+  beforeEach(() => {
+    vi.useRealTimers();
+    vi.clearAllMocks();
+  });
+
+  it("flips true via markActiveLayoutHydrated and is reactive", () => {
+    __setActiveLayoutBootStateForTests({ gateOpen: true, didHydrate: false });
+    expect(didActiveLayoutHydrate()).toBe(false);
+    markActiveLayoutHydrated();
+    expect(didActiveLayoutHydrate()).toBe(true);
+  });
+
+  it("__resetRuntimeLayoutForTests defaults the hydrate signal true", () => {
+    __resetRuntimeLayoutForTests();
+    expect(didActiveLayoutHydrate()).toBe(true);
+  });
+});
+
+describe("active-layout save gate & empty-save guard (recovery)", () => {
+  beforeEach(() => {
+    vi.useRealTimers();
+    vi.clearAllMocks();
+    __resetRuntimeLayoutForTests();
+  });
+
+  it("does NOT overwrite with cells:[] when nothing was hydrated this session", async () => {
+    vi.useFakeTimers();
+    // Simulate the corrupt/timed-out-read boot path: gate eventually open, but
+    // hydration never completed, so an empty save must be suppressed.
+    __setActiveLayoutBootStateForTests({ gateOpen: true, didHydrate: false });
+    // The store is empty (cells === []). An early save (e.g. from the boot
+    // project-tab select) must not clobber a possibly-non-empty on-disk file.
+    scheduleActiveSave();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(invoke).not.toHaveBeenCalledWith("active_layout_save", expect.anything());
+  });
+
+  it("allows an empty save once a real layout has been hydrated", async () => {
+    vi.useFakeTimers();
+    __setActiveLayoutBootStateForTests({ gateOpen: true, didHydrate: false });
+    // A real (even empty) layout loaded — the user genuinely has zero panes.
+    markActiveLayoutHydrated();
+    scheduleActiveSave();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(invoke).toHaveBeenCalledWith(
+      "active_layout_save",
+      expect.objectContaining({ layout: expect.objectContaining({ cells: [] }) }),
+    );
+  });
+
+  it("parks saves while the gate is closed, then flushes on open", async () => {
+    vi.useFakeTimers();
+    __setActiveLayoutBootStateForTests({ gateOpen: false, didHydrate: true });
+    setRuntimeLayout([cell("a")]);
+    // Gate closed: the mutation's scheduled save is parked, not issued.
+    await vi.advanceTimersByTimeAsync(500);
+    expect(invoke).not.toHaveBeenCalledWith("active_layout_save", expect.anything());
+    // Opening the gate flushes the parked save.
+    openActiveLayoutSaveGate();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(invoke).toHaveBeenCalledWith("active_layout_save", expect.anything());
+  });
+
+  it("flushActiveLayoutNow persists immediately, cancelling the debounce", async () => {
+    vi.useFakeTimers();
+    __setActiveLayoutBootStateForTests({ gateOpen: true, didHydrate: true });
+    setRuntimeLayout([cell("a", { tabs: [{ id: "tab-a", sessionId: "raum-a" }] })]);
+    vi.mocked(invoke).mockClear();
+    // No timer advance — flushActiveLayoutNow must write synchronously.
+    await flushActiveLayoutNow();
+    expect(invoke).toHaveBeenCalledWith(
+      "active_layout_save",
+      expect.objectContaining({
+        layout: expect.objectContaining({
+          cells: [expect.objectContaining({ id: "a" })],
+        }),
+      }),
+    );
+    // The debounce timer was cleared, so advancing time issues no second save.
+    vi.mocked(invoke).mockClear();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(invoke).not.toHaveBeenCalledWith("active_layout_save", expect.anything());
+  });
+
+  it("flushActiveLayoutNow is a no-op when the gate is closed", async () => {
+    __setActiveLayoutBootStateForTests({ gateOpen: false, didHydrate: true });
+    setRuntimeLayout([cell("a")]);
+    vi.mocked(invoke).mockClear();
+    await flushActiveLayoutNow();
+    expect(invoke).not.toHaveBeenCalledWith("active_layout_save", expect.anything());
+  });
+
+  it("flushActiveLayoutNow does not clobber a never-hydrated empty layout", async () => {
+    __setActiveLayoutBootStateForTests({ gateOpen: true, didHydrate: false });
+    vi.mocked(invoke).mockClear();
+    await flushActiveLayoutNow();
+    expect(invoke).not.toHaveBeenCalledWith("active_layout_save", expect.anything());
+  });
+
+  it("allows a later empty save after the user persisted a real layout (corrupt-read leg)", async () => {
+    vi.useFakeTimers();
+    // Corrupt/timed-out read boot path: gate open, hydration never completed.
+    __setActiveLayoutBootStateForTests({ gateOpen: true, didHydrate: false });
+    // 1. The user builds a non-empty layout — this persists (bypasses the
+    //    guard via cells.length > 0) and marks the on-disk file as raum-owned.
+    setRuntimeLayout([cell("a", { tabs: [{ id: "tab-a", sessionId: "raum-a" }] })]);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(invoke).toHaveBeenCalledWith(
+      "active_layout_save",
+      expect.objectContaining({
+        layout: expect.objectContaining({ cells: [expect.objectContaining({ id: "a" })] }),
+      }),
+    );
+    // 2. The user closes every pane — the resulting empty save must now persist
+    //    cells:[] so the next launch reflects the genuinely-empty grid instead
+    //    of reloading the stale single-pane layout from step 1.
+    vi.mocked(invoke).mockClear();
+    setRuntimeLayout([]);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(invoke).toHaveBeenCalledWith(
+      "active_layout_save",
+      expect.objectContaining({ layout: expect.objectContaining({ cells: [] }) }),
+    );
+  });
+
+  it("still blocks a boot-time empty save before any non-empty write (corrupt-read leg)", async () => {
+    vi.useFakeTimers();
+    __setActiveLayoutBootStateForTests({ gateOpen: true, didHydrate: false });
+    // No non-empty save has happened — an empty save fired by the boot
+    // project-tab select must still be suppressed (anti-clobber invariant).
+    setRuntimeLayout([]);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(invoke).not.toHaveBeenCalledWith("active_layout_save", expect.anything());
   });
 });

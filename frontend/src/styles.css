@@ -369,19 +369,35 @@ body,
   box-shadow:
     0 1px 0 rgba(255, 255, 255, 0.03) inset,
     0 1px 2px rgb(0 0 0 / 0.45);
-  /* Overshoot spring so layout changes "settle" into place. */
+  /* Unified layout-settle motion. Every place that drives a pane's slot —
+     idle reflow (this rule), dnd-active sibling reflow (below), and
+     maximize/restore — now shares ONE curve (`--motion-ease`), ONE duration
+     (160ms), and ONE property model (left/right/top/bottom, matching how the
+     frame is actually positioned above). The old spring overshoot
+     (cubic-bezier(0.34,1.56,0.64,1)) read as a wobble/bounce on release; the
+     decelerate-only `--motion-ease` settles crisply. Animating right/bottom
+     (not width/height) is what keeps the trailing edges from shearing when a
+     pane reflows — the previous mismatch (left/top vs. width/height) moved
+     two corners on different timelines. */
   transition:
-    left 180ms cubic-bezier(0.34, 1.56, 0.64, 1),
-    right 180ms cubic-bezier(0.34, 1.56, 0.64, 1),
-    top 180ms cubic-bezier(0.34, 1.56, 0.64, 1),
-    bottom 180ms cubic-bezier(0.34, 1.56, 0.64, 1),
+    left 160ms var(--motion-ease),
+    right 160ms var(--motion-ease),
+    top 160ms var(--motion-ease),
+    bottom 160ms var(--motion-ease),
     box-shadow 220ms ease,
-    transform 220ms cubic-bezier(0.2, 0.9, 0.25, 1);
+    transform 220ms var(--motion-ease);
 }
 
 /* While a divider is being dragged, suppress position transitions so the
-   pane tracks the pointer 1:1 instead of fighting with 180ms easing. */
-[data-dnd-root].is-resizing .leaf-frame {
+   pane tracks the pointer 1:1 instead of fighting with 160ms easing.
+   `.window-resize-active` (stamped by lib/gridResizeClass.ts while the OS
+   window is mid-resize) gets the same treatment: percentage rects recompute
+   on every browser layout pass during a window drag-resize, and the 160ms
+   settle would make panes lag the window edge — zeroing the transition keeps
+   the grid pinned 1:1 to the new geometry, then the class clears on a short
+   debounce so the settle curve returns on release. */
+[data-dnd-root].is-resizing .leaf-frame,
+[data-dnd-root].window-resize-active .leaf-frame {
   transition: none;
 }
 
@@ -501,6 +517,32 @@ body,
 @media (prefers-reduced-motion: reduce) {
   .leaf-frame.pane-unread-completed {
     animation: none;
+  }
+
+  /* Collapse the layout-position springs. The grid's value is fast,
+     recoverable orchestration — motion is polish, not signal — so under a
+     reduced-motion preference we drop every pane glide to a near-instant
+     linear move and kill the decorative transforms (lift scale, snap shrink,
+     drop-zone glide) and attention animations entirely. Panes still *move*
+     to their new slots; they just don't ease/overshoot. */
+  .leaf-frame,
+  [data-dnd-root].dnd-active .leaf-frame:not(.pane-dragging):not(.surface-dragging-source),
+  [data-dnd-root].maximize-anim .terminal-surface-frame,
+  .drop-zone-landing {
+    transition-duration: 0.01ms !important;
+    transition-timing-function: linear !important;
+  }
+  .leaf-frame.pane-dragging,
+  .leaf-frame.pane-dragging.is-snapped,
+  .terminal-surface-frame.surface-dragging-source,
+  .terminal-surface-frame.surface-dragging-source.is-snapped {
+    transform: translate(var(--drag-dx, 0px), var(--drag-dy, 0px)) !important;
+    transition: none !important;
+  }
+  .leaf-frame.pane-unread-completed,
+  .wiggle,
+  .pane-divider::before {
+    animation: none !important;
   }
 }
 
@@ -885,13 +927,21 @@ body,
   box-shadow:
     0 0 0 1px rgba(113, 113, 122, 0.5),
     0 10px 24px -12px rgba(0, 0, 0, 0.7);
+  /* Shrink a hair to open the space the drop-zone cluster sits in (see the
+     pane-shrink note by `.drop-arrow`). Pure transform — no relayout, so xterm
+     never refits. */
+  transform: scale(var(--dnd-pane-shrink, 0.965));
+  /* Same curve/duration/property model as the base reflow above — the
+     frame is positioned with left/right/top/bottom, so we MUST animate
+     those four (not width/height) or the trailing edges shear during the
+     drag preview reflow. */
   transition:
-    left 160ms cubic-bezier(0.2, 0.9, 0.25, 1),
-    top 160ms cubic-bezier(0.2, 0.9, 0.25, 1),
-    width 160ms cubic-bezier(0.2, 0.9, 0.25, 1),
-    height 160ms cubic-bezier(0.2, 0.9, 0.25, 1),
+    left 160ms var(--motion-ease),
+    right 160ms var(--motion-ease),
+    top 160ms var(--motion-ease),
+    bottom 160ms var(--motion-ease),
     box-shadow 220ms ease,
-    transform 220ms cubic-bezier(0.2, 0.9, 0.25, 1);
+    transform 220ms var(--motion-ease);
 }
 
 /* DRAGGING: the pane itself lifts and follows the cursor. No separate
@@ -901,7 +951,10 @@ body,
    is 1:1; box-shadow animates so the "lift" reads as a physical motion. */
 .leaf-frame.pane-dragging {
   z-index: 60;
-  transform: translate(var(--drag-dx), var(--drag-dy)) rotate(-0.6deg) scale(1.02);
+  /* No rotation — terminals stay axis-aligned so xterm's grid never reads as
+     skewed under the lift. Just a slight scale-up + the cursor-tracking
+     translate; the box-shadow carries the "picked up" depth cue. */
+  transform: translate(var(--drag-dx), var(--drag-dy)) scale(1.02);
   transition:
     transform 0ms,
     box-shadow 220ms ease;
@@ -951,6 +1004,29 @@ body,
   z-index: 40;
 }
 
+/* EDGE SNAP: once the dwell latches an edge / root zone, the dragged pane is
+   routed to its slot rect (chrome via the render loop, surface via the
+   projection), so it settles into the exact spot it will occupy — the dragged
+   window IS its own landing preview, never a separate placeholder that could
+   look different. It must wear the SAME drag-time shrink as every other pane
+   (`--dnd-pane-shrink`), or it overflows its slot and reads bigger than its
+   now-shrunken neighbours. A quick pop into that size sells the click. */
+.leaf-frame.pane-dragging.is-edge-snapped {
+  transform: scale(var(--dnd-pane-shrink, 0.965));
+  animation: edge-snap-pop 200ms cubic-bezier(0.2, 0.9, 0.25, 1);
+  box-shadow:
+    0 0 0 1px color-mix(in oklab, var(--foreground) 28%, transparent),
+    0 14px 32px -18px rgba(0, 0, 0, 0.6);
+}
+@keyframes edge-snap-pop {
+  from {
+    transform: scale(calc(var(--dnd-pane-shrink, 0.965) * 0.95));
+  }
+  to {
+    transform: scale(var(--dnd-pane-shrink, 0.965));
+  }
+}
+
 /* Maximized pane fills the canvas completely (no gutter, no border, no
    radius). The grid canvas itself owns the rounded outer edge — keeping a
    pane-level border + radius here would draw a hairline rectangle inside
@@ -975,11 +1051,14 @@ body,
    class wins by source order while the maximize-anim window is open
    (~240 ms) and reverts to the no-transition default once it closes. */
 [data-dnd-root].maximize-anim .terminal-surface-frame {
+  /* Mirror the unified `.leaf-frame` settle (160ms `--motion-ease`,
+     left/right/top/bottom) so the surface grows/shrinks in lockstep with
+     the chrome card during a maximize/restore — no spring overshoot. */
   transition:
-    left 180ms cubic-bezier(0.34, 1.56, 0.64, 1),
-    right 180ms cubic-bezier(0.34, 1.56, 0.64, 1),
-    top 180ms cubic-bezier(0.34, 1.56, 0.64, 1),
-    bottom 180ms cubic-bezier(0.34, 1.56, 0.64, 1);
+    left 160ms var(--motion-ease),
+    right 160ms var(--motion-ease),
+    top 160ms var(--motion-ease),
+    bottom 160ms var(--motion-ease);
 }
 
 /* Hide every leaf-frame that isn't the maximized one — both while a pane
@@ -1027,7 +1106,9 @@ body,
    document order) paints over the translated source surface and the
    dragged thumbnail appears empty inside its border. */
 .terminal-surface-frame.surface-dragging-source {
-  transform: translate(var(--drag-dx), var(--drag-dy)) rotate(-0.6deg) scale(1.02);
+  /* Axis-aligned to match the chrome card above (no rotate) — the live
+     xterm pixels stay square under the lift. */
+  transform: translate(var(--drag-dx), var(--drag-dy)) scale(1.02);
   transition: transform 0ms;
   will-change: transform;
   z-index: 50;
@@ -1044,6 +1125,13 @@ body,
 .terminal-surface-frame.surface-dragging-source.is-snapped {
   transform: translate(var(--snap-dx, 0px), var(--snap-dy, 0px)) scale(0.4);
   transition: transform 120ms cubic-bezier(0.2, 0.9, 0.25, 1);
+}
+
+/* Surface mirror for the edge-snap (see `.is-edge-snapped` chrome rule) — sit
+   at the slot rect under the chrome's icon body, wearing the same drag-time
+   shrink as its card (and every sibling) so they line up exactly. */
+.terminal-surface-frame.surface-dragging-source.is-edge-snapped {
+  transform: scale(var(--dnd-pane-shrink, 0.965));
 }
 
 .terminal-surface-body {
@@ -1634,9 +1722,21 @@ body,
     bottom 220ms cubic-bezier(0.2, 0.9, 0.25, 1),
     left 220ms cubic-bezier(0.2, 0.9, 0.25, 1),
     right 220ms cubic-bezier(0.2, 0.9, 0.25, 1),
+    opacity 200ms ease-out,
     filter 180ms ease-out;
   pointer-events: none;
   border-radius: 999px;
+}
+
+/* While a pane is being dragged to rearrange, take the resize dividers fully
+   out of play: fade their filament (it sits right where the drop handles do)
+   AND drop their hit zone, so hovering a seam doesn't flip the cursor to
+   col/row-resize mid-rearrange. The drop handles fade in as these fade out. */
+[data-dnd-root].dnd-active .pane-divider {
+  pointer-events: none;
+}
+[data-dnd-root].dnd-active .pane-divider::before {
+  opacity: 0;
 }
 
 /* Vertical pill (col-resize = row-axis split between siblings).
@@ -1649,13 +1749,19 @@ body,
   bottom: calc(50% - 14px);
   transform: translateX(-0.75px);
 }
-.pane-divider.cursor-col-resize:hover::before {
+.pane-divider.cursor-col-resize:hover::before,
+.pane-divider.cursor-col-resize.is-dragging::before,
+.pane-divider.cursor-col-resize:focus-visible::before {
   top: 6%;
   bottom: 6%;
   background-color: rgba(var(--accent-split), 0.7);
   filter: drop-shadow(0 0 6px rgba(var(--accent-split), 0.45));
 }
-[data-dnd-root].is-resizing .pane-divider.cursor-col-resize:hover::before {
+/* While THIS divider is mid-drag the filament intensifies and STAYS lit even
+   if the cursor outruns the 6px hit zone — keyed on the per-divider
+   `.is-dragging` flag (set in divider-layer.tsx on pointerdown), not on
+   `:hover`, which let go the moment the pointer left the line. */
+.pane-divider.cursor-col-resize.is-dragging::before {
   background-color: rgba(var(--accent-split), 0.95);
   filter: drop-shadow(0 0 10px rgba(var(--accent-split), 0.6));
 }
@@ -1670,13 +1776,17 @@ body,
   right: calc(50% - 14px);
   transform: translateY(-0.75px);
 }
-.pane-divider.cursor-row-resize:hover::before {
+.pane-divider.cursor-row-resize:hover::before,
+.pane-divider.cursor-row-resize.is-dragging::before,
+.pane-divider.cursor-row-resize:focus-visible::before {
   left: 6%;
   right: 6%;
   background-color: rgba(var(--accent-split), 0.7);
   filter: drop-shadow(0 0 6px rgba(var(--accent-split), 0.45));
 }
-[data-dnd-root].is-resizing .pane-divider.cursor-row-resize:hover::before {
+/* See the col-resize note above — per-divider `.is-dragging` keeps the
+   filament lit + intensified for the whole drag. */
+.pane-divider.cursor-row-resize.is-dragging::before {
   background-color: rgba(var(--accent-split), 0.95);
   filter: drop-shadow(0 0 10px rgba(var(--accent-split), 0.6));
 }
@@ -1723,10 +1833,143 @@ body,
   filter: drop-shadow(0 0 10px rgba(var(--accent-split), 0.6));
 }
 
-/* Drop-zone and snap-zone overlays are intentionally not rendered. The
- * live reflow of the grid (see <TerminalGrid>'s previewTree memo) *is*
- * the feedback. Additional overlay layers on top of xterm canvases
- * caused continuous repaints and visible flicker on non-dragging panes. */
+/* ── Dragged-pane icon body ────────────────────────────────────────── */
+/* While a pane is dragged, its body blanks to the harness icon (the header
+   stays). An opaque cover over the chrome body — it sits above the live xterm
+   surface, so we carry a clean icon card around, never a distortable
+   screenshot. Once latched, the pane settles into its slot still wearing this
+   look, so the dragged window and its landing spot are the SAME element. */
+.pane-drag-body {
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  display: grid;
+  place-items: center;
+  background: var(--terminal-bg);
+}
+.pane-drag-body-icon {
+  width: 30px;
+  height: 30px;
+  opacity: 0.42;
+  color: var(--foreground);
+}
+
+/* ── Drop-zone affordance ──────────────────────────────────────────── */
+/* Two solid-pill layers (no glass — backdrop blur shimmers as terminal output
+   streams behind it). Both stay mounted for the whole drag, so nothing
+   re-animates frame to frame.
+     • Anchors — a quiet pill on every seam + outer edge, across the grid, so
+       the drop boundaries are always legible.
+     • Cluster — on the pane (or grid) under the pointer, four directional
+       chevron tabs; the tab for the zone under the cursor fills with the split
+       accent. The cluster GLIDES between targets (no remount), so it slides
+       pane-to-pane instead of flickering. */
+.drop-anchors {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 1;
+}
+
+/* A grip handle — the universal "grab / drop here" affordance, so the seam
+   reads as draggable at a glance. Present and solid (opaque, so streaming
+   output behind it can't shimmer), with the split accent so it pops off the
+   canvas. The grip dots inside make the handle unmistakable. */
+.drop-anchor {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--foreground) 16%, var(--background));
+  border: 1px solid color-mix(in oklab, var(--foreground) 36%, transparent);
+  box-shadow:
+    0 1px 0 color-mix(in oklab, var(--foreground) 12%, transparent) inset,
+    0 3px 10px -4px rgba(0, 0, 0, 0.6);
+  /* Reveal once on mount; `scale` (not transform) so the inline centering
+     transform is never clobbered. `backwards` holds the hidden frame before
+     start (no flash). */
+  animation: drop-anchor-in 300ms cubic-bezier(0.16, 1, 0.3, 1) backwards;
+}
+
+/* Oriented along the boundary it marks — a vertical gap gets a tall handle
+   with its grip dots stacked; a horizontal gap, a wide handle with them in a
+   row. */
+.drop-anchor-v {
+  flex-direction: column;
+  width: 12px;
+  height: 38px;
+}
+.drop-anchor-h {
+  flex-direction: row;
+  width: 38px;
+  height: 12px;
+}
+
+.drop-grip {
+  width: 3px;
+  height: 3px;
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--foreground) 72%, transparent);
+}
+
+@keyframes drop-anchor-in {
+  from {
+    opacity: 0;
+    scale: 0.4;
+  }
+  to {
+    opacity: 1;
+    scale: 1;
+  }
+}
+
+/* PANE SHRINK. On drag, every non-source pane (chrome + its live xterm
+   surface) scales down a hair to open the space the handles live in. A pure
+   transform — no relayout — so xterm never refits or rewraps; it reverts the
+   instant the drag ends. The source pane (`.pane-dragging` /
+   `.surface-dragging-source`) is excluded: it's the lifted card following the
+   cursor. The chrome's scale lives in the `.dnd-active .leaf-frame` reflow
+   rule above (which already carries a `transform 220ms` transition); the
+   surface gets a matching one here so the two layers shrink in lockstep. */
+[data-dnd-root].dnd-active .terminal-surface-frame:not(.surface-dragging-source) {
+  transform: scale(var(--dnd-pane-shrink, 0.965));
+  transition: transform 220ms var(--motion-ease);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .drop-anchor {
+    animation-duration: 1ms;
+  }
+}
+
+/* ── Hydration skeleton ────────────────────────────────────────────── */
+/* Faint pane outlines shown while the saved layout is still rehydrating from
+ * TOML, so a restored grid never flashes the "spawn a harness" empty-state on
+ * cold boot (it holds the canvas until `didActiveLayoutHydrate()` flips). A
+ * very low-contrast fill + dashed edge reads as "loading structure" without
+ * implying any specific content. */
+.grid-skeleton-pane {
+  border-radius: var(--pane-radius);
+  background-color: color-mix(in oklab, var(--foreground) 4%, transparent);
+  border: 1px dashed color-mix(in oklab, var(--foreground) 12%, transparent);
+  animation: grid-skeleton-breathe 1.8s ease-in-out infinite;
+}
+@keyframes grid-skeleton-breathe {
+  0%,
+  100% {
+    opacity: 0.5;
+  }
+  50% {
+    opacity: 0.8;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .grid-skeleton-pane {
+    animation: none;
+  }
+}
 
 @keyframes wiggle {
   0%,

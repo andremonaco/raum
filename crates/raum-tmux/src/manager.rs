@@ -19,6 +19,23 @@ use tracing::warn;
 
 pub const RAUM_TMUX_SOCKET: &str = "raum";
 
+/// Default tmux socket name for the running instance.
+///
+/// An explicit `RAUM_TMUX_SOCKET` wins (used by integration tests and power
+/// users). Otherwise the socket follows the active instance namespace
+/// (`raum`, `raum-dev`, …) so a `task dev` build and a release install never
+/// share a tmux server — and therefore never fight over each other's agent
+/// sessions. See [`raum_core::paths::instance_name`].
+#[must_use]
+pub fn default_socket_name() -> String {
+    if let Ok(explicit) = std::env::var("RAUM_TMUX_SOCKET") {
+        if !explicit.is_empty() {
+            return explicit;
+        }
+    }
+    raum_core::paths::instance_name()
+}
+
 #[derive(Debug, Error)]
 pub enum TmuxError {
     #[error("io: {0}")]
@@ -100,7 +117,7 @@ pub struct TmuxManager {
 impl Default for TmuxManager {
     fn default() -> Self {
         Self {
-            socket: RAUM_TMUX_SOCKET.to_string(),
+            socket: default_socket_name(),
             binary: PathBuf::from("tmux"),
         }
     }
