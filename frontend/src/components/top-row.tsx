@@ -22,16 +22,20 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { toast } from "solid-sonner";
 import {
   activeProjectSlug,
   projectBySlug,
-  projectStore,
   refreshProjects,
+  reopenProject,
   setActiveProjectSlug,
+  setProjectHidden,
   subscribeProjectEvents,
   upsertProject,
   type ProjectListItem,
 } from "../stores/projectStore";
+import { otherProjects, visibleProjects } from "../stores/projectVisibility";
+import { clearPendingAddProject, openProjectFromCli, pendingAddProjectPath } from "../lib/cliOpen";
 import { markStart } from "../lib/perf";
 import {
   refreshAgents,
@@ -77,6 +81,15 @@ import {
 } from "./ui/dialog";
 import { HoverCard, HoverCardContent, HoverCardPortal, HoverCardTrigger } from "./ui/hover-card";
 import { Popover, PopoverContent, PopoverPortal, PopoverTrigger } from "./ui/popover";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuPortal,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "./ui/dropdown-menu";
+import { CloseGlyph } from "./terminal-grid/glyphs";
 import { Scrollable } from "./ui/scrollable";
 import { Tooltip, TooltipContent, TooltipPortal, TooltipTrigger } from "./ui/tooltip";
 import {
@@ -121,6 +134,19 @@ const [crossProjectViewMode, setCrossProjectViewMode] = createSignal<CrossProjec
 );
 export { crossProjectViewMode, setCrossProjectViewMode };
 
+/** Drive a terminal-launch (`raum <dir>`) open and reconcile the surrounding
+ *  view: when an existing project is focused, leave any cross-project view and
+ *  reset the filter (mirroring a manual tab click); surface a toast on error. */
+async function handleCliOpen(path: string): Promise<void> {
+  const result = await openProjectFromCli(path);
+  if (result === "focused") {
+    setSelectedFilter("active");
+    setCrossProjectViewMode(null);
+  } else if (result === "error") {
+    toast.error("Couldn't open directory", { description: path });
+  }
+}
+
 // On macOS decorum sets TitleBarStyle::Overlay — native traffic lights, drag,
 // and zoom animation are all handled by the OS. On Linux/Windows we use our
 // own buttons and startDragging().
@@ -159,6 +185,9 @@ interface ProjectTabProps {
   compact: boolean;
   onSelect: () => void;
   onRemove: () => void;
+  /** Non-destructive shelve — drops the tab from the bar; sessions keep
+   *  running and the project moves to the "+" → "Other projects" list. */
+  onHide: () => void;
 }
 
 const ProjectTab: Component<ProjectTabProps> = (props) => {
@@ -361,6 +390,22 @@ const ProjectTab: Component<ProjectTabProps> = (props) => {
                 </span>
               </Show>
             </button>
+
+            {/* Hover-reveal shelve button. Non-destructive: hides the tab and
+                moves the project to the "+" → "Other projects" list; any
+                running sessions keep going. */}
+            <button
+              type="button"
+              aria-label={`Hide ${props.project.name || props.project.slug}`}
+              data-testid={`hide-project-${props.project.slug}`}
+              class="mr-1 hidden shrink-0 items-center self-center rounded-sm p-0.5 text-muted-foreground hover:bg-hover hover:text-foreground group-hover:flex"
+              onClick={(e) => {
+                e.stopPropagation();
+                props.onHide();
+              }}
+            >
+              <CloseGlyph />
+            </button>
           </>
         }
       >
@@ -420,6 +465,17 @@ const ProjectTab: Component<ProjectTabProps> = (props) => {
         >
           <button
             type="button"
+            class="block w-full rounded px-2 py-1 text-left hover:bg-hover"
+            onClick={() => {
+              setMenuOpen(false);
+              props.onHide();
+            }}
+          >
+            Hide project
+          </button>
+          <div aria-hidden="true" class="my-1 h-px bg-border" />
+          <button
+            type="button"
             class="block w-full rounded px-2 py-1 text-left text-destructive hover:bg-destructive/10"
             onClick={() => {
               setMenuOpen(false);
@@ -443,6 +499,11 @@ const ProjectTab: Component<ProjectTabProps> = (props) => {
 export const TopRow: Component = () => {
   const keymap = useKeymap();
   const [modalOpen, setModalOpen] = createSignal(false);
+  // Terminal launcher (`raum <dir>`) for an unregistered directory: open the
+  // Add-Project modal pre-filled with the requested path.
+  createEffect(() => {
+    if (pendingAddProjectPath()) setModalOpen(true);
+  });
   const [appSettingsOpen, setAppSettingsOpen] = createSignal(false);
   const [keymapSettingsOpen, setKeymapSettingsOpen] = createSignal(false);
   const [confirmRemove, setConfirmRemove] = createSignal<ProjectListItem | undefined>(undefined);
@@ -540,10 +601,29 @@ export const TopRow: Component = () => {
     let unlistenMenu: UnlistenFn | undefined;
     let unlistenPaneActivity: UnlistenFn | undefined;
     let unlistenReviewLinks: UnlistenFn | undefined;
+    let unlistenCliOpen: UnlistenFn | undefined;
 
     listen<string>("menu-action", (ev) => {
       if (ev.payload === "open-settings") {
         setAppSettingsOpen(true);
+      } else if (ev.payload === "install-cli") {
+        void invoke<{ path: string; onPath: boolean }>("cli_install_shim")
+          .then((res) => {
+            if (res.onPath) {
+              toast.success("Installed 'raum' command", {
+                description: `${res.path} — run \`raum <dir>\` to open a project from the terminal.`,
+              });
+            } else {
+              toast.warning("Installed 'raum' — add it to your PATH", {
+                description: `${res.path} is not on your PATH. Add its directory to PATH, then run \`raum <dir>\`.`,
+              });
+            }
+          })
+          .catch((e) => {
+            toast.error("Couldn't install 'raum' command", {
+              description: e instanceof Error ? e.message : String(e),
+            });
+          });
       }
     })
       .then((u) => {
@@ -589,7 +669,30 @@ export const TopRow: Component = () => {
         /* Tauri context unavailable (tests). */
       });
 
-    void refreshProjects();
+    // Terminal launcher (`raum <dir>`), already-running case: a second
+    // invocation emits this with the resolved absolute directory path.
+    listen<string>("cli-open-project", (ev) => {
+      void handleCliOpen(ev.payload);
+    })
+      .then((u) => {
+        unlistenCliOpen = u;
+      })
+      .catch(() => {
+        /* Tauri context unavailable (tests). */
+      });
+
+    void refreshProjects().then(() => {
+      // Cold-start case: drain the directory captured before the window
+      // mounted. After the project list is loaded so an existing project is
+      // recognised rather than re-prompted.
+      void invoke<string | null>("cli_take_pending_open")
+        .then((path) => {
+          if (path) void handleCliOpen(path);
+        })
+        .catch(() => {
+          /* Tauri context unavailable (tests). */
+        });
+    });
     // Atomic rehydration: seed both stores from a single snapshot so
     // memos don't render `0 0 0` for the window between `refreshAgents`
     // and `refreshTerminals` settling. Subscriptions above attach
@@ -651,6 +754,7 @@ export const TopRow: Component = () => {
       unlistenMenu?.();
       unlistenPaneActivity?.();
       unlistenReviewLinks?.();
+      unlistenCliOpen?.();
     });
   });
 
@@ -664,19 +768,20 @@ export const TopRow: Component = () => {
     // Estimates per-tab width from the actual project name length: sigil (28)
     // + padding/gap (~44) + name text at monospace ~8px/char + branch badge (~48).
     let total = 0;
-    for (const p of projectStore.items) {
+    const shown = visibleProjects();
+    for (const p of shown) {
       const nameLen = (p.name || p.slug).length;
       total += 28 + 44 + nameLen * 8 + 48;
     }
     // inter-tab gap-0.5 (2px) + trailing "+" add-project button (~28px)
-    return total + Math.max(0, projectStore.items.length - 1) * 2 + 28;
+    return total + Math.max(0, shown.length - 1) * 2 + 28;
   };
 
   const evaluateCompact = () => {
     if (!headerRef || !leftSectionRef || !rightSectionRef || !tabsScrollRef) {
       return;
     }
-    const tabCount = projectStore.items.length;
+    const tabCount = visibleProjects().length;
     if (tabCount === 0) return;
     const headerWidth = headerRef.clientWidth;
     const leftWidth = leftSectionRef.scrollWidth;
@@ -709,10 +814,10 @@ export const TopRow: Component = () => {
     onCleanup(() => obs.disconnect());
   });
 
-  // Re-evaluate when projects are added/removed — ResizeObserver won't fire
+  // Re-evaluate when the visible tab set changes — ResizeObserver won't fire
   // since the center section's width doesn't change with tab count.
   createEffect(() => {
-    projectStore.items.length;
+    void visibleProjects().length;
     if (typeof requestAnimationFrame !== "undefined") {
       requestAnimationFrame(evaluateCompact);
     } else {
@@ -748,7 +853,7 @@ export const TopRow: Component = () => {
       const idx = i - 1;
       unregs.push(
         keymap.register(`select-project-${i}`, () => {
-          const target = projectStore.items[idx];
+          const target = visibleProjects()[idx];
           if (target) {
             setActiveProjectSlug(target.slug);
             setSelectedFilter("active");
@@ -766,7 +871,7 @@ export const TopRow: Component = () => {
 
   function cycleTab(dir: 1 | -1): () => void {
     return () => {
-      const items = projectStore.items;
+      const items = visibleProjects();
       if (items.length === 0) return;
       const current = activeProjectSlug();
       const idx = items.findIndex((p) => p.slug === current);
@@ -809,6 +914,17 @@ export const TopRow: Component = () => {
     } catch (e) {
       console.warn("project_remove failed", e);
     }
+  }
+
+  // Bring a suspended/shelved (or freshly-registered) project into the
+  // foreground: make it active AND drop any cross-project spotlight / non-active
+  // filter, mirroring a normal tab click. Without the filter+spotlight reset the
+  // grid would keep painting the previous (cross-project) view and the project
+  // the user just reopened would never actually surface.
+  function reopenAndFocus(slug: string): void {
+    reopenProject(slug);
+    setSelectedFilter("active");
+    setCrossProjectViewMode(null);
   }
 
   // Toggle a cross-project view from a clickable counter on the right side of
@@ -1033,7 +1149,7 @@ export const TopRow: Component = () => {
               aria-label="Projects"
               data-testid="project-tabs"
             >
-              <For each={projectStore.items}>
+              <For each={visibleProjects()}>
                 {(project) => (
                   <ProjectTab
                     project={project}
@@ -1046,26 +1162,47 @@ export const TopRow: Component = () => {
                       setCrossProjectViewMode(null);
                     }}
                     onRemove={() => setConfirmRemove(project)}
+                    onHide={() => void setProjectHidden(project.slug, true)}
                   />
                 )}
               </For>
-              <Tooltip>
-                <TooltipTrigger
+              <DropdownMenu>
+                <DropdownMenuTrigger
                   as={Button}
                   type="button"
                   variant="ghost"
                   size="icon-sm"
                   class="h-7 w-7 text-muted-foreground hover:text-foreground"
-                  onClick={() => setModalOpen(true)}
-                  aria-label="Add project"
+                  aria-label="Add or reopen projects"
                   data-testid="add-project-button"
                 >
                   <PlusIcon class="size-3.5" />
-                </TooltipTrigger>
-                <TooltipPortal>
-                  <TooltipContent>Add project</TooltipContent>
-                </TooltipPortal>
-              </Tooltip>
+                </DropdownMenuTrigger>
+                <DropdownMenuPortal>
+                  <DropdownMenuContent class="min-w-52">
+                    <DropdownMenuItem onSelect={() => setModalOpen(true)}>
+                      <PlusIcon class="size-3.5" />
+                      New project…
+                    </DropdownMenuItem>
+                    <Show when={otherProjects().length > 0}>
+                      <DropdownMenuSeparator />
+                      <div class="px-2 py-1 text-[10px] uppercase tracking-wider text-muted-foreground">
+                        Other projects
+                      </div>
+                      <For each={otherProjects()}>
+                        {(project) => (
+                          <DropdownMenuItem onSelect={() => reopenAndFocus(project.slug)}>
+                            <span class="font-mono" style={{ color: project.color }}>
+                              {project.sigil}
+                            </span>
+                            <span class="truncate">{project.name || project.slug}</span>
+                          </DropdownMenuItem>
+                        )}
+                      </For>
+                    </Show>
+                  </DropdownMenuContent>
+                </DropdownMenuPortal>
+              </DropdownMenu>
             </nav>
           </Scrollable>
         </div>
@@ -1320,7 +1457,15 @@ export const TopRow: Component = () => {
         </div>
       </header>
 
-      <AddProjectModal open={modalOpen()} onClose={() => setModalOpen(false)} />
+      <AddProjectModal
+        open={modalOpen()}
+        initialRootPath={pendingAddProjectPath()}
+        onRegistered={(p) => reopenAndFocus(p.slug)}
+        onClose={() => {
+          setModalOpen(false);
+          clearPendingAddProject();
+        }}
+      />
 
       <Dialog
         open={!!confirmRemove()}

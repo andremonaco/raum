@@ -59,6 +59,7 @@ function seedProjects(): void {
       rootPath: "/tmp/alpha",
       inRepoSettings: false,
       hasRaumToml: false,
+      hidden: false,
     },
     {
       slug: "beta",
@@ -68,6 +69,7 @@ function seedProjects(): void {
       rootPath: "/tmp/beta",
       inRepoSettings: false,
       hasRaumToml: false,
+      hidden: false,
     },
   ]);
   setActiveProjectSlug("alpha");

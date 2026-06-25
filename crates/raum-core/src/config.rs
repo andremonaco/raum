@@ -472,6 +472,11 @@ pub struct ProjectConfig {
     /// Whether hydration/worktree edits should be written to `.raum.toml`
     /// (when a committed one is present) instead of this file.
     pub in_repo_settings: bool,
+    /// Manually shelved from the top-bar tab list (non-destructive). Auto-suspend
+    /// of session-less projects is derived in the frontend and never written
+    /// here. Persisted only when `true` so existing files round-trip unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
     // Nested tables follow.
     pub hydration: HydrationManifest,
     pub worktree: WorktreeConfig,
@@ -489,6 +494,7 @@ impl Default for ProjectConfig {
             color: "#7dd3fc".into(),
             sigil: None,
             in_repo_settings: false,
+            hidden: false,
             hydration: HydrationManifest::default(),
             worktree: WorktreeConfig::default(),
             agent_defaults: AgentDefaults::default(),
@@ -792,6 +798,34 @@ mod tests {
             ..ProjectConfig::default()
         };
         roundtrip(p);
+    }
+
+    #[test]
+    fn project_config_hidden_roundtrips_and_skips_when_false() {
+        // A visible project never gains a `hidden` line (no diff churn for
+        // existing users); a shelved one persists and round-trips.
+        let visible = ProjectConfig {
+            slug: "acme".into(),
+            name: "Acme".into(),
+            root_path: PathBuf::from("/tmp/acme"),
+            ..ProjectConfig::default()
+        };
+        let raw = toml::to_string_pretty(&visible).expect("serialize");
+        assert!(
+            !raw.contains("hidden"),
+            "default project should not serialize `hidden`, got:\n{raw}"
+        );
+
+        let shelved = ProjectConfig {
+            hidden: true,
+            ..visible
+        };
+        let raw = toml::to_string_pretty(&shelved).expect("serialize");
+        assert!(
+            raw.contains("hidden = true"),
+            "shelved project should serialize `hidden = true`, got:\n{raw}"
+        );
+        roundtrip(shelved);
     }
 
     #[test]

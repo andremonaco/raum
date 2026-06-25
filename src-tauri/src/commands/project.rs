@@ -54,6 +54,9 @@ pub struct ProjectListItem {
     pub root_path: String,
     pub in_repo_settings: bool,
     pub has_raum_toml: bool,
+    /// Manually shelved from the top-bar tab list. Auto-suspend of session-less
+    /// projects is derived in the frontend and not reflected here.
+    pub hidden: bool,
 }
 
 impl ProjectListItem {
@@ -66,6 +69,7 @@ impl ProjectListItem {
             root_path: project.root_path.to_string_lossy().into_owned(),
             in_repo_settings: project.in_repo_settings,
             has_raum_toml,
+            hidden: project.hidden,
         }
     }
 }
@@ -86,6 +90,9 @@ pub struct ProjectUpdate {
     pub sigil: Option<String>,
     #[serde(default)]
     pub in_repo_settings: Option<bool>,
+    /// Manual shelve toggle. `None` = no change.
+    #[serde(default)]
+    pub hidden: Option<bool>,
     #[serde(default)]
     pub hydration: Option<HydrationManifest>,
     #[serde(default)]
@@ -256,6 +263,44 @@ pub fn project_list(
     Ok(out)
 }
 
+/// Look up a registered project by filesystem path.
+///
+/// Backs the terminal-launch flow (`raum <dir>`): the frontend hands the
+/// resolved absolute path here and we report whether it already maps to a
+/// project so the UI can focus that tab instead of re-running the add-project
+/// flow. Both the query path and each project's `root_path` are canonicalized
+/// before comparison so symlinks / `..` / trailing slashes can't cause a false
+/// miss. Returns `Ok(None)` when the path resolves to no registered project
+/// (including when it cannot be canonicalized).
+#[tauri::command]
+pub fn project_find_by_path(
+    state: tauri::State<'_, AppHandleState>,
+    path: String,
+) -> Result<Option<ProjectListItem>, String> {
+    let Ok(target) = std::fs::canonicalize(&path) else {
+        return Ok(None);
+    };
+    let store = state
+        .config_store
+        .lock()
+        .map_err(|e| format!("config_store lock: {e}"))?;
+    let slugs = store
+        .list_project_slugs()
+        .map_err(|e| format!("list_project_slugs: {e}"))?;
+    for slug in slugs {
+        let Ok(Some(project)) = store.read_project(&slug) else {
+            continue;
+        };
+        if std::fs::canonicalize(&project.root_path).is_ok_and(|p| p == target) {
+            let has_raum_toml = store
+                .read_raum_toml(&project.root_path)
+                .is_ok_and(|o| o.is_some());
+            return Ok(Some(ProjectListItem::from_project(&project, has_raum_toml)));
+        }
+    }
+    Ok(None)
+}
+
 /// §5.4 / §5.2 — partial update of the user-level `project.toml`. Only the
 /// fields the UI supplies are overwritten. `.raum.toml` is never touched here.
 ///
@@ -279,6 +324,7 @@ pub fn project_update<R: Runtime>(
 
     let previous_color = project.color.clone();
     let previous_sigil = resolve_sigil(&project.slug, project.sigil.as_deref());
+    let previous_hidden = project.hidden;
     if let Some(name) = update.name {
         project.name = name;
     }
@@ -297,6 +343,9 @@ pub fn project_update<R: Runtime>(
     }
     if let Some(flag) = update.in_repo_settings {
         project.in_repo_settings = flag;
+    }
+    if let Some(flag) = update.hidden {
+        project.hidden = flag;
     }
     if let Some(hydration) = update.hydration {
         project.hydration = hydration;
@@ -337,6 +386,18 @@ pub fn project_update<R: Runtime>(
             }),
         ) {
             tracing::warn!(slug = %project.slug, error = %e, "project-sigil-changed emit failed");
+        }
+    }
+
+    if project.hidden != previous_hidden {
+        if let Err(e) = app.emit(
+            "project-visibility-changed",
+            serde_json::json!({
+                "slug": project.slug,
+                "hidden": project.hidden,
+            }),
+        ) {
+            tracing::warn!(slug = %project.slug, error = %e, "project-visibility-changed emit failed");
         }
     }
 
@@ -723,6 +784,11 @@ mod tests {
         assert_eq!(item.name, "Acme");
         assert!(item.in_repo_settings);
         assert!(item.has_raum_toml);
+        assert!(!item.hidden);
+
+        project.hidden = true;
+        let item = ProjectListItem::from_project(&project, true);
+        assert!(item.hidden);
     }
 
     #[test]
@@ -800,5 +866,27 @@ mod tests {
         let back = store.read_project(&project.slug).unwrap().unwrap();
         assert_eq!(back.color, "#ff00ff");
         assert_eq!(back.name, project.name);
+    }
+
+    #[test]
+    fn partial_update_sets_hidden_without_touching_other_fields() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let store = build_store(&dir.path().join("cfg"));
+
+        let project = project_with_defaults("Acme", repo);
+        store.write_project(&project).unwrap();
+        assert!(!store.read_project(&project.slug).unwrap().unwrap().hidden);
+
+        // Mimic `project_update` with only `hidden` set.
+        let mut reloaded = store.read_project(&project.slug).unwrap().unwrap();
+        reloaded.hidden = true;
+        store.write_project(&reloaded).unwrap();
+
+        let back = store.read_project(&project.slug).unwrap().unwrap();
+        assert!(back.hidden);
+        assert_eq!(back.name, project.name);
+        assert_eq!(back.color, project.color);
     }
 }

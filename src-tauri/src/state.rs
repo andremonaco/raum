@@ -1,6 +1,7 @@
 //! Tauri-managed shared state. Wave 2 fills in TmuxManager / agent registry / etc.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -16,6 +17,13 @@ use crate::commands::harness_runtime::HarnessRuntimeRegistry;
 /// additions additive so parallel waves don't clobber each other.
 pub struct AppHandleState {
     pub config_store: Mutex<ConfigStore>,
+    /// Directory passed on the command line at a *cold* launch (`raum <dir>`),
+    /// resolved to an absolute path by `cli::parse_open_path` in `run()` before
+    /// the window mounts. The frontend drains this once on boot via
+    /// `cli_take_pending_open` and opens/focuses the project. `None` for a plain
+    /// `raum` launch. The already-running case takes a different path entirely
+    /// (the single-instance callback emits `cli-open-project`).
+    pub pending_cli_open: Mutex<Option<PathBuf>>,
     /// §3 — owns the `-L raum` tmux socket. Wrapped in `Arc` so we can hand
     /// clones to per-session background tasks without taking the Mutex.
     pub tmux: Arc<TmuxManager>,
@@ -133,6 +141,7 @@ impl Default for AppHandleState {
     fn default() -> Self {
         Self {
             config_store: Mutex::new(ConfigStore::default()),
+            pending_cli_open: Mutex::new(None),
             tmux: Arc::new(TmuxManager::default()),
             terminals: Mutex::new(crate::commands::terminal::TerminalRegistry::default()),
             agents: Mutex::new(AgentRegistry::with_defaults()),

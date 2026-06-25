@@ -54,6 +54,32 @@ You can also skip the wizard at any step — raum flips
 `config.onboarded = true` and never reopens it. The "Add project" (`+`) tab
 at the top still works afterwards.
 
+### Open a project from the terminal
+
+Once the `raum` command is on your `PATH`, you can open any directory straight
+from a shell — like `code .`:
+
+```bash
+raum .                 # open the current directory
+raum ~/dev/some-repo   # open a specific path
+```
+
+If the directory is already a registered project, raum focuses its tab
+(un-shelving it if it was hidden). If it's new, raum opens the **Add project**
+dialog pre-filled with that path so you confirm the name and color — the same
+flow as adding from the UI. The command launches the app detached, so your shell
+prompt returns immediately.
+
+Getting the `raum` command on `PATH`:
+
+- **Homebrew (macOS)** — installed automatically by the cask; `brew upgrade`
+  keeps it current.
+- **`.dmg` drag-install (macOS)** — open raum, then the menu
+  **raum → Install 'raum' Command in PATH**. It drops a small launcher into
+  `/usr/local/bin` (falling back to `~/.local/bin`).
+- **Linux `.deb`** — the `raum` binary is already on `PATH`; `raum .` works out
+  of the box. (Background it with `raum . &` to free the shell.)
+
 ## 3. Spawn your first agent
 
 Once a project is selected in the top row:

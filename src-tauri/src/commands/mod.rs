@@ -4,6 +4,7 @@
 
 pub mod agent;
 pub mod agent_hydrate;
+pub mod cli;
 pub mod config;
 pub mod devtools;
 pub mod files;

@@ -26,6 +26,13 @@ use tracing::{info, warn};
 #[cfg(target_os = "macos")]
 const MENU_ID_OPEN_SETTINGS: &str = "open-settings";
 
+/// ID of the "Install 'raum' Command in PATH" item in the macOS app submenu.
+/// Clicking it emits `menu-action` with this payload; the frontend routes it to
+/// the `cli_install_shim` command so users who drag the `.app` out of the DMG
+/// get the `raum <dir>` terminal command (Homebrew users get it via the cask).
+#[cfg(target_os = "macos")]
+const MENU_ID_INSTALL_CLI: &str = "install-cli";
+
 /// Bump `RLIMIT_NOFILE` to the hard cap on macOS.
 ///
 /// GUI apps launched by Finder/Dock inherit launchd's soft limit (256 by
@@ -100,9 +107,23 @@ pub fn run() {
     // login shell once here, before any `which::which()` call runs.
     path_env::augment_process_path();
 
+    // Capture an optional `raum <dir>` argument for a *cold* launch and seed it
+    // into shared state; the frontend drains it on boot via
+    // `cli_take_pending_open`. The already-running case is handled separately by
+    // the single-instance callback below (it emits `cli-open-project`).
+    let app_state = state::AppHandleState::default();
+    if let Some(path) = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| cli::parse_open_path(std::env::args().skip(1), &cwd))
+    {
+        if let Ok(mut guard) = app_state.pending_cli_open.lock() {
+            *guard = Some(path);
+        }
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_decorum::init())
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
             // §2.5 — duplicate launch focuses the existing window instead of
             // opening a new one. The callback fires on the already-running
             // instance; the duplicate process exits with status 0 after.
@@ -114,6 +135,17 @@ pub fn run() {
                 }
             } else {
                 warn!("single-instance: main window not found");
+            }
+            // `raum <dir>` from a second invocation: resolve the directory
+            // against the *second* process's CWD and hand the absolute path to
+            // the frontend, which focuses an existing project or starts the add
+            // flow for a new one.
+            if let Some(path) =
+                cli::parse_open_path(argv.iter().skip(1), std::path::Path::new(&cwd))
+            {
+                if let Err(e) = app.emit("cli-open-project", path.to_string_lossy().into_owned()) {
+                    warn!(error = %e, "single-instance: cli-open-project emit failed");
+                }
             }
         }))
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -136,9 +168,13 @@ pub fn run() {
                 warn!(menu_id = %id, error = %e, "menu-action emit failed");
             }
         })
-        .manage(state::AppHandleState::default())
+        .manage(app_state)
         .invoke_handler(tauri::generate_handler![
             commands::ping,
+            // Terminal-launch bridge (`raum <dir>`): cold-start drain + the
+            // "Install 'raum' Command in PATH" action.
+            commands::cli::cli_take_pending_open,
+            commands::cli::cli_install_shim,
             commands::config_get,
             commands::config_mark_onboarded,
             commands::active_layout_get,
@@ -199,6 +235,7 @@ pub fn run() {
             commands::permission::reply_permission,
             // §5.4 — project command surface (Wave 3B).
             commands::project::project_register,
+            commands::project::project_find_by_path,
             commands::project::project_list,
             commands::project::project_update,
             commands::project::project_remove,
@@ -309,6 +346,23 @@ pub fn run() {
 
             // Show after all titlebar setup to avoid flashing native chrome.
             main_window.show().unwrap();
+
+            // A terminal cold-launch (`raum <dir>`) execs the bundled binary
+            // directly — the macOS `raum-cli` wrapper uses `nohup … &`, not
+            // LaunchServices — so the process is not made frontmost
+            // automatically and `show()` alone doesn't activate the app. When a
+            // CLI directory is pending, activate the window the same way the
+            // already-running path does, otherwise the requested project opens
+            // *behind* the terminal the user typed into. Peek (don't drain) the
+            // pending slot; the frontend drains it via `cli_take_pending_open`.
+            if app
+                .state::<state::AppHandleState>()
+                .pending_cli_open
+                .lock()
+                .is_ok_and(|g| g.is_some())
+            {
+                let _ = main_window.set_focus();
+            }
 
             // §12.3 — register the three OS-level global shortcuts. Their
             // accelerators can be overridden via keybindings.toml; we look them
@@ -982,6 +1036,10 @@ fn build_app_menu<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<Menu<R
             .accelerator("Cmd+,")
             .build(app)?;
 
+        let install_cli_item =
+            MenuItemBuilder::with_id(MENU_ID_INSTALL_CLI, "Install 'raum' Command in PATH")
+                .build(app)?;
+
         let app_submenu = SubmenuBuilder::new(app, "raum")
             .item(&PredefinedMenuItem::about(
                 app,
@@ -990,6 +1048,7 @@ fn build_app_menu<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<Menu<R
             )?)
             .separator()
             .item(&settings_item)
+            .item(&install_cli_item)
             .separator()
             .services()
             .separator()

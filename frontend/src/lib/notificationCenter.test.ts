@@ -47,6 +47,7 @@ function seedProject(slug: string, name: string, sigil: string): void {
     rootPath: `/tmp/${slug}`,
     inRepoSettings: false,
     hasRaumToml: false,
+    hidden: false,
   });
 }
 
