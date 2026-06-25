@@ -93,6 +93,14 @@ export const Sidebar: Component = () => {
   // Rendered outside the provider (e.g. in unit tests), `useKeymap` returns
   // a no-op API so this is a safe call.
   useKeymapAction("toggle-sidebar", () => setCollapsed((v) => !v));
+  // `new-worktree` (⌘⇧N) + the spotlight "New worktree" command both land
+  // here: open the create-worktree modal for the active project (same as the
+  // sidebar "+" button). No-op when no project is active. Previously the
+  // accelerator and palette row were dead (no registered handler).
+  useKeymapAction("new-worktree", () => {
+    const slug = activeProjectSlug();
+    if (slug) setCreateModalSlug(slug);
+  });
 
   // Persist width back to `config.toml` exactly once per drag (on pointer-up
   // via `ResizeHandle.onCommit`). Skip any write that would echo the value we

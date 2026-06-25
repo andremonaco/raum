@@ -148,6 +148,34 @@ const EDGE_EXIT_FRACTION = 0.3;
 const ROOT_ENTER_MARGIN = 72;
 const ROOT_EXIT_MARGIN = 120;
 
+/** Dwell before an edge-split / root-edge preview engages. Sweeping the cursor
+ *  across the drop-zone guides should just light them up; only a deliberate
+ *  short hold reflows the grid into that gap (so the layout doesn't thrash as
+ *  the pointer crosses zones). The center/review snap keeps its own
+ *  `armDelayMs` instead. 140ms is long enough to feel intentional, short
+ *  enough not to feel laggy. Exported for tests. */
+export const EDGE_PREVIEW_DWELL_MS = 140;
+
+/**
+ * Identity of the current "drop intent" for the dwell timer. Each kind of
+ * commit gets its own dwell, keyed on `(targetId, zone)` so sweeping between
+ * zones restarts the hold and sitting on one carries `armed` forward:
+ *   • `center:<id>` — the cross-harness review snap (a real sibling pane).
+ *   • `edge:<id>:<zone>` — an edge split (real pane) or root-edge wrap.
+ * Returns null when there's no committable intent this frame.
+ */
+function dwellKeyOf(
+  snapped: boolean,
+  targetId: string | RootTargetSentinel | null,
+  zone: DropZone | null,
+): string | null {
+  if (targetId === null || zone === null) return null;
+  if (snapped) {
+    return targetId !== ROOT_TARGET && zone === "center" ? `center:${targetId}` : null;
+  }
+  return zone === "center" ? null : `edge:${String(targetId)}:${zone}`;
+}
+
 /**
  * Minimal cell shape used for hit-testing. Structurally compatible with
  * the store's `RuntimeCell` so callers can pass cells directly without
@@ -252,44 +280,38 @@ export function beginDrag(opts: BeginDragOptions): void {
     escapedTargetId: null,
   });
 
-  // Pending dwell timer + the target it was scheduled against. Both must
+  // Pending dwell timer + the intent key it was scheduled against. Both must
   // line up at fire time — if the user has retargeted or unsnapped, the
   // late callback is a no-op. Tracked outside `dragState` so cancellations
   // are O(1) and don't churn the reactive signal.
   let armTimerId: ReturnType<typeof setTimeout> | null = null;
-  let armTimerTargetId: string | null = null;
+  let armTimerKey: string | null = null;
 
   function clearArmTimer(): void {
     if (armTimerId !== null) {
       clearTimeout(armTimerId);
       armTimerId = null;
-      armTimerTargetId = null;
+      armTimerKey = null;
     }
   }
 
-  function scheduleArmFor(targetId: string): void {
+  function scheduleArmFor(key: string, delay: number): void {
     clearArmTimer();
-    if (armDelayMs === 0) return; // instant arm path skips the timer
-    armTimerTargetId = targetId;
+    if (delay === 0) return; // instant arm path skips the timer
+    armTimerKey = key;
     armTimerId = setTimeout(() => {
       armTimerId = null;
       const cur = dragState();
-      // Only flip armed=true if the snap is still engaged on the SAME
-      // target the timer was scheduled against. Re-target / release
-      // between scheduling and firing must cancel the arm — the late
-      // callback would otherwise commit a destructive review against a
-      // pane the user is no longer hovering.
-      if (
-        cur &&
-        cur.snapped &&
-        cur.targetId === armTimerTargetId &&
-        cur.targetId !== ROOT_TARGET &&
-        !cur.armed
-      ) {
+      // Only flip armed=true if the SAME drop intent is still active. A
+      // re-target / release / zone change between scheduling and firing
+      // must cancel the arm — the late callback would otherwise engage a
+      // preview (or commit a destructive review) against a zone the user
+      // has already left.
+      if (cur && !cur.armed && dwellKeyOf(cur.snapped, cur.targetId, cur.zone) === armTimerKey) {
         setDragState({ ...cur, armed: true });
       }
-      armTimerTargetId = null;
-    }, armDelayMs);
+      armTimerKey = null;
+    }, delay);
   }
 
   // rAF throttle for pointermove. Trackpads fire pointermove at 120+ Hz;
@@ -389,47 +411,41 @@ export function beginDrag(opts: BeginDragOptions): void {
       nextEscapedTargetId = null;
     }
 
-    // Dwell-to-arm state machine. Three transitions matter:
-    //   • RELEASE      (snap was on, now off)               → cancel
-    //                                                         timer,
-    //                                                         armed=false.
-    //   • FRESH ENGAGE (snap was off OR target changed)     → cancel
-    //                                                         old timer,
-    //                                                         schedule
-    //                                                         new one
-    //                                                         (or arm
-    //                                                         instantly
-    //                                                         when
-    //                                                         delay=0).
-    //   • HOLD         (snap on same target as last frame)  → keep
-    //                                                         prev.armed
-    //                                                         and the
-    //                                                         already-
-    //                                                         scheduled
-    //                                                         timer.
-    // Carrying `prev.armed` through the HOLD branch is critical: any
-    // pointermove inside the snap interior would otherwise reset armed
-    // to false, defeating the dwell entirely.
-    const wasSnappedSameTarget =
-      prev?.snapped === true && prev?.targetId === outTargetId && outTargetId !== null;
+    // Dwell-to-arm state machine, keyed on the drop intent (`dwellKeyOf`) so
+    // it covers BOTH the center/review snap and edge/root splits with one set
+    // of transitions:
+    //   • RELEASE      (no intent this frame)        → cancel timer, armed=false.
+    //   • FRESH ENGAGE (intent key changed)          → cancel old timer,
+    //                                                   schedule a new one (or
+    //                                                   arm instantly when the
+    //                                                   delay is 0).
+    //   • HOLD         (same intent as last frame)   → keep prev.armed and the
+    //                                                   already-scheduled timer.
+    // Carrying `prev.armed` through HOLD is critical: any pointermove within
+    // the same zone would otherwise reset armed to false, defeating the dwell.
+    // Center uses the configured review `armDelayMs` (often 0 — instant);
+    // edge/root splits use `EDGE_PREVIEW_DWELL_MS` so the reflow waits for a
+    // deliberate hold.
+    const curKey = dwellKeyOf(snapped, outTargetId, outZone);
+    const prevKey = prev ? dwellKeyOf(prev.snapped, prev.targetId, prev.zone) : null;
+    const dwellDelay = curKey?.startsWith("center:") ? armDelayMs : EDGE_PREVIEW_DWELL_MS;
 
     let armed = false;
     let armStartedAtMs: number | null = null;
-    if (snapped && outTargetId !== null && outTargetId !== ROOT_TARGET) {
-      if (wasSnappedSameTarget) {
+    if (curKey !== null) {
+      if (curKey === prevKey) {
         armed = prev?.armed ?? false;
         armStartedAtMs = prev?.armStartedAtMs ?? null;
       } else {
-        // FRESH ENGAGE: either initial entry, retarget to a different
-        // pane, or re-entry after a release. Restart the dwell from 0.
-        armed = armDelayMs === 0;
-        armStartedAtMs = armDelayMs === 0 ? null : Date.now();
-        scheduleArmFor(outTargetId as string);
+        // FRESH ENGAGE: initial entry, retarget, zone change, or re-entry
+        // after a release. Restart the dwell from 0.
+        armed = dwellDelay === 0;
+        armStartedAtMs = dwellDelay === 0 ? null : Date.now();
+        scheduleArmFor(curKey, dwellDelay);
       }
     } else {
-      // RELEASE (or no snap to begin with). Make sure no timer can
-      // resurrect the arm against a stale target after the user has
-      // moved on.
+      // RELEASE (or no intent to begin with). Make sure no timer can
+      // resurrect the arm against a stale zone after the user has moved on.
       clearArmTimer();
     }
 
@@ -483,8 +499,28 @@ export function beginDrag(opts: BeginDragOptions): void {
       snapped: final?.snapped ?? false,
       armed: final?.armed ?? false,
     };
+
+    // FLIP setup — capture the dragged pane's CURRENT visual rect (with the
+    // `--drag-dx/--drag-dy` translate still applied) BEFORE we clear the drag
+    // state. `committedLands` is true only for the gestures that actually
+    // relocate the source pane (edge-split / root-edge move); a center
+    // review or a cancelled drop leaves the source in place, so there's
+    // nothing to glide and we skip the FLIP. See `flipPaneOnDrop`.
+    const direction = result.zone ? zoneFromResult(result.zone) : null;
+    const committedLands =
+      result.targetId !== null && direction !== null && result.sourceId !== result.targetId;
+    const flip = committedLands ? captureFlipFirsts(rootEl, sourceId) : null;
+
+    // `cleanup()` strips the drag transform + `.pane-dragging` class and nulls
+    // `dragState`; `onDrop()` then commits the new layout (the store write
+    // moves the pane's slot synchronously, but the DOM reflects it on the
+    // next frame). Running the FLIP AFTER both means we measure the pane's
+    // committed slot and animate the captured-vs-committed delta back to
+    // identity — the released pane glides into place instead of popping from
+    // the scale(0.4) snap thumbnail to full size.
     cleanup();
     onDrop(result);
+    if (flip) for (const f of flip) playFlip(f);
   }
 
   function onCancel(): void {
@@ -583,6 +619,136 @@ export function beginDrag(opts: BeginDragOptions): void {
 /** Force-cancel the current drag if any. */
 export function cancelDrag(): void {
   if (activeCleanup) activeCleanup();
+}
+
+// ---- FLIP on drop ---------------------------------------------------------
+//
+// "FLIP" = First, Last, Invert, Play. On release we want the dragged pane to
+// GLIDE from where the cursor left it into its committed slot, instead of the
+// old behaviour where `.is-snapped`'s `scale(0.4)` thumbnail snapped straight
+// to the full-size committed rect (a jarring teleport). The technique:
+//   • FIRST  — measure the pane's on-screen rect while the drag transform is
+//              still applied (captured in `onUp` before `cleanup()`).
+//   • LAST   — after the layout commit, measure the pane's resting rect.
+//   • INVERT — apply a transform that visually puts the pane back at FIRST.
+//   • PLAY   — next frame, transition that transform to identity, so the pane
+//              slides FIRST → LAST under the settle curve.
+// Position/scale only — no rotation; terminals must stay axis-aligned.
+
+/** Settle curve + duration for the FLIP glide. Mirrors the unified layout
+ *  reflow timing in styles.css (`--motion-ease` at 160 ms) so a released
+ *  pane decelerates exactly like its reflowing siblings. */
+const FLIP_DURATION_MS = 160;
+const FLIP_EASE = "cubic-bezier(0.2, 0.9, 0.25, 1)";
+
+interface FlipFirst {
+  el: HTMLElement;
+  /** Visual rect (incl. drag transform + snap scale) at release. */
+  first: DOMRect;
+  /** True for the live xterm surface frame. The surface gets a
+   *  position-only glide (no scale) so its canvas glyphs don't shear/
+   *  stretch when the landing slot differs in size from the lifted
+   *  source; the chrome frame keeps the full translate+scale FLIP. */
+  positionOnly: boolean;
+}
+
+/** Map a drop result's zone back to a layout direction, or null for the
+ *  review/center zone (which never relocates the source pane). */
+function zoneFromResult(zone: DropZone): "top" | "right" | "bottom" | "left" | null {
+  return zone === "center" ? null : zone;
+}
+
+/** FIRST: grab EVERY frame the dragged pane owns — both the chrome card
+ *  (`.terminal-chrome-frame`) and the live xterm surface
+ *  (`.terminal-surface-frame`) carry `.leaf-frame[data-cell-id]`. A naive
+ *  `querySelector` returns whichever paints first in the DOM (the surface),
+ *  so the visible header/border would settle on a different timeline than
+ *  the terminal pixels — the "not locked together" double-settle. Capturing
+ *  and gliding BOTH keeps the layers in lockstep. Returns null if no frame
+ *  is in the DOM. */
+function captureFlipFirsts(rootEl: HTMLElement, sourceId: string): FlipFirst[] | null {
+  const els = rootEl.querySelectorAll<HTMLElement>(
+    `.leaf-frame[data-cell-id="${cssEscape(sourceId)}"]`,
+  );
+  if (els.length === 0) return null;
+  const out: FlipFirst[] = [];
+  els.forEach((el) =>
+    out.push({
+      el,
+      first: el.getBoundingClientRect(),
+      positionOnly: el.classList.contains("terminal-surface-frame"),
+    }),
+  );
+  return out;
+}
+
+/** LAST + INVERT + PLAY. Measures the committed rect, applies the inverse
+ *  translate/scale instantly, then animates back to identity next frame.
+ *  Skipped under a reduced-motion preference — the pane simply appears in its
+ *  committed slot (no glide), matching the CSS reduced-motion collapse. */
+function playFlip({ el, first, positionOnly }: FlipFirst): void {
+  if (
+    typeof window !== "undefined" &&
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(prefers-reduced-motion: reduce)").matches
+  ) {
+    return;
+  }
+  // Defer one frame so the store commit has flushed to the DOM and the
+  // pane sits at its LAST (committed) position before we measure.
+  requestAnimationFrame(() => {
+    const last = el.getBoundingClientRect();
+    if (last.width === 0 || last.height === 0) return; // pane gone (e.g. closed)
+    const dx = first.left - last.left;
+    const dy = first.top - last.top;
+    // Surface (xterm) frames glide position-only so glyphs don't shear; the
+    // chrome card scales from its lifted size into the committed slot.
+    const sx = positionOnly ? 1 : first.width / last.width;
+    const sy = positionOnly ? 1 : first.height / last.height;
+    // Skip imperceptible deltas — avoids a no-op transition that could fight
+    // the next genuine layout change.
+    if (
+      Math.abs(dx) < 0.5 &&
+      Math.abs(dy) < 0.5 &&
+      Math.abs(sx - 1) < 0.01 &&
+      Math.abs(sy - 1) < 0.01
+    ) {
+      return;
+    }
+    // INVERT — put the pane visually back at FIRST. transform-origin top-left
+    // so the translate + scale compose cleanly off the rect's corner.
+    el.style.transformOrigin = "top left";
+    el.style.transition = "none";
+    el.style.transform = `translate(${dx}px, ${dy}px) scale(${sx}, ${sy})`;
+    // Force a style flush so the browser registers the INVERT before we swap
+    // to the PLAY transition (without this the two writes coalesce and no
+    // animation runs).
+    void el.getBoundingClientRect();
+    // PLAY — next frame, ease the transform back to identity.
+    requestAnimationFrame(() => {
+      el.style.transition = `transform ${FLIP_DURATION_MS}ms ${FLIP_EASE}`;
+      el.style.transform = "translate(0, 0) scale(1)";
+      const clear = (): void => {
+        el.style.transition = "";
+        el.style.transform = "";
+        el.style.transformOrigin = "";
+        el.removeEventListener("transitionend", clear);
+      };
+      el.addEventListener("transitionend", clear);
+      // Safety net: if the transitionend never fires (interrupted by another
+      // layout mutation), clear the inline overrides after the duration so
+      // the pane doesn't get stuck with a stale inline transform.
+      setTimeout(clear, FLIP_DURATION_MS + 60);
+    });
+  });
+}
+
+/** Minimal CSS.escape shim for attribute-selector safety. Pane ids are
+ *  app-generated (`cell-N`) so this only guards against an unexpected quote;
+ *  prefer the native API when present. */
+function cssEscape(value: string): string {
+  if (typeof CSS !== "undefined" && typeof CSS.escape === "function") return CSS.escape(value);
+  return value.replace(/["\\]/g, "\\$&");
 }
 
 // ---- hit-testing ----------------------------------------------------------

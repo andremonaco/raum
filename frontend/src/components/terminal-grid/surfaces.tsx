@@ -78,6 +78,15 @@ export const TerminalSurfaceHost: Component<{ surface: TerminalSurfaceDescriptor
     const s = dragState();
     return s?.snapped === true && s.targetId !== null && s.targetId !== ROOT_TARGET;
   });
+  // Mirror the chrome's edge-snap dock so the live terminal pixels click into
+  // the landing slot alongside their card.
+  const isEdgeSnappedSource = createMemo(() => {
+    if (!isDragSource()) return false;
+    const s = dragState();
+    return (
+      !!s && s.armed && !s.snapped && s.zone !== null && s.zone !== "center" && s.targetId !== null
+    );
+  });
   const fileDropActive = createMemo(
     () => props.surface.kind !== "shell" && dropTargetPaneId() === props.surface.key,
   );
@@ -153,6 +162,7 @@ export const TerminalSurfaceHost: Component<{ surface: TerminalSurfaceDescriptor
         "pane-max-anim-target": isMaxAnimTarget(),
         "surface-dragging-source": isDragSource(),
         "is-snapped": isSnappedSource(),
+        "is-edge-snapped": isEdgeSnappedSource(),
         "pane-unread-completed": isUnreadCompleted(),
         "file-drop-target": fileDropActive(),
       }}

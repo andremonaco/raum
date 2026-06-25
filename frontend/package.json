@@ -47,6 +47,7 @@
     "@xterm/addon-fit": "latest",
     "@xterm/addon-search": "latest",
     "@xterm/addon-serialize": "latest",
+    "@xterm/addon-web-links": "latest",
     "@xterm/addon-webgl": "latest",
     "@xterm/xterm": "latest",
     "codemirror": "^6.0.2",

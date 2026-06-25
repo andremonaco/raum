@@ -47,18 +47,38 @@ import { addRecentSearch, clearRecentSearch, recentSearches } from "../lib/recen
 import { listHarnessSessions } from "../stores/terminalStore";
 import { activeProjectSlug, projectBySlug, setActiveProjectSlug } from "../stores/projectStore";
 import { resolveSessionTabLabel } from "../lib/harnessTabLabel";
-import { useKeymapAction } from "../lib/keymapContext";
+import { resolveSpawnWorktree } from "../lib/resolveSpawnWorktree";
+import { useKeymap, useKeymapAction } from "../lib/keymapContext";
 import {
   buildPreviewParts,
   runScrollbackSearch,
   type ScrollbackMatch,
 } from "../lib/scrollbackSearch";
 import { listTerminals, type TerminalBufferKind } from "../lib/terminalRegistry";
+import {
+  compactTree,
+  equalizeAllRatios,
+  focusedPaneId,
+  tileAll,
+  toggleMaximize,
+} from "../stores/runtimeLayoutStore";
+// STORE lane (lib/layoutPresets.ts) — imported by exact name; may not exist
+// until that sibling lands. Listed as a consumed contract.
+import { LAYOUT_PRESETS, applyLayoutPreset } from "../lib/layoutPresets";
+import { setPreviewOnboarding } from "../lib/devOnboardingPreview";
+import { emit as emitTauriEvent } from "@tauri-apps/api/event";
 const FileEditorModal = lazy(() =>
   import("./file-editor-modal").then((m) => ({ default: m.FileEditorModal })),
 );
 import { Badge } from "./ui/badge";
-import { ClockIcon, SearchIcon, HARNESS_ICONS, type HarnessIconKind } from "./icons";
+import {
+  ClockIcon,
+  KeyboardIcon,
+  PlayIcon,
+  SearchIcon,
+  HARNESS_ICONS,
+  type HarnessIconKind,
+} from "./icons";
 import { Scrollable } from "./ui/scrollable";
 import { FileTypeIcon } from "../lib/fileTypeIcon";
 import type { Worktree } from "../stores/worktreeStore";
@@ -93,7 +113,84 @@ type HarnessItem = {
 };
 type FileItem = { type: "file"; hit: WorktreeFileHit };
 type ScrollbackItem = { type: "scrollback"; match: ScrollbackMatch };
-type ResultItem = RecentItem | HarnessItem | FileItem | ScrollbackItem;
+/**
+ * A runnable verb in the palette. Sourced from two places (see
+ * `commandItems`): every rebindable keymap entry (so the palette doubles as a
+ * shortcut launcher), plus a curated list of mouse-only actions that have no
+ * accelerator. `run()` performs the action; `accelerator` is the live binding
+ * shown as a trailing kbd (undefined for mouse-only verbs).
+ */
+type CommandItem = {
+  type: "command";
+  /** Stable id used as the fuzzy-match haystack key and dedupe key. */
+  id: string;
+  title: string;
+  accelerator: string | undefined;
+  run: () => void;
+};
+type ResultItem = RecentItem | HarnessItem | FileItem | ScrollbackItem | CommandItem;
+
+// ---------------------------------------------------------------------------
+// Command verbs
+// ---------------------------------------------------------------------------
+
+/** Spawn-harness verbs — dispatched as the same window event TopRow emits. */
+const SPAWN_COMMAND_DEFS: { kind: string; label: string }[] = [
+  { kind: "shell", label: "Spawn shell" },
+  { kind: "claude-code", label: "Spawn Claude Code" },
+  { kind: "codex", label: "Spawn Codex" },
+  { kind: "opencode", label: "Spawn OpenCode" },
+];
+
+/**
+ * Human-friendly titles for the keymap actions we surface as palette rows.
+ * Actions not in this map are skipped — the keymap exposes low-level ids
+ * (e.g. "focus-pane-left") that would just be noise in a command list, so we
+ * opt actions in explicitly rather than dumping the whole table.
+ */
+const KEYMAP_COMMAND_TITLES: Record<string, string> = {
+  "split-pane-right": "Split pane right",
+  "split-pane-down": "Split pane down",
+  "close-pane": "Close pane",
+  "minimize-pane": "Minimize pane",
+  "maximize-pane": "Maximize focused pane",
+  "undo-layout": "Undo layout change",
+  "new-worktree": "New worktree",
+  // Intentionally omitted: "global-search" (the palette IS the search — a row
+  // for it would close+reopen the dock and wipe the query), and
+  // "switch-worktree" (no worktree-switcher UI exists yet, so the row + its
+  // ⌘P accelerator are dead — surface it only once a handler is wired).
+  "cheat-sheet": "Show keyboard shortcuts",
+  "toggle-broadcast": "Toggle synchronize-input",
+  "focus-next-waiting": "Focus next waiting harness",
+  "reset-harness": "Reset harness",
+};
+
+/**
+ * Lightweight subsequence fuzzy match: every char of `needle` must appear in
+ * `haystack` in order. Returns a score (lower = better) favouring early/dense
+ * matches, or -1 for no match. Mirrors the ordering the harness/file lists
+ * already rely on (best first).
+ */
+function fuzzyScore(haystack: string, needle: string): number {
+  if (!needle) return 0;
+  const h = haystack.toLowerCase();
+  const n = needle.toLowerCase();
+  let hi = 0;
+  let score = 0;
+  let prevMatch = -1;
+  for (let ni = 0; ni < n.length; ni++) {
+    const ch = n[ni]!;
+    const found = h.indexOf(ch, hi);
+    if (found === -1) return -1;
+    // Penalise gaps between consecutive matched chars and a late first hit.
+    if (prevMatch >= 0) score += found - prevMatch - 1;
+    else score += found;
+    prevMatch = found;
+    hi = found + 1;
+  }
+  return score;
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -109,6 +206,71 @@ function stateLabel(state: string): string {
   if (state === "working") return "active";
   if (state === "waiting") return "waiting";
   return "idle";
+}
+
+const IS_MAC = typeof navigator !== "undefined" && /Mac/i.test(navigator.platform);
+
+/**
+ * Pretty-print an accelerator string ("CmdOrCtrl+Shift+D") into platform
+ * glyphs ("⌘⇧D" on macOS, "Ctrl+Shift+D" elsewhere). Self-contained so the
+ * palette doesn't depend on the keymap-settings modal's internal helpers.
+ */
+function formatAccelerator(accel: string): string {
+  const tokens = accel
+    .split("+")
+    .map((t) => t.trim())
+    .filter(Boolean);
+  const glyph = (t: string): string => {
+    if (IS_MAC) {
+      switch (t) {
+        case "Meta":
+        case "CmdOrCtrl":
+        case "Cmd":
+        case "Command":
+          return "⌘";
+        case "Ctrl":
+        case "Control":
+          return "⌃";
+        case "Alt":
+        case "Option":
+          return "⌥";
+        case "Shift":
+          return "⇧";
+      }
+    }
+    switch (t) {
+      case "Meta":
+      case "CmdOrCtrl":
+      case "Cmd":
+      case "Command":
+        return IS_MAC ? "⌘" : "Ctrl";
+      case "Control":
+        return "Ctrl";
+      case "Up":
+        return "↑";
+      case "Down":
+        return "↓";
+      case "Left":
+        return "←";
+      case "Right":
+        return "→";
+    }
+    return t;
+  };
+  const parts = tokens.map(glyph);
+  // macOS convention packs modifiers with no separator; other platforms join
+  // with "+" for readability.
+  return IS_MAC ? parts.join("") : parts.join("+");
+}
+
+/** Icon for a command row, keyed off its stable id prefix. */
+function commandIcon(id: string): typeof PlayIcon {
+  if (id.startsWith("spawn:")) {
+    const kind = id.slice("spawn:".length) as HarnessIconKind;
+    return HARNESS_ICONS[kind] ?? HARNESS_ICONS["shell" as HarnessIconKind];
+  }
+  if (id.startsWith("keymap:")) return KeyboardIcon;
+  return PlayIcon;
 }
 
 // ---------------------------------------------------------------------------
@@ -128,18 +290,28 @@ export const SpotlightDock: Component = () => {
   let scrollbackSearchTimer: ReturnType<typeof setTimeout> | null = null;
   let scrollbackCancel: { aborted: boolean } | null = null;
 
+  const keymap = useKeymap();
+
   // ⌘. — backwards-compat shortcut via keymap system
   useKeymapAction("spotlight", toggleSpotlight);
 
-  // ⌘F — primary trigger, captured before the browser can intercept it
-  const onGlobalKeydown = (e: KeyboardEvent): void => {
-    if ((e.metaKey || e.ctrlKey) && e.key === "f" && !e.shiftKey) {
-      e.preventDefault();
-      toggleSpotlight();
+  // ⌘F — primary trigger, flowing through the single keymap pipeline (so the
+  // binding stays rebindable). When the user is inside a terminal, ⌘F means
+  // "find in THIS terminal", not "open the global dock" — so we detect terminal
+  // focus and hand off to the focused pane via `raum:pane-find-requested`
+  // (TerminalPane listens and opens its in-pane find). This replaces the old
+  // capture-phase race between the pane listener and the dock; routing both
+  // intents through the one global-search handler makes the outcome
+  // deterministic regardless of mount order. ⌘F anywhere else opens the dock.
+  const openSearch = (): void => {
+    const active = document.activeElement;
+    if (active instanceof HTMLElement && active.closest(".terminal-chrome-frame")) {
+      window.dispatchEvent(new CustomEvent("raum:pane-find-requested"));
+      return;
     }
+    toggleSpotlight();
   };
-  window.addEventListener("keydown", onGlobalKeydown, { capture: true });
-  onCleanup(() => window.removeEventListener("keydown", onGlobalKeydown, { capture: true }));
+  useKeymapAction("global-search", openSearch);
 
   // On open in modal-mode: consume pendingQuery, reset state, steal focus.
   // In top-bar-driven mode: reset state but do NOT steal focus — the top-bar
@@ -309,6 +481,181 @@ export const SpotlightDock: Component = () => {
     scrollbackHits().map((match): ScrollbackItem => ({ type: "scrollback", match })),
   );
 
+  // ---------------------------------------------------------------------------
+  // Command verbs — keymap actions + curated mouse-only verbs
+  // ---------------------------------------------------------------------------
+
+  /** Dispatch a keymap action's top-of-stack handler, then close the dock. */
+  function runKeymapAction(action: string): void {
+    closeSpotlight();
+    keymap.dispatch(action);
+  }
+
+  /** The full, unfiltered command catalogue. */
+  const commandCatalogue = createMemo<CommandItem[]>(() => {
+    const cmds: CommandItem[] = [];
+
+    // Spawn-harness verbs (mouse-only — no dedicated accelerator).
+    for (const def of SPAWN_COMMAND_DEFS) {
+      cmds.push({
+        type: "command",
+        id: `spawn:${def.kind}`,
+        title: def.label,
+        accelerator: undefined,
+        run: () => {
+          const slug = activeProjectSlug();
+          closeSpotlight();
+          // Mirror TopRow.spawn(): a harness needs a project, so when none is
+          // active, guide the user to add one (TopRow listens for this and
+          // opens the Add-Project modal) instead of dispatching a spawn the
+          // grid silently drops. Shells spawn with no project. Reuse the
+          // pinned-worktree resolver so a palette spawn lands where the
+          // top-bar spawn would.
+          if (def.kind !== "shell" && !slug) {
+            window.dispatchEvent(new CustomEvent("raum:add-project-requested"));
+            return;
+          }
+          window.dispatchEvent(
+            new CustomEvent("raum:spawn-requested", {
+              detail: {
+                kind: def.kind,
+                projectSlug: slug,
+                worktreeId: slug ? resolveSpawnWorktree(slug) : undefined,
+              },
+            }),
+          );
+        },
+      });
+    }
+
+    // Layout verbs — call the store ops directly (no keymap binding).
+    cmds.push(
+      {
+        type: "command",
+        id: "layout:equalize",
+        title: "Equalize panes",
+        accelerator: undefined,
+        run: () => {
+          closeSpotlight();
+          equalizeAllRatios();
+        },
+      },
+      {
+        type: "command",
+        id: "layout:tile",
+        title: "Tile panes",
+        accelerator: undefined,
+        run: () => {
+          closeSpotlight();
+          tileAll();
+        },
+      },
+      {
+        type: "command",
+        id: "layout:compact",
+        title: "Compact panes",
+        accelerator: undefined,
+        run: () => {
+          closeSpotlight();
+          compactTree();
+        },
+      },
+    );
+
+    // Layout presets (STORE lane). Content-agnostic tree-shape templates.
+    for (const preset of LAYOUT_PRESETS) {
+      cmds.push({
+        type: "command",
+        id: `preset:${preset.id}`,
+        title: `Apply layout: ${preset.label}`,
+        accelerator: undefined,
+        run: () => {
+          closeSpotlight();
+          applyLayoutPreset(preset.id);
+        },
+      });
+    }
+
+    // Maximize — prefer the keymap action (rebindable) but fall back to the
+    // store op directly so the verb works even if nothing registered a handler.
+    cmds.push({
+      type: "command",
+      id: "verb:maximize-pane",
+      title: KEYMAP_COMMAND_TITLES["maximize-pane"] ?? "Maximize focused pane",
+      accelerator: keymap.accelerator("maximize-pane"),
+      run: () => {
+        closeSpotlight();
+        if (!keymap.dispatch("maximize-pane")) {
+          const id = focusedPaneId();
+          if (id) toggleMaximize(id);
+        }
+      },
+    });
+
+    // App-level verbs with no keymap binding.
+    cmds.push(
+      {
+        type: "command",
+        id: "app:settings",
+        title: "Open Settings",
+        accelerator: undefined,
+        run: () => {
+          closeSpotlight();
+          // TopRow listens on the Tauri `menu-action` bus for "open-settings"
+          // (same payload the native menu emits), so we reuse it rather than
+          // adding a new command.
+          void emitTauriEvent("menu-action", "open-settings").catch(() => {
+            /* event bus unavailable (tests / SSR) */
+          });
+        },
+      },
+      {
+        type: "command",
+        id: "app:replay-onboarding",
+        title: "Replay onboarding",
+        accelerator: undefined,
+        run: () => {
+          closeSpotlight();
+          // Shared dev-preview signal that force-mounts the OnboardingWizard
+          // (same store the TopRow debug button drives).
+          setPreviewOnboarding(true);
+        },
+      },
+    );
+
+    // Keymap-derived verbs — surfaced with their live accelerator so the
+    // palette doubles as a rebindable shortcut launcher. We opt actions in via
+    // KEYMAP_COMMAND_TITLES (the raw table holds low-level ids that would just
+    // be noise here). Maximize is handled above with its fallback.
+    const seen = new Set(["maximize-pane"]);
+    for (const entry of keymap.entries()) {
+      const title = KEYMAP_COMMAND_TITLES[entry.action];
+      if (!title || seen.has(entry.action)) continue;
+      seen.add(entry.action);
+      cmds.push({
+        type: "command",
+        id: `keymap:${entry.action}`,
+        title,
+        accelerator: entry.accelerator,
+        run: () => runKeymapAction(entry.action),
+      });
+    }
+
+    return cmds;
+  });
+
+  /** Commands matching the current query, best-fuzzy-match first. */
+  const commandMatches = createMemo<CommandItem[]>(() => {
+    const q = query().trim();
+    if (!q) return [];
+    return commandCatalogue()
+      .map((cmd) => ({ cmd, score: fuzzyScore(cmd.title, q) }))
+      .filter((r) => r.score >= 0)
+      .sort((a, b) => a.score - b.score)
+      .slice(0, 8)
+      .map((r) => r.cmd);
+  });
+
   const allItems = createMemo<ResultItem[]>(() => {
     const q = query().trim();
     if (!q) {
@@ -317,6 +664,7 @@ export const SpotlightDock: Component = () => {
       return [...recents, ...harnessMatches()];
     }
     return [
+      ...commandMatches(),
       ...fileHits().map((hit): FileItem => ({ type: "file", hit })),
       ...harnessMatches(),
       ...scrollbackItems(),
@@ -328,6 +676,12 @@ export const SpotlightDock: Component = () => {
       setQuery(item.query);
       setSelectedIdx(-1);
       scheduleSearch(item.query);
+      return;
+    }
+    if (item.type === "command") {
+      // `run()` is responsible for closing the dock (most do it before an
+      // async dispatch so focus lands on the target, not the palette).
+      item.run();
       return;
     }
     if (item.type === "harness") {
@@ -428,12 +782,14 @@ export const SpotlightDock: Component = () => {
     const hasHarnesses = harnessMatches().length > 0;
     const fileCount = fileHits().length;
     const scrollbackCount = scrollbackHits().length;
+    const commandCount = commandMatches().length;
     return {
       hasRecent,
       hasHarnesses,
       harnessCount: harnessMatches().length,
       fileCount,
       scrollbackCount,
+      commandCount,
       items,
     };
   });
@@ -478,6 +834,24 @@ export const SpotlightDock: Component = () => {
                     <XIcon class="size-3.5" />
                   </button>
                 </Show>
+                {/* Shortcuts affordance — opens the cheat-sheet so users can
+                    discover gestures/keys without already knowing ⌘/. */}
+                <button
+                  type="button"
+                  class="focus-ring flex size-5 shrink-0 items-center justify-center rounded-full border border-border bg-muted text-[11px] font-medium text-muted-foreground hover:text-foreground"
+                  onClick={() => {
+                    closeSpotlight();
+                    keymap.dispatch("cheat-sheet");
+                  }}
+                  title={
+                    keymap.accelerator("cheat-sheet")
+                      ? `Keyboard shortcuts (${formatAccelerator(keymap.accelerator("cheat-sheet")!)})`
+                      : "Keyboard shortcuts"
+                  }
+                  aria-label="Show keyboard shortcuts"
+                >
+                  ?
+                </button>
                 <kbd class="shrink-0 rounded border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
                   ⌘F
                 </kbd>
@@ -489,6 +863,7 @@ export const SpotlightDock: Component = () => {
               when={
                 sections().items.length > 0 ||
                 (query().trim().length > 0 &&
+                  sections().commandCount === 0 &&
                   sections().harnessCount === 0 &&
                   sections().scrollbackCount === 0 &&
                   sections().fileCount === 0)
@@ -500,6 +875,7 @@ export const SpotlightDock: Component = () => {
                 <Show
                   when={
                     query().trim().length > 0 &&
+                    sections().commandCount === 0 &&
                     sections().harnessCount === 0 &&
                     sections().scrollbackCount === 0 &&
                     sections().fileCount === 0
@@ -520,6 +896,11 @@ export const SpotlightDock: Component = () => {
 
                 <For each={sections().items}>
                   {(item, idx) => {
+                    const isFirstCommand = createMemo(
+                      () =>
+                        item.type === "command" &&
+                        (idx() === 0 || sections().items[idx() - 1]?.type !== "command"),
+                    );
                     const isFirstFile = createMemo(
                       () =>
                         item.type === "file" &&
@@ -537,6 +918,9 @@ export const SpotlightDock: Component = () => {
                     );
                     return (
                       <>
+                        <Show when={isFirstCommand()}>
+                          <SectionHeader label="Commands" count={sections().commandCount} />
+                        </Show>
                         <Show when={isFirstFile()}>
                           <SectionHeader label="Files" count={sections().fileCount} />
                         </Show>
@@ -613,6 +997,22 @@ const ItemContent: Component<{
   onClearRecent: (q: string) => void;
 }> = (props) => (
   <Switch>
+    <Match when={props.item.type === "command" && (props.item as CommandItem)}>
+      {(cmd) => {
+        const Icon = commandIcon(cmd().id);
+        return (
+          <>
+            <Icon class="size-3.5 shrink-0 text-muted-foreground" />
+            <span class="flex-1 truncate text-foreground/90">{cmd().title}</span>
+            <Show when={cmd().accelerator}>
+              <kbd class="ml-1 shrink-0 rounded border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
+                {formatAccelerator(cmd().accelerator!)}
+              </kbd>
+            </Show>
+          </>
+        );
+      }}
+    </Match>
     <Match when={props.item.type === "recent" && (props.item as RecentItem)}>
       {(recent) => (
         <>

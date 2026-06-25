@@ -1,5 +1,6 @@
 import { Show, createResource, createSignal, onCleanup, onMount, type Component } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
+import { toast } from "solid-sonner";
 import { check as checkForUpdate } from "@tauri-apps/plugin-updater";
 import { TopRow } from "./components/top-row";
 import { Sidebar } from "./components/sidebar";
@@ -10,11 +11,13 @@ import { Toaster } from "./components/ui/sonner";
 import { KeymapProvider, useKeymapAction } from "./lib/keymapContext";
 import {
   markActiveLayoutHydrated,
+  markActiveLayoutHydrationSettled,
   openActiveLayoutSaveGate,
   setRuntimeLayout,
   type ActiveLayoutState,
   type CellKind,
 } from "./stores/runtimeLayoutStore";
+import type { TerminalListItem } from "./stores/terminalStore";
 import { installQuitFlush } from "./lib/quitFlush";
 import { notifyBannerEnabled, startNotificationCenter } from "./lib/notificationCenter";
 import { installGlobalContextMenuSuppressor } from "./lib/suppressContextMenu";
@@ -118,18 +121,40 @@ const HYDRATE_TIMEOUT = Symbol("active-layout-get-timeout");
  *  pane to spawn fresh — which is exactly how we ended up with hundreds
  *  of dangling tmux sessions. The authoritative live-check now happens
  *  inside `terminal_reattach` where `tmux has-session` is the source of
- *  truth. No-ops when no snapshot exists. */
-async function hydrateActiveLayout(): Promise<void> {
+ *  truth. No-ops when no snapshot exists.
+ *
+ *  Returns the set of `session_id`s the saved layout placed into the grid (so
+ *  the boot recovery toast can tell which live tmux sessions are *extra* — i.e.
+ *  recovered orphans not in any cell), or `null` when hydration didn't resolve
+ *  to a real layout (timeout / read failure / non-Tauri env) and a count would
+ *  be meaningless. An empty set means "hydration succeeded, layout had no
+ *  cells" — distinct from `null`. */
+async function hydrateActiveLayout(): Promise<Set<string> | null> {
   try {
     const saved = await Promise.race([
-      invoke<ActiveLayoutState>("active_layout_get"),
+      invoke<ActiveLayoutState & { quarantined?: boolean }>("active_layout_get"),
       new Promise<typeof HYDRATE_TIMEOUT>((resolve) =>
         setTimeout(() => resolve(HYDRATE_TIMEOUT), ACTIVE_LAYOUT_GET_TIMEOUT_MS),
       ),
     ]);
     if (saved === HYDRATE_TIMEOUT) {
       console.warn("active_layout_get timed out; skipping layout hydration this launch");
-      return;
+      return null;
+    }
+
+    // Surface a corrupt-and-quarantined active-layout.toml HERE, on the success
+    // path: the backend degrades a corrupt file to the default and reports it
+    // via `quarantined` rather than rejecting (which would clobber the
+    // recoverable file). So a vanished layout reads as a recoverable hiccup,
+    // not silent data loss. The backend owns the `<path>.bad-<stamp>` rename
+    // and doesn't hand the name back over IPC, so the copy stays honest about
+    // that rather than inventing a path.
+    if (saved.quarantined) {
+      toast("Saved layout couldn't be read", {
+        description:
+          "It was set aside so it's recoverable, and raum started with a fresh grid. " +
+          "Your tmux sessions are safe — recovered ones appear in the dock.",
+      });
     }
 
     // A real layout (even an empty one) has now loaded — empty saves from here
@@ -152,7 +177,7 @@ async function hydrateActiveLayout(): Promise<void> {
     // as it still exists on disk.
     if (saved.project_slug) setActiveProjectSlug(saved.project_slug);
 
-    if (!saved.cells || saved.cells.length === 0) return;
+    if (!saved.cells || saved.cells.length === 0) return new Set<string>();
 
     const cells = saved.cells.map((c) => ({
       id: c.id,
@@ -176,14 +201,29 @@ async function hydrateActiveLayout(): Promise<void> {
     }));
 
     setRuntimeLayout(cells);
+
+    // Session ids the saved layout actually placed into the grid. The boot
+    // recovery toast diffs this against the live `terminal_list` to count
+    // sessions that survived but landed in the dock as orphans.
+    const placed = new Set<string>();
+    for (const c of cells) {
+      for (const t of c.tabs) {
+        if (t.sessionId) placed.add(t.sessionId);
+      }
+    }
+    return placed;
   } catch {
-    // Non-Tauri environment (browser dev), missing file, or a corrupt/
-    // unparsable active-layout.toml whose `active_layout_get` rejected.
-    // We deliberately leave `markActiveLayoutHydrated()` UNCALLED here: the
+    // Genuine IPC failure: non-Tauri environment (browser dev) or a hard
+    // backend error — NOT a corrupt file (the backend degrades corruption to
+    // a default + `quarantined` flag on the success path above, so it never
+    // rejects here). No toast: there's no set-aside file to report, and
+    // firing one here would be a false signal every browser-dev launch.
+    //
+    // We deliberately leave `markActiveLayoutHydrated()` UNCALLED: the
     // empty-save guard then refuses to overwrite a layout we failed to read
-    // (do-not-overwrite on read failure), so a recoverable-by-hand corrupt
-    // file isn't clobbered with `cells: []` by a stray boot save. The backend
-    // read path quarantines the bad file separately (Contract 5).
+    // (do-not-overwrite on read failure), so nothing gets clobbered with
+    // `cells: []` by a stray boot save.
+    return null;
   } finally {
     // Open the persistence gate exactly once, after hydration has either
     // restored cells or confirmed there were none. Any save scheduled by
@@ -193,7 +233,73 @@ async function hydrateActiveLayout(): Promise<void> {
     // grid empty on the next launch with every live session adrift in the
     // dock as an orphan.
     openActiveLayoutSaveGate();
+    // Mark the hydration ATTEMPT finished on every exit (success, empty,
+    // timeout, corrupt) so the grid's loading skeleton always resolves — to
+    // the saved layout, the first-run CTA, or the spawn picker — instead of
+    // hanging on a faint skeleton forever after a failed/empty read. Distinct
+    // from markActiveLayoutHydrated(), which stays uncalled on failures to
+    // keep the empty-save anti-clobber guard armed.
+    markActiveLayoutHydrationSettled();
   }
+}
+
+/** Pure count of recovered orphan sessions: alive (non-dead) live sessions the
+ *  just-hydrated layout did NOT place into a cell. Exported for unit tests so
+ *  the diff rule lives somewhere exercisable without a Tauri host. */
+export function countRecoveredSessions(
+  placed: ReadonlySet<string>,
+  live: readonly Pick<TerminalListItem, "session_id" | "dead">[],
+): number {
+  let recovered = 0;
+  for (const item of live) {
+    if (item.dead === true) continue;
+    if (placed.has(item.session_id)) continue;
+    recovered += 1;
+  }
+  return recovered;
+}
+
+/** One-time boot toast that tells the user how many live tmux sessions
+ *  survived a close/reboot but did NOT land back in the grid — i.e. recovered
+ *  orphans now waiting in the dock. Without this the survivors appear silently
+ *  in the dock tray and a user who doesn't scan the strip assumes they were
+ *  lost.
+ *
+ *  `placed` is the set of session ids the just-hydrated layout mounted into
+ *  cells (or `null` when hydration didn't resolve — see `hydrateActiveLayout`).
+ *  We diff that against the authoritative live list from `terminal_list`:
+ *  every alive (non-dead) session NOT in `placed` is a recovered orphan. The
+ *  Rust boot reconcile (`reconcile_inner`) has already adopted these into the
+ *  registry by the time we read, so `terminal_list` is the reliable source —
+ *  the frontend's own later `terminal_reconcile` call usually returns `[]`.
+ *
+ *  Best-effort and silent on any failure: a missing Tauri host (tests / browser
+ *  dev) or an empty/clean recovery simply shows nothing. */
+async function notifyRecoveredSessions(placed: Set<string> | null): Promise<void> {
+  // `null` means hydration never resolved to a real layout (timeout / read
+  // failure). We can't tell "recovered" from "expected" without a baseline, so
+  // stay quiet rather than mislabel every live session as an orphan.
+  if (placed === null) return;
+  let live: TerminalListItem[];
+  try {
+    live = await invoke<TerminalListItem[]>("terminal_list");
+  } catch {
+    // No Tauri host or an older backend — nothing to report.
+    return;
+  }
+  const recovered = countRecoveredSessions(placed, live);
+  if (recovered === 0) return;
+  const noun = recovered === 1 ? "session" : "sessions";
+  // The count spans ALL projects (terminal_list is global), but each project's
+  // dock only shows its OWN orphans — so don't claim "N waiting in the dock"
+  // when the user may be on a project whose dock shows 0. Acknowledge that
+  // some may live under other projects.
+  toast(`Recovered ${recovered} ${noun}`, {
+    description:
+      recovered === 1
+        ? "It's waiting in the dock — if it isn't under this project, switch projects to find it. Click its chip to place it back in the grid."
+        : "They're waiting in the dock, some possibly under other projects — switch projects to find them. Click a chip to place one back in the grid.",
+  });
 }
 
 /** Registers app-root keymap handlers that don't live on any single
@@ -290,7 +396,11 @@ const App: Component = () => {
       // are fixing.
       console.warn("config_get failed; continuing with defaults", e);
     }
-    await hydrateActiveLayout();
+    const placed = await hydrateActiveLayout();
+    // Fire-and-forget: the recovery toast must not gate the wizard/onboarding
+    // resource resolving, and a slow `terminal_list` shouldn't delay first
+    // paint. Errors are swallowed inside the helper.
+    void notifyRecoveredSessions(placed);
     void prewarmAllWorktrees();
     void scheduleBackgroundUpdateCheck(c);
     return c;

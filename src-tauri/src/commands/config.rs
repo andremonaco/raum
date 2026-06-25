@@ -110,19 +110,38 @@ pub fn config_mark_onboarded(state: tauri::State<'_, AppHandleState>) -> Result<
 /// Read the last-saved active layout snapshot from `state/active-layout.toml`.
 /// Returns an empty `ActiveLayoutState` (with `cells: []`) when no snapshot
 /// exists yet (first launch or user cleared the grid and the file is absent).
+/// Wire shape of [`active_layout_get`]. `#[serde(flatten)]` keeps the
+/// `ActiveLayoutState` fields (`cells`, …) at the top level so the frontend's
+/// existing `saved.cells` access is unchanged; `quarantined` is added
+/// alongside so the UI can toast when a corrupt active-layout.toml was set
+/// aside on this read (otherwise the graceful degrade-to-default is silent).
+#[derive(serde::Serialize)]
+pub struct ActiveLayoutGetResult {
+    #[serde(flatten)]
+    pub layout: ActiveLayoutState,
+    pub quarantined: bool,
+}
+
 #[tauri::command]
 pub fn active_layout_get(
     state: tauri::State<'_, AppHandleState>,
-) -> Result<ActiveLayoutState, String> {
+) -> Result<ActiveLayoutGetResult, String> {
     // Same hardening as `config_get`: recover a poisoned lock so a corrupt
-    // read can never reject. `read_active_layout` now quarantines a corrupt
-    // file and returns the default, so a parse error no longer surfaces as
-    // `Err` (which the frontend `catch` would turn into a layout clobber).
+    // read can never reject. `read_active_layout_checked` quarantines a corrupt
+    // file and returns the default plus a `quarantined` flag, so a parse error
+    // no longer surfaces as `Err` (which the frontend `catch` would turn into a
+    // layout clobber) — instead the frontend toasts on the success path.
     let store = state
         .config_store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    store.read_active_layout().map_err(|e| e.to_string())
+    store
+        .read_active_layout_checked()
+        .map(|(layout, quarantined)| ActiveLayoutGetResult {
+            layout,
+            quarantined,
+        })
+        .map_err(|e| e.to_string())
 }
 
 /// Persist the current runtime grid state (geometry + session IDs) to

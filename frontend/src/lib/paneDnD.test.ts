@@ -5,6 +5,7 @@ import {
   beginDrag,
   cancelDrag,
   dragState,
+  EDGE_PREVIEW_DWELL_MS,
   paneZone,
   ROOT_TARGET,
   SNAP_HYST_PX,
@@ -591,17 +592,66 @@ describe("magnetic snap via beginDrag", () => {
       expect(dragState()?.armed).toBe(true); // armed survives the HOLD
     });
 
-    it("ROOT_TARGET drops never arm regardless of armDelayMs", () => {
-      // Root-edge gestures bypass the snap entirely — they're for
-      // splits / wrapping the layout, not reviews. armed must stay
-      // false even after a long hold near a root edge.
+    it("ROOT_TARGET wraps never snap, but arm after the edge-preview dwell", () => {
+      // Root-edge gestures bypass the magnetic snap entirely — that's for
+      // reviews. But like any split they DO arm after the short preview
+      // dwell so the live reflow engages; the dwell just debounces it.
+      // They use EDGE_PREVIEW_DWELL_MS, not the review `armDelayMs`.
       start({ armDelayMs: 600 });
       // Approach the right edge of the root (within ROOT_ENTER_MARGIN).
       move(995, 500);
       expect(dragState()?.targetId).toBe(ROOT_TARGET);
       expect(dragState()?.snapped).toBe(false);
-      vi.advanceTimersByTime(2000);
+      // Just shy of the edge dwell → still unarmed.
+      vi.advanceTimersByTime(EDGE_PREVIEW_DWELL_MS - 20);
       expect(dragState()?.armed).toBe(false);
+      // Past the edge dwell → armed (preview engages), still never snapped.
+      vi.advanceTimersByTime(40);
+      expect(dragState()?.armed).toBe(true);
+      expect(dragState()?.snapped).toBe(false);
+    });
+
+    it("edge-split zones arm after the edge-preview dwell, without snapping", () => {
+      // Hover tgt's LEFT edge (x just inside 500). It's a split zone, not an
+      // interior, so the magnet never engages — but the preview reflow is
+      // still gated behind the same short dwell.
+      start({ armDelayMs: 600 });
+      move(510, 500);
+      expect(dragState()?.targetId).toBe("tgt");
+      expect(dragState()?.zone).toBe("left");
+      expect(dragState()?.snapped).toBe(false);
+      expect(dragState()?.armed).toBe(false);
+      vi.advanceTimersByTime(EDGE_PREVIEW_DWELL_MS - 20);
+      expect(dragState()?.armed).toBe(false);
+      vi.advanceTimersByTime(40);
+      expect(dragState()?.armed).toBe(true);
+      expect(dragState()?.snapped).toBe(false);
+    });
+
+    it("sweeping between edge zones restarts the dwell (no premature arm)", () => {
+      // Use a 3-pane strip so the middle pane's left/right edges are both
+      // interior boundaries (away from the root-edge margins). Land on mid's
+      // left edge, dwell partway, then slide to mid's right edge: a fresh
+      // intent key → the dwell restarts from 0.
+      start({
+        armDelayMs: 600,
+        cells: [
+          { id: "src", x: 0, y: 0, w: 3333, h: 10000 },
+          { id: "mid", x: 3333, y: 0, w: 3334, h: 10000 },
+          { id: "rgt", x: 6667, y: 0, w: 3333, h: 10000 },
+        ],
+      });
+      move(345, 500); // mid LEFT edge (boundary ~px 333)
+      expect(dragState()?.targetId).toBe("mid");
+      expect(dragState()?.zone).toBe("left");
+      vi.advanceTimersByTime(EDGE_PREVIEW_DWELL_MS - 20);
+      expect(dragState()?.armed).toBe(false);
+      move(655, 500); // mid RIGHT edge (boundary ~px 667) — fresh dwell
+      expect(dragState()?.zone).toBe("right");
+      vi.advanceTimersByTime(EDGE_PREVIEW_DWELL_MS - 20);
+      expect(dragState()?.armed).toBe(false); // would have armed if carried
+      vi.advanceTimersByTime(40);
+      expect(dragState()?.armed).toBe(true);
     });
   });
 });

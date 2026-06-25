@@ -386,6 +386,15 @@ impl ConfigStore {
         read_toml_or_default(&self.root.join("state").join("active-layout.toml"))
     }
 
+    /// Like [`read_active_layout`] but also reports whether the on-disk file
+    /// was corrupt and got quarantined on this read. The flag lets the
+    /// frontend surface a "saved layout couldn't be read, set aside" toast on
+    /// the success path — the read itself still degrades gracefully to the
+    /// default (never a hard error), so the corruption is otherwise invisible.
+    pub fn read_active_layout_checked(&self) -> Result<(ActiveLayoutState, bool), StoreError> {
+        read_toml_tracked(&self.root.join("state").join("active-layout.toml"))
+    }
+
     pub fn write_active_layout(&self, state: &ActiveLayoutState) -> Result<(), StoreError> {
         ensure_dir_0700(&self.root.join("state"))?;
         write_toml(&self.root.join("state").join("active-layout.toml"), state)
@@ -485,15 +494,23 @@ fn validate_slug(slug: &str) -> Result<(), StoreError> {
 }
 
 fn read_toml_or_default<T: DeserializeOwned + Default>(path: &Path) -> Result<T, StoreError> {
+    read_toml_tracked(path).map(|(value, _quarantined)| value)
+}
+
+/// Core of [`read_toml_or_default`], additionally reporting whether a corrupt
+/// file was quarantined on this read (`true`) or the read was clean / the file
+/// absent (`false`). [`read_toml_or_default`] discards the flag; callers that
+/// want to surface the quarantine (e.g. the active-layout read) use this.
+fn read_toml_tracked<T: DeserializeOwned + Default>(path: &Path) -> Result<(T, bool), StoreError> {
     if !path.exists() {
-        return Ok(T::default());
+        return Ok((T::default(), false));
     }
     let raw = std::fs::read_to_string(path)?;
     if raw.trim().is_empty() {
-        return Ok(T::default());
+        return Ok((T::default(), false));
     }
     match toml::from_str(&raw) {
-        Ok(parsed) => Ok(parsed),
+        Ok(parsed) => Ok((parsed, false)),
         // A non-empty file that fails to parse is corrupt (interrupted
         // write before the atomic rename window closed, a hand-edit, or a
         // value a future/older schema can't deserialize). Returning the
@@ -506,7 +523,7 @@ fn read_toml_or_default<T: DeserializeOwned + Default>(path: &Path) -> Result<T,
         // path NEVER turns a corrupt file into a hard failure.
         Err(e) => {
             quarantine_bad_toml(path, &e);
-            Ok(T::default())
+            Ok((T::default(), true))
         }
     }
 }

@@ -32,10 +32,15 @@
  *   instead of leaving some handles silently dead.
  */
 
-import { Component, For, Show, createMemo } from "solid-js";
+import { Component, For, Show, createMemo, createSignal } from "solid-js";
 
 import { MIN_RATIO, leafIds as treeLeafIds, type LayoutNode } from "../lib/layoutTree";
 import { setSplitRatiosByBoundary } from "../stores/runtimeLayoutStore";
+
+/** Keyboard nudge step, as a fraction of the parent split's along-axis
+ *  extent. One ArrowKey press shifts the boundary 2 % — fine enough to dial
+ *  in a ratio, coarse enough to move visibly. */
+const KEY_NUDGE_FRACTION = 0.02;
 
 interface PctRect {
   left: number;
@@ -163,6 +168,26 @@ function walk(node: LayoutNode, rect: PctRect, out: DividerSpec[]): void {
 const Divider: Component<{ spec: DividerSpec; visibleLeafIds: readonly string[] }> = (props) => {
   const isRow = () => props.spec.axis === "row";
 
+  // Per-divider drag flag. Drives `.is-dragging` so the bright filament
+  // stays lit *on this exact divider* for the whole drag. Previously the
+  // bloom was keyed on `:hover`, which "let go" the instant the cursor
+  // drifted off the 6 px hit zone mid-drag (the pointer easily outruns the
+  // line on a fast throw) — the handle would go dim while still actively
+  // resizing. A real state flag follows the gesture, not the cursor's
+  // momentary position.
+  const [isDragging, setIsDragging] = createSignal(false);
+
+  // Live ratio of the sibling BEFORE this boundary, 0..1, for
+  // `aria-valuenow`. Reads the pruned ratios so the announced value tracks
+  // the visible split even while a drag is mid-flight.
+  const valueNow = createMemo(() => {
+    const ratios = props.spec.prunedRatios;
+    const i = props.spec.index;
+    const pair = (ratios[i] ?? 0) + (ratios[i + 1] ?? 0);
+    if (pair <= 0) return 50;
+    return Math.round(((ratios[i] ?? 0) / pair) * 100);
+  });
+
   // Drag state lives entirely inside the onPointerDown closure, and the
   // move/up listeners attach to `document` — NOT to the divider element.
   //
@@ -198,6 +223,7 @@ const Divider: Component<{ spec: DividerSpec; visibleLeafIds: readonly string[] 
     const visibleLeafIds = [...props.visibleLeafIds];
 
     grid.classList.add("is-resizing");
+    setIsDragging(true);
     document.body.style.cursor = rowAxis ? "col-resize" : "row-resize";
     document.body.style.userSelect = "none";
 
@@ -248,6 +274,7 @@ const Divider: Component<{ spec: DividerSpec; visibleLeafIds: readonly string[] 
       document.removeEventListener("pointerup", onUp);
       document.removeEventListener("pointercancel", onUp);
       grid.classList.remove("is-resizing");
+      setIsDragging(false);
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
       if (pendingPair) {
@@ -287,13 +314,64 @@ const Divider: Component<{ spec: DividerSpec; visibleLeafIds: readonly string[] 
     });
   }
 
+  // Keyboard resize. With the divider focused, the along-axis arrow keys
+  // nudge the boundary by `KEY_NUDGE_FRACTION` of the parent extent — same
+  // `setSplitRatiosByBoundary` path the pointer drag uses, so the LCA
+  // boundary rewrite stays correct under pruning. Row-axis (col-resize)
+  // dividers respond to Left/Right; column-axis (row-resize) to Up/Down.
+  function onKeyDown(e: KeyboardEvent): void {
+    const rowAxis = isRow();
+    let delta = 0;
+    if (rowAxis) {
+      if (e.key === "ArrowLeft") delta = -KEY_NUDGE_FRACTION;
+      else if (e.key === "ArrowRight") delta = KEY_NUDGE_FRACTION;
+    } else {
+      if (e.key === "ArrowUp") delta = -KEY_NUDGE_FRACTION;
+      else if (e.key === "ArrowDown") delta = KEY_NUDGE_FRACTION;
+    }
+    if (delta === 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const ratios = props.spec.prunedRatios;
+    const i = props.spec.index;
+    let l = ratios[i] + delta;
+    let r = ratios[i + 1] - delta;
+    if (l < MIN_RATIO) {
+      const adj = MIN_RATIO - l;
+      l = MIN_RATIO;
+      r -= adj;
+    }
+    if (r < MIN_RATIO) {
+      const adj = MIN_RATIO - r;
+      r = MIN_RATIO;
+      l -= adj;
+    }
+    setSplitRatiosByBoundary({
+      axis: props.spec.axis,
+      leftLeafIds: [...props.spec.leftLeafIds],
+      rightLeafIds: [...props.spec.rightLeafIds],
+      visibleLeafIds: [...props.visibleLeafIds],
+      prunedLeftRatio: l,
+      prunedRightRatio: r,
+    });
+  }
+
   return (
     <div
       class="pane-divider pointer-events-auto absolute group"
       classList={{
         "cursor-col-resize": isRow(),
         "cursor-row-resize": !isRow(),
+        "is-dragging": isDragging(),
       }}
+      role="separator"
+      tabindex={0}
+      aria-orientation={isRow() ? "vertical" : "horizontal"}
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-valuenow={valueNow()}
+      aria-label={isRow() ? "Resize columns" : "Resize rows"}
+      onKeyDown={onKeyDown}
       style={
         // The hit target is wider/taller than the visible line (6 px total)
         // so the user can grab it easily at any DPI.

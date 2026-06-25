@@ -298,8 +298,21 @@ export const Dock: Component<DockProps> = (props) => {
         <For each={minimizedCells()}>
           {(cell) => <DockChip cell={cell} tick={tick()} onRestore={props.onRestore} />}
         </For>
-        <Show when={orphanRecords().length > 0 && minimizedCells().length > 0}>
-          <span class="h-4 w-px shrink-0 bg-border" aria-hidden />
+        <Show when={orphanRecords().length > 0}>
+          {/* Set the recovered survivors visually apart from deliberately
+              minimized chips: a thin divider (only when minimized chips
+              precede them) plus a small "Recovered" group label so the run of
+              dashed-warning chips reads as "these came back after a restart",
+              not "you stashed these here". */}
+          <Show when={minimizedCells().length > 0}>
+            <span class="h-4 w-px shrink-0 bg-border" aria-hidden />
+          </Show>
+          <span
+            class="shrink-0 select-none px-0.5 text-[9px] uppercase tracking-wide text-warning"
+            aria-hidden
+          >
+            Recovered
+          </span>
         </Show>
         <For each={orphanRecords()}>{(record) => <OrphanChip record={record} />}</For>
       </div>
@@ -336,7 +349,7 @@ const FilterGroup: Component = () => {
                   as="button"
                   type="button"
                   aria-pressed={active()}
-                  class="flex h-6 w-6 items-center justify-center rounded transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                  class="focus-ring flex h-6 w-6 items-center justify-center rounded transition-colors"
                   classList={{
                     "bg-active text-foreground": active(),
                     "text-foreground-subtle hover:text-foreground hover:bg-hover": !active(),
@@ -481,7 +494,7 @@ const DockChip: Component<DockChipProps> = (props) => {
       <TooltipTrigger
         as="button"
         type="button"
-        class="flex h-6 max-w-56 shrink-0 cursor-pointer items-center gap-1.5 rounded-md bg-surface-raised px-2 text-[10px] text-muted-foreground transition-colors hover:bg-hover hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+        class="focus-ring flex h-6 max-w-56 shrink-0 cursor-pointer items-center gap-1.5 rounded-md bg-surface-raised px-2 text-[10px] text-muted-foreground transition-colors hover:bg-hover hover:text-foreground"
         onClick={() => props.onRestore(props.cell.id)}
         title={`Restore ${label()}`}
       >
@@ -579,8 +592,27 @@ const OrphanChip: Component<OrphanChipProps> = (props) => {
     setFocusedPaneId(newPaneId);
   };
 
-  const onKill = (e: MouseEvent): void => {
-    e.stopPropagation();
+  // Killing a recovered survivor is destructive and irreversible (the tmux
+  // session — and any unsaved agent work in it — is gone). These chips look
+  // tiny and sit right next to a restore target, so a single stray × click
+  // shouldn't be enough. Require a two-step confirm: the first click *arms*
+  // the kill (the × swaps to an unmistakable "Kill?" pill) and a second click
+  // within the window actually kills. The arm self-disarms after a few seconds
+  // so a chip never sits silently primed.
+  const KILL_CONFIRM_WINDOW_MS = 3_000;
+  const [armed, setArmed] = createSignal(false);
+  let disarmTimer: ReturnType<typeof setTimeout> | undefined;
+  const disarm = (): void => {
+    if (disarmTimer !== undefined) {
+      clearTimeout(disarmTimer);
+      disarmTimer = undefined;
+    }
+    setArmed(false);
+  };
+  onCleanup(disarm);
+
+  const performKill = (): void => {
+    disarm();
     const sessionId = props.record.session_id;
     markTerminalClosing(sessionId);
     void invoke("terminal_kill", { sessionId }).catch((err: unknown) => {
@@ -592,15 +624,33 @@ const OrphanChip: Component<OrphanChipProps> = (props) => {
     });
   };
 
+  const onKill = (e: MouseEvent): void => {
+    e.stopPropagation();
+    if (armed()) {
+      performKill();
+      return;
+    }
+    // First click only arms — never kills outright.
+    setArmed(true);
+    if (disarmTimer !== undefined) clearTimeout(disarmTimer);
+    disarmTimer = setTimeout(() => {
+      disarmTimer = undefined;
+      setArmed(false);
+    }, KILL_CONFIRM_WINDOW_MS);
+  };
+
   return (
     <Tooltip openDelay={150} closeDelay={0} placement="top">
       <TooltipTrigger
         as="div"
-        class="group flex h-6 max-w-56 shrink-0 items-center rounded-md bg-surface-raised text-[10px] text-muted-foreground transition-colors hover:bg-hover hover:text-foreground"
+        // Dashed, warning-tinted ring marks these as recovered survivors, not
+        // chips the user deliberately minimized (those carry a solid surface
+        // and no border). Keep the same height/radius so the strip stays tidy.
+        class="group flex h-6 max-w-56 shrink-0 items-center rounded-md border border-dashed border-warning/50 bg-surface-raised text-[10px] text-muted-foreground transition-colors hover:bg-hover hover:text-foreground"
       >
         <button
           type="button"
-          class="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 px-2 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+          class="focus-ring flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 px-2"
           onClick={onAdopt}
           title="Restore to grid"
         >
@@ -608,25 +658,44 @@ const OrphanChip: Component<OrphanChipProps> = (props) => {
           <DockStateIndicator state={state()} reliability={reliability()} />
           <span class="min-w-0 truncate text-[10px]">{orphanLabel(props.record)}</span>
         </button>
-        <button
-          type="button"
-          aria-label={`Close ${orphanLabel(props.record)}`}
-          class="mr-1 flex h-4 w-4 shrink-0 items-center justify-center rounded text-[12px] leading-none text-foreground-dim opacity-0 transition-opacity hover:bg-active hover:text-foreground group-hover:opacity-100 focus-visible:opacity-100"
-          onClick={onKill}
+        <Show
+          when={armed()}
+          fallback={
+            <button
+              type="button"
+              aria-label={`Close ${orphanLabel(props.record)}`}
+              class="focus-ring mr-1 flex h-4 w-4 shrink-0 items-center justify-center rounded text-[12px] leading-none text-foreground-dim opacity-0 transition-opacity hover:bg-active hover:text-foreground group-hover:opacity-100 focus-visible:opacity-100"
+              onClick={onKill}
+            >
+              ×
+            </button>
+          }
         >
-          ×
-        </button>
+          {/* Armed state: an unmistakable destructive affordance. A second
+              click here kills; clicking the chip body (restore) or letting the
+              window lapse cancels. */}
+          <button
+            type="button"
+            aria-label={`Confirm kill ${orphanLabel(props.record)}`}
+            class="focus-ring mr-1 flex h-4 shrink-0 items-center justify-center rounded bg-destructive px-1 text-[9px] font-medium uppercase leading-none tracking-wide text-background"
+            onClick={onKill}
+          >
+            Kill?
+          </button>
+        </Show>
       </TooltipTrigger>
       <TooltipPortal>
         <TooltipContent class={DOCK_TOOLTIP_CLASS}>
           <div class="flex min-w-0 items-center gap-1.5">
             <Icon />
             <span class="min-w-0 flex-1 truncate font-medium">
-              {orphanLabel(props.record)} — not in grid
+              {orphanLabel(props.record)} — recovered, not in grid
             </span>
             <DockStateLabel state={state()} />
           </div>
-          <p class="text-[9px] text-foreground-dim">Click to restore into the grid; × to kill</p>
+          <p class="text-[9px] text-foreground-dim">
+            Click to restore into the grid; × then confirm to kill
+          </p>
         </TooltipContent>
       </TooltipPortal>
     </Tooltip>

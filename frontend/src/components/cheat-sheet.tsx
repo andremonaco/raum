@@ -66,6 +66,55 @@ function buildRows(effective: KeymapEntry[], defaults: KeymapEntry[]): Row[] {
   return rows;
 }
 
+/**
+ * Mouse/pointer gestures that drive the BSP grid but have no keyboard
+ * accelerator — they live only in the pointer state machine (`lib/paneDnD.ts`)
+ * and the divider drag handlers, so the cheat-sheet documents them here so
+ * users can discover them without reading the source.
+ */
+const LAYOUT_GESTURES: { gesture: string; effect: string }[] = [
+  {
+    gesture: "Drag pane header → edge band",
+    effect: "Drop near a pane's left/right/top/bottom edge (a ~32px band) to split alongside it",
+  },
+  {
+    gesture: "Drag pane header → center",
+    effect: "Drop on a pane's center (anywhere off the edge bands) to start a cross-harness review",
+  },
+  {
+    gesture: "Drag pane header → grid edge",
+    effect: "Drop within ~72px of the grid edge to wrap as a top-level row/column",
+  },
+  {
+    gesture: "Double-click a pane",
+    effect: "Maximize the pane (header or body); double-click again to restore",
+  },
+  { gesture: "Double-click divider", effect: "Reset the split back to 50/50" },
+  { gesture: "Drag divider", effect: "Resize the two panes either side" },
+];
+
+const LayoutGestures: Component = () => (
+  <section class="border-t border-border px-4 py-3">
+    <h3 class="mb-2 text-xs font-medium uppercase text-muted-foreground">
+      Layout &amp; Drag — Gestures
+    </h3>
+    <table class="w-full text-left text-sm">
+      <tbody>
+        <For each={LAYOUT_GESTURES}>
+          {(g) => (
+            <tr class="border-t border-border first:border-t-0 hover:bg-muted/50">
+              <td class="whitespace-nowrap px-0 py-2 pr-4 font-medium text-foreground">
+                {g.gesture}
+              </td>
+              <td class="px-0 py-2 text-muted-foreground">{g.effect}</td>
+            </tr>
+          )}
+        </For>
+      </tbody>
+    </table>
+  </section>
+);
+
 const AcceleratorPill: Component<{
   accelerator: string | undefined;
   muted?: boolean;
@@ -174,6 +223,8 @@ export const CheatSheet: Component = () => {
                 </For>
               </tbody>
             </table>
+
+            <LayoutGestures />
           </Scrollable>
 
           <footer class="border-t border-border px-4 py-2 text-right text-xs text-muted-foreground">

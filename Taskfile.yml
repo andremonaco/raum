@@ -11,6 +11,12 @@ tasks:
   dev:
     desc: Run the app in dev mode with hot reload
     dir: src-tauri
+    # RAUM_INSTANCE=dev isolates the dev build from a release install: its own
+    # ~/.config/raum-dev tree (config, state/sessions.toml, event socket) and
+    # its own `-L raum-dev` tmux server, so debugging never collides with the
+    # prod app's live agents. Run both at once freely.
+    env:
+      RAUM_INSTANCE: dev
     cmd: cargo tauri dev --config tauri.dev.conf.json
 
   build:

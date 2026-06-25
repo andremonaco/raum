@@ -53,13 +53,20 @@ import {
   subscribeTerminalEvents,
   terminalStore,
   unreadCompletedForProject,
-  waitingCount,
-  waitingTerminals,
   type TerminalListItem,
   type TerminalRecord,
 } from "../stores/terminalStore";
 import { placedSessionIds, subscribePaneActivity } from "../stores/runtimeLayoutStore";
 import { subscribeReviewLinkEvents } from "../stores/reviewLinkStore";
+import { attentionQueue, waitingByBlockedLongest } from "../stores/agentStore";
+import {
+  broadcastActive,
+  broadcastMemberIds,
+  broadcastScope,
+  setBroadcastScope,
+  toggleBroadcast,
+  type BroadcastScope,
+} from "../lib/broadcastStore";
 import { useKeymap } from "../lib/keymapContext";
 import { PROJECT_COLOR_PALETTE } from "../lib/projectColors";
 import { PROJECT_SIGIL_PALETTE, SIGIL_RESET, deriveSigilFromSlug } from "../lib/projectSigils";
@@ -96,6 +103,7 @@ import {
   ActivityIcon,
   AlertCircleIcon,
   CheckIcon,
+  ChevronDownIcon,
   GitBranchIcon,
   HARNESS_ICONS,
   type HarnessIconKind,
@@ -105,7 +113,6 @@ import {
   RaumLogo,
   SearchIcon,
 } from "./icons";
-import { resolveSessionTabLabel } from "../lib/harnessTabLabel";
 import {
   branchForProject,
   subscribeWorktreeBranchEvents,
@@ -113,6 +120,7 @@ import {
 } from "../stores/worktreeStore";
 import { resolveSpawnWorktree } from "../lib/resolveSpawnWorktree";
 import { ProjectSettingsDialog } from "./project-settings-dialog";
+import { AttentionRail } from "./attention-rail";
 
 // Internal value kept as "needs-input" so the keymap wiring (§8.5) and the
 // grid-side consumer don't have to rename. UI surfaces the label "Waiting".
@@ -164,6 +172,13 @@ const SPAWN_DEFS: SpawnDef[] = [
   { kind: "codex", label: "Codex", action: "spawn-codex" },
   { kind: "opencode", label: "OpenCode", action: "spawn-opencode" },
 ];
+
+// Broadcast scope choices, in the order the scope picker lists them. "manual"
+// is intentionally omitted: there is no per-pane "add to broadcast" UI yet, so
+// the manual member set can never be populated — selecting it would arm
+// broadcast with zero members (every keystroke goes nowhere). Re-add once a
+// membership affordance exists (broadcastStore already has the setters).
+const BROADCAST_SCOPES: BroadcastScope[] = ["all-visible", "active-project"];
 
 function prettifyAccel(accel: string | undefined): string {
   if (!accel) return "";
@@ -565,6 +580,43 @@ export const TopRow: Component = () => {
     setOrphanSweepResult({ count: killed, ids });
   }
 
+  // Attention rail pin: the rail anchors off the awaiting counter as a
+  // click-to-open Popover. Default-open whenever something is waiting so the
+  // user lands in mission-control without a click; they can dismiss it and it
+  // stays closed until the next time `waitingCount` rises from zero.
+  const [railOpen, setRailOpen] = createSignal(false);
+  // Drive the pin off the FULL attention queue (waiting + errored +
+  // completed-unread), not just `waitingCount` — otherwise an agent that
+  // ERRORS populates the rail but never auto-surfaces it, and a failed agent
+  // sits unseen behind a "0" badge, undercutting the who-needs-me promise.
+  const attentionCount = createMemo(() => attentionQueue().length);
+  let prevAttention = 0;
+  createEffect(() => {
+    const n = attentionCount();
+    if (n > 0 && prevAttention === 0) setRailOpen(true);
+    if (n === 0) setRailOpen(false);
+    prevAttention = n;
+  });
+
+  // Round-robin cursor for "focus-next-waiting": each press advances through
+  // the wait-duration-sorted queue (oldest-blocked first). Stored as the last
+  // focused session id rather than an index so list churn between presses
+  // doesn't skip or repeat an entry.
+  const [lastFocusedWaitingId, setLastFocusedWaitingId] = createSignal<string | null>(null);
+  function focusNextWaiting(): void {
+    const queue = waitingByBlockedLongest();
+    if (queue.length === 0) return;
+    const last = lastFocusedWaitingId();
+    const lastIdx = last ? queue.findIndex((s) => s.session_id === last) : -1;
+    const next = queue[(lastIdx + 1) % queue.length]!;
+    const id = next.session_id;
+    if (!id) return;
+    setLastFocusedWaitingId(id);
+    window.dispatchEvent(
+      new CustomEvent("terminal-focus-requested", { detail: { sessionId: id } }),
+    );
+  }
+
   const [compactTabs, setCompactTabs] = createSignal(false);
   let tabsScrollRef: HTMLElement | undefined;
   let headerRef: HTMLElement | undefined;
@@ -864,6 +916,19 @@ export const TopRow: Component = () => {
     for (const def of SPAWN_DEFS) {
       unregs.push(keymap.register(def.action, () => void spawn(def.kind)));
     }
+    // FLEET mission-control hotkeys.
+    unregs.push(keymap.register("focus-next-waiting", () => focusNextWaiting()));
+    unregs.push(keymap.register("toggle-broadcast", () => toggleBroadcast()));
+    // First-run CTA: the empty grid's "Add a project" button (TerminalGrid)
+    // dispatches this event; open the Add-Project modal in response so the
+    // button is functional from a zero-project cold start.
+    const onAddProjectRequested = (): void => {
+      setModalOpen(true);
+    };
+    window.addEventListener("raum:add-project-requested", onAddProjectRequested);
+    unregs.push(() =>
+      window.removeEventListener("raum:add-project-requested", onAddProjectRequested),
+    );
     onCleanup(() => {
       for (const fn of unregs) fn();
     });
@@ -1286,82 +1351,167 @@ export const TopRow: Component = () => {
               );
             })()}
 
-            {/* Awaiting — toggles the cross-project awaiting view; hover-card
-                still previews the list of waiting harnesses. */}
+            {/* Awaiting — the trigger doubles as the attention-rail anchor.
+                Left-click pins the rail (mission control); the small caret
+                toggles the cross-project awaiting view so both affordances
+                stay reachable from one compact control. */}
             {(() => {
               const active = () => crossProjectViewMode() === "awaiting";
-              const has = () => waitingCount() > 0;
+              const has = () => attentionCount() > 0;
               return (
-                <HoverCard>
-                  <HoverCardTrigger
-                    as="button"
-                    type="button"
-                    class="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] font-medium transition-colors"
+                <Popover open={railOpen()} onOpenChange={setRailOpen}>
+                  <div
+                    class="inline-flex items-center gap-0.5 rounded-md transition-colors"
                     classList={{
-                      "bg-selected text-foreground": active(),
-                      "bg-warning/15 text-warning animate-pulse": !active() && has(),
-                      "text-muted-foreground hover:text-foreground font-mono": !active() && !has(),
+                      "bg-selected": active(),
+                      "bg-warning/15": !active() && has(),
                     }}
-                    onClick={() => toggleCrossProjectView("awaiting")}
-                    aria-pressed={active()}
-                    aria-label="Show awaiting across projects"
-                    data-testid="waiting-count"
                   >
-                    <AlertCircleIcon class={has() ? "size-3.5 shrink-0" : "size-3 shrink-0"} />
-                    <Show when={has()} fallback={<>0</>}>
-                      {waitingCount()} need input
-                    </Show>
-                  </HoverCardTrigger>
-                  <Show when={has()}>
-                    <HoverCardPortal>
-                      <HoverCardContent class="w-80 p-1" data-testid="waiting-list">
-                        <div class="flex flex-col">
-                          <For each={waitingTerminals()}>
-                            {(t) => {
-                              const project = () =>
-                                t.project_slug
-                                  ? (projectBySlug().get(t.project_slug) ?? null)
-                                  : null;
-                              const Icon =
-                                HARNESS_ICONS[t.kind as HarnessIconKind] ??
-                                HARNESS_ICONS["shell" as HarnessIconKind];
-                              return (
-                                <button
-                                  type="button"
-                                  class="group flex items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs hover:bg-hover focus:bg-hover focus:outline-none"
-                                  onClick={() => {
-                                    window.dispatchEvent(
-                                      new CustomEvent("terminal-focus-requested", {
-                                        detail: { sessionId: t.session_id },
-                                      }),
-                                    );
-                                  }}
-                                >
-                                  <Icon class="size-3.5 shrink-0 text-warning" />
-                                  <span class="flex-1 truncate text-foreground/90">
-                                    {resolveSessionTabLabel(t.session_id)}
-                                  </span>
-                                  <Show when={project()}>
-                                    {(p) => (
-                                      <span class="flex shrink-0 items-center gap-1 text-[10px] text-muted-foreground/70">
-                                        <Show when={p().sigil}>
-                                          <span class="font-mono text-muted-foreground/60">
-                                            {p().sigil}
-                                          </span>
-                                        </Show>
-                                        <span class="truncate">{p().name}</span>
-                                      </span>
-                                    )}
-                                  </Show>
-                                </button>
-                              );
-                            }}
-                          </For>
-                        </div>
-                      </HoverCardContent>
-                    </HoverCardPortal>
-                  </Show>
-                </HoverCard>
+                    <PopoverTrigger
+                      as="button"
+                      type="button"
+                      class="inline-flex items-center gap-1 rounded-l-md px-1.5 py-0.5 text-[10px] font-medium transition-colors"
+                      classList={{
+                        "text-foreground": active(),
+                        "text-warning animate-pulse": !active() && has(),
+                        "text-muted-foreground hover:text-foreground font-mono":
+                          !active() && !has(),
+                      }}
+                      aria-label="Open attention rail"
+                      data-testid="waiting-count"
+                    >
+                      <AlertCircleIcon class={has() ? "size-3.5 shrink-0" : "size-3 shrink-0"} />
+                      <Show when={has()} fallback={<>0</>}>
+                        {attentionCount()} need attention
+                      </Show>
+                    </PopoverTrigger>
+                    {/* Caret: cross-project awaiting view toggle (the legacy
+                        behaviour). Kept distinct from the rail trigger. */}
+                    <button
+                      type="button"
+                      class="rounded-r-md px-0.5 py-0.5 text-[10px] transition-colors"
+                      classList={{
+                        "text-foreground": active(),
+                        "text-warning": !active() && has(),
+                        "text-muted-foreground hover:text-foreground": !active() && !has(),
+                      }}
+                      onClick={() => toggleCrossProjectView("awaiting")}
+                      aria-pressed={active()}
+                      aria-label="Show awaiting across projects"
+                      data-testid="awaiting-view-toggle"
+                    >
+                      <ActivityIcon class="size-2.5" />
+                    </button>
+                  </div>
+                  <PopoverPortal>
+                    <PopoverContent class="w-80 p-1" data-testid="attention-rail-popover">
+                      <AttentionRail onClose={() => setRailOpen(false)} />
+                    </PopoverContent>
+                  </PopoverPortal>
+                </Popover>
+              );
+            })()}
+
+            {/* Synchronize input (broadcast) — mirror keystrokes from the
+                focused pane to the synced set. The toggle exposes the scope
+                picker on its caret so the user can target all-visible /
+                active-project / manual sets. The visible synced-set count
+                doubles as the obviousness affordance the contract calls for. */}
+            {(() => {
+              const on = () => broadcastActive();
+              const count = () => (on() ? broadcastMemberIds().length : 0);
+              const scopeLabel = (s: BroadcastScope): string =>
+                s === "all-visible"
+                  ? "All visible"
+                  : s === "active-project"
+                    ? "Active project"
+                    : "Manual";
+              return (
+                <Popover>
+                  <div
+                    class="inline-flex items-center gap-0.5 rounded-md transition-colors"
+                    classList={{ "bg-primary/15": on() }}
+                    data-broadcast-active={on() ? "true" : undefined}
+                  >
+                    <Tooltip>
+                      <TooltipTrigger
+                        as="button"
+                        type="button"
+                        class="inline-flex items-center gap-1 rounded-l-md px-1.5 py-0.5 font-mono text-[10px] transition-colors"
+                        classList={{
+                          "text-primary": on(),
+                          "text-muted-foreground hover:text-foreground": !on(),
+                        }}
+                        onClick={() => toggleBroadcast()}
+                        aria-pressed={on()}
+                        aria-label="Toggle synchronize input"
+                        data-testid="broadcast-toggle"
+                      >
+                        {/* Concentric-ring "broadcast" glyph. */}
+                        <svg
+                          xmlns="http://www.w3.org/2000/svg"
+                          class="size-3 shrink-0"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          stroke-width="2"
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                        >
+                          <circle cx="12" cy="12" r="2" />
+                          <path d="M16.24 7.76a6 6 0 0 1 0 8.49M7.76 16.24a6 6 0 0 1 0-8.49M19.07 4.93a10 10 0 0 1 0 14.14M4.93 19.07a10 10 0 0 1 0-14.14" />
+                        </svg>
+                        <Show when={on()}>
+                          <span class="tabular-nums">{count()}</span>
+                        </Show>
+                      </TooltipTrigger>
+                      <TooltipPortal>
+                        <TooltipContent>
+                          {on() ? `Synchronizing input → ${count()} panes` : "Synchronize input"}
+                          <Show when={keymap.accelerator("toggle-broadcast")}>
+                            <span class="ml-1 opacity-70">
+                              ({prettifyAccel(keymap.accelerator("toggle-broadcast"))})
+                            </span>
+                          </Show>
+                        </TooltipContent>
+                      </TooltipPortal>
+                    </Tooltip>
+                    <PopoverTrigger
+                      as="button"
+                      type="button"
+                      class="rounded-r-md px-0.5 py-0.5 text-[10px] transition-colors"
+                      classList={{
+                        "text-primary": on(),
+                        "text-muted-foreground hover:text-foreground": !on(),
+                      }}
+                      aria-label="Broadcast scope"
+                      data-testid="broadcast-scope"
+                    >
+                      <ChevronDownIcon class="size-2.5" />
+                    </PopoverTrigger>
+                  </div>
+                  <PopoverPortal>
+                    <PopoverContent class="w-48 p-1 text-xs">
+                      <div class="mb-1 px-2 py-1 text-[10px] uppercase tracking-wider text-muted-foreground">
+                        Synchronize scope
+                      </div>
+                      <For each={BROADCAST_SCOPES}>
+                        {(s) => (
+                          <button
+                            type="button"
+                            class="flex w-full items-center justify-between rounded px-2 py-1 text-left hover:bg-hover"
+                            onClick={() => setBroadcastScope(s)}
+                          >
+                            <span>{scopeLabel(s)}</span>
+                            <Show when={broadcastScope() === s}>
+                              <CheckIcon class="size-3 text-primary" />
+                            </Show>
+                          </button>
+                        )}
+                      </For>
+                    </PopoverContent>
+                  </PopoverPortal>
+                </Popover>
               );
             })()}
 
