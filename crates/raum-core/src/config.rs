@@ -47,6 +47,7 @@ pub struct Config {
     pub keybindings: Keybindings,
     pub harnesses: HarnessesConfig,
     pub updater: UpdaterConfig,
+    pub projects: ProjectsConfig,
     /// Catch-all for forward-compatible keys so unknown user-added settings
     /// survive a round-trip. Logged at INFO by the store when populated.
     #[serde(flatten, skip_serializing_if = "BTreeMap::is_empty")]
@@ -66,6 +67,7 @@ impl Default for Config {
             keybindings: Keybindings::default(),
             harnesses: HarnessesConfig::default(),
             updater: UpdaterConfig::default(),
+            projects: ProjectsConfig::default(),
             unknown: BTreeMap::new(),
         }
     }
@@ -342,6 +344,34 @@ impl Default for AppearanceConfig {
             theme_id: DEFAULT_THEME_ID.to_string(),
             custom_theme_path: None,
             show_prompt_overlay: true,
+        }
+    }
+}
+
+/// Top-bar project-tab behaviour. Session-less projects already auto-suspend
+/// (derived in the frontend); this adds an OPTIONAL time-based hide: collapse a
+/// project's tab when none of its harnesses have been *used* (a prompt typed +
+/// sent) within `auto_hide_inactive_days`. The active project, and any project
+/// with a harness needing attention, are never hidden. Disabled by default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProjectsConfig {
+    /// Hide project tabs with no harness-prompt activity in the threshold window.
+    pub auto_hide_inactive: bool,
+    /// Days of inactivity before a project's tab is hidden (min 1).
+    #[serde(default = "default_auto_hide_inactive_days")]
+    pub auto_hide_inactive_days: u32,
+}
+
+fn default_auto_hide_inactive_days() -> u32 {
+    14
+}
+
+impl Default for ProjectsConfig {
+    fn default() -> Self {
+        Self {
+            auto_hide_inactive: false,
+            auto_hide_inactive_days: default_auto_hide_inactive_days(),
         }
     }
 }

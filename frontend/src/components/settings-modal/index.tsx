@@ -7,6 +7,7 @@
  *
  * Sections:
  *   - Appearance    — theme picker + per-pane prompt overlay toggle
+ *   - Projects      — top-bar tab behaviour (auto-hide inactive projects)
  *   - Notifications — OS permission + when-to-notify toggles + sound
  *   - Harnesses     — per-harness extra CLI flags appended at spawn time
  *   - Worktrees     — worktree path-pattern preset + custom editor
@@ -23,6 +24,7 @@ import { Scrollable } from "../ui/scrollable";
 import { AppearanceSection } from "./appearance";
 import { HarnessesSection } from "./harnesses";
 import { NotificationsSection } from "./notifications";
+import { ProjectsSection } from "./projects";
 import { SECTIONS } from "./nav";
 import type { SectionId } from "./types";
 import { UpdatesSection } from "./updates";
@@ -45,6 +47,9 @@ const SectionContent: Component<{ section: SectionId; open: boolean }> = (props)
     <>
       <div class={cx(props.section === "appearance" ? "" : "hidden")}>
         <AppearanceSection />
+      </div>
+      <div class={cx(props.section === "projects" ? "" : "hidden")}>
+        <ProjectsSection />
       </div>
       <div class={cx(props.section === "notifications" ? "" : "hidden")}>
         <NotificationsSection active={props.section === "notifications"} open={props.open} />

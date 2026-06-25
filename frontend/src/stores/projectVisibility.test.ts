@@ -18,14 +18,21 @@ import {
 import {
   __resetTerminalStoreForTests,
   applyAgentStateToTerminal,
+  setLastPrompt,
   setTerminals,
   type TerminalListItem,
 } from "./terminalStore";
 import {
   __resetProjectVisibilityForTests,
+  __setNowForTests,
   otherProjects,
   visibleProjects,
 } from "./projectVisibility";
+import {
+  __resetProjectsPrefsForTests,
+  setAutoHideInactiveDays,
+  setAutoHideInactiveEnabled,
+} from "../lib/projectsPrefs";
 
 const invokeMock = vi.mocked(invoke);
 
@@ -60,6 +67,7 @@ describe("projectVisibility", () => {
     __resetTerminalStoreForTests();
     __resetAgentStoreForTests();
     __resetProjectVisibilityForTests();
+    __resetProjectsPrefsForTests();
     invokeMock.mockReset();
     invokeMock.mockResolvedValue(undefined);
   });
@@ -151,5 +159,82 @@ describe("projectVisibility", () => {
       update: { slug: "beta", hidden: false },
     });
     expect(projectStore.items.find((p) => p.slug === "beta")?.hidden).toBe(false);
+  });
+
+  // ---- inactivity auto-hide (opt-in) -------------------------------------
+
+  const NOW = 1_700_000_000_000; // fixed "now" for deterministic staleness
+  const DAY = 86_400_000;
+
+  function betaWithPrompt(submittedAtMs: number): void {
+    setProjects([project(), project({ slug: "beta", name: "Beta" })]);
+    setActiveProjectSlug("alpha");
+    setTerminals([terminal({ session_id: "s-beta", project_slug: "beta", created_unix: 1 })]);
+    setLastPrompt("s-beta", { text: "hi", submittedAtMs });
+  }
+
+  it("does not inactivity-hide when the setting is off (default)", () => {
+    __setNowForTests(NOW);
+    betaWithPrompt(NOW - 100 * DAY); // very stale, but feature disabled
+    expect(visibleProjects().map((p) => p.slug)).toContain("beta");
+  });
+
+  it("hides a project unused beyond the threshold when enabled", () => {
+    setAutoHideInactiveEnabled(true);
+    setAutoHideInactiveDays(5);
+    __setNowForTests(NOW);
+    betaWithPrompt(NOW - 10 * DAY); // last prompt 10 days ago > 5-day window
+
+    expect(visibleProjects().map((p) => p.slug)).not.toContain("beta");
+    expect(otherProjects().map((p) => p.slug)).toContain("beta");
+  });
+
+  it("keeps a project used within the threshold", () => {
+    setAutoHideInactiveEnabled(true);
+    setAutoHideInactiveDays(5);
+    __setNowForTests(NOW);
+    betaWithPrompt(NOW - 2 * DAY); // prompted 2 days ago, inside window
+
+    expect(visibleProjects().map((p) => p.slug)).toContain("beta");
+  });
+
+  it("treats a freshly-created (never-prompted) session as just-used", () => {
+    setAutoHideInactiveEnabled(true);
+    setAutoHideInactiveDays(5);
+    __setNowForTests(NOW);
+    setProjects([project(), project({ slug: "beta", name: "Beta" })]);
+    setActiveProjectSlug("alpha");
+    // created_unix is seconds; created ~1 day ago, no prompt yet.
+    setTerminals([
+      terminal({
+        session_id: "s-beta",
+        project_slug: "beta",
+        created_unix: Math.floor((NOW - DAY) / 1000),
+      }),
+    ]);
+
+    expect(visibleProjects().map((p) => p.slug)).toContain("beta");
+  });
+
+  it("keeps a stale project that has a harness needing attention", () => {
+    setAutoHideInactiveEnabled(true);
+    setAutoHideInactiveDays(5);
+    __setNowForTests(NOW);
+    betaWithPrompt(NOW - 10 * DAY); // stale…
+    applyAgentStateToTerminal("s-beta", "waiting"); // …but waiting on the user
+
+    expect(visibleProjects().map((p) => p.slug)).toContain("beta");
+  });
+
+  it("never inactivity-hides the active project", () => {
+    setAutoHideInactiveEnabled(true);
+    setAutoHideInactiveDays(5);
+    __setNowForTests(NOW);
+    setProjects([project()]);
+    setActiveProjectSlug("alpha");
+    setTerminals([terminal({ session_id: "s-alpha", project_slug: "alpha", created_unix: 1 })]);
+    setLastPrompt("s-alpha", { text: "hi", submittedAtMs: NOW - 100 * DAY });
+
+    expect(visibleProjects().map((p) => p.slug)).toContain("alpha");
   });
 });

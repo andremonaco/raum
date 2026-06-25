@@ -292,6 +292,7 @@ pub fn run() {
             commands::config_set_worktree_path_pattern,
             commands::config_set_appearance_theme,
             commands::config_set_appearance_show_prompt_overlay,
+            commands::config_set_projects_auto_hide,
             // Global search — file search over a project's root or arbitrary path.
             commands::search::project_find_files,
             commands::search::search_files_in_path,

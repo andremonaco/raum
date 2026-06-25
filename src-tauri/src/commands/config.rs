@@ -247,6 +247,28 @@ pub fn config_set_appearance_show_prompt_overlay(
     store.write_config(&cfg).map_err(|e| e.to_string())
 }
 
+/// Persist the top-bar "auto-hide inactive projects" toggle + day threshold.
+/// A project whose harnesses haven't been prompted within `days` collapses into
+/// the "Other projects" list. The staleness check itself is derived in the
+/// frontend (it has the per-session prompt timestamps); this only stores the
+/// preference. `days` is clamped to a minimum of 1.
+#[tauri::command]
+pub fn config_set_projects_auto_hide(
+    state: tauri::State<'_, AppHandleState>,
+    enabled: bool,
+    days: u32,
+) -> Result<(), String> {
+    let days = days.max(1);
+    let store = state.config_store.lock().map_err(|e| e.to_string())?;
+    let mut cfg: Config = store.read_config().map_err(|e| e.to_string())?;
+    if cfg.projects.auto_hide_inactive == enabled && cfg.projects.auto_hide_inactive_days == days {
+        return Ok(());
+    }
+    cfg.projects.auto_hide_inactive = enabled;
+    cfg.projects.auto_hide_inactive_days = days;
+    store.write_config(&cfg).map_err(|e| e.to_string())
+}
+
 /// Persist the global worktree `path_pattern`. Called by the Worktrees settings
 /// section when the user picks a preset or edits a custom pattern.
 ///
