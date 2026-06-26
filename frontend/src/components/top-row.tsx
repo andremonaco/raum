@@ -451,13 +451,13 @@ const ProjectTab: Component<ProjectTabProps> = (props) => {
             <Show when={waitingForProject() > 0}>
               <span
                 aria-hidden="true"
-                class="pointer-events-none absolute right-0.5 top-0.5 h-1.5 w-1.5 rounded-full bg-warning animate-pulse"
+                class="pointer-events-none absolute right-0.5 top-0.5 h-1.5 w-1.5 rounded-full bg-warning animate-pulse group-hover:hidden"
               />
             </Show>
             <Show when={waitingForProject() === 0 && unreadCompletedForProj() > 0}>
               <span
                 aria-hidden="true"
-                class="pointer-events-none absolute right-0.5 top-0.5 h-1.5 w-1.5 rounded-full bg-success"
+                class="pointer-events-none absolute right-0.5 top-0.5 h-1.5 w-1.5 rounded-full bg-success group-hover:hidden"
               />
             </Show>
           </TooltipTrigger>
@@ -470,6 +470,26 @@ const ProjectTab: Component<ProjectTabProps> = (props) => {
             </TooltipContent>
           </TooltipPortal>
         </Tooltip>
+      </Show>
+
+      {/* Compact mode: hover-reveal shelve X in the corner — mirrors the
+          expanded tab's hide button. It swaps in where the attention dot sits
+          (the dot is `group-hover:hidden`), so the 28 px tab never shows both.
+          Sibling of the trigger (not nested — can't nest buttons) and absolutely
+          positioned within the `relative` wrapper. */}
+      <Show when={props.compact}>
+        <button
+          type="button"
+          aria-label={`Hide ${props.project.name || props.project.slug}`}
+          data-testid={`hide-project-${props.project.slug}`}
+          class="absolute right-0 top-0 z-10 hidden h-3.5 w-3.5 items-center justify-center rounded-full bg-popover text-muted-foreground shadow-sm ring-1 ring-border hover:bg-hover hover:text-foreground group-hover:flex"
+          onClick={(e) => {
+            e.stopPropagation();
+            props.onHide();
+          }}
+        >
+          <CloseGlyph />
+        </button>
       </Show>
 
       <Show when={menuOpen()}>
