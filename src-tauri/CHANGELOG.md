@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.11](https://github.com/andremonaco/raum/releases/tag/v0.1.11) - 2026-06-25
+
+### Added
+
+- feat(projects): opt-in auto-hide of inactive project tabs
+- feat(grid): drag-to-rearrange overhaul — grip handles + self-fitting harness ghost
+
+### Fixed
+
+- fix(recovery): make close/reopen/computer-restart sustainably recoverable
+
+
 ## [0.1.10](https://github.com/andremonaco/raum/releases/tag/v0.1.10) - 2026-06-24
 
 
