@@ -215,6 +215,66 @@ jobs:
             exit 1
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      # Rebuild latest.json from scratch, ONCE, after the whole matrix.
+      #
+      # Each matrix build job uploads its own latest.json and tauri-action's
+      # per-job merge races under concurrency (last writer wins) — which has
+      # silently dropped platforms from the published manifest (v0.1.11 shipped
+      # darwin-x86_64 only, so the in-app updater failed for Apple-Silicon and
+      # Linux users with "None of the fallback platforms ... were found").
+      # Reassemble it here from the signature assets already attached to the
+      # draft release, then clobber the racy one. The bundles + .sig files are
+      # already correct; only the manifest was wrong. Draft releases require the
+      # token-authed API download path, which gh uses.
+      - name: rebuild complete latest.json (defeats the matrix upload race)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+          work="$(mktemp -d)"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$work" --pattern '*.sig'
+          shopt -s nullglob
+          declare -A seen=()
+          platforms='{}'
+          for sig in "$work"/*.sig; do
+            bundle="$(basename "$sig" .sig)"   # e.g. raum_aarch64.app.tar.gz
+            case "$bundle" in
+              *.deb) continue ;;                                    # not an updater target
+              *aarch64.app.tar.gz)                key="darwin-aarch64" ;;
+              *x64.app.tar.gz|*x86_64.app.tar.gz) key="darwin-x86_64" ;;
+              *aarch64.AppImage)                  key="linux-aarch64" ;;
+              *.AppImage)                         key="linux-x86_64" ;;
+              *) echo "::warning::unmapped updater artifact '$bundle' — skipping"; continue ;;
+            esac
+            # Emit both the bare key and the `-app` alias the app's updater prefers.
+            platforms="$(jq \
+              --arg k "$key" \
+              --arg sig "$(cat "$sig")" \
+              --arg url "${base}/${bundle}" \
+              '.[$k] = {signature:$sig, url:$url} | .[$k + "-app"] = {signature:$sig, url:$url}' \
+              <<<"$platforms")"
+            seen[$key]=1
+          done
+          # Never publish a manifest missing a platform the matrix builds.
+          for need in darwin-aarch64 darwin-x86_64 linux-x86_64; do
+            if [ -z "${seen[$need]:-}" ]; then
+              echo "::error::latest.json would ship without '$need' — aborting publish" >&2
+              exit 1
+            fi
+          done
+          jq -n \
+            --arg version "$version" \
+            --arg pub_date "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" \
+            --argjson platforms "$platforms" \
+            '{version: $version, notes: "", pub_date: $pub_date, platforms: $platforms}' \
+            > "$work/latest.json"
+          echo "rebuilt latest.json:"
+          jq '{version, platforms: (.platforms | keys)}' "$work/latest.json"
+          gh release upload "$TAG" "$work/latest.json" --repo "$GITHUB_REPOSITORY" --clobber
+
       - name: flip draft → published
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
