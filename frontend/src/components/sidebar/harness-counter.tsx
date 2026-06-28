@@ -11,7 +11,7 @@
 
 import { Component, Show } from "solid-js";
 import { harnessCountsForWorktree } from "../../stores/terminalStore";
-import { ActivityIcon, AlertCircleIcon, CheckIcon, LoaderIcon } from "../icons";
+import { ActivityIcon, CheckIcon, LoaderIcon, TriangleAlertIcon } from "../icons";
 import type { HarnessCounterProps, HarnessCounts } from "./types";
 
 export const HarnessCounter: Component<HarnessCounterProps> = (counterProps) => {
@@ -44,7 +44,10 @@ export const HarnessCounter: Component<HarnessCounterProps> = (counterProps) => 
         }}
         title={`${c().waiting} waiting`}
       >
-        <AlertCircleIcon class="size-2.5" classList={{ "animate-pulse": c().waiting > 0 }} />
+        {/* Angular triangle rather than a thin circle: it holds visual parity
+            with the activity/check strokes at the same size-2.5 box, where a
+            circle outline reads optically smaller. */}
+        <TriangleAlertIcon class="size-2.5" classList={{ "animate-pulse": c().waiting > 0 }} />
         {c().waiting}
       </span>
       <span

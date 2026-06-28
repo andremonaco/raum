@@ -157,9 +157,10 @@ const ProjectAccordion: Component<{
             </li>
           }
         >
-          {/* Aggregate "All terminals" scope selector. */}
+          {/* Aggregate "All scopes" divider — selects the cross-worktree scope. */}
           <AllTerminalsRow
             projectSlug={slug()}
+            projectName={listProps.project.name}
             isActive={isAllActive()}
             counts={projectHarnessCounts()}
           />

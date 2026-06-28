@@ -160,7 +160,7 @@ export const Sidebar: Component = () => {
                       class="flex w-full items-center justify-center gap-0.5 rounded px-0.5 py-1.5 hover:bg-hover"
                       classList={{ "sidebar-row-active": isAllActiveMini() }}
                       aria-current={isAllActiveMini() ? "true" : undefined}
-                      title={`All terminals — ${allCounts().active} active · ${allCounts().waiting} waiting · ${allCounts().idle} idle`}
+                      title={`All scopes — ${allCounts().active} active · ${allCounts().waiting} waiting · ${allCounts().idle} idle`}
                       onClick={() => setActiveWorktreeAll(project().slug)}
                     >
                       <GridEqualIcon

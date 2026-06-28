@@ -22,6 +22,7 @@ import { PlusIcon } from "./plus";
 import { RaumLogo } from "./raum-logo";
 import { SearchIcon } from "./search";
 import { ShellIcon } from "./shell";
+import { TriangleAlertIcon } from "./triangle-alert";
 
 export {
   ActivityIcon,
@@ -48,6 +49,7 @@ export {
   RaumLogo,
   SearchIcon,
   ShellIcon,
+  TriangleAlertIcon,
 };
 
 export type HarnessIconKind = "shell" | "claude-code" | "codex" | "opencode";

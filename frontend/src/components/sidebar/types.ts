@@ -164,6 +164,7 @@ export interface DiscardConfirmDialogProps {
 
 export interface AllTerminalsRowProps {
   projectSlug: string;
+  projectName: string;
   isActive: boolean;
   counts: HarnessCounts;
 }
