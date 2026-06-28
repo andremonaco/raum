@@ -1167,10 +1167,10 @@ fn bootstrap_git_watchers(app: &mut tauri::App) {
             status_pulse.clone(),
         ) {
             Ok(w) => {
-                info!(slug = %slug, "git_watcher: started");
+                info!(id = %slug, "git_watcher: started");
                 watchers.insert(slug, w);
             }
-            Err(e) => warn!(slug = %slug, error = %e, "git_watcher: start failed"),
+            Err(e) => warn!(id = %slug, error = %e, "git_watcher: start failed"),
         }
     }
 }

@@ -26,7 +26,7 @@
 //! emitted ~80 identical WARNs/min and never recovered without an app
 //! restart.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -36,6 +36,8 @@ use serde_json::json;
 use tauri::{AppHandle, Emitter, Runtime};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+
+use super::notify_watch::{ErrorRateMap, HealthState, SUPERVISOR_TICK, emit_rate_limited_error};
 
 /// Git checkout writes multiple files (HEAD, index, packed-refs) in quick
 /// succession. Coalesce the burst so we emit one frontend event per switch.
@@ -50,31 +52,6 @@ enum PulseKind {
     Index,
 }
 
-/// Minimum time between identical-error WARN emissions per (slug, error)
-/// pair. Anything inside the window increments a `suppressed` counter that
-/// surfaces as a single INFO at window close — so a 7 000-warn-per-day
-/// burst becomes ~30 lines and the *transitions* stay visible.
-const ERROR_WARN_WINDOW: Duration = Duration::from_secs(60);
-
-/// Sustained-error duration that triggers a watcher rebuild. Below this, an
-/// occasional EMFILE during a transient pressure spike is left alone — the
-/// FSEvents stream usually recovers on its own. Above it the stream is
-/// effectively dead and only a fresh watcher will resume events.
-const REBUILD_AFTER_SUSTAINED_ERRORS: Duration = Duration::from_secs(30);
-
-/// Initial wait between rebuild attempts after a failure. Doubles up to
-/// `REBUILD_BACKOFF_CEILING`.
-const REBUILD_BACKOFF_INITIAL: Duration = Duration::from_secs(30);
-const REBUILD_BACKOFF_CEILING: Duration = Duration::from_secs(300);
-
-/// How often the supervisor checks the watcher's health.
-const SUPERVISOR_TICK: Duration = Duration::from_secs(15);
-
-/// Number of consecutive errors required (in addition to the time
-/// threshold) before we consider rebuilding. Guards against rebuilding on a
-/// single transient error that happened to land just before a tick.
-const REBUILD_MIN_ERR_COUNT: u64 = 3;
-
 /// Holds the current `RecommendedWatcher` plus the dirs it's watching, so
 /// the supervisor can swap the watcher out without disturbing anything
 /// else. `root` lives here too so rebuilds and rescans share one source of
@@ -83,42 +60,6 @@ struct Inner {
     watcher: RecommendedWatcher,
     watched: HashSet<PathBuf>,
     root: PathBuf,
-}
-
-#[derive(Default)]
-struct ErrorRateMap {
-    by_kind: HashMap<String, KindBucket>,
-}
-
-struct KindBucket {
-    window_start: Instant,
-    suppressed: u64,
-}
-
-#[derive(Default)]
-struct HealthState {
-    /// First error since the last successful event reception, if any.
-    first_err_at: Option<Instant>,
-    /// Errors observed since the last successful event.
-    err_count: u64,
-    /// Consecutive rebuild failures so we can back off exponentially.
-    rebuild_attempts: u32,
-    /// Earliest time the supervisor is allowed to retry a previously
-    /// failed rebuild. `None` means "no pending backoff".
-    next_rebuild_eligible_at: Option<Instant>,
-}
-
-impl HealthState {
-    fn record_ok(&mut self) {
-        self.first_err_at = None;
-        self.err_count = 0;
-    }
-    fn record_err(&mut self, now: Instant) {
-        self.err_count = self.err_count.saturating_add(1);
-        if self.first_err_at.is_none() {
-            self.first_err_at = Some(now);
-        }
-    }
 }
 
 pub struct GitHeadWatcher {
@@ -309,7 +250,7 @@ fn build_watcher(
                 if let Ok(mut h) = cb_health.lock() {
                     h.record_err(Instant::now());
                 }
-                emit_rate_limited_error(&cb_error, &cb_slug, &e);
+                emit_rate_limited_error(&cb_error, "git_watcher", &cb_slug, &e);
             }
         })?;
 
@@ -328,55 +269,10 @@ fn build_watcher(
     Ok((watcher, watched))
 }
 
-/// Emit at most one WARN per `(slug, error)` per `ERROR_WARN_WINDOW`, then
-/// a single suppression-count INFO at the end of the window. Keeps the log
-/// useful when notify is in a sustained-error state — the transitions and
-/// the count are still visible.
-fn emit_rate_limited_error(state: &Arc<Mutex<ErrorRateMap>>, slug: &str, err: &notify::Error) {
-    let key = format!("{err}");
-    let Ok(mut state) = state.lock() else {
-        // Poisoned mutex: drop the warn rather than panic in a callback
-        // that runs on notify's backend thread.
-        return;
-    };
-    let now = Instant::now();
-    match state.by_kind.get_mut(&key) {
-        None => {
-            state.by_kind.insert(
-                key.clone(),
-                KindBucket {
-                    window_start: now,
-                    suppressed: 0,
-                },
-            );
-            warn!(slug = %slug, error = %key, "git_watcher: notify error");
-        }
-        Some(bucket) => {
-            if now.duration_since(bucket.window_start) >= ERROR_WARN_WINDOW {
-                if bucket.suppressed > 0 {
-                    info!(
-                        slug = %slug,
-                        error = %key,
-                        suppressed = bucket.suppressed,
-                        window_secs = ERROR_WARN_WINDOW.as_secs(),
-                        "git_watcher: suppressed repeated notify errors",
-                    );
-                }
-                bucket.window_start = now;
-                bucket.suppressed = 0;
-                warn!(slug = %slug, error = %key, "git_watcher: notify error");
-            } else {
-                bucket.suppressed = bucket.suppressed.saturating_add(1);
-            }
-        }
-    }
-}
-
-/// Long-running supervisor: every `SUPERVISOR_TICK`, check whether the
-/// watcher has been erroring for `REBUILD_AFTER_SUSTAINED_ERRORS` with no
-/// successful events in between. If so, build a fresh watcher and swap it
-/// in. On rebuild failure (typically also EMFILE), back off exponentially
-/// before the next attempt.
+/// Long-running supervisor: every [`SUPERVISOR_TICK`], rebuild the watcher when
+/// it has been erroring long enough (see [`HealthState::rebuild_due`]). On
+/// rebuild failure (typically also EMFILE), back off exponentially before the
+/// next attempt.
 async fn supervise_watcher(
     slug: String,
     inner: Arc<Mutex<Inner>>,
@@ -392,69 +288,49 @@ async fn supervise_watcher(
         tick.tick().await;
 
         let now = Instant::now();
-        let trigger = {
+        let dropped_errors = {
             let Ok(h) = health.lock() else { continue };
-            if let Some(eligible) = h.next_rebuild_eligible_at {
-                if now < eligible {
-                    continue;
-                }
+            match h.rebuild_due(now) {
+                Some(n) => n,
+                None => continue,
             }
-            match h.first_err_at {
-                Some(first)
-                    if now.duration_since(first) >= REBUILD_AFTER_SUSTAINED_ERRORS
-                        && h.err_count >= REBUILD_MIN_ERR_COUNT =>
-                {
-                    Some(h.err_count)
-                }
-                _ => continue,
-            }
-        };
-        let Some(dropped_errors) = trigger else {
-            continue;
         };
 
-        // Snapshot the root outside the watcher-construction call so we
-        // don't hold the inner lock while notify creates its FSEvents
-        // stream.
+        // Snapshot the root outside the watcher-construction call so we don't
+        // hold the inner lock while notify creates its FSEvents stream.
         let root = match inner.lock() {
             Ok(g) => g.root.clone(),
             Err(_) => continue,
         };
-        let result = build_watcher(
+
+        match build_watcher(
             slug.clone(),
             &root,
             pulse_tx.clone(),
             error_state.clone(),
             health.clone(),
-        );
-
-        match result {
+        ) {
             Ok((new_watcher, new_watched)) => {
                 if let Ok(mut g) = inner.lock() {
                     g.watcher = new_watcher;
                     g.watched = new_watched;
                 }
                 if let Ok(mut h) = health.lock() {
-                    h.first_err_at = None;
-                    h.err_count = 0;
-                    h.rebuild_attempts = 0;
-                    h.next_rebuild_eligible_at = None;
+                    h.mark_rebuilt();
                 }
                 info!(
-                    slug = %slug,
+                    id = %slug,
                     dropped_errors = dropped_errors,
                     "git_watcher: rebuilt watcher after sustained errors",
                 );
             }
             Err(e) => {
                 if let Ok(mut h) = health.lock() {
-                    h.rebuild_attempts = h.rebuild_attempts.saturating_add(1);
-                    let backoff = backoff_for_attempt(h.rebuild_attempts);
-                    h.next_rebuild_eligible_at = Some(now + backoff);
+                    let (attempt, backoff) = h.defer_rebuild(now);
                     warn!(
-                        slug = %slug,
+                        id = %slug,
                         error = %e,
-                        attempt = h.rebuild_attempts,
+                        attempt = attempt,
                         retry_in_secs = backoff.as_secs(),
                         "git_watcher: rebuild failed, backing off",
                     );
@@ -462,19 +338,6 @@ async fn supervise_watcher(
             }
         }
     }
-}
-
-/// Exponential backoff schedule: 30 s, 60 s, 120 s, 240 s, capped at the
-/// 300 s ceiling. `attempt` is 1-indexed (we always increment before
-/// looking up).
-fn backoff_for_attempt(attempt: u32) -> Duration {
-    let shift = attempt.saturating_sub(1).min(8);
-    let mult = 1u64 << shift;
-    let secs = REBUILD_BACKOFF_INITIAL
-        .as_secs()
-        .saturating_mul(mult)
-        .min(REBUILD_BACKOFF_CEILING.as_secs());
-    Duration::from_secs(secs)
 }
 
 /// Collect every directory whose `HEAD` file identifies a branch — the main
@@ -625,17 +488,5 @@ mod tests {
         std::fs::create_dir_all(&real).unwrap();
         std::fs::write(root.join(".git"), format!("gitdir: {}\n", real.display())).unwrap();
         assert_eq!(resolve_git_dir(&root), real);
-    }
-
-    #[test]
-    fn backoff_doubles_then_caps() {
-        assert_eq!(backoff_for_attempt(1), Duration::from_secs(30));
-        assert_eq!(backoff_for_attempt(2), Duration::from_secs(60));
-        assert_eq!(backoff_for_attempt(3), Duration::from_secs(120));
-        assert_eq!(backoff_for_attempt(4), Duration::from_secs(240));
-        // 30 * 2^4 = 480 -> capped at 300
-        assert_eq!(backoff_for_attempt(5), Duration::from_secs(300));
-        // Far-future attempts also stay capped.
-        assert_eq!(backoff_for_attempt(50), Duration::from_secs(300));
     }
 }

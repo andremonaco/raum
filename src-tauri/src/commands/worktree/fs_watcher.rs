@@ -57,54 +57,19 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use super::status_service::RefreshCause;
+use crate::commands::notify_watch::{
+    ErrorRateMap, HealthState, SUPERVISOR_TICK, emit_rate_limited_error,
+};
 
 /// Coalesce a burst of edits (an agent saving many files at once) into one
 /// pulse. The status service debounces another 200 ms on top.
 const DEBOUNCE: Duration = Duration::from_millis(150);
-
-/// One WARN per this window per watcher, plus a suppression-count INFO at the
-/// window's end — keeps the log useful under a sustained notify-error state.
-const ERROR_WARN_WINDOW: Duration = Duration::from_secs(60);
-
-/// Sustained-error duration before the supervisor rebuilds the watcher.
-const REBUILD_AFTER_SUSTAINED_ERRORS: Duration = Duration::from_secs(30);
-const REBUILD_MIN_ERR_COUNT: u64 = 3;
-const REBUILD_BACKOFF_INITIAL: Duration = Duration::from_secs(30);
-const REBUILD_BACKOFF_CEILING: Duration = Duration::from_secs(300);
-const SUPERVISOR_TICK: Duration = Duration::from_secs(15);
 
 /// Holds the live watcher and the root it watches so the supervisor can swap
 /// the watcher out on rebuild without disturbing anything else.
 struct Inner {
     watcher: RecommendedWatcher,
     root: PathBuf,
-}
-
-#[derive(Default)]
-struct ErrorWindow {
-    window_start: Option<Instant>,
-    suppressed: u64,
-}
-
-#[derive(Default)]
-struct HealthState {
-    first_err_at: Option<Instant>,
-    err_count: u64,
-    rebuild_attempts: u32,
-    next_rebuild_eligible_at: Option<Instant>,
-}
-
-impl HealthState {
-    fn record_ok(&mut self) {
-        self.first_err_at = None;
-        self.err_count = 0;
-    }
-    fn record_err(&mut self, now: Instant) {
-        self.err_count = self.err_count.saturating_add(1);
-        if self.first_err_at.is_none() {
-            self.first_err_at = Some(now);
-        }
-    }
 }
 
 /// Cloneable handles the watcher callback + supervisor rebuild both need, bundled
@@ -116,7 +81,7 @@ struct WatcherDeps {
     /// Newly created non-ignored directories → the dir-add drain (Linux only;
     /// macOS recursion covers new dirs for free, so the callback never sends).
     dir_tx: mpsc::UnboundedSender<PathBuf>,
-    error_state: Arc<Mutex<ErrorWindow>>,
+    error_state: Arc<Mutex<ErrorRateMap>>,
     health: Arc<Mutex<HealthState>>,
 }
 
@@ -175,7 +140,7 @@ impl WorktreeFsWatcher {
         let deps = WatcherDeps {
             raw_tx,
             dir_tx,
-            error_state: Arc::new(Mutex::new(ErrorWindow::default())),
+            error_state: Arc::new(Mutex::new(ErrorRateMap::default())),
             health: Arc::new(Mutex::new(HealthState::default())),
         };
 
@@ -281,7 +246,12 @@ fn build_watcher(root: PathBuf, deps: &WatcherDeps) -> notify::Result<Recommende
                 if let Ok(mut h) = deps.health.lock() {
                     h.record_err(Instant::now());
                 }
-                emit_rate_limited_error(&deps.error_state, &cb_root, &e);
+                emit_rate_limited_error(
+                    &deps.error_state,
+                    "worktree_fs_watcher",
+                    cb_root.display(),
+                    &e,
+                );
             }
         })?;
 
@@ -346,7 +316,7 @@ fn build_gitignore(root: &Path) -> Gitignore {
     let _ = builder.add(root.join(".gitignore"));
     let _ = builder.add(root.join(".git").join("info").join("exclude"));
     builder.build().unwrap_or_else(|e| {
-        warn!(root = %root.display(), error = %e, "worktree_fs_watcher: gitignore build failed");
+        warn!(id = %root.display(), error = %e, "worktree_fs_watcher: gitignore build failed");
         Gitignore::empty()
     })
 }
@@ -373,40 +343,11 @@ fn under_dot_git(path: &Path, root: &Path) -> bool {
         .is_some_and(|c| c.as_os_str() == ".git")
 }
 
-/// Emit at most one WARN per `ERROR_WARN_WINDOW`, then a single suppression
-/// count at the window's end. Runs on notify's backend thread, so it never
-/// panics on a poisoned mutex — it drops the log instead.
-fn emit_rate_limited_error(state: &Arc<Mutex<ErrorWindow>>, root: &Path, err: &notify::Error) {
-    let Ok(mut w) = state.lock() else {
-        return;
-    };
-    let now = Instant::now();
-    let reopen = match w.window_start {
-        None => true,
-        Some(start) => now.duration_since(start) >= ERROR_WARN_WINDOW,
-    };
-    if reopen {
-        if w.suppressed > 0 {
-            info!(
-                root = %root.display(),
-                suppressed = w.suppressed,
-                window_secs = ERROR_WARN_WINDOW.as_secs(),
-                "worktree_fs_watcher: suppressed repeated notify errors",
-            );
-        }
-        w.window_start = Some(now);
-        w.suppressed = 0;
-        warn!(root = %root.display(), error = %err, "worktree_fs_watcher: notify error");
-    } else {
-        w.suppressed = w.suppressed.saturating_add(1);
-    }
-}
-
-/// Rebuild the watcher once notify has been erroring for
-/// `REBUILD_AFTER_SUSTAINED_ERRORS` with no successful events in between. Backs
-/// off exponentially when the rebuild itself fails (typically also EMFILE). The
-/// rebuilt watcher gets a fresh clone of `raw_tx` into the same debounce
-/// channel, so the debounce task (which holds the receiver) keeps working.
+/// Rebuild the watcher once notify has been erroring long enough (see
+/// [`HealthState::rebuild_due`]). Backs off exponentially when the rebuild
+/// itself fails (typically also EMFILE). The rebuilt watcher gets fresh clones
+/// of `raw_tx`/`dir_tx` into the same channels (via `deps`), so the debounce and
+/// dir-add tasks — which hold the receivers — keep working.
 async fn supervise_watcher(inner: Arc<Mutex<Inner>>, deps: WatcherDeps) {
     let health = deps.health.clone();
     let mut tick = tokio::time::interval(SUPERVISOR_TICK);
@@ -416,22 +357,11 @@ async fn supervise_watcher(inner: Arc<Mutex<Inner>>, deps: WatcherDeps) {
         tick.tick().await;
 
         let now = Instant::now();
-        let should_rebuild = {
+        {
             let Ok(h) = health.lock() else { continue };
-            if let Some(eligible) = h.next_rebuild_eligible_at {
-                if now < eligible {
-                    continue;
-                }
+            if h.rebuild_due(now).is_none() {
+                continue;
             }
-            matches!(
-                h.first_err_at,
-                Some(first)
-                    if now.duration_since(first) >= REBUILD_AFTER_SUSTAINED_ERRORS
-                        && h.err_count >= REBUILD_MIN_ERR_COUNT
-            )
-        };
-        if !should_rebuild {
-            continue;
         }
 
         // Snapshot the root outside the lock so notify's stream construction
@@ -446,22 +376,17 @@ async fn supervise_watcher(inner: Arc<Mutex<Inner>>, deps: WatcherDeps) {
                     g.watcher = new_watcher;
                 }
                 if let Ok(mut h) = health.lock() {
-                    h.first_err_at = None;
-                    h.err_count = 0;
-                    h.rebuild_attempts = 0;
-                    h.next_rebuild_eligible_at = None;
+                    h.mark_rebuilt();
                 }
-                info!(root = %root.display(), "worktree_fs_watcher: rebuilt watcher after sustained errors");
+                info!(id = %root.display(), "worktree_fs_watcher: rebuilt watcher after sustained errors");
             }
             Err(e) => {
                 if let Ok(mut h) = health.lock() {
-                    h.rebuild_attempts = h.rebuild_attempts.saturating_add(1);
-                    let backoff = backoff_for_attempt(h.rebuild_attempts);
-                    h.next_rebuild_eligible_at = Some(now + backoff);
+                    let (attempt, backoff) = h.defer_rebuild(now);
                     warn!(
-                        root = %root.display(),
+                        id = %root.display(),
                         error = %e,
-                        attempt = h.rebuild_attempts,
+                        attempt = attempt,
                         retry_in_secs = backoff.as_secs(),
                         "worktree_fs_watcher: rebuild failed, backing off",
                     );
@@ -469,18 +394,6 @@ async fn supervise_watcher(inner: Arc<Mutex<Inner>>, deps: WatcherDeps) {
             }
         }
     }
-}
-
-/// Exponential backoff: 30 s, 60 s, 120 s, 240 s, capped at the 300 s ceiling.
-/// `attempt` is 1-indexed.
-fn backoff_for_attempt(attempt: u32) -> Duration {
-    let shift = attempt.saturating_sub(1).min(8);
-    let mult = 1u64 << shift;
-    let secs = REBUILD_BACKOFF_INITIAL
-        .as_secs()
-        .saturating_mul(mult)
-        .min(REBUILD_BACKOFF_CEILING.as_secs());
-    Duration::from_secs(secs)
 }
 
 #[cfg(test)]
@@ -544,16 +457,6 @@ mod tests {
             root,
             &gi
         ));
-    }
-
-    #[test]
-    fn backoff_grows_then_caps() {
-        assert_eq!(backoff_for_attempt(1), Duration::from_secs(30));
-        assert_eq!(backoff_for_attempt(2), Duration::from_secs(60));
-        assert_eq!(backoff_for_attempt(3), Duration::from_secs(120));
-        assert_eq!(backoff_for_attempt(4), Duration::from_secs(240));
-        assert_eq!(backoff_for_attempt(5), Duration::from_secs(300));
-        assert_eq!(backoff_for_attempt(99), Duration::from_secs(300));
     }
 
     /// The inotify watch-set must exclude ignored trees (`target/`,
