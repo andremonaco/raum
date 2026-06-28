@@ -240,6 +240,20 @@ export function undoLayout(): boolean {
   for (const id of snap.minimized) {
     if (!snap.tree || !treeContains(snap.tree, id)) restoredMin.add(id);
   }
+  // Retain any pane that is minimized RIGHT NOW but absent from the restored
+  // tree. Such a pane was minimized after this snapshot was taken — most
+  // importantly a tab the inactivity auto-dock extracted into its own off-tree
+  // pane (`minimizeTab`, which deliberately records no history). Without this,
+  // undo would rebuild the minimized set purely from `snap.minimized`, dropping
+  // that pane's flag while its `panes` entry survives — stranding it off-tree
+  // AND unminimized: invisible in both grid and dock, yet a live session.
+  // (A pane minimized *and* present in `snap.tree` is the normal undo-a-minimize
+  // case and must still be un-minimized, so the tree-absence check is required.)
+  for (const id of minimizedPaneIds()) {
+    if ((!snap.tree || !treeContains(snap.tree, id)) && runtimeLayoutStore.panes[id]) {
+      restoredMin.add(id);
+    }
+  }
   setMinimizedPaneIds(restoredMin);
   setMaximizedPaneId(
     snap.maximized && snap.tree && treeContains(snap.tree, snap.maximized) ? snap.maximized : null,
@@ -356,13 +370,16 @@ export function isPaneMinimized(id: string): boolean {
  *  Removes its leaf from `tree` so siblings reflow to fill the freed space.
  *  The `PaneContent` stays in `panes` and the xterm surface keeps mounting
  *  off-tree (see `projectTerminalSurfaces`), so scrollback survives. */
-export function minimizePane(paneId: string): void {
+export function minimizePane(paneId: string, opts?: { recordHistory?: boolean }): void {
   if (!runtimeLayoutStore.panes[paneId]) return;
   const mins = minimizedPaneIds();
   if (mins.has(paneId)) return;
   // Snapshot pre-minimize (pane in tree, not minimized) so Cmd+Z brings it
-  // back into the grid — minimize is a reversible visibility change.
-  pushLayoutHistory();
+  // back into the grid — minimize is a reversible visibility change. The
+  // inactivity auto-dock passes `recordHistory: false` so a background dock
+  // doesn't bury the user's last manual action under undo entries they never
+  // made (the dock chip is the recovery affordance there).
+  if (opts?.recordHistory !== false) pushLayoutHistory();
 
   const tree = currentTree();
   if (tree && treeContains(tree, paneId)) {
@@ -408,6 +425,76 @@ export function restorePane(paneId: string): void {
     return;
   }
   insertExistingPaneFocused(paneId);
+}
+
+/** Pull a single tab out of a multi-tab pane and stash it in the dock as its
+ *  own minimized single-tab pane. The tab's session stays alive — this is a
+ *  MOVE, not a close (unlike `removeCellTab`, which tears the pane down when its
+ *  last tab goes). A `CellTab` carries no `kind`, so the new pane inherits the
+ *  source pane's `kind` (every tab in a pane shares it). When the pane holds
+ *  only this one tab, the tab *is* the pane, so we minimize the whole pane.
+ *
+ *  Returns the id of the resulting minimized pane (the new single-tab pane for
+ *  the multi-tab case, or `paneId` for the whole-pane case), or `null` on a
+ *  no-op. `opts.activityMs` stamps the dock chip's "last used" time; the
+ *  inactivity auto-dock passes the tab's computed idle time so the chip's
+ *  relative timestamp + Recent sort stay accurate.
+ *
+ *  The multi-tab EXTRACTION path is intentionally NOT an undo step: the undo
+ *  snapshot captures only the tree + visibility flags, not the `panes` map, so
+ *  undoing the tab move (which mutates `panes[source].tabs`) would strand the
+ *  extracted session off-tree and invisible. The dock chip is its recovery
+ *  affordance instead. `opts.recordHistory` therefore only governs the
+ *  single-tab delegate to `minimizePane` (a whole-pane minimize IS undoable). */
+export function minimizeTab(
+  paneId: string,
+  tabId: string,
+  opts?: { recordHistory?: boolean; activityMs?: number },
+): string | null {
+  const pane = runtimeLayoutStore.panes[paneId];
+  if (!pane) return null;
+  const tab = pane.tabs.find((t) => t.id === tabId);
+  if (!tab) return null;
+
+  if (pane.tabs.length <= 1) {
+    minimizePane(paneId, { recordHistory: opts?.recordHistory });
+    if (opts?.activityMs !== undefined && runtimeLayoutStore.panes[paneId]) {
+      setRuntimeLayoutStore("panes", paneId, { lastActivityMs: opts.activityMs });
+      applyCellActivityMirror(paneId, { lastActivityMs: opts.activityMs });
+    }
+    return paneId;
+  }
+
+  const newId = nextCellId();
+  const movedTab = unwrap(tab) as CellTab;
+  const newPane: PaneContent = {
+    id: newId,
+    kind: pane.kind,
+    tabs: [movedTab],
+    activeTabId: movedTab.id,
+  };
+  const projectSlug = movedTab.projectSlug ?? pane.projectSlug;
+  const worktreeId = movedTab.worktreeId ?? pane.worktreeId;
+  if (projectSlug !== undefined) newPane.projectSlug = projectSlug;
+  if (worktreeId !== undefined) newPane.worktreeId = worktreeId;
+  if (opts?.activityMs !== undefined) newPane.lastActivityMs = opts.activityMs;
+  setRuntimeLayoutStore("panes", newId, newPane);
+
+  // Reassign the source pane's active tab if we're moving the active one
+  // (mirror `removeCellTab`'s neighbor pick), then drop the tab from it.
+  if (pane.activeTabId === tabId) {
+    const idx = pane.tabs.findIndex((t) => t.id === tabId);
+    const neighbor = idx > 0 ? pane.tabs[idx - 1] : pane.tabs[idx + 1];
+    if (neighbor) setRuntimeLayoutStore("panes", paneId, "activeTabId", neighbor.id);
+  }
+  setRuntimeLayoutStore("panes", paneId, "tabs", (prev) => prev.filter((t) => t.id !== tabId));
+
+  const nextSet = new Set(minimizedPaneIds());
+  nextSet.add(newId);
+  setMinimizedPaneIds(nextSet);
+  rebuildCells();
+  scheduleActiveSave();
+  return newId;
 }
 
 /** Mirror `panes[id]` activity metadata into the matching `cells[i]`

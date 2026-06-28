@@ -57,6 +57,7 @@ import {
   type TerminalRecord,
 } from "../stores/terminalStore";
 import { placedSessionIds, subscribePaneActivity } from "../stores/runtimeLayoutStore";
+import { startTerminalAutoDock } from "../stores/terminalAutoDock";
 import { subscribeReviewLinkEvents } from "../stores/reviewLinkStore";
 import { attentionQueue, waitingByBlockedLongest } from "../stores/agentStore";
 import {
@@ -76,6 +77,8 @@ import { closeSpotlight, setTopBarQuery, spotlightOpen } from "../lib/spotlightS
 import { AddProjectModal } from "./add-project-modal";
 import { KeymapSettingsModal } from "./keymap-settings-modal";
 import { SettingsModal } from "./settings-modal";
+import type { SectionId } from "./settings-modal/types";
+import { runUpdateCheck, type OpenSettingsDetail } from "../lib/updateNotifier";
 import { Button } from "./ui/button";
 import {
   Dialog,
@@ -540,6 +543,16 @@ export const TopRow: Component = () => {
     if (pendingAddProjectPath()) setModalOpen(true);
   });
   const [appSettingsOpen, setAppSettingsOpen] = createSignal(false);
+  // Section the settings modal should jump to on open. `undefined` keeps the
+  // last-viewed section (the plain gear / Cmd+, path); set explicitly when a
+  // deep link — e.g. the update toast's "Install…" — wants a specific tab.
+  const [settingsInitialSection, setSettingsInitialSection] = createSignal<SectionId | undefined>(
+    undefined,
+  );
+  const openAppSettings = (section?: SectionId) => {
+    setSettingsInitialSection(section);
+    setAppSettingsOpen(true);
+  };
   const [keymapSettingsOpen, setKeymapSettingsOpen] = createSignal(false);
   const [confirmRemove, setConfirmRemove] = createSignal<ProjectListItem | undefined>(undefined);
   const [orphanSweepResult, setOrphanSweepResult] = createSignal<
@@ -677,7 +690,9 @@ export const TopRow: Component = () => {
 
     listen<string>("menu-action", (ev) => {
       if (ev.payload === "open-settings") {
-        setAppSettingsOpen(true);
+        openAppSettings();
+      } else if (ev.payload === "check-updates") {
+        void runUpdateCheck({ interactive: true });
       } else if (ev.payload === "install-cli") {
         void invoke<{ path: string; onPath: boolean }>("cli_install_shim")
           .then((res) => {
@@ -704,6 +719,12 @@ export const TopRow: Component = () => {
       .catch(() => {
         /* Tauri context unavailable (tests). */
       });
+
+    // Deep link to a settings tab (e.g. the update toast's "Install…" action).
+    const onOpenSettings = (ev: Event) => {
+      openAppSettings((ev as CustomEvent<OpenSettingsDetail>).detail?.section);
+    };
+    window.addEventListener("raum:open-settings", onOpenSettings);
 
     subscribeProjectEvents()
       .then((u) => {
@@ -740,6 +761,10 @@ export const TopRow: Component = () => {
       .catch(() => {
         /* Tauri context unavailable (tests). */
       });
+    // Start the inactivity auto-dock clock (the effects are already live from
+    // module import; this just starts time moving so an idle app still docks
+    // tabs once they cross the threshold). No-op unless the setting is enabled.
+    startTerminalAutoDock();
 
     // Terminal launcher (`raum <dir>`), already-running case: a second
     // invocation emits this with the resolved absolute directory path.
@@ -827,6 +852,7 @@ export const TopRow: Component = () => {
       unlistenPaneActivity?.();
       unlistenReviewLinks?.();
       unlistenCliOpen?.();
+      window.removeEventListener("raum:open-settings", onOpenSettings);
     });
   });
 
@@ -1114,7 +1140,7 @@ export const TopRow: Component = () => {
             type="button"
             aria-label="Open settings"
             class="focus-ring rounded-sm p-1 text-foreground-subtle hover:bg-hover hover:text-foreground"
-            onClick={() => setAppSettingsOpen(true)}
+            onClick={() => openAppSettings()}
           >
             <svg
               xmlns="http://www.w3.org/2000/svg"
@@ -1681,7 +1707,11 @@ export const TopRow: Component = () => {
         </DialogPortal>
       </Dialog>
 
-      <SettingsModal open={appSettingsOpen()} onClose={() => setAppSettingsOpen(false)} />
+      <SettingsModal
+        open={appSettingsOpen()}
+        initialSection={settingsInitialSection()}
+        onClose={() => setAppSettingsOpen(false)}
+      />
 
       <KeymapSettingsModal
         open={keymapSettingsOpen()}

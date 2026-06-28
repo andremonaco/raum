@@ -7,6 +7,7 @@ import type { HarnessIconKind } from "../icons";
 export type SectionId =
   | "appearance"
   | "projects"
+  | "terminals"
   | "notifications"
   | "harnesses"
   | "worktrees"
