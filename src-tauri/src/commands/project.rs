@@ -535,10 +535,18 @@ pub fn project_config_effective(
         .config_store
         .lock()
         .map_err(|e| format!("config_store lock: {e}"))?;
+    let config = store
+        .read_config()
+        .map_err(|e| format!("read_config: {e}"))?;
     let maybe = store
         .effective_project(&slug)
         .map_err(|e| format!("effective_project: {e}"))?;
-    Ok(maybe.map(EffectiveProjectDto::from))
+    Ok(maybe.map(|mut eff| {
+        // The worktree path is configured globally (Settings → Worktrees), so
+        // surface the global path rather than the stale per-project value.
+        eff.worktree.apply_global_path(&config.worktree_config);
+        EffectiveProjectDto::from(eff)
+    }))
 }
 
 // ---- gitignore tree ---------------------------------------------------------

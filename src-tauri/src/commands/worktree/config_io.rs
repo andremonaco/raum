@@ -4,7 +4,6 @@
 use std::path::{Path, PathBuf};
 
 use raum_core::config::WorktreeConfig;
-use raum_hydration::resolve_worktree_pattern;
 
 use crate::state::AppHandleState;
 
@@ -50,34 +49,14 @@ pub(super) fn load_effective(
         .effective_project(project_slug)
         .map_err(|e| format!("effective_project: {e}"))?
         .ok_or_else(|| format!("project not found: {project_slug}"))?;
-    // Reconcile strategy/pattern for legacy configs that predate the field.
-    eff.worktree.normalize();
-    // If the effective path_pattern is empty (all layers above the built-in
-    // default were silent), fall back to the built-in default via
-    // `resolve_worktree_pattern`.
-    if eff.worktree.path_pattern.is_empty() {
-        let config = store
-            .read_config()
-            .map_err(|e| format!("read_config: {e}"))?;
-        let resolved = resolve_worktree_pattern(
-            &config,
-            &raum_core::config::ProjectConfig {
-                slug: eff.slug.clone(),
-                root_path: eff.root_path.clone(),
-                worktree: eff.worktree.clone(),
-                ..raum_core::config::ProjectConfig::default()
-            },
-            None,
-        );
-        eff.worktree = WorktreeConfig {
-            path_strategy: eff.worktree.path_strategy,
-            path_pattern: resolved.path_pattern,
-            branch_prefix_mode: eff.worktree.branch_prefix_mode,
-            branch_prefix_custom: eff.worktree.branch_prefix_custom.clone(),
-            hooks: eff.worktree.hooks.clone(),
-        };
-        eff.worktree.normalize();
-    }
+    // The worktree path is a single global setting (Settings → Worktrees) that
+    // applies to every project — overlay it onto the effective config so the
+    // preview/create paths always honor the global default. Branch-prefix and
+    // hooks stay per-project.
+    let config = store
+        .read_config()
+        .map_err(|e| format!("read_config: {e}"))?;
+    eff.worktree.apply_global_path(&config.worktree_config);
     Ok(eff)
 }
 
@@ -99,53 +78,6 @@ pub(super) fn rescan_git_watcher(
             w.rescan(root);
         }
     }
-}
-
-/// True when `target` lives somewhere under `<root>/.raum/`. Used to gate the
-/// `.gitignore` auto-write on the inside-project worktree preset.
-pub(super) fn target_is_inside_raum_dir(root: &Path, target: &Path) -> bool {
-    let raum_dir = root.join(".raum");
-    target.starts_with(&raum_dir)
-}
-
-/// Ensure `<root>/.gitignore` lists `.raum/`. Idempotent:
-///
-/// * Missing file → create one containing `.raum/\n`.
-/// * Existing file that already ignores `.raum` (or `.raum/`) → no-op.
-/// * Existing file without the entry → append a `.raum/` line (preserving a
-///   trailing newline if one was present, adding one otherwise).
-pub(super) fn ensure_raum_gitignored(root: &Path) -> std::io::Result<()> {
-    let gitignore = root.join(".gitignore");
-    match std::fs::read_to_string(&gitignore) {
-        Ok(existing) => {
-            if gitignore_has_raum_entry(&existing) {
-                return Ok(());
-            }
-            let mut updated = existing;
-            if !updated.ends_with('\n') {
-                updated.push('\n');
-            }
-            updated.push_str(".raum/\n");
-            std::fs::write(&gitignore, updated)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::write(&gitignore, ".raum/\n")
-        }
-        Err(e) => Err(e),
-    }
-}
-
-pub(super) fn gitignore_has_raum_entry(body: &str) -> bool {
-    body.lines().any(|line| {
-        let trimmed = line.trim();
-        // Skip comments and blank lines. Accept either `.raum` or `.raum/` —
-        // git treats both as ignoring the directory at repo root. Also accept
-        // the leading-slash forms users sometimes write (`/.raum`, `/.raum/`).
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            return false;
-        }
-        matches!(trimmed, ".raum" | ".raum/" | "/.raum" | "/.raum/")
-    })
 }
 
 /// §6.8 — in-app TOML-fragment editor.

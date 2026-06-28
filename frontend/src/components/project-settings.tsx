@@ -15,8 +15,8 @@ import { tildify } from "~/lib/pathDisplay";
 type PathStrategy = "sibling-group" | "nested" | "custom";
 
 const PATH_STRATEGY_LABEL: Record<PathStrategy, string> = {
-  "sibling-group": "Sibling group",
-  nested: "Nested (inside .raum/)",
+  "sibling-group": "Parent",
+  nested: "Nested",
   custom: "Custom",
 };
 

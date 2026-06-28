@@ -4,12 +4,14 @@
 use std::path::Path;
 use std::process::Command;
 
-use raum_hydration::{worktree_list as git_worktree_list, worktree_remove as git_worktree_remove};
+use raum_hydration::{
+    get_raum_base_branch, worktree_list as git_worktree_list,
+    worktree_remove as git_worktree_remove,
+};
 use tauri::ipc::Channel;
 
 use super::branches::ahead_behind;
 use super::config_io::{blocking, load_effective, rescan_git_watcher};
-use super::create::get_raum_base_branch;
 use super::remove::{delete_local_branch, sessions_for_worktree_strs};
 use super::status::is_dirty;
 use super::status_service::trigger_status_refresh;

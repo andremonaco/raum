@@ -45,9 +45,9 @@ const PresetRow: Component<{
 };
 
 export const WorktreesSection: Component<{ active: boolean }> = (props) => {
-  const [pattern, setPattern] = createSignal<string>(WORKTREE_PRESETS.sibling);
-  const [customDraft, setCustomDraft] = createSignal<string>(WORKTREE_PRESETS.sibling);
-  const [preset, setPreset] = createSignal<WorktreePresetKey>("sibling");
+  const [pattern, setPattern] = createSignal<string>(WORKTREE_PRESETS.parent);
+  const [customDraft, setCustomDraft] = createSignal<string>(WORKTREE_PRESETS.parent);
+  const [preset, setPreset] = createSignal<WorktreePresetKey>("parent");
   const [saving, setSaving] = createSignal(false);
   const [seeded, setSeeded] = createSignal(false);
   const [saveError, setSaveError] = createSignal<string | undefined>(undefined);
@@ -58,7 +58,7 @@ export const WorktreesSection: Component<{ active: boolean }> = (props) => {
     try {
       const cfg = await invoke<{ worktreeConfig?: { pathPattern?: string } }>("config_get");
       const p = cfg.worktreeConfig?.pathPattern?.trim();
-      const effective = p && p.length > 0 ? p : WORKTREE_PRESETS.sibling;
+      const effective = p && p.length > 0 ? p : WORKTREE_PRESETS.parent;
       setPattern(effective);
       setCustomDraft(effective);
       setPreset(detectPreset(effective));
@@ -155,20 +155,20 @@ export const WorktreesSection: Component<{ active: boolean }> = (props) => {
         </p>
         <div class="flex flex-col gap-1.5">
           <PresetRow
-            checked={preset() === "inside"}
+            checked={preset() === "nested"}
             disabled={!seeded() || saving()}
-            title="Inside the project"
+            title="Nested"
             description="Lives under a .raum/ folder at the project root. raum adds .raum/ to .gitignore the first time you use this."
-            pattern={WORKTREE_PRESETS.inside}
-            onSelect={() => selectPreset("inside")}
+            pattern={WORKTREE_PRESETS.nested}
+            onSelect={() => selectPreset("nested")}
           />
           <PresetRow
-            checked={preset() === "sibling"}
+            checked={preset() === "parent"}
             disabled={!seeded() || saving()}
-            title="Sibling folder"
-            description="Dropped next to the project in a <name>-worktrees/ directory. This is the default."
-            pattern={WORKTREE_PRESETS.sibling}
-            onSelect={() => selectPreset("sibling")}
+            title="Parent"
+            description="Dropped next to the project in a <name>-worktrees/ directory in the parent folder. This is the default."
+            pattern={WORKTREE_PRESETS.parent}
+            onSelect={() => selectPreset("parent")}
           />
           <PresetRow
             checked={preset() === "custom"}
@@ -187,7 +187,7 @@ export const WorktreesSection: Component<{ active: boolean }> = (props) => {
           <input
             type="text"
             class="w-full rounded border border-border bg-background px-2 py-1 font-mono text-xs text-foreground focus:border-ring focus:outline-none disabled:opacity-50"
-            placeholder="{repo-root}/.raum/{worktree-slug}"
+            placeholder="{repo-root}/.raum/{branch-slug}"
             value={customDraft()}
             onInput={(e) => setCustomDraft(e.currentTarget.value)}
             onBlur={commitCustom}
@@ -195,9 +195,9 @@ export const WorktreesSection: Component<{ active: boolean }> = (props) => {
           />
           <p class="text-[10px] text-muted-foreground">
             Tokens: <code class="rounded bg-muted px-1 py-px font-mono">{"{repo-root}"}</code>,{" "}
-            <code class="rounded bg-muted px-1 py-px font-mono">{"{repo-name}"}</code>,{" "}
+            <code class="rounded bg-muted px-1 py-px font-mono">{"{base-folder}"}</code>,{" "}
             <code class="rounded bg-muted px-1 py-px font-mono">{"{parent-dir}"}</code>,{" "}
-            <code class="rounded bg-muted px-1 py-px font-mono">{"{worktree-slug}"}</code>,{" "}
+            <code class="rounded bg-muted px-1 py-px font-mono">{"{branch-slug}"}</code>,{" "}
             <code class="rounded bg-muted px-1 py-px font-mono">{"{branch-name}"}</code>.
           </p>
         </div>

@@ -69,12 +69,12 @@ const PREFIX_PRESETS = [
 type PathStrategy = "sibling-group" | "nested" | "custom";
 
 const STRATEGY_LABEL: Record<PathStrategy, string> = {
-  "sibling-group": "Sibling",
+  "sibling-group": "Parent",
   nested: "Nested",
   custom: "Custom",
 };
 
-const STRATEGY_OPTIONS: PathStrategy[] = ["sibling-group", "nested", "custom"];
+const STRATEGY_OPTIONS: PathStrategy[] = ["nested", "sibling-group", "custom"];
 
 // Example placeholder text used while the user has typed nothing yet — keeps
 // the preview cards at a stable height instead of collapsing to "—".

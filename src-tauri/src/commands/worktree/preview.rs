@@ -11,9 +11,10 @@ use raum_hydration::{
     worktree_list as git_worktree_list,
 };
 
+use raum_hydration::get_raum_base_branch;
+
 use super::branches::fetch_upstream_branch;
 use super::config_io::{apply_strategy_override, load_effective, os_username};
-use super::create::get_raum_base_branch;
 use super::types::{WorktreeListItem, WorktreeManifestPreview, WorktreePathPreview};
 use crate::state::AppHandleState;
 

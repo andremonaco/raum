@@ -252,9 +252,19 @@ impl PathStrategy {
     /// Reverse map: classify a pattern string back into its preset, or
     /// `Custom` when it doesn't match a known one. Used to derive the
     /// strategy for legacy configs that predate the field.
+    ///
+    /// Legacy alias tokens are canonicalized first (`{repo-name}` →
+    /// `{base-folder}`, `{worktree-slug}` → `{branch-slug}`) so a pattern saved
+    /// by an older raum (the settings UI used to persist the alias forms) still
+    /// classifies into its preset. This mirrors `canonicalizePattern` in
+    /// `frontend/src/components/settings-modal/utils.ts`, keeping the Settings
+    /// modal, the create-worktree modal, and Project Settings in agreement.
     #[must_use]
     pub fn infer_from_pattern(pattern: &str) -> Self {
-        match pattern {
+        let canon = pattern
+            .replace("{repo-name}", "{base-folder}")
+            .replace("{worktree-slug}", "{branch-slug}");
+        match canon.as_str() {
             SIBLING_GROUP_PATH_PATTERN => Self::SiblingGroup,
             NESTED_PATH_PATTERN => Self::Nested,
             _ => Self::Custom,
@@ -298,6 +308,24 @@ impl WorktreeConfig {
                 }
             }
         }
+    }
+
+    /// Overlay the globally-configured worktree path (Settings → Worktrees) onto
+    /// this config.
+    ///
+    /// The worktree *path* is a single global setting shared by every project —
+    /// `project.toml` / `.raum.toml` no longer carry per-project path overrides —
+    /// so this replaces `path_pattern` / `path_strategy` while leaving
+    /// branch-prefix and hooks untouched. An empty global pattern falls back to
+    /// the built-in default.
+    pub fn apply_global_path(&mut self, global: &WorktreeConfig) {
+        let p = global.path_pattern.trim();
+        self.path_pattern = if p.is_empty() {
+            DEFAULT_PATH_PATTERN.to_string()
+        } else {
+            p.to_string()
+        };
+        self.path_strategy = PathStrategy::infer_from_pattern(&self.path_pattern);
     }
 }
 
@@ -1070,6 +1098,21 @@ mod tests {
         assert_eq!(
             PathStrategy::infer_from_pattern("anything-else/{branch-slug}"),
             PathStrategy::Custom
+        );
+    }
+
+    #[test]
+    fn path_strategy_infers_legacy_alias_token_patterns() {
+        // Patterns saved by an older raum used the alias tokens `{repo-name}` /
+        // `{worktree-slug}`; they must still classify into their preset (not
+        // Custom) so all the strategy-derived UI surfaces agree.
+        assert_eq!(
+            PathStrategy::infer_from_pattern("{parent-dir}/{repo-name}-worktrees/{worktree-slug}"),
+            PathStrategy::SiblingGroup
+        );
+        assert_eq!(
+            PathStrategy::infer_from_pattern("{repo-root}/.raum/{worktree-slug}"),
+            PathStrategy::Nested
         );
     }
 

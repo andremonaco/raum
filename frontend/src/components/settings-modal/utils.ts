@@ -69,9 +69,20 @@ export function renderPathPreview(pattern: string, rootPath: string, branch: str
     .replace(/\{project-slug\}/g, baseFolder);
 }
 
+/** Rewrite the older alias tokens raum used to persist (`{repo-name}`,
+ *  `{worktree-slug}`) to their canonical equivalents (`{base-folder}`,
+ *  `{branch-slug}`) so a pattern saved before the token cleanup still maps onto
+ *  its preset instead of falling through to "custom". */
+function canonicalizePattern(pattern: string): string {
+  return pattern
+    .replace(/\{repo-name\}/g, "{base-folder}")
+    .replace(/\{worktree-slug\}/g, "{branch-slug}");
+}
+
 export function detectPreset(pattern: string): WorktreePresetKey {
-  if (pattern === WORKTREE_PRESETS.inside) return "inside";
-  if (pattern === WORKTREE_PRESETS.sibling) return "sibling";
+  const canon = canonicalizePattern(pattern);
+  if (canon === WORKTREE_PRESETS.nested) return "nested";
+  if (canon === WORKTREE_PRESETS.parent) return "parent";
   return "custom";
 }
 

@@ -68,9 +68,13 @@ export const INSTALL_COMMANDS: Partial<Record<HarnessIconKind, string>> = {
   opencode: "npm install -g opencode-ai",
 };
 
+// Canonical preset patterns. Tokens match the backend constants exactly
+// (`{base-folder}` / `{branch-slug}`) so `detectPreset` here and
+// `PathStrategy::infer_from_pattern` in Rust classify them identically.
+//   nested → NESTED_PATH_PATTERN, parent → SIBLING_GROUP/DEFAULT_PATH_PATTERN.
 export const WORKTREE_PRESETS = {
-  inside: "{repo-root}/.raum/{worktree-slug}",
-  sibling: "{parent-dir}/{repo-name}-worktrees/{worktree-slug}",
+  nested: "{repo-root}/.raum/{branch-slug}",
+  parent: "{parent-dir}/{base-folder}-worktrees/{branch-slug}",
 } as const;
 
 /** Command surfaced for Homebrew-cask installs; copied to the clipboard so

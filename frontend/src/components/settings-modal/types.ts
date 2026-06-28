@@ -43,7 +43,7 @@ export interface HarnessEntry {
   placeholder: string;
 }
 
-export type WorktreePresetKey = "inside" | "sibling" | "custom";
+export type WorktreePresetKey = "nested" | "parent" | "custom";
 
 export interface ProjectListItem {
   slug: string;
