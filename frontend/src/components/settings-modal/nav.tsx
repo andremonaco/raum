@@ -47,6 +47,27 @@ export const SECTIONS: Section[] = [
     ),
   },
   {
+    id: "terminals",
+    label: "Terminals",
+    icon: () => (
+      <svg
+        xmlns="http://www.w3.org/2000/svg"
+        class="size-3 shrink-0"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        {/* A terminal window: prompt chevron + cursor line. */}
+        <rect x="3" y="4" width="18" height="16" rx="2" />
+        <path d="M7 9l3 3-3 3" />
+        <path d="M13 15h4" />
+      </svg>
+    ),
+  },
+  {
     id: "notifications",
     label: "Notifications",
     icon: () => (

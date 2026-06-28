@@ -5,9 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use raum_core::config::{
-    BranchPrefixMode, Config, DEFAULT_PATH_PATTERN, ProjectConfig, RaumToml, WorktreeConfig,
-};
+use raum_core::config::{Config, ProjectConfig, RaumToml, WorktreeConfig};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -57,34 +55,25 @@ pub fn validate_path_pattern(pattern: &str) -> Result<(), PatternError> {
     Ok(())
 }
 
-/// Resolve the effective `WorktreeConfig` using the precedence chain:
-/// `.raum.toml → project.toml → config.toml → built-in default`.
+/// Resolve the effective `WorktreeConfig`.
 ///
-/// An empty `path_pattern` is treated as "unset" so the next-lower precedence layer applies.
+/// The worktree *path* (`path_pattern` / `path_strategy`) is a single global
+/// setting (Settings → Worktrees) shared by every project; `project.toml` /
+/// `.raum.toml` no longer carry per-project path overrides. An empty global
+/// pattern falls back to the built-in default. Branch-prefix and hooks are still
+/// resolved per-project (`.raum.toml` worktree block over `project.toml`).
 pub fn resolve_worktree_pattern(
     config: &Config,
     project: &ProjectConfig,
     raum_toml: Option<&RaumToml>,
 ) -> WorktreeConfig {
-    if let Some(rt) = raum_toml {
-        if let Some(w) = &rt.worktree {
-            if !w.path_pattern.is_empty() {
-                return w.clone();
-            }
-        }
-    }
-    if !project.worktree.path_pattern.is_empty() {
-        return project.worktree.clone();
-    }
-    if !config.worktree_config.path_pattern.is_empty() {
-        return config.worktree_config.clone();
-    }
-    WorktreeConfig {
-        path_pattern: DEFAULT_PATH_PATTERN.into(),
-        branch_prefix_mode: BranchPrefixMode::None,
-        branch_prefix_custom: None,
-        ..WorktreeConfig::default()
-    }
+    // Branch-prefix + hooks: `.raum.toml` worktree block wins, else project-level.
+    let mut wc = raum_toml
+        .and_then(|rt| rt.worktree.clone())
+        .unwrap_or_else(|| project.worktree.clone());
+    // The worktree path is globally authoritative.
+    wc.apply_global_path(&config.worktree_config);
+    wc
 }
 
 /// Render `pattern` against `inputs`, producing an absolute-ish `PathBuf`.
@@ -150,7 +139,9 @@ fn extract_tokens(pattern: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use raum_core::config::{Config, ProjectConfig, RaumToml, WorktreeConfig};
+    use raum_core::config::{
+        BranchPrefixMode, Config, NESTED_PATH_PATTERN, ProjectConfig, RaumToml, WorktreeConfig,
+    };
     use std::path::PathBuf;
 
     fn project_with(pattern: &str) -> ProjectConfig {
@@ -321,8 +312,9 @@ mod tests {
     }
 
     #[test]
-    fn precedence_raum_toml_wins() {
-        let config = Config::default();
+    fn global_path_overrides_raum_toml() {
+        // The worktree path is globally authoritative — a `.raum.toml` path is ignored.
+        let config = config_with("config/{branch-slug}");
         let project = project_with("project/{branch-slug}");
         let raum = RaumToml {
             worktree: Some(WorktreeConfig {
@@ -332,47 +324,59 @@ mod tests {
             ..RaumToml::default()
         };
         let resolved = resolve_worktree_pattern(&config, &project, Some(&raum));
-        assert_eq!(resolved.path_pattern, "raum/{branch-slug}");
+        assert_eq!(resolved.path_pattern, "config/{branch-slug}");
     }
 
     #[test]
-    fn precedence_project_wins_over_config() {
+    fn global_path_overrides_project() {
         let config = config_with("config/{branch-slug}");
         let project = project_with("project/{branch-slug}");
-        let resolved = resolve_worktree_pattern(&config, &project, None);
-        assert_eq!(resolved.path_pattern, "project/{branch-slug}");
-    }
-
-    #[test]
-    fn precedence_config_used_when_project_empty() {
-        let config = config_with("config/{branch-slug}");
-        let project = project_with("");
         let resolved = resolve_worktree_pattern(&config, &project, None);
         assert_eq!(resolved.path_pattern, "config/{branch-slug}");
     }
 
     #[test]
-    fn precedence_falls_back_to_builtin_default() {
+    fn falls_back_to_builtin_when_global_empty() {
         let config = config_with("");
-        let project = project_with("");
+        let project = project_with("project/{branch-slug}");
         let resolved = resolve_worktree_pattern(&config, &project, None);
-        assert_eq!(resolved.path_pattern, DEFAULT_PATH_PATTERN);
+        assert_eq!(resolved.path_pattern, NESTED_PATH_PATTERN);
     }
 
     #[test]
-    fn precedence_raum_toml_with_empty_pattern_falls_through() {
-        // An explicit empty path_pattern in .raum.toml should not override project.
-        let config = Config::default();
+    fn prefix_and_hooks_resolved_from_raum_toml() {
+        // Path comes from global config; branch-prefix comes from `.raum.toml`.
+        let config = config_with("config/{branch-slug}");
         let project = project_with("project/{branch-slug}");
         let raum = RaumToml {
             worktree: Some(WorktreeConfig {
-                path_pattern: String::new(),
+                path_pattern: "raum/{branch-slug}".into(),
+                branch_prefix_mode: BranchPrefixMode::Username,
                 ..WorktreeConfig::default()
             }),
             ..RaumToml::default()
         };
         let resolved = resolve_worktree_pattern(&config, &project, Some(&raum));
-        assert_eq!(resolved.path_pattern, "project/{branch-slug}");
+        assert_eq!(resolved.path_pattern, "config/{branch-slug}");
+        assert_eq!(resolved.branch_prefix_mode, BranchPrefixMode::Username);
+    }
+
+    #[test]
+    fn prefix_falls_back_to_project_without_raum_toml() {
+        let config = config_with("config/{branch-slug}");
+        let project = ProjectConfig {
+            slug: "demo".into(),
+            root_path: PathBuf::from("/tmp/work/demo"),
+            worktree: WorktreeConfig {
+                path_pattern: "project/{branch-slug}".into(),
+                branch_prefix_mode: BranchPrefixMode::Username,
+                ..WorktreeConfig::default()
+            },
+            ..ProjectConfig::default()
+        };
+        let resolved = resolve_worktree_pattern(&config, &project, None);
+        assert_eq!(resolved.path_pattern, "config/{branch-slug}");
+        assert_eq!(resolved.branch_prefix_mode, BranchPrefixMode::Username);
     }
 
     #[test]

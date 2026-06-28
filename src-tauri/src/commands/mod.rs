@@ -14,6 +14,7 @@ pub mod harness_runtime;
 pub mod hotkeys;
 pub mod lifecycle;
 pub mod notifications;
+pub(crate) mod notify_watch;
 pub mod permission;
 pub mod project;
 pub mod review;

@@ -46,20 +46,36 @@ describe("<CreateWorktreeModal>", () => {
     });
   });
 
-  it("pre-selects the project's configured strategy", async () => {
+  it("drops the path-strategy picker and links to Settings instead", async () => {
     render(() => (
       <CreateWorktreeModal projectSlug={PROJECT_SLUG} open={true} onClose={() => undefined} />
     ));
 
-    // Wait for the default-preview resource to resolve, then assert the
-    // segmented control reflects the backend-reported strategy ("nested").
-    await waitFor(() => {
-      const nestedBtn = screen.getByTestId("strategy-nested");
-      expect(nestedBtn.getAttribute("aria-checked")).toBe("true");
-    });
+    // The "Change in Settings" link is the only placement control now.
+    const link = await screen.findByTestId("open-worktree-settings");
+    expect(link.textContent).toContain("Change in Settings");
 
-    const sibling = screen.getByTestId("strategy-sibling-group");
-    expect(sibling.getAttribute("aria-checked")).toBe("false");
+    // The per-create segmented control is gone — placement is steered from
+    // Settings → Worktrees.
+    expect(screen.queryByTestId("strategy-nested")).toBeNull();
+    expect(screen.queryByTestId("strategy-sibling-group")).toBeNull();
+    expect(screen.queryByTestId("strategy-custom")).toBeNull();
+  });
+
+  it("dispatches the open-settings event for the worktrees section", async () => {
+    const onClose = vi.fn();
+    const onOpenSettings = vi.fn();
+    window.addEventListener("raum:open-settings", onOpenSettings);
+    render(() => <CreateWorktreeModal projectSlug={PROJECT_SLUG} open={true} onClose={onClose} />);
+
+    const link = await screen.findByTestId("open-worktree-settings");
+    link.click();
+
+    expect(onClose).toHaveBeenCalled();
+    expect(onOpenSettings).toHaveBeenCalled();
+    const ev = onOpenSettings.mock.calls[0][0] as CustomEvent<{ section: string }>;
+    expect(ev.detail.section).toBe("worktrees");
+    window.removeEventListener("raum:open-settings", onOpenSettings);
   });
 
   it("defaults the base branch picker to the project's current branch", async () => {
@@ -110,8 +126,6 @@ describe("<CreateWorktreeModal>", () => {
           {
             branch: "feat/hooked",
             baseBranch: "main",
-            strategyOverride: null,
-            patternOverride: null,
           },
           new Channel(),
         ),

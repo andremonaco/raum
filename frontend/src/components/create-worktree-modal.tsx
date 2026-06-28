@@ -25,6 +25,7 @@ import { toast } from "solid-sonner";
 import { cacheWorktreeList, clearWorktreeListCache, type Worktree } from "../stores/worktreeStore";
 import { projectStore } from "../stores/projectStore";
 import { tildify } from "../lib/pathDisplay";
+import { openSettingsSection } from "../lib/settingsNav";
 import { createOperationProgress, type ProgressEvent } from "../lib/operationProgress";
 import { GitBranchIcon, LoaderIcon } from "./icons";
 import { OperationProgress } from "./operation-progress";
@@ -66,15 +67,10 @@ const PREFIX_PRESETS = [
   "ci/",
 ] as const;
 
+// Wire type for the configured path strategy, still surfaced by the preview
+// command. The per-create picker is gone — placement is steered from
+// Settings → Worktrees — so this is read-only here.
 type PathStrategy = "sibling-group" | "nested" | "custom";
-
-const STRATEGY_LABEL: Record<PathStrategy, string> = {
-  "sibling-group": "Sibling",
-  nested: "Nested",
-  custom: "Custom",
-};
-
-const STRATEGY_OPTIONS: PathStrategy[] = ["sibling-group", "nested", "custom"];
 
 // Example placeholder text used while the user has typed nothing yet — keeps
 // the preview cards at a stable height instead of collapsing to "—".
@@ -167,8 +163,6 @@ async function previewManifest(projectSlug: string): Promise<WorktreeManifestPre
 interface CreateArgs {
   branch: string;
   baseBranch: string | null;
-  strategyOverride: PathStrategy | null;
-  patternOverride: string | null;
 }
 
 /**
@@ -201,8 +195,11 @@ export function useWorktreeCreate(projectSlug: () => string): {
           fromRef: args.baseBranch ?? null,
           baseBranch: args.baseBranch ?? null,
           skipHydration: false,
-          pathStrategy: args.strategyOverride,
-          pathPatternOverride: args.patternOverride,
+          // Placement is steered from Settings → Worktrees; the modal never
+          // sends a per-create override. (The backend still accepts these for
+          // the `raum worktree create` CLI.)
+          pathStrategy: null,
+          pathPatternOverride: null,
         },
         onProgress: channel,
       });
@@ -254,15 +251,6 @@ const CREATE_STEPS = [
 
 export const CreateWorktreeModal: Component<CreateWorktreeModalProps> = (props) => {
   const [branch, setBranch] = createSignal("");
-  // `null` means "use the project default" (whatever the settings/effective
-  // pathStrategy resolves to). Picking a different value here only affects
-  // this one creation.
-  const [strategyOverride, setStrategyOverride] = createSignal<PathStrategy | null>(null);
-  // Freeform pattern edited by the user when strategy === "custom". Seeded
-  // from the project's current configured pattern the first time the user
-  // switches to Custom, so they get a real starting point to tweak.
-  const [customPattern, setCustomPattern] = createSignal("");
-  const [customPatternSeeded, setCustomPatternSeeded] = createSignal(false);
   const [baseBranch, setBaseBranch] = createSignal<string | null>(null);
   const projectSlug = createMemo(() => props.projectSlug);
 
@@ -292,68 +280,15 @@ export const CreateWorktreeModal: Component<CreateWorktreeModalProps> = (props) 
     }
   });
 
-  // Fetch a preview to learn the *configured* strategy (used to highlight the
-  // segmented control when the user hasn't overridden it). We pass an example
-  // branch so this works even before the user has typed anything.
-  const [defaultPreview] = createResource(
-    () => (props.open ? projectSlug() : null),
-    async (slug) => {
-      if (!slug) return null;
-      try {
-        return await previewPath({
-          slug,
-          branch: EXAMPLE_BRANCH,
-          strategy: null,
-          patternOverride: null,
-        });
-      } catch {
-        return null;
-      }
-    },
-  );
-
-  const effectiveStrategy = createMemo<PathStrategy>(
-    () => strategyOverride() ?? defaultPreview()?.pathStrategy ?? "sibling-group",
-  );
-
-  // Seed the custom-pattern input the first time the user switches to Custom
-  // — they get the project's current pattern as a starting point to edit,
-  // instead of an empty field that silently does nothing.
-  createEffect(() => {
-    if (effectiveStrategy() !== "custom") return;
-    if (customPatternSeeded()) return;
-    const seed = defaultPreview()?.pattern;
-    if (seed) {
-      setCustomPattern(seed);
-      setCustomPatternSeeded(true);
-    }
-  });
-
-  // Override fed to backend previews/creates. Only send it when Custom is
-  // active and the user has typed a non-empty pattern — otherwise the preset
-  // (sibling/nested) path wins.
-  const patternOverride = createMemo<string | null>(() => {
-    if (effectiveStrategy() !== "custom") return null;
-    const p = customPattern().trim();
-    return p.length > 0 ? p : null;
-  });
-
-  // Live preview that follows the typed branch (or the example placeholder)
-  // and the chosen strategy override. We always pass the override so the
-  // preview matches what `worktree_create` will actually do.
+  // Live preview that follows the typed branch (or the example placeholder).
+  // Placement is whatever Settings → Worktrees resolves to — the modal never
+  // overrides it — so we always pass `null` strategy/pattern.
   const [pathPreview] = createResource(
-    () =>
-      [
-        props.open,
-        projectSlug(),
-        branch() || EXAMPLE_BRANCH,
-        strategyOverride(),
-        patternOverride(),
-      ] as const,
-    async ([open, slug, br, strategy, override]) => {
+    () => [props.open, projectSlug(), branch() || EXAMPLE_BRANCH] as const,
+    async ([open, slug, br]) => {
       if (!open) return null;
       try {
-        return await previewPath({ slug, branch: br, strategy, patternOverride: override });
+        return await previewPath({ slug, branch: br, strategy: null, patternOverride: null });
       } catch {
         return null;
       }
@@ -388,8 +323,6 @@ export const CreateWorktreeModal: Component<CreateWorktreeModalProps> = (props) 
         {
           branch: branch(),
           baseBranch: baseBranch(),
-          strategyOverride: strategyOverride(),
-          patternOverride: patternOverride(),
         },
         channel,
       );
@@ -398,9 +331,6 @@ export const CreateWorktreeModal: Component<CreateWorktreeModalProps> = (props) 
         description: out.branch,
       });
       setBranch("");
-      setStrategyOverride(null);
-      setCustomPattern("");
-      setCustomPatternSeeded(false);
       props.onClose();
     } catch {
       // error() signal already captured the message; keep the modal open so the
@@ -417,9 +347,6 @@ export const CreateWorktreeModal: Component<CreateWorktreeModalProps> = (props) 
           // progress panel needs to stay visible until the backend resolves.
           if (creator.pending()) return;
           setBranch("");
-          setStrategyOverride(null);
-          setCustomPattern("");
-          setCustomPatternSeeded(false);
           setBaseBranch(null);
           props.onClose();
         }
@@ -535,47 +462,6 @@ export const CreateWorktreeModal: Component<CreateWorktreeModalProps> = (props) 
               </p>
             </div>
 
-            {/* Path strategy — pre-selected from project settings, override per-creation */}
-            <div class="space-y-1">
-              <label class="text-xs text-muted-foreground">Path strategy</label>
-              <div class="grid grid-cols-3 gap-1" role="radiogroup" aria-label="Path strategy">
-                <For each={STRATEGY_OPTIONS}>
-                  {(s) => (
-                    <button
-                      type="button"
-                      role="radio"
-                      aria-checked={effectiveStrategy() === s}
-                      class="rounded px-2 py-1 text-[11px] transition-colors"
-                      classList={{
-                        "bg-active text-foreground": effectiveStrategy() === s,
-                        "text-muted-foreground hover:bg-active/40": effectiveStrategy() !== s,
-                      }}
-                      onClick={() => setStrategyOverride(s)}
-                      data-testid={`strategy-${s}`}
-                    >
-                      {STRATEGY_LABEL[s]}
-                    </button>
-                  )}
-                </For>
-              </div>
-              <Show when={effectiveStrategy() === "custom"}>
-                <TextField value={customPattern()} onChange={setCustomPattern}>
-                  <TextFieldInput
-                    type="text"
-                    placeholder="{parent-dir}/{base-folder}-worktrees/{branch-slug}"
-                    class="font-mono text-xs"
-                    data-testid="custom-pattern-input"
-                  />
-                </TextField>
-                <p class="text-[10px] text-muted-foreground">
-                  Tokens: <code class="rounded bg-muted px-1 py-px font-mono">{"{repo-root}"}</code>
-                  , <code class="rounded bg-muted px-1 py-px font-mono">{"{parent-dir}"}</code>,{" "}
-                  <code class="rounded bg-muted px-1 py-px font-mono">{"{base-folder}"}</code>,{" "}
-                  <code class="rounded bg-muted px-1 py-px font-mono">{"{branch-slug}"}</code>.
-                </p>
-              </Show>
-            </div>
-
             {/* Prefixed branch — fixed height, single line */}
             <div class="min-h-[44px] min-w-0 rounded-md bg-muted p-2 text-xs">
               <div class="text-muted-foreground">Prefixed branch</div>
@@ -626,7 +512,7 @@ export const CreateWorktreeModal: Component<CreateWorktreeModalProps> = (props) 
                           </div>
                         </div>
                         <div class="mt-1 text-muted-foreground">
-                          Change the default in Project Settings → Worktree path.
+                          Change the default in Settings → Worktrees.
                         </div>
                       </TooltipContent>
                     </TooltipPortal>
@@ -643,6 +529,20 @@ export const CreateWorktreeModal: Component<CreateWorktreeModalProps> = (props) 
               >
                 {compactPath(pathPreview()?.path, rootPath()) || "—"}
               </div>
+              <p class="mt-1 text-[10px] text-muted-foreground">
+                Location is set by your worktree settings.{" "}
+                <button
+                  type="button"
+                  class="text-foreground underline underline-offset-2 hover:text-primary focus:outline-none"
+                  onClick={() => {
+                    props.onClose();
+                    openSettingsSection("worktrees");
+                  }}
+                  data-testid="open-worktree-settings"
+                >
+                  Change in Settings
+                </button>
+              </p>
             </div>
 
             <div class="min-h-[64px] rounded-md bg-muted p-2 text-xs">

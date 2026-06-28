@@ -21,6 +21,15 @@ vi.mock("@tauri-apps/api/event", () => ({
       };
     }),
 }));
+// `startNotificationCenter` seeds + subscribes to window focus. Stub the
+// window API so it resolves under jsdom; the focus tests drive the signal
+// directly via `__setWindowFocusedForTests` instead.
+vi.mock("@tauri-apps/api/window", () => ({
+  getCurrentWindow: () => ({
+    isFocused: async () => false,
+    onFocusChanged: async () => () => {},
+  }),
+}));
 
 import {
   __clearPendingPermissionForTests,
@@ -28,6 +37,7 @@ import {
   __handleNotificationEventForTests,
   __handleSessionRemovedForTests,
   __resetNotificationCenterForTests,
+  __setWindowFocusedForTests,
   badgeMode,
   ensureNotificationPermission,
   pendingPermissionCount,
@@ -237,6 +247,49 @@ describe("notification center", () => {
       body: "Codex finished.",
       sessionId: "orphan",
     });
+  });
+
+  it("suppresses the OS banner for waiting while the window is focused", async () => {
+    seedSession("focus-wait", "claude-code", "raum");
+    __setWindowFocusedForTests(true);
+    __handleAgentStateChangedForTests({
+      session_id: "focus-wait",
+      harness: "claude-code",
+      from: "working",
+      to: "waiting",
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    // In-app Attention rail covers the focused case — no OS banner.
+    expect(sendCalls()).toHaveLength(0);
+  });
+
+  it("suppresses the OS banner for done/errored while the window is focused", async () => {
+    __setWindowFocusedForTests(true);
+    __handleAgentStateChangedForTests({
+      session_id: "focus-done",
+      harness: "codex",
+      from: "working",
+      to: "completed",
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(sendCalls()).toHaveLength(0);
+  });
+
+  it("suppresses the OS banner for permission requests while focused but keeps the badge accurate", async () => {
+    __setWindowFocusedForTests(true);
+    await __handleNotificationEventForTests({
+      harness: "codex",
+      event: "PermissionRequest",
+      session_id: "focus-perm",
+      permission_key: "focus-perm",
+      payload: { tool_name: "shell" },
+    });
+    // The pending-permission counter still increments (drives the badge)…
+    expect(pendingPermissionCount()).toBe(1);
+    // …but the OS banner is suppressed in favour of the in-app rail.
+    expect(sendCalls()).toHaveLength(0);
   });
 
   it("decrements pendingPermissionCount when a request is cleared", async () => {

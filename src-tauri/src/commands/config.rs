@@ -8,7 +8,7 @@
 //! Plus `os_info` so the wizard can pick the right install/upgrade commands
 //! (Homebrew on macOS vs apt/dnf/pacman/zypper/apk on Linux).
 
-use raum_core::config::{ActiveLayoutState, Config, DEFAULT_PATH_PATTERN};
+use raum_core::config::{ActiveLayoutState, Config, NESTED_PATH_PATTERN};
 use raum_core::prereqs::{self, HarnessReport, PrereqReport};
 use raum_hydration::validate_path_pattern;
 use serde::Serialize;
@@ -269,13 +269,37 @@ pub fn config_set_projects_auto_hide(
     store.write_config(&cfg).map_err(|e| e.to_string())
 }
 
+/// Persist the "auto-dock inactive terminals" toggle + day threshold. A
+/// terminal/harness with no activity (a prompt sent, the pane focused, or just
+/// created) within `days` is moved into the dock — per individual tab. The
+/// staleness check itself is derived in the frontend (it holds the per-session
+/// activity timestamps); this only stores the preference. `days` is clamped to a
+/// minimum of 1.
+#[tauri::command]
+pub fn config_set_terminals_auto_dock(
+    state: tauri::State<'_, AppHandleState>,
+    enabled: bool,
+    days: u32,
+) -> Result<(), String> {
+    let days = days.max(1);
+    let store = state.config_store.lock().map_err(|e| e.to_string())?;
+    let mut cfg: Config = store.read_config().map_err(|e| e.to_string())?;
+    if cfg.terminals.auto_dock_inactive == enabled && cfg.terminals.auto_dock_inactive_days == days
+    {
+        return Ok(());
+    }
+    cfg.terminals.auto_dock_inactive = enabled;
+    cfg.terminals.auto_dock_inactive_days = days;
+    store.write_config(&cfg).map_err(|e| e.to_string())
+}
+
 /// Persist the global worktree `path_pattern`. Called by the Worktrees settings
 /// section when the user picks a preset or edits a custom pattern.
 ///
 /// An empty/whitespace-only pattern is treated as "reset to default" and stores
-/// the built-in `DEFAULT_PATH_PATTERN`. Validation uses the same rules as
-/// `worktree_preview_path` so an invalid pattern here surfaces the same error
-/// the user would see at worktree-create time.
+/// the built-in `NESTED_PATH_PATTERN` (raum's default strategy). Validation uses
+/// the same rules as `worktree_preview_path` so an invalid pattern here surfaces
+/// the same error the user would see at worktree-create time.
 #[tauri::command]
 pub fn config_set_worktree_path_pattern(
     state: tauri::State<'_, AppHandleState>,
@@ -283,7 +307,7 @@ pub fn config_set_worktree_path_pattern(
 ) -> Result<String, String> {
     let trimmed = pattern.trim();
     let effective = if trimmed.is_empty() {
-        DEFAULT_PATH_PATTERN.to_string()
+        NESTED_PATH_PATTERN.to_string()
     } else {
         validate_path_pattern(trimmed).map_err(|e| e.to_string())?;
         trimmed.to_string()

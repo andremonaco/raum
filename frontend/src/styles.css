@@ -197,6 +197,10 @@ textarea,
   /* Text hierarchy */
   --foreground-subtle: color-mix(in oklab, oklch(0.985 0 0) 65%, transparent);
   --foreground-dim: color-mix(in oklab, oklch(0.985 0 0) 45%, transparent);
+  /* Active detail-tab underline — the *maximum* allowed emphasis on tab-like
+     chrome: a thin foreground tint, never an accent hue, fill, or glow. Kept
+     here (not as a Tailwind border color) so the rule reads as a single token. */
+  --tab-underline: color-mix(in oklab, var(--foreground) 35%, transparent);
   /* Border weights */
   --border-subtle: color-mix(in oklab, oklch(0.985 0 0) 8%, transparent);
   --border-strong: color-mix(in oklab, oklch(0.985 0 0) 22%, transparent);
@@ -2026,107 +2030,41 @@ body,
  *  Apply by wrapping overflowing content with <Scrollable> (see
  *  components/ui/scrollable.tsx), which sets this theme by default.
  *
- *  The visible rail is a 2px filament down the edge of the container.
- *  Dim at rest → warm bloom on hover → full accent + drop-shadow while
- *  scrubbing. Colour follows the live `--project-accent`.
+ *  A conventional overlay scrollbar: a quiet grey thumb (rounded, ~8px)
+ *  that darkens on hover and while scrubbing. No gradient fade or glow —
+ *  the familiar scrollbar users expect.
  */
-/* Theme class is applied directly to each `.os-scrollbar` element, so
-   all styling flows through OverlayScrollbars' own CSS variables. The
-   `background` property accepts gradients, so the dim→bright→dim fade
-   ships as the handle's own fill. */
+/* Theme class is applied directly to each `.os-scrollbar` element, so all
+   styling flows through OverlayScrollbars' own CSS variables. */
 .os-theme-raum {
-  --os-size: 10px;
-  --os-padding-perpendicular: 4px;
-  --os-padding-axis: 3px;
+  --os-size: 12px;
+  --os-padding-perpendicular: 2px;
+  --os-padding-axis: 2px;
 
-  --os-track-border-radius: 999px;
+  --os-track-border-radius: 8px;
   --os-track-bg: transparent;
   --os-track-bg-hover: transparent;
   --os-track-bg-active: transparent;
 
-  --os-handle-border-radius: 999px;
+  --os-handle-border-radius: 8px;
   --os-handle-min-size: 28px;
 
-  /* Thread thickness: 2px idle, 3px hover, 3px active — keep it slim.
-     (OverlayScrollbars uses these as `width` on vertical handles and
-     `height` on horizontal, with its own transition between states.) */
-  --os-handle-perpendicular-size: 2px;
-  --os-handle-perpendicular-size-hover: 3px;
-  --os-handle-perpendicular-size-active: 3px;
+  /* Conventional full-thickness thumb (~8px after padding), not a filament. */
+  --os-handle-perpendicular-size: 100%;
+  --os-handle-perpendicular-size-hover: 100%;
+  --os-handle-perpendicular-size-active: 100%;
+
+  /* Solid, quiet grey thumb; darkens on hover / scrub. No gradient, no glow. */
+  --os-handle-bg: color-mix(in oklab, var(--foreground) 22%, transparent);
+  --os-handle-bg-hover: color-mix(in oklab, var(--foreground) 36%, transparent);
+  --os-handle-bg-active: color-mix(in oklab, var(--foreground) 48%, transparent);
 }
 
-/* Idle handle background — vertical gradient that fades out at both
-   ends so the thread softly dissolves into the panel. */
-.os-theme-raum.os-scrollbar-vertical {
-  --os-handle-bg: linear-gradient(
-    to bottom,
-    transparent 0%,
-    color-mix(in oklab, var(--foreground) 35%, transparent) 20%,
-    color-mix(in oklab, var(--foreground) 50%, transparent) 50%,
-    color-mix(in oklab, var(--foreground) 35%, transparent) 80%,
-    transparent 100%
-  );
-  --os-handle-bg-hover: linear-gradient(
-    to bottom,
-    transparent 0%,
-    color-mix(in oklab, var(--foreground) 55%, transparent) 16%,
-    color-mix(in oklab, var(--foreground) 80%, transparent) 50%,
-    color-mix(in oklab, var(--foreground) 55%, transparent) 84%,
-    transparent 100%
-  );
-  --os-handle-bg-active: linear-gradient(
-    to bottom,
-    transparent 0%,
-    color-mix(in oklab, var(--foreground) 80%, transparent) 12%,
-    var(--foreground) 50%,
-    color-mix(in oklab, var(--foreground) 80%, transparent) 88%,
-    transparent 100%
-  );
-}
-
-.os-theme-raum.os-scrollbar-horizontal {
-  --os-handle-bg: linear-gradient(
-    to right,
-    transparent 0%,
-    color-mix(in oklab, var(--foreground) 35%, transparent) 20%,
-    color-mix(in oklab, var(--foreground) 50%, transparent) 50%,
-    color-mix(in oklab, var(--foreground) 35%, transparent) 80%,
-    transparent 100%
-  );
-  --os-handle-bg-hover: linear-gradient(
-    to right,
-    transparent 0%,
-    color-mix(in oklab, var(--foreground) 55%, transparent) 16%,
-    color-mix(in oklab, var(--foreground) 80%, transparent) 50%,
-    color-mix(in oklab, var(--foreground) 55%, transparent) 84%,
-    transparent 100%
-  );
-  --os-handle-bg-active: linear-gradient(
-    to right,
-    transparent 0%,
-    color-mix(in oklab, var(--foreground) 80%, transparent) 12%,
-    var(--foreground) 50%,
-    color-mix(in oklab, var(--foreground) 80%, transparent) 88%,
-    transparent 100%
-  );
-}
-
-/* Subtle drop-shadow bloom on hover and scrubbing. Kept small so the
-   rail never overwhelms its panel. */
+/* Simple state transition — colour only (no gradient, no glow). */
 .os-theme-raum .os-scrollbar-handle {
   transition:
     opacity 0.15s,
-    background 0.2s,
-    filter 0.2s,
-    border-color 0.15s,
-    width 0.15s,
-    height 0.15s;
-}
-.os-theme-raum:hover .os-scrollbar-handle {
-  filter: drop-shadow(0 0 3px color-mix(in oklab, var(--foreground) 22%, transparent));
-}
-.os-theme-raum.os-scrollbar-active .os-scrollbar-handle {
-  filter: drop-shadow(0 0 4px color-mix(in oklab, var(--foreground) 40%, transparent));
+    background 0.15s;
 }
 
 /* Opt-in modifier: hide the rail entirely while leaving wheel/drag/touch

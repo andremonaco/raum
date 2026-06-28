@@ -8,7 +8,7 @@
 import { Component, JSX, Show, createMemo } from "solid-js";
 
 import { FileTypeIcon } from "../../lib/fileTypeIcon";
-import { splitPath } from "../../lib/gitChangeDisplay";
+import { STATUS_LETTER, splitPath } from "../../lib/gitChangeDisplay";
 import { StatusLetter } from "./status-letter";
 import type { FileChangeRowProps } from "./types";
 
@@ -18,6 +18,13 @@ export const FileChangeRow: Component<FileChangeRowProps & { children?: JSX.Elem
   const parts = createMemo(() => splitPath(props.path));
   const hoverTitle = () =>
     props.title ?? (props.origPath ? `${props.origPath} → ${props.path}` : props.path);
+
+  // Restrained status tint on the filename: reuse the StatusLetter color token
+  // family (success/warning/destructive/info) but dampen it to a quiet,
+  // muted intensity so it reads as differentiation, not bright decoration.
+  // Emphasized (staged) rows stay on plain `text-foreground` — no tint.
+  const nameClass = () =>
+    props.emphasized === true ? undefined : `${STATUS_LETTER[props.kind].colorClass} opacity-80`;
 
   return (
     <li class="group/file flex items-center gap-1.5 rounded px-1 py-0.5 hover:bg-hover">
@@ -39,7 +46,7 @@ export const FileChangeRow: Component<FileChangeRowProps & { children?: JSX.Elem
       >
         <FileTypeIcon name={props.path} class="size-3.5 shrink-0 opacity-75" />
         <span class="min-w-0 flex-1 truncate">
-          <span>{parts().name}</span>
+          <span class={nameClass()}>{parts().name}</span>
           <Show when={parts().dir !== ""}>
             <span class="ml-1.5 text-[10px] text-foreground-dim">{parts().dir}</span>
           </Show>

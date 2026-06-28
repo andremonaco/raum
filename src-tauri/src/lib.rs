@@ -1,6 +1,7 @@
 //! raum Tauri host. Entry point wires plugins and exposes the command surface.
 
 mod cli;
+mod cli_worktree;
 mod commands;
 mod keymap;
 mod notifications;
@@ -26,12 +27,20 @@ use tracing::{info, warn};
 #[cfg(target_os = "macos")]
 const MENU_ID_OPEN_SETTINGS: &str = "open-settings";
 
-/// ID of the "Install 'raum' Command in PATH" item in the macOS app submenu.
+/// ID of the "Install 'raum' Terminal Command" item in the macOS app submenu.
 /// Clicking it emits `menu-action` with this payload; the frontend routes it to
 /// the `cli_install_shim` command so users who drag the `.app` out of the DMG
 /// get the `raum <dir>` terminal command (Homebrew users get it via the cask).
+/// raum also attempts this automatically on first launch (see
+/// [`cli::auto_install_shim_if_safe`]); this item is the manual fallback/repair.
 #[cfg(target_os = "macos")]
 const MENU_ID_INSTALL_CLI: &str = "install-cli";
+
+/// ID of the "Check for Updates…" item in the macOS app submenu. Clicking it
+/// emits `menu-action` with this payload; the frontend routes it to a silent
+/// updater check that surfaces an in-app toast (`updateNotifier`).
+#[cfg(target_os = "macos")]
+const MENU_ID_CHECK_UPDATES: &str = "check-updates";
 
 /// Bump `RLIMIT_NOFILE` to the hard cap on macOS.
 ///
@@ -87,7 +96,11 @@ fn raise_nofile_limit() {
 }
 
 pub fn run() {
-    // §2.7 — no user CLI surface. Inspect args; print GUI-only --help and exit before window.
+    // Headless subcommands (`raum worktree …`) run to completion and exit here,
+    // before any GUI/tracing/window setup.
+    cli::dispatch_subcommand();
+
+    // §2.7 — `--help` / `--version` print GUI-only help and exit before window.
     if !cli::handle_args() {
         return;
     }
@@ -106,6 +119,18 @@ pub fn run() {
     // (`claude`, `codex`, `opencode`) fail to resolve. Probe the user's
     // login shell once here, before any `which::which()` call runs.
     path_env::augment_process_path();
+
+    // Install the uniform `raum` Agent Skill into each set-up harness so agents
+    // running inside raum discover the `raum worktree create` CLI. Idempotent
+    // (only rewrites on content change) and gated on each harness's config dir
+    // existing, so it never litters. Detached so disk I/O can't delay the window.
+    std::thread::spawn(|| {
+        for w in raum_core::harness::install_raum_skill() {
+            if w.wrote {
+                info!(path = %w.path.display(), "installed raum skill");
+            }
+        }
+    });
 
     // Capture an optional `raum <dir>` argument for a *cold* launch and seed it
     // into shared state; the frontend drains it on boot via
@@ -293,6 +318,7 @@ pub fn run() {
             commands::config_set_appearance_theme,
             commands::config_set_appearance_show_prompt_overlay,
             commands::config_set_projects_auto_hide,
+            commands::config_set_terminals_auto_dock,
             // Global search — file search over a project's root or arbitrary path.
             commands::search::project_find_files,
             commands::search::search_files_in_path,
@@ -351,6 +377,17 @@ pub fn run() {
 
             // Show after all titlebar setup to avoid flashing native chrome.
             main_window.show().unwrap();
+
+            // First-launch convenience: make `raum <dir>` work from a terminal
+            // for direct-download installs without a manual menu click. Silent,
+            // best-effort, off the startup thread (it touches the filesystem);
+            // the "Install 'raum' Terminal Command" menu item is the explicit
+            // fallback. Release-only — in dev the exe is the throwaway
+            // target/debug binary, which we must not wire onto $PATH.
+            #[cfg(target_os = "macos")]
+            if !cfg!(debug_assertions) {
+                std::thread::spawn(commands::cli::auto_install_shim_if_safe);
+            }
 
             // A terminal cold-launch (`raum <dir>`) execs the bundled binary
             // directly — the macOS `raum-cli` wrapper uses `nohup … &`, not
@@ -1130,10 +1167,10 @@ fn bootstrap_git_watchers(app: &mut tauri::App) {
             status_pulse.clone(),
         ) {
             Ok(w) => {
-                info!(slug = %slug, "git_watcher: started");
+                info!(id = %slug, "git_watcher: started");
                 watchers.insert(slug, w);
             }
-            Err(e) => warn!(slug = %slug, error = %e, "git_watcher: start failed"),
+            Err(e) => warn!(id = %slug, error = %e, "git_watcher: start failed"),
         }
     }
 }
@@ -1162,12 +1199,15 @@ fn build_app_menu<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<Menu<R
             .website_label(Some("github.com/andremonaco/raum"))
             .build();
 
+        let check_updates_item =
+            MenuItemBuilder::with_id(MENU_ID_CHECK_UPDATES, "Check for Updates…").build(app)?;
+
         let settings_item = MenuItemBuilder::with_id(MENU_ID_OPEN_SETTINGS, "Settings…")
             .accelerator("Cmd+,")
             .build(app)?;
 
         let install_cli_item =
-            MenuItemBuilder::with_id(MENU_ID_INSTALL_CLI, "Install 'raum' Command in PATH")
+            MenuItemBuilder::with_id(MENU_ID_INSTALL_CLI, "Install 'raum' Terminal Command")
                 .build(app)?;
 
         let app_submenu = SubmenuBuilder::new(app, "raum")
@@ -1176,6 +1216,8 @@ fn build_app_menu<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<Menu<R
                 Some("About raum"),
                 Some(about_metadata),
             )?)
+            .separator()
+            .item(&check_updates_item)
             .separator()
             .item(&settings_item)
             .item(&install_cli_item)

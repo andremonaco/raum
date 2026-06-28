@@ -109,7 +109,11 @@ import {
 } from "../../stores/runtimeLayoutStore";
 import { toast } from "solid-sonner";
 import { listCrossProjectHarnessSessions, terminalStore } from "../../stores/terminalStore";
-import { ALL_WORKTREES_SCOPE, activeWorktreeStore } from "../../stores/worktreeStore";
+import {
+  ALL_WORKTREES_SCOPE,
+  activeWorktreeStore,
+  matchesWorktreeScope,
+} from "../../stores/worktreeStore";
 import { DividerLayer } from "../divider-layer";
 import { Dock } from "../dock";
 import { FolderIcon, HARNESS_ICONS } from "../icons";
@@ -276,6 +280,25 @@ export const TerminalGrid: Component = () => {
       out.push(pane);
     }
     return out;
+  });
+
+  // Minimized panes shown in the dock, scoped to the active project + the
+  // sidebar's worktree scope — exactly mirroring `pruneTreeByScope` for the
+  // in-tree grid, so a minimized chip obeys the same visibility rule as the
+  // pane it came from. Project-less shells stay global (visible in every
+  // project's dock), like un-minimized shells in the grid. The unscoped
+  // `offTreePanes()` still feeds `projectTerminalSurfaces` below, so every
+  // minimized session keeps its xterm mounted across project switches and
+  // scrollback survives.
+  const scopedMinimizedPanes = createMemo(() => {
+    const slug = activeProjectSlug();
+    const scope = activeScope();
+    const mainPath = activeMainPath();
+    return offTreePanes().filter(
+      (p) =>
+        p.projectSlug === undefined ||
+        (p.projectSlug === slug && matchesWorktreeScope(scope, p.worktreeId, mainPath)),
+    );
   });
 
   // True once the drag latches an edge/root zone (dwell armed, not a review
@@ -487,6 +510,7 @@ export const TerminalGrid: Component = () => {
           projectSlug?: string;
           worktreeId?: string;
           splitDirection?: "right" | "bottom";
+          initialPrompt?: string;
         }>
       ).detail;
       if (!detail || !detail.kind || detail.kind === "empty") return;
@@ -497,7 +521,9 @@ export const TerminalGrid: Component = () => {
       const newPane: PaneContent = {
         id,
         kind: detail.kind,
-        tabs: [{ id: tabId }],
+        // `initialPrompt` (set e.g. by the sidebar Commit button) is forwarded
+        // to `terminal_spawn` so the harness launches pre-loaded with a task.
+        tabs: [{ id: tabId, initialPrompt: detail.initialPrompt }],
         activeTabId: tabId,
         projectSlug: detail.projectSlug,
         worktreeId: detail.worktreeId,
@@ -851,7 +877,7 @@ export const TerminalGrid: Component = () => {
           </Show>
         </div>
       </div>
-      <Dock minimizedPanes={offTreePanes()} onRestore={onRestoreFromDock} />
+      <Dock minimizedPanes={scopedMinimizedPanes()} onRestore={onRestoreFromDock} />
     </div>
   );
 };

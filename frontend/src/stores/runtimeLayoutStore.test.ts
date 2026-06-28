@@ -42,6 +42,7 @@ import {
   setFocusedPaneId,
   minimizedPaneIds,
   minimizePane,
+  minimizeTab,
   restorePane,
   setSessionId,
   setSplitRatios,
@@ -666,6 +667,93 @@ describe("runtimeLayoutStore (BSP)", () => {
     restorePane("a");
     expect(runtimeLayoutStore.cells.map((c) => c.id)).toEqual(["a"]);
     expect(minimizedPaneIds().has("a")).toBe(false);
+  });
+
+  // ── minimizeTab (per-tab auto-dock extraction) ──────────────────────────
+  it("minimizeTab extracts a tab into its own minimized single-tab pane", () => {
+    splitPane(pane("a", { kind: "claude-code" }), null, "right");
+    const firstTabId = runtimeLayoutStore.cells[0].tabs[0].id;
+    setTabSessionId("a", firstTabId, "raum-a1");
+    const secondTabId = addCellTab("a"); // addCellTab makes the new tab active
+    setTabSessionId("a", secondTabId, "raum-a2");
+
+    const newId = minimizeTab("a", firstTabId);
+    expect(newId).not.toBeNull();
+    expect(newId).not.toBe("a");
+    // Source pane stays in the tree, now holding only the (still-active) second tab.
+    expect(runtimeLayoutStore.cells.map((c) => c.id)).toEqual(["a"]);
+    expect(runtimeLayoutStore.cells[0].tabs.map((t) => t.id)).toEqual([secondTabId]);
+    expect(runtimeLayoutStore.cells[0].activeTabId).toBe(secondTabId);
+    // New pane is off-tree, minimized, single-tab, inherits kind, session preserved.
+    const np = runtimeLayoutStore.panes[newId!];
+    expect(np).toBeDefined();
+    expect(np.kind).toBe("claude-code");
+    expect(np.tabs).toHaveLength(1);
+    expect(np.tabs[0].id).toBe(firstTabId);
+    expect(np.tabs[0].sessionId).toBe("raum-a1");
+    expect(np.activeTabId).toBe(firstTabId);
+    expect(minimizedPaneIds().has(newId!)).toBe(true);
+    expect(runtimeLayoutStore.cells.find((c) => c.id === newId)).toBeUndefined();
+  });
+
+  it("minimizeTab reassigns the source active tab when the moved tab was active", () => {
+    splitPane(pane("a"), null, "right");
+    const firstTabId = runtimeLayoutStore.cells[0].tabs[0].id;
+    const secondTabId = addCellTab("a"); // active = secondTabId
+    const newId = minimizeTab("a", secondTabId); // extract the ACTIVE tab
+    expect(runtimeLayoutStore.cells[0].tabs.map((t) => t.id)).toEqual([firstTabId]);
+    expect(runtimeLayoutStore.cells[0].activeTabId).toBe(firstTabId);
+    expect(runtimeLayoutStore.panes[newId!].activeTabId).toBe(secondTabId);
+  });
+
+  it("minimizeTab minimizes the whole pane when the tab is its only tab", () => {
+    splitPane(pane("a"), null, "right");
+    splitPane(pane("b"), "a", "right");
+    const tabId = runtimeLayoutStore.cells.find((c) => c.id === "a")!.tabs[0].id;
+    const result = minimizeTab("a", tabId);
+    expect(result).toBe("a");
+    expect(minimizedPaneIds().has("a")).toBe(true);
+    expect(runtimeLayoutStore.cells.map((c) => c.id)).toEqual(["b"]);
+    // No new pane is created — the whole pane was minimized in place.
+    expect(Object.keys(runtimeLayoutStore.panes).sort()).toEqual(["a", "b"]);
+  });
+
+  it("minimizeTab stamps the dock chip activity time from opts.activityMs", () => {
+    splitPane(pane("a"), null, "right");
+    const firstTabId = runtimeLayoutStore.cells[0].tabs[0].id;
+    addCellTab("a");
+    const newId = minimizeTab("a", firstTabId, { activityMs: 12345 });
+    expect(runtimeLayoutStore.panes[newId!].lastActivityMs).toBe(12345);
+  });
+
+  it("minimizeTab stamps activityMs on the single-tab (whole-pane) branch too", () => {
+    splitPane(pane("a"), null, "right");
+    splitPane(pane("b"), "a", "right");
+    const tabId = runtimeLayoutStore.cells.find((c) => c.id === "a")!.tabs[0].id;
+    // The auto-dock driver always passes activityMs; standalone idle panes take
+    // this delegate-to-minimizePane path, so the chip's Recent-sort time must stick.
+    const result = minimizeTab("a", tabId, { activityMs: 67890 });
+    expect(result).toBe("a");
+    expect(runtimeLayoutStore.panes["a"].lastActivityMs).toBe(67890);
+  });
+
+  it("minimizeTab carries the moved tab's project/worktree onto the new pane", () => {
+    splitPane(pane("a", { projectSlug: "proj", worktreeId: "/wt/main" }), null, "right");
+    const firstTabId = runtimeLayoutStore.cells[0].tabs[0].id;
+    // A second tab so the pane is multi-tab and the first is extracted, not the pane.
+    addCellTab("a", { projectSlug: "proj", worktreeId: "/wt/feature" });
+    const newId = minimizeTab("a", firstTabId);
+    // The moved (first) tab carried no per-tab binding → inherits pane-level.
+    expect(runtimeLayoutStore.panes[newId!].projectSlug).toBe("proj");
+    expect(runtimeLayoutStore.panes[newId!].worktreeId).toBe("/wt/main");
+  });
+
+  it("minimizeTab is a no-op for an unknown pane or tab", () => {
+    splitPane(pane("a"), null, "right");
+    expect(minimizeTab("missing", "tab-x")).toBeNull();
+    expect(minimizeTab("a", "tab-x")).toBeNull();
+    // Layout untouched.
+    expect(runtimeLayoutStore.cells.map((c) => c.id)).toEqual(["a"]);
   });
 
   it("active_layout_save round-trips minimized panes off-tree", async () => {

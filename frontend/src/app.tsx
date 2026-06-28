@@ -1,7 +1,6 @@
 import { Show, createResource, createSignal, onCleanup, onMount, type Component } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "solid-sonner";
-import { check as checkForUpdate } from "@tauri-apps/plugin-updater";
 import { TopRow } from "./components/top-row";
 import { Sidebar } from "./components/sidebar";
 import { TerminalGrid } from "./components/terminal-grid";
@@ -19,7 +18,8 @@ import {
 } from "./stores/runtimeLayoutStore";
 import type { TerminalListItem } from "./stores/terminalStore";
 import { installQuitFlush } from "./lib/quitFlush";
-import { notifyBannerEnabled, startNotificationCenter } from "./lib/notificationCenter";
+import { startNotificationCenter } from "./lib/notificationCenter";
+import { runUpdateCheck } from "./lib/updateNotifier";
 import { installGlobalContextMenuSuppressor } from "./lib/suppressContextMenu";
 import { installDevtoolsShortcut } from "./lib/devtoolsShortcut";
 import { loadThemeFromConfig } from "./lib/theme/themeController";
@@ -50,51 +50,20 @@ const UPDATE_POLL_INTERVAL_MS = 5 * 60 * 60 * 1000;
  *  tmux hydration and initial pane spawns over the Tauri IPC bus. */
 const UPDATE_STARTUP_DELAY_MS = 10_000;
 
-/** Run one updater check. Surfaces an OS notification only when the
- *  reported version differs from the one we last notified about, so a user
- *  who dismisses a notification isn't re-pinged every poll cycle for the
- *  same release. Honours `notifyBannerEnabled` so a user who has chosen
- *  silent-with-badge isn't interrupted. Swallows all errors — a missing
- *  network must not bubble out of the periodic timer. */
-async function runBackgroundUpdateCheck(lastNotified: { version: string | null }): Promise<void> {
-  try {
-    const update = await checkForUpdate();
-    if (!update) return;
-    if (lastNotified.version === update.version) return;
-    lastNotified.version = update.version;
-    if (notifyBannerEnabled()) {
-      try {
-        await invoke("notifications_send", {
-          args: {
-            title: `raum update available: ${update.version}`,
-            body: "Open Settings → Updates to download and install.",
-            sessionId: null,
-          },
-        });
-      } catch (e) {
-        console.warn("notifications_send (update) failed", e);
-      }
-    }
-    console.info(`raum: update ${update.version} available`);
-  } catch (e) {
-    console.warn("background update check failed", e);
-  }
-}
-
 /** Run a background updater check after startup (when the user has opted
- *  in) and repeat every 5 hours for the life of the process. The Settings
- *  → Updates pane remains the canonical install surface; this just
- *  nudges users when a release drops while the app is running. */
+ *  in) and repeat every 5 hours for the life of the process. Surfaces a
+ *  persistent in-app toast (see `updateNotifier`) rather than an OS banner,
+ *  so the nudge is present whenever the user looks at the window. The
+ *  Settings → Updates pane remains the canonical install surface. */
 async function scheduleBackgroundUpdateCheck(snapshot: RaumConfigSnapshot): Promise<void> {
   if (import.meta.env.DEV) return;
   if (snapshot.updater?.check_on_launch === false) return;
 
   await new Promise((resolve) => setTimeout(resolve, UPDATE_STARTUP_DELAY_MS));
 
-  const lastNotified: { version: string | null } = { version: null };
-  await runBackgroundUpdateCheck(lastNotified);
+  await runUpdateCheck({ interactive: false });
   setInterval(() => {
-    void runBackgroundUpdateCheck(lastNotified);
+    void runUpdateCheck({ interactive: false });
   }, UPDATE_POLL_INTERVAL_MS);
 }
 

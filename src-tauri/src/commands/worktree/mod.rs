@@ -33,6 +33,7 @@ mod branches;
 mod browse;
 mod config_io;
 mod create;
+mod fs_watcher;
 mod git_ops;
 mod git_parse;
 mod history;

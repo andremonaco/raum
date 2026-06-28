@@ -128,8 +128,16 @@ fn worktree_creation_respects_pattern_prefix_and_hydration() {
     );
     assert_eq!(effective.hydration.copy, vec![".env".to_string()]);
 
-    // Resolve the effective worktree config via the precedence chain.
-    let config = Config::default();
+    // Resolve the effective worktree config. The path is globally authoritative
+    // (Settings → Worktrees); the custom branch prefix still comes from
+    // `.raum.toml`.
+    let config = Config {
+        worktree_config: WorktreeConfig {
+            path_pattern: "{parent-dir}/{base-folder}-wt/{branch-slug}".into(),
+            ..WorktreeConfig::default()
+        },
+        ..Config::default()
+    };
     let resolved = resolve_worktree_pattern(&config, &project, Some(&raum));
     assert_eq!(
         resolved.path_pattern,

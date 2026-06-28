@@ -8,13 +8,14 @@
  * Sections:
  *   - Appearance    — theme picker + per-pane prompt overlay toggle
  *   - Projects      — top-bar tab behaviour (auto-hide inactive projects)
+ *   - Terminals     — terminal/harness lifecycle (auto-dock inactive terminals)
  *   - Notifications — OS permission + when-to-notify toggles + sound
  *   - Harnesses     — per-harness extra CLI flags appended at spawn time
  *   - Worktrees     — worktree path-pattern preset + custom editor
  *   - Updates       — in-app updater + release-channel hooks
  */
 
-import { Component, For, createSignal } from "solid-js";
+import { Component, For, createEffect, createSignal, on } from "solid-js";
 import { Dialog as DialogPrimitive } from "@kobalte/core/dialog";
 
 import { cx } from "~/lib/cva";
@@ -26,6 +27,7 @@ import { HarnessesSection } from "./harnesses";
 import { NotificationsSection } from "./notifications";
 import { ProjectsSection } from "./projects";
 import { SECTIONS } from "./nav";
+import { TerminalsSection } from "./terminals";
 import type { SectionId } from "./types";
 import { UpdatesSection } from "./updates";
 import { WorktreesSection } from "./worktrees";
@@ -51,6 +53,9 @@ const SectionContent: Component<{ section: SectionId; open: boolean }> = (props)
       <div class={cx(props.section === "projects" ? "" : "hidden")}>
         <ProjectsSection />
       </div>
+      <div class={cx(props.section === "terminals" ? "" : "hidden")}>
+        <TerminalsSection />
+      </div>
       <div class={cx(props.section === "notifications" ? "" : "hidden")}>
         <NotificationsSection active={props.section === "notifications"} open={props.open} />
       </div>
@@ -73,11 +78,28 @@ const SectionContent: Component<{ section: SectionId; open: boolean }> = (props)
 
 export interface SettingsModalProps {
   open: boolean;
+  /** Section to jump to when the modal opens. When omitted, the last-viewed
+   *  section is kept (the plain gear / Cmd+, path). */
+  initialSection?: SectionId;
   onClose: () => void;
 }
 
 export const SettingsModal: Component<SettingsModalProps> = (props) => {
   const [activeSection, setActiveSection] = createSignal<SectionId>("appearance");
+
+  // Jump to a requested section on open (e.g. a deep link to Updates). Tracks
+  // both `open` and `initialSection` so a deep link also navigates when the
+  // modal is *already* open (e.g. the update toast's "Install…" clicked while
+  // Settings is showing another tab). Only acts when a section is provided, so
+  // a plain open keeps the last tab.
+  createEffect(
+    on(
+      () => [props.open, props.initialSection] as const,
+      ([open, section]) => {
+        if (open && section) setActiveSection(section);
+      },
+    ),
+  );
 
   return (
     <DialogPrimitive open={props.open} onOpenChange={(o) => !o && props.onClose()}>

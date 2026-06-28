@@ -29,6 +29,7 @@
 //! push/pop is most likely to have happened.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -38,6 +39,7 @@ use tauri::Emitter;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
+use super::fs_watcher::WorktreeFsWatcher;
 use super::status::compute_status;
 use super::types::WorktreeStatus;
 use crate::state::AppHandleState;
@@ -57,12 +59,15 @@ const FALLBACK_POLL: Duration = Duration::from_secs(15);
 const STASH_TTL: Duration = Duration::from_secs(30);
 
 /// Why a recompute was requested. Only distinction that matters today:
-/// `WatcherPulse` forces a stash recount.
+/// `WatcherPulse` forces a stash recount. `FsEdit` (a working-tree file change
+/// seen by the per-worktree fs watcher) behaves like `Mutation` — no stash
+/// recount, just a debounced recompute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefreshCause {
     Mutation,
     WatcherPulse,
     Focus,
+    FsEdit,
 }
 
 /// Payload of the `worktree-status-changed` event.
@@ -77,6 +82,14 @@ struct StatusChangedPayload {
 struct WatchEntry {
     trigger_tx: mpsc::UnboundedSender<RefreshCause>,
     task: tauri::async_runtime::JoinHandle<()>,
+    /// Working-tree file watcher for this path — pulses `trigger_tx` with
+    /// `FsEdit` so raw edits (no git command) refresh promptly instead of
+    /// waiting for the fallback poll. Attached asynchronously after the entry is
+    /// inserted (see `set_subscriptions` phase 2); `None` until then or if the
+    /// watcher failed to start. Held only for its `Drop` (stops watching when
+    /// the entry is unsubscribed) — never read, hence the allow.
+    #[allow(dead_code)]
+    fs_watcher: Option<WorktreeFsWatcher>,
 }
 
 #[derive(Debug)]
@@ -134,25 +147,92 @@ impl WorktreeStatusService {
     /// are aborted. Idempotent.
     pub fn set_subscriptions(&self, paths: Vec<String>) {
         let wanted: HashSet<String> = paths.into_iter().filter(|p| !p.is_empty()).collect();
-        let Ok(mut entries) = self.inner.entries.lock() else {
-            warn!("status_service: entries mutex poisoned");
-            return;
-        };
-        entries.retain(|path, entry| {
-            let keep = wanted.contains(path);
-            if !keep {
-                debug!(path = %path, "status_service: unsubscribed");
-                entry.task.abort();
-            }
-            keep
-        });
-        for path in wanted {
-            entries.entry(path.clone()).or_insert_with(|| {
-                let (trigger_tx, trigger_rx) = mpsc::unbounded_channel();
-                let task = spawn_watch_task(self.inner.clone(), path, trigger_rx);
-                WatchEntry { trigger_tx, task }
+
+        // Phase 1 (brief lock): drop removed paths; for each new path spawn its
+        // cheap, non-blocking watch task and insert a placeholder entry whose
+        // working-tree watcher is attached later. The seed status emits from the
+        // watch task immediately — the fs watcher only adds raw-edit liveness.
+        let to_start: Vec<(String, mpsc::UnboundedSender<RefreshCause>)> = {
+            let Ok(mut entries) = self.inner.entries.lock() else {
+                warn!("status_service: entries mutex poisoned");
+                return;
+            };
+            entries.retain(|path, entry| {
+                let keep = wanted.contains(path);
+                if !keep {
+                    debug!(path = %path, "status_service: unsubscribed");
+                    entry.task.abort();
+                }
+                keep
             });
+            let mut to_start = Vec::new();
+            for path in wanted {
+                if entries.contains_key(&path) {
+                    continue;
+                }
+                let (trigger_tx, trigger_rx) = mpsc::unbounded_channel();
+                let task = spawn_watch_task(self.inner.clone(), path.clone(), trigger_rx);
+                entries.insert(
+                    path.clone(),
+                    WatchEntry {
+                        trigger_tx: trigger_tx.clone(),
+                        task,
+                        fs_watcher: None,
+                    },
+                );
+                to_start.push((path, trigger_tx));
+            }
+            to_start
+        };
+
+        if to_start.is_empty() {
+            return;
         }
+
+        // Phase 2 (off the lock AND off the command thread): build each
+        // working-tree watcher and attach it. On Linux this walks the tree and
+        // registers inotify watches, which can take a while — doing it here
+        // keeps the status hot path and the (synchronous) subscribe command
+        // responsive. A path unsubscribed mid-build simply drops the watcher.
+        let inner = self.inner.clone();
+        tauri::async_runtime::spawn(async move {
+            for (path, trigger_tx) in to_start {
+                // The watcher pulses `trigger_tx`; keep a handle to verify, at
+                // attach time, that the entry still owns *this* channel.
+                let attach_tx = trigger_tx.clone();
+                let build_path = path.clone();
+                let built = tokio::task::spawn_blocking(move || {
+                    WorktreeFsWatcher::start(PathBuf::from(&build_path), trigger_tx)
+                })
+                .await;
+                let watcher = match built {
+                    Ok(Ok(w)) => w,
+                    Ok(Err(e)) => {
+                        warn!(path = %path, error = %e, "status_service: working-tree watcher failed to start; relying on fallback poll");
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!(path = %path, error = %e, "status_service: working-tree watcher build panicked; relying on fallback poll");
+                        continue;
+                    }
+                };
+                let Ok(mut entries) = inner.entries.lock() else {
+                    return;
+                };
+                // Attach only if the entry still owns the channel this watcher
+                // pulses. If the path was unsubscribed (entry gone) or
+                // unsubscribed-then-resubscribed (entry replaced with a fresh
+                // `trigger_tx`/watch task) while we were building, this watcher
+                // is stale — dropping it stops its OS watch, and the newer
+                // subscription's own phase 2 attaches the matching watcher.
+                match entries.get_mut(&path) {
+                    Some(entry) if entry.trigger_tx.same_channel(&attach_tx) => {
+                        entry.fs_watcher = Some(watcher);
+                    }
+                    _ => drop(watcher),
+                }
+            }
+        });
     }
 
     /// Debounced refresh nudge for one path. No-op when the path isn't
