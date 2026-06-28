@@ -2,6 +2,7 @@ import { ActivityIcon } from "./activity";
 import { AlertCircleIcon } from "./alert-circle";
 import { CheckIcon } from "./check";
 import { ChevronDownIcon } from "./chevron-down";
+import { ChevronRightIcon } from "./chevron-right";
 import { ClaudeCodeIcon } from "./claude-code";
 import { ClockIcon } from "./clock";
 import { CodexIcon } from "./codex";
@@ -12,6 +13,7 @@ import { GitBranchIcon } from "./git-branch";
 import { GitMergeIcon } from "./git-merge";
 import { GridEqualIcon } from "./grid-equal";
 import { GridTileIcon } from "./grid-tile";
+import { HistoryIcon } from "./history";
 import { KeyboardIcon } from "./keyboard";
 import { LoaderIcon } from "./loader";
 import { OpenCodeIcon } from "./opencode";
@@ -26,6 +28,7 @@ export {
   AlertCircleIcon,
   CheckIcon,
   ChevronDownIcon,
+  ChevronRightIcon,
   ClaudeCodeIcon,
   ClockIcon,
   CodexIcon,
@@ -36,6 +39,7 @@ export {
   GitMergeIcon,
   GridEqualIcon,
   GridTileIcon,
+  HistoryIcon,
   KeyboardIcon,
   LoaderIcon,
   OpenCodeIcon,

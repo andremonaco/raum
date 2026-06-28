@@ -19,8 +19,8 @@
  *   • `projectStore` — project list, active slug, colors.
  *   • `worktreeStore` — the existing active-worktree tracking + cache.
  *
- * This module folder is the post-§9 split: each region (`worktree-row`,
- * `project-section`, `discard-confirm-dialog`, …) lives next door so the
+ * This module folder is the post-§9 split: each region (`worktree-accordion`,
+ * `worktree-tab`, `discard-confirm-dialog`, …) lives next door so the
  * root file stays scannable.
  */
 
@@ -41,8 +41,8 @@ import { useKeymapAction } from "../../lib/keymapContext";
 import { sidebarHidden } from "../../lib/sidebarVisibility";
 import { Scrollable } from "../ui/scrollable";
 import { SIDEBAR_COLLAPSED_PX } from "./constants";
-import { ProjectSection } from "./project-section";
 import { ResizeHandle } from "./resize-handle";
+import { WorktreeAccordion } from "./worktree-accordion";
 
 // Re-exported so consumers that imported from `./components/sidebar` (e.g.
 // the unit-test suite) don't need to know the file split happened.
@@ -52,7 +52,6 @@ export const Sidebar: Component = () => {
   const [width, setWidth] = createSignal(280);
   const [collapsed, setCollapsed] = createSignal(false);
   const [dragging, setDragging] = createSignal(false);
-  const [worktreeFilter, setWorktreeFilter] = createSignal("");
   // Tracks which project slug has its create-worktree modal open (null = closed).
   const [createModalSlug, setCreateModalSlug] = createSignal<string | null>(null);
   // Track the last value we persisted so the drag-end commit doesn't echo
@@ -121,7 +120,7 @@ export const Sidebar: Component = () => {
   );
 
   // Fetch worktrees for the active project when collapsed so the mini-view
-  // has data. When expanded, ProjectSection mounts its own resource.
+  // has data. When expanded, WorktreeAccordion mounts its own resource.
   createEffect(() => {
     if (!collapsed()) return;
     const p = activeProject();
@@ -241,42 +240,16 @@ export const Sidebar: Component = () => {
         </Show>
 
         <Show when={!collapsed()}>
-          {/* Search + add row */}
-          <div class="flex shrink-0 items-center gap-1 px-2 py-2">
-            <input
-              type="search"
-              class="h-7 min-w-0 flex-1 rounded bg-selected px-2 text-[11px] text-foreground placeholder:text-foreground-dim focus:outline-none focus:ring-1 focus:ring-ring"
-              placeholder="Filter worktrees…"
-              value={worktreeFilter()}
-              onInput={(e) => setWorktreeFilter(e.currentTarget.value)}
-              aria-label="Filter worktrees"
-            />
-            <button
-              type="button"
-              class="flex h-7 w-7 shrink-0 items-center justify-center rounded bg-selected text-base leading-none text-muted-foreground transition-all duration-100 hover:bg-hover hover:text-foreground active:scale-90 disabled:cursor-not-allowed disabled:opacity-40 disabled:active:scale-100"
-              title={activeProjectSlug() ? "New worktree" : "Select a project first"}
-              disabled={!activeProjectSlug()}
-              onClick={() => setCreateModalSlug(activeProjectSlug() ?? null)}
-            >
-              +
-            </button>
-          </div>
-          <Scrollable class="min-h-0 flex-1 p-2">
-            <Show
-              keyed
-              when={activeProject()}
-              fallback={<p class="px-2 text-foreground-dim">No projects registered yet.</p>}
-            >
-              {(project) => (
-                <ProjectSection
-                  project={project}
-                  worktreeFilter={worktreeFilter()}
-                  createOpen={createModalSlug() === project.slug}
-                  onCreateClose={() => setCreateModalSlug(null)}
-                />
-              )}
-            </Show>
-          </Scrollable>
+          {/* ---- Expanded body: the worktree accordion (§2) --------------------- */}
+          {/* A vertical stack of collapsible worktree tabs; the open tab owns the */}
+          {/* one focused Scrollable for its Changes/History/Files detail, so the  */}
+          {/* changes handle is per-worktree and never nests scroll regions (§8).  */}
+          <WorktreeAccordion
+            project={activeProject()}
+            createOpen={createModalSlug() !== null && createModalSlug() === activeProject()?.slug}
+            onRequestCreate={() => setCreateModalSlug(activeProjectSlug() ?? null)}
+            onCreateClose={() => setCreateModalSlug(null)}
+          />
           <ResizeHandle
             getWidth={() => width()}
             onChange={(next) => setWidth(next)}

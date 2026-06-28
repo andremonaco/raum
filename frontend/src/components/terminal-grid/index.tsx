@@ -487,6 +487,7 @@ export const TerminalGrid: Component = () => {
           projectSlug?: string;
           worktreeId?: string;
           splitDirection?: "right" | "bottom";
+          initialPrompt?: string;
         }>
       ).detail;
       if (!detail || !detail.kind || detail.kind === "empty") return;
@@ -497,7 +498,9 @@ export const TerminalGrid: Component = () => {
       const newPane: PaneContent = {
         id,
         kind: detail.kind,
-        tabs: [{ id: tabId }],
+        // `initialPrompt` (set e.g. by the sidebar Commit button) is forwarded
+        // to `terminal_spawn` so the harness launches pre-loaded with a task.
+        tabs: [{ id: tabId, initialPrompt: detail.initialPrompt }],
         activeTabId: tabId,
         projectSlug: detail.projectSlug,
         worktreeId: detail.worktreeId,
