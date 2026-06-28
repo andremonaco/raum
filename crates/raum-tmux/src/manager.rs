@@ -36,6 +36,29 @@ pub fn default_socket_name() -> String {
     raum_core::paths::instance_name()
 }
 
+/// True when a tmux command's stderr means "there is no live server on this
+/// socket" — the cold-socket condition the boot recovery path treats as an
+/// empty session list rather than a hard error.
+///
+/// tmux phrases this several ways depending on *when* the client notices the
+/// server is gone:
+/// - `no server running on <socket>` — the socket file is absent (clean cold start).
+/// - `error connecting to <socket> (...)` — the socket file exists but nothing
+///   is listening (stale socket, e.g. after a crash).
+/// - `server exited unexpectedly` / `lost server` — the client connected to a
+///   socket whose server is dying/just died and the connection dropped mid-
+///   command. This is a race seen right after `kill-server`, and notably on
+///   slower runners (observed on Linux arm64 CI) where the window between the
+///   server's exit and the socket teardown is wide enough to hit.
+///
+/// All four are functionally "no live sessions" for recovery purposes.
+fn is_no_server_stderr(stderr: &str) -> bool {
+    stderr.contains("no server running")
+        || stderr.contains("error connecting")
+        || stderr.contains("server exited unexpectedly")
+        || stderr.contains("lost server")
+}
+
 #[derive(Debug, Error)]
 pub enum TmuxError {
     #[error("io: {0}")]
@@ -153,7 +176,7 @@ impl TmuxManager {
         let out = self.cmd().arg("kill-server").output()?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            if stderr.contains("no server running") || stderr.contains("error connecting") {
+            if is_no_server_stderr(&stderr) {
                 return Ok(());
             }
             return Err(TmuxError::NonZero {
@@ -214,7 +237,7 @@ impl TmuxManager {
     /// Captures stderr and routes any unexpected output through `tracing::warn!`
     /// keyed by the subcommand, instead of inheriting it onto the parent
     /// process's stderr (where it would surface in the dev console).
-    /// Cold-socket "no server running" / "error connecting" lines are
+    /// Cold-socket / dead-server lines (see [`is_no_server_stderr`]) are
     /// expected during early bootstrap and are swallowed silently.
     fn run_quiet(&self, args: &[&str]) {
         let out = match self.cmd().args(args).output() {
@@ -229,10 +252,7 @@ impl TmuxManager {
         }
         let stderr = String::from_utf8_lossy(&out.stderr);
         let trimmed = stderr.trim();
-        if trimmed.is_empty()
-            || trimmed.contains("no server running")
-            || trimmed.contains("error connecting")
-        {
+        if trimmed.is_empty() || is_no_server_stderr(trimmed) {
             return;
         }
         warn!(args = ?args, stderr = %trimmed, "tmux invocation reported error");
@@ -250,7 +270,7 @@ impl TmuxManager {
         if !out.status.success() {
             // tmux returns 1 when no server is running — treat as empty.
             let stderr = String::from_utf8_lossy(&out.stderr);
-            if stderr.contains("no server running") || stderr.contains("error connecting") {
+            if is_no_server_stderr(&stderr) {
                 return Ok(vec![]);
             }
             return Err(TmuxError::NonZero {
@@ -962,5 +982,22 @@ sess-windows-crlf\t1700000002\t100\t30\r
         assert_eq!(parsed.current_path, "");
         assert_eq!(parsed.pane_title, "");
         assert_eq!(parsed.window_name, "");
+    }
+
+    #[test]
+    fn cold_socket_stderr_variants_classify_as_no_server() {
+        // Every phrasing tmux uses for "no live server on this socket" — the
+        // boot recovery path must treat all of these as an empty session list.
+        // `server exited unexpectedly` is the race seen on slower CI runners
+        // (Linux arm64) right after `kill-server`.
+        assert!(is_no_server_stderr("no server running on /tmp/tmux-raum\n"));
+        assert!(is_no_server_stderr(
+            "error connecting to /tmp/tmux-raum (No such file or directory)\n"
+        ));
+        assert!(is_no_server_stderr("server exited unexpectedly\n"));
+        assert!(is_no_server_stderr("lost server\n"));
+        // A genuine error (e.g. a bad session name) must NOT be swallowed.
+        assert!(!is_no_server_stderr("can't find session: nope\n"));
+        assert!(!is_no_server_stderr(""));
     }
 }
