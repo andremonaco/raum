@@ -45,9 +45,9 @@ const PresetRow: Component<{
 };
 
 export const WorktreesSection: Component<{ active: boolean }> = (props) => {
-  const [pattern, setPattern] = createSignal<string>(WORKTREE_PRESETS.parent);
-  const [customDraft, setCustomDraft] = createSignal<string>(WORKTREE_PRESETS.parent);
-  const [preset, setPreset] = createSignal<WorktreePresetKey>("parent");
+  const [pattern, setPattern] = createSignal<string>(WORKTREE_PRESETS.nested);
+  const [customDraft, setCustomDraft] = createSignal<string>(WORKTREE_PRESETS.nested);
+  const [preset, setPreset] = createSignal<WorktreePresetKey>("nested");
   const [saving, setSaving] = createSignal(false);
   const [seeded, setSeeded] = createSignal(false);
   const [saveError, setSaveError] = createSignal<string | undefined>(undefined);
@@ -58,7 +58,7 @@ export const WorktreesSection: Component<{ active: boolean }> = (props) => {
     try {
       const cfg = await invoke<{ worktreeConfig?: { pathPattern?: string } }>("config_get");
       const p = cfg.worktreeConfig?.pathPattern?.trim();
-      const effective = p && p.length > 0 ? p : WORKTREE_PRESETS.parent;
+      const effective = p && p.length > 0 ? p : WORKTREE_PRESETS.nested;
       setPattern(effective);
       setCustomDraft(effective);
       setPreset(detectPreset(effective));
@@ -158,7 +158,7 @@ export const WorktreesSection: Component<{ active: boolean }> = (props) => {
             checked={preset() === "nested"}
             disabled={!seeded() || saving()}
             title="Nested"
-            description="Lives under a .raum/ folder at the project root. raum adds .raum/ to .gitignore the first time you use this."
+            description="Lives under a .raum/ folder at the project root. raum adds .raum/ to .gitignore the first time you use this. This is the default."
             pattern={WORKTREE_PRESETS.nested}
             onSelect={() => selectPreset("nested")}
           />
@@ -166,7 +166,7 @@ export const WorktreesSection: Component<{ active: boolean }> = (props) => {
             checked={preset() === "parent"}
             disabled={!seeded() || saving()}
             title="Parent"
-            description="Dropped next to the project in a <name>-worktrees/ directory in the parent folder. This is the default."
+            description="Dropped next to the project in a <name>-worktrees/ directory in the parent folder."
             pattern={WORKTREE_PRESETS.parent}
             onSelect={() => selectPreset("parent")}
           />
