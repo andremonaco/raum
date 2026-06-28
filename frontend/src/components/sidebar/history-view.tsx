@@ -92,26 +92,25 @@ function splitConventional(subject: string): { type: string; prefix: string; res
 }
 
 /**
- * Semantic accent per conventional-commit type, following the common modern
- * convention: release-impacting work gets a vivid hue, internal-but-notable
- * work goes sky, and housekeeping/tooling (chore, build, ci, test, style) is
- * deliberately a muted neutral grey — it isn't user-facing, so it recedes.
+ * Per-conventional-commit-type accent. Each type carries its own hue so the log
+ * scans by category at a glance — but never green or red, which read as a
+ * pass/fail status rather than a *kind* of change. Housekeeping / tooling stays
+ * a muted neutral grey: it isn't user-facing, so it recedes.
  */
 function typeAccentClass(type: string): string {
   switch (type) {
-    // Release-impacting.
     case "feat":
-      return "text-success"; // new features → green
+      return "text-sky-400"; // new features → blue
     case "fix":
     case "revert":
-      return "text-destructive"; // corrections / undos → red
+      return "text-violet-400"; // corrections / undos → purple
     case "perf":
-      return "text-warning"; // performance → amber
-    // Internal but notable.
+      return "text-amber-400"; // performance → amber
     case "refactor":
+      return "text-fuchsia-400"; // restructuring → magenta
     case "docs":
-      return "text-info"; // sky
-    // Housekeeping / tooling — intentionally muted (the modern "chore is grey").
+      return "text-cyan-400"; // documentation → cyan
+    // Housekeeping / tooling — muted neutral grey, recedes.
     case "chore":
     case "build":
     case "ci":
