@@ -102,16 +102,6 @@ export const TabItem: Component<{
     return text;
   };
 
-  // Subtitles render only the first line of multi-line prompts. The
-  // `title=` tooltip carries the full text (newlines preserved) so the
-  // user can hover for the rest.
-  const lastPromptSubtitle = (): string | undefined => {
-    const text = lastPromptText();
-    if (!text) return undefined;
-    const idx = text.indexOf("\n");
-    return idx >= 0 ? text.slice(0, idx) : text;
-  };
-
   function openMenu(e: MouseEvent) {
     e.preventDefault();
     e.stopPropagation();
@@ -151,14 +141,12 @@ export const TabItem: Component<{
     <Tooltip>
       <TooltipTrigger
         as="div"
-        class="pane-header-tab group relative flex min-w-[120px] max-w-[300px] grow basis-[180px] cursor-pointer items-center gap-1 rounded-md px-2 text-[10px] uppercase leading-none tracking-wide transition-colors"
+        class="pane-header-tab group relative flex h-[22px] min-w-[120px] max-w-[300px] grow basis-[180px] cursor-pointer select-none items-center gap-1.5 rounded-md px-2.5 text-[10px] uppercase leading-none tracking-wide transition-colors duration-150"
         classList={{
-          "h-[22px]": !!lastPromptSubtitle(),
-          "h-[18px]": !lastPromptSubtitle(),
-          "bg-selected text-foreground":
+          "bg-selected text-foreground font-medium":
             props.isActive && tabState() !== "waiting" && !isUnreadCompleted(),
-          "bg-selected text-warning": props.isActive && tabState() === "waiting",
-          "bg-selected text-success":
+          "bg-selected text-warning font-medium": props.isActive && tabState() === "waiting",
+          "bg-selected text-success font-medium":
             props.isActive && tabState() !== "waiting" && isUnreadCompleted(),
           "text-foreground-subtle hover:bg-hover hover:text-foreground":
             !props.isActive && tabState() !== "waiting" && !isUnreadCompleted(),
@@ -180,55 +168,46 @@ export const TabItem: Component<{
         }}
       >
         <HarnessIcon />
-        <div class="flex min-w-0 flex-1 flex-col justify-center">
-          <div class="flex min-w-0 items-center gap-1">
-            <Show when={editing()}>
-              <input
-                type="text"
-                class="h-4 w-28 rounded-sm border border-border bg-background px-1 text-[10px] uppercase tracking-wide text-foreground outline-none focus:border-ring"
-                value={draft()}
-                onInput={(e) => setDraft(e.currentTarget.value)}
-                onClick={(e) => e.stopPropagation()}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    e.preventDefault();
-                    commitRename();
-                  } else if (e.key === "Escape") {
-                    e.preventDefault();
-                    cancelRename();
-                  }
-                }}
-                onBlur={commitRename}
-                ref={(el) => {
-                  queueMicrotask(() => {
-                    el.focus();
-                    el.select();
-                  });
-                }}
-              />
-            </Show>
-            <Show when={!editing() && tabLabel()}>
-              <span class="min-w-0 flex-1 truncate normal-case">{tabLabel()}</span>
-            </Show>
-            <Show when={props.showClose && !editing()}>
-              <button
-                type="button"
-                aria-label="Close tab"
-                class="pane-header-tab-close ml-0.5 hidden shrink-0 rounded-sm p-0.5 hover:bg-hover hover:text-foreground group-hover:flex"
-                onClick={(e) => {
-                  props.onClose(e);
-                }}
-              >
-                <CloseGlyph />
-              </button>
-            </Show>
-          </div>
-          <Show when={lastPromptSubtitle()}>
-            <div class="mt-px min-w-0 truncate text-[9px] font-normal leading-none normal-case tracking-normal opacity-85">
-              {lastPromptSubtitle()}
-            </div>
-          </Show>
-        </div>
+        <Show when={editing()}>
+          <input
+            type="text"
+            class="h-4 w-28 rounded-sm border border-border bg-background px-1 text-[10px] uppercase tracking-wide text-foreground outline-none focus:border-ring"
+            value={draft()}
+            onInput={(e) => setDraft(e.currentTarget.value)}
+            onClick={(e) => e.stopPropagation()}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                commitRename();
+              } else if (e.key === "Escape") {
+                e.preventDefault();
+                cancelRename();
+              }
+            }}
+            onBlur={commitRename}
+            ref={(el) => {
+              queueMicrotask(() => {
+                el.focus();
+                el.select();
+              });
+            }}
+          />
+        </Show>
+        <Show when={!editing() && tabLabel()}>
+          <span class="min-w-0 flex-1 truncate normal-case">{tabLabel()}</span>
+        </Show>
+        <Show when={props.showClose && !editing()}>
+          <button
+            type="button"
+            aria-label="Close tab"
+            class="pane-header-tab-close pointer-events-none ml-auto shrink-0 rounded p-0.5 opacity-0 transition-opacity duration-150 hover:bg-hover hover:text-foreground group-hover:pointer-events-auto group-hover:opacity-100"
+            onClick={(e) => {
+              props.onClose(e);
+            }}
+          >
+            <CloseGlyph />
+          </button>
+        </Show>
 
         <Show when={menuOpen()}>
           <div

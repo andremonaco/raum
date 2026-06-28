@@ -179,7 +179,7 @@ export const PaneHeader: Component<PaneHeaderProps> = (props) => {
       data-testid={`pane-header-${props.cellId}`}
       onPointerDown={onHeaderPointerDown}
     >
-      <div class="no-scrollbar flex min-w-0 flex-1 items-center overflow-x-auto pl-1.5">
+      <div class="no-scrollbar flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto pl-1.5">
         <For each={props.tabs}>
           {(tab) => (
             <TabItem
@@ -197,7 +197,7 @@ export const PaneHeader: Component<PaneHeaderProps> = (props) => {
           type="button"
           title="New tab"
           aria-label="New tab"
-          class="pane-header-chrome-button ml-0.5 flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded-md text-foreground-subtle hover:bg-hover hover:text-foreground"
+          class="pane-header-chrome-button flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-md text-foreground-subtle transition-colors duration-150 hover:bg-hover hover:text-foreground"
           onClick={onAddTab}
         >
           <PlusGlyph />

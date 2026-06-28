@@ -48,12 +48,6 @@ export const ProjectedSessionFrame: Component<{ sessionId: string; rect: Rect | 
       "box-shadow": `inset 0 1px 0 color-mix(in oklab, ${project()?.color ?? "#6b7280"} 26%, transparent)`,
       "background-image": `linear-gradient(180deg, color-mix(in oklab, ${project()?.color ?? "#6b7280"} 7%, transparent) 0%, transparent 100%)`,
     }) as Record<string, string>;
-  const projectedSubtitle = (): string | undefined => {
-    const text = terminal()?.lastPrompt?.text;
-    if (!text) return undefined;
-    const idx = text.indexOf("\n");
-    return idx >= 0 ? text.slice(0, idx) : text;
-  };
 
   return (
     <Show when={terminal()}>
@@ -82,21 +76,10 @@ export const ProjectedSessionFrame: Component<{ sessionId: string; rect: Rect | 
                   <Tooltip>
                     <TooltipTrigger
                       as="div"
-                      class="pane-header-tab relative flex min-w-[120px] max-w-[300px] grow basis-[180px] flex-col justify-center rounded-md px-2 text-[10px] uppercase leading-none tracking-wide text-foreground"
-                      classList={{
-                        "h-[26px]": !!projectedSubtitle(),
-                        "h-[18px]": !projectedSubtitle(),
-                      }}
+                      class="pane-header-tab relative flex h-[22px] min-w-[120px] max-w-[300px] grow basis-[180px] items-center gap-1.5 rounded-md px-2.5 text-[10px] uppercase leading-none tracking-wide text-foreground"
                     >
-                      <div class="flex min-w-0 items-center gap-1">
-                        <HarnessIcon />
-                        <span class="min-w-0 flex-1 truncate normal-case">{label()}</span>
-                      </div>
-                      <Show when={projectedSubtitle()}>
-                        <div class="mt-px min-w-0 truncate pl-[18px] text-[9px] font-normal normal-case tracking-normal opacity-85">
-                          {projectedSubtitle()}
-                        </div>
-                      </Show>
+                      <HarnessIcon />
+                      <span class="min-w-0 flex-1 truncate normal-case">{label()}</span>
                     </TooltipTrigger>
                     <TooltipPortal>
                       <TooltipContent class="max-w-md">
