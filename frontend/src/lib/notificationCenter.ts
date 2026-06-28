@@ -9,13 +9,15 @@
  *   1. An OS notification via the Rust `notifications_send` Tauri command
  *      (which calls `UNUserNotificationCenter.add` on macOS via
  *      `objc2-user-notifications`, and `notify-rust`/zbus on Linux). Fires
- *      regardless of window focus — if the user has enabled notifications
- *      in settings they should see every event. Clicking the notification
- *      focuses the owning pane via the Tauri `notifications:clicked`
- *      event the Rust delegate emits. There is NO in-app toast fallback:
- *      the user's "OS only, even when system notifications are off" rule
- *      means we always attempt the OS path and accept that macOS will
- *      drop the notification if permission is denied.
+ *      only while the raum window is **unfocused** — when raum is on top the
+ *      in-app Attention rail (FLEET mission control) already lists every
+ *      agent needing a human, so an OS banner on top of it is a redundant
+ *      double-notification. See {@link windowFocused}. Clicking the
+ *      notification focuses the owning pane via the Tauri
+ *      `notifications:clicked` event the Rust delegate emits. There is NO
+ *      in-app toast fallback: the user's "OS only, even when system
+ *      notifications are off" rule means we always attempt the OS path and
+ *      accept that macOS will drop the notification if permission is denied.
  *   2. An optional sound played via the backend `notifications_play_sound`
  *      command, which delegates to the OS event-sound player (afplay /
  *      canberra-gtk-play). Path from `Config.notifications.sound` (§11.5).
@@ -29,6 +31,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { createEffect, createRoot, createSignal } from "solid-js";
 
 import { kindDisplayLabel } from "./agentKind";
@@ -147,6 +150,23 @@ export { notifyOnDone };
  */
 const [notifyBannerEnabled, setNotifyBannerEnabled] = createSignal(true);
 export { notifyBannerEnabled };
+
+/**
+ * Whether the raum window currently holds OS focus. Drives the OS-banner
+ * focus gate: when raum is focused the in-app Attention rail already lists
+ * every agent needing a human, so firing an OS banner on top of it is the
+ * duplicate the user explicitly doesn't want (system banner *and* in-app
+ * rail). The dispatchers therefore only escalate to the OS path while the
+ * window is unfocused.
+ *
+ * Defaults to `false` (assume backgrounded) so that, before the focus
+ * listener initialises, a genuine background event is never silently
+ * swallowed — the worst case is a single duplicate banner in the first few
+ * ms after launch, never a missed notification. Kept current by the
+ * `onFocusChanged` subscription installed in {@link startNotificationCenter}.
+ */
+const [windowFocused, setWindowFocused] = createSignal(false);
+export { windowFocused };
 
 /**
  * §11.3 — dock/taskbar badge verbosity. Mirrors `raum_core::config::BadgeMode`
@@ -500,6 +520,10 @@ async function dispatchWaitingNotification(sessionId: string, harness: AgentKind
   // `handleAgentStateChanged`'s unread/pending counters.
   if (!notifyBannerEnabled()) return;
 
+  // Window focused → the in-app Attention rail already surfaces this. Skip
+  // the OS banner to avoid a duplicate. See `windowFocused`.
+  if (windowFocused()) return;
+
   await emitOsNotification(title, body, sessionId, "needs_input");
 }
 
@@ -521,6 +545,10 @@ async function dispatchDoneNotification(
 
   // Banner master switch off → silent-with-badge.
   if (!notifyBannerEnabled()) return;
+
+  // Window focused → the in-app Attention rail already surfaces this. Skip
+  // the OS banner to avoid a duplicate. See `windowFocused`.
+  if (windowFocused()) return;
 
   await emitOsNotification(title, body, sessionId, "done");
 }
@@ -576,6 +604,22 @@ interface NotificationClickedPayload {
 export async function startNotificationCenter(): Promise<UnlistenFn> {
   await ensureNotificationPermission();
   await loadNotificationConfig();
+
+  // Seed + track window focus so the OS-banner dispatchers can suppress
+  // themselves while raum is on top (the in-app Attention rail covers it).
+  // Best-effort: in a non-Tauri context (vitest/jsdom) the window API may
+  // throw — swallow it and leave `windowFocused` at its `false` default so
+  // notifications still fire.
+  let unlistenFocus: UnlistenFn = () => {};
+  try {
+    const win = getCurrentWindow();
+    setWindowFocused(await win.isFocused());
+    unlistenFocus = await win.onFocusChanged(({ payload: focused }) => {
+      setWindowFocused(focused);
+    });
+  } catch (e) {
+    console.warn("window focus tracking unavailable", e);
+  }
 
   const unlistenState = await listen<AgentStateChangedPayload>("agent-state-changed", (ev) => {
     handleAgentStateChanged(ev.payload);
@@ -646,6 +690,7 @@ export async function startNotificationCenter(): Promise<UnlistenFn> {
     unlistenRemoved();
     unlistenPermission();
     unlistenClick();
+    unlistenFocus();
     disposeReactive();
     lastNotifyAt.clear();
   };
@@ -679,6 +724,11 @@ async function dispatchPermissionNotification(payload: NotificationEventPayload)
   // mode), so the user still notices; we just don't interrupt with a
   // banner.
   if (!notifyBannerEnabled()) return;
+
+  // Window focused → the in-app Attention rail already surfaces this. Skip
+  // the OS banner to avoid a duplicate. The pending-permission counter above
+  // keeps the badge accurate either way. See `windowFocused`.
+  if (windowFocused()) return;
 
   await emitOsNotification(title, summary, sessionId || null, "needs_input");
 }
@@ -733,6 +783,12 @@ export function __resetNotificationCenterForTests(): void {
   setNotifyOnWaiting(true);
   setNotifyOnDone(true);
   setNotifyBannerEnabled(true);
+  setWindowFocused(false);
+}
+
+/** @internal — drive the window-focus signal without a Tauri runtime. */
+export function __setWindowFocusedForTests(focused: boolean): void {
+  setWindowFocused(focused);
 }
 
 /** @internal — hand the event handler directly so tests don't need Tauri IPC. */
