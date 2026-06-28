@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.13](https://github.com/andremonaco/raum/releases/tag/v0.1.13) - 2026-06-28
+
+### Added
+
+- feat(app): nested worktree default, terminals auto-dock config, menu items
+- feat(worktree): per-worktree working-tree fs watcher for instant status
+- feat(cli): `raum worktree create` + raum Agent Skill
+
+### Fixed
+
+- fix(tmux): treat dead-server stderr as no live sessions
+
+### Other
+
+- refactor(watcher): share notify self-heal scaffolding via notify_watch
+- refactor(worktree): make working-tree fs watcher gitignore-aware and fd-bounded
+
+
 ## [0.1.12](https://github.com/andremonaco/raum/releases/tag/v0.1.12) - 2026-06-26
 
 
