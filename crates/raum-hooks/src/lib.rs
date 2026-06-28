@@ -13,6 +13,7 @@ pub mod socket;
 
 pub use socket::{
     EventSocketHandle, HookEvent, PER_AGENT_BACKLOG, PendingKey, PendingRequests,
-    RAUM_EVENT_SOCK_ENV, RAUM_SESSION_ENV, ReplyError as SocketReplyError,
-    set_env as set_event_sock_env, spawn_event_socket,
+    RAUM_EVENT_SOCK_ENV, RAUM_PROJECT_ROOT_ENV, RAUM_PROJECT_SLUG_ENV, RAUM_SESSION_ENV,
+    RAUM_WORKTREE_ID_ENV, ReplyError as SocketReplyError, set_env as set_event_sock_env,
+    spawn_event_socket,
 };

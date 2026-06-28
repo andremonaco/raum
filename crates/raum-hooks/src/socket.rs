@@ -22,6 +22,12 @@ use tracing::{debug, warn};
 
 pub const RAUM_EVENT_SOCK_ENV: &str = "RAUM_EVENT_SOCK";
 pub const RAUM_SESSION_ENV: &str = "RAUM_SESSION";
+/// Project context injected into each pane's tmux env so the `raum` CLI
+/// (e.g. `raum worktree create <branch>`) can resolve which project/worktree it
+/// is running inside without a round-trip to the running app.
+pub const RAUM_PROJECT_SLUG_ENV: &str = "RAUM_PROJECT_SLUG";
+pub const RAUM_PROJECT_ROOT_ENV: &str = "RAUM_PROJECT_ROOT";
+pub const RAUM_WORKTREE_ID_ENV: &str = "RAUM_WORKTREE_ID";
 pub const PER_AGENT_BACKLOG: usize = 8_000;
 
 /// A single hook event delivered over the UDS.

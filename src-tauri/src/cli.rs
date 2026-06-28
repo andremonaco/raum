@@ -18,10 +18,34 @@ USAGE:
     raum [DIR]      Open the GUI window. Pass a directory to open it as a project
                     — added if new, focused if already registered.
 
+    raum worktree create <BRANCH>
+                    Create a git worktree using your raum settings (runs
+                    hydration + pre/post-create scripts). Intended for agents
+                    running inside a raum pane. See `raum worktree --help`.
+
 OPTIONS:
     -h, --help      Show this message
     -V, --version   Show version
 ";
+
+/// Headless subcommands that run to completion and exit *before* any GUI,
+/// tracing, or window setup. Currently just `raum worktree …`, which lets an
+/// agent inside a raum pane create a worktree (`raum worktree create <branch>`)
+/// using the user's stored settings.
+///
+/// Exits the process with the subcommand's status code when it handles one;
+/// returns normally otherwise so GUI boot continues. (This is the one
+/// intentional exception to §2.7 — `worktree` is a deliberate, documented
+/// agent-facing surface, not an internal flag.)
+pub fn dispatch_subcommand() {
+    let mut args = std::env::args().skip(1);
+    if let Some(first) = args.next() {
+        if first == "worktree" {
+            let rest: Vec<String> = args.collect();
+            std::process::exit(crate::cli_worktree::run(&rest));
+        }
+    }
+}
 
 /// Dispatch command-line args.
 ///

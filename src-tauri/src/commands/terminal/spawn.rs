@@ -147,6 +147,13 @@ pub async fn terminal_spawn<R: Runtime>(
         .lock()
         .ok()
         .and_then(|g| g.as_ref().map(|h| h.path.to_string_lossy().into_owned()));
+    // Project context for the `raum` CLI running inside this pane. The project
+    // root is the *main* repo (not the per-worktree `cwd`), so the CLI creates
+    // new worktrees against the right repo.
+    let raum_project_slug_value = args.project_slug.clone();
+    let raum_project_root_value: Option<String> =
+        (!project_dir.as_os_str().is_empty()).then(|| project_dir.to_string_lossy().into_owned());
+    let raum_worktree_id_value = args.worktree_id.clone();
     let harness_env: Vec<(String, String)> = harness_session_env_pairs(&state, args.kind);
     let cwd_for_new = cwd.clone();
     tokio::task::spawn_blocking(move || {
@@ -154,6 +161,15 @@ pub async fn terminal_spawn<R: Runtime>(
             vec![(raum_hooks::RAUM_SESSION_ENV, raum_session_value.as_str())];
         if let Some(p) = raum_event_sock_value.as_deref() {
             env_pairs.push((raum_hooks::RAUM_EVENT_SOCK_ENV, p));
+        }
+        if let Some(s) = raum_project_slug_value.as_deref() {
+            env_pairs.push((raum_hooks::RAUM_PROJECT_SLUG_ENV, s));
+        }
+        if let Some(r) = raum_project_root_value.as_deref() {
+            env_pairs.push((raum_hooks::RAUM_PROJECT_ROOT_ENV, r));
+        }
+        if let Some(w) = raum_worktree_id_value.as_deref() {
+            env_pairs.push((raum_hooks::RAUM_WORKTREE_ID_ENV, w));
         }
         for (k, v) in &harness_env {
             env_pairs.push((k.as_str(), v.as_str()));

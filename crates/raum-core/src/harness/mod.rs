@@ -32,6 +32,7 @@ pub mod opencode_reply;
 pub mod opencode_sse;
 pub mod reply;
 pub mod setup;
+pub mod skill;
 pub mod traits;
 
 pub use channel::{ChannelError, ChannelHealth, NotificationChannel, NotificationSink};
@@ -53,6 +54,7 @@ pub use setup::{
     ActionOutcome, ActionReport, ConfigPathEntry, ConfigScope, ScanReport, SelftestReport,
     SetupAction, SetupContext, SetupError, SetupExecutor, SetupPlan, SetupReport,
 };
+pub use skill::{SkillWrite, install_raum_skill};
 pub use traits::{
     HarnessIdentity, HarnessRuntime, LaunchOverrides, NotificationSetup, SessionSpec,
 };

@@ -1,6 +1,7 @@
 //! raum Tauri host. Entry point wires plugins and exposes the command surface.
 
 mod cli;
+mod cli_worktree;
 mod commands;
 mod keymap;
 mod notifications;
@@ -87,7 +88,11 @@ fn raise_nofile_limit() {
 }
 
 pub fn run() {
-    // §2.7 — no user CLI surface. Inspect args; print GUI-only --help and exit before window.
+    // Headless subcommands (`raum worktree …`) run to completion and exit here,
+    // before any GUI/tracing/window setup.
+    cli::dispatch_subcommand();
+
+    // §2.7 — `--help` / `--version` print GUI-only help and exit before window.
     if !cli::handle_args() {
         return;
     }
@@ -106,6 +111,18 @@ pub fn run() {
     // (`claude`, `codex`, `opencode`) fail to resolve. Probe the user's
     // login shell once here, before any `which::which()` call runs.
     path_env::augment_process_path();
+
+    // Install the uniform `raum` Agent Skill into each set-up harness so agents
+    // running inside raum discover the `raum worktree create` CLI. Idempotent
+    // (only rewrites on content change) and gated on each harness's config dir
+    // existing, so it never litters. Detached so disk I/O can't delay the window.
+    std::thread::spawn(|| {
+        for w in raum_core::harness::install_raum_skill() {
+            if w.wrote {
+                info!(path = %w.path.display(), "installed raum skill");
+            }
+        }
+    });
 
     // Capture an optional `raum <dir>` argument for a *cold* launch and seed it
     // into shared state; the frontend drains it on boot via
