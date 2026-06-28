@@ -29,6 +29,7 @@
 //! push/pop is most likely to have happened.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -38,6 +39,7 @@ use tauri::Emitter;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
+use super::fs_watcher::WorktreeFsWatcher;
 use super::status::compute_status;
 use super::types::WorktreeStatus;
 use crate::state::AppHandleState;
@@ -57,12 +59,15 @@ const FALLBACK_POLL: Duration = Duration::from_secs(15);
 const STASH_TTL: Duration = Duration::from_secs(30);
 
 /// Why a recompute was requested. Only distinction that matters today:
-/// `WatcherPulse` forces a stash recount.
+/// `WatcherPulse` forces a stash recount. `FsEdit` (a working-tree file change
+/// seen by the per-worktree fs watcher) behaves like `Mutation` — no stash
+/// recount, just a debounced recompute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefreshCause {
     Mutation,
     WatcherPulse,
     Focus,
+    FsEdit,
 }
 
 /// Payload of the `worktree-status-changed` event.
@@ -77,6 +82,11 @@ struct StatusChangedPayload {
 struct WatchEntry {
     trigger_tx: mpsc::UnboundedSender<RefreshCause>,
     task: tauri::async_runtime::JoinHandle<()>,
+    /// Working-tree file watcher for this path — pulses `trigger_tx` with
+    /// `FsEdit` so raw edits (no git command) refresh promptly instead of
+    /// waiting for the fallback poll. Held only for its `Drop` (stops watching
+    /// when the entry is unsubscribed); `None` if the watcher failed to start.
+    _fs_watcher: Option<WorktreeFsWatcher>,
 }
 
 #[derive(Debug)]
@@ -149,8 +159,22 @@ impl WorktreeStatusService {
         for path in wanted {
             entries.entry(path.clone()).or_insert_with(|| {
                 let (trigger_tx, trigger_rx) = mpsc::unbounded_channel();
-                let task = spawn_watch_task(self.inner.clone(), path, trigger_rx);
-                WatchEntry { trigger_tx, task }
+                let task = spawn_watch_task(self.inner.clone(), path.clone(), trigger_rx);
+                // Working-tree watcher for instant raw-edit refresh. Failure to
+                // start is non-fatal — the fallback poll still covers the path.
+                let fs_watcher =
+                    match WorktreeFsWatcher::start(PathBuf::from(&path), trigger_tx.clone()) {
+                        Ok(w) => Some(w),
+                        Err(e) => {
+                            warn!(path = %path, error = %e, "status_service: working-tree watcher failed to start; relying on fallback poll");
+                            None
+                        }
+                    };
+                WatchEntry {
+                    trigger_tx,
+                    task,
+                    _fs_watcher: fs_watcher,
+                }
             });
         }
     }
