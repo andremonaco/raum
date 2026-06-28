@@ -17,13 +17,25 @@
 //! before the single pulse (the status service then debounces another 200 ms
 //! and only emits when the computed status actually changed).
 //!
-//! **fd cost:** on macOS (FSEvents) the recursive watch is one stream per
-//! worktree (~1 fd). On Linux (inotify) recursive registration still adds a
-//! watch per subdir, including ignored ones like `target/` — on huge trees that
-//! can approach `max_user_watches`; the gitignore filter still prevents the
-//! `git diff` storm, so correctness holds either way. Watcher lifecycle is tied
-//! to the status service's subscription set, which only ever holds the *active
-//! project's* visible worktrees — these never span inactive projects.
+//! **fd cost / registration strategy is platform-split:**
+//! * macOS (FSEvents): one *recursive* stream per worktree (~1 fd), inherently
+//!   cheap — ignored-subtree events are dropped by the gitignore filter in the
+//!   callback, never registered as separate watches.
+//! * Linux/other (inotify): a recursive registration would add one watch
+//!   *descriptor per subdirectory* — including the ignored `target/` (10-30 GB)
+//!   and `node_modules/` — which can exhaust the per-user `max_user_watches`
+//!   budget (shared with `git_watcher`) or fail with `ENOSPC`. So we instead
+//!   enumerate only the *non-ignored* directories with `ignore::WalkBuilder`
+//!   (which honors root + nested `.gitignore`, the global excludesfile, and
+//!   `.git/info/exclude`, and prunes `.git`) and register one `NonRecursive`
+//!   watch each. Newly created non-ignored dirs are watched on demand (the
+//!   dir-add drain in `start`), so coverage stays complete without recursing
+//!   into ignored trees.
+//!
+//! Watcher lifecycle is tied to the status service's subscription set, which
+//! only ever holds the *active project's* visible worktrees — never inactive
+//! projects. Construction is done off the status-service lock (see
+//! `status_service::set_subscriptions`) because the Linux walk can take a while.
 //!
 //! Errors self-heal like `git_watcher`: notify-backend errors are rate-limited
 //! in the log and a supervisor rebuilds the watcher after they persist.
@@ -38,6 +50,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use ignore::WalkBuilder;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
@@ -94,6 +107,24 @@ impl HealthState {
     }
 }
 
+/// Cloneable handles the watcher callback + supervisor rebuild both need, bundled
+/// so `build_watcher` / `supervise_watcher` don't carry four positional args.
+#[derive(Clone)]
+struct WatcherDeps {
+    /// One `()` per relevant event → the debounce task → a `FsEdit` trigger.
+    raw_tx: mpsc::UnboundedSender<()>,
+    /// Newly created non-ignored directories → the dir-add drain (Linux only;
+    /// macOS recursion covers new dirs for free, so the callback never sends).
+    dir_tx: mpsc::UnboundedSender<PathBuf>,
+    error_state: Arc<Mutex<ErrorWindow>>,
+    health: Arc<Mutex<HealthState>>,
+}
+
+/// True on backends where a recursive watch would register a descriptor per
+/// subdir (inotify); false where one recursive stream is cheap (macOS FSEvents).
+/// A `cfg!` (not `#[cfg]`) so both branches always compile and are type-checked.
+const PER_DIR_WATCHES: bool = !cfg!(target_os = "macos");
+
 /// A running working-tree watcher. Dropping it aborts its tasks and releases
 /// the underlying notify watcher (stops watching).
 pub(super) struct WorktreeFsWatcher {
@@ -136,23 +167,24 @@ impl WorktreeFsWatcher {
         // churn this watcher exists to drop. Fall back to the raw path if the
         // dir can't be resolved (it always should — it's a live worktree).
         let root = std::fs::canonicalize(&root).unwrap_or(root);
-        let error_state = Arc::new(Mutex::new(ErrorWindow::default()));
-        let health = Arc::new(Mutex::new(HealthState::default()));
 
         // Raw notify pulses (one `()` per relevant event) feed the debounce
-        // task, which collapses a burst into a single status trigger.
+        // task; new-dir paths feed the dir-add drain (Linux only).
         let (raw_tx, mut raw_rx) = mpsc::unbounded_channel::<()>();
+        let (dir_tx, mut dir_rx) = mpsc::unbounded_channel::<PathBuf>();
+        let deps = WatcherDeps {
+            raw_tx,
+            dir_tx,
+            error_state: Arc::new(Mutex::new(ErrorWindow::default())),
+            health: Arc::new(Mutex::new(HealthState::default())),
+        };
 
-        // Keep `raw_tx` so the supervisor can hand a fresh clone to a rebuilt
-        // watcher; the debounce task owns the sole receiver.
-        let watcher = build_watcher(
-            root.clone(),
-            raw_tx.clone(),
-            error_state.clone(),
-            health.clone(),
-        )?;
+        // `deps` is cloned into the supervisor (for rebuilds) and the callback;
+        // the debounce task owns the sole `raw_rx`.
+        let watcher = build_watcher(root.clone(), &deps)?;
         let inner = Arc::new(Mutex::new(Inner { watcher, root }));
 
+        let trigger_for_debounce = trigger_tx;
         let debounce = tauri::async_runtime::spawn(async move {
             while raw_rx.recv().await.is_some() {
                 let deadline = tokio::time::Instant::now() + DEBOUNCE;
@@ -167,18 +199,36 @@ impl WorktreeFsWatcher {
                     }
                 }
                 // The receiver is gone only once the path is unsubscribed; stop.
-                if trigger_tx.send(RefreshCause::FsEdit).is_err() {
+                if trigger_for_debounce.send(RefreshCause::FsEdit).is_err() {
                     return;
                 }
             }
         });
 
-        let supervisor = tauri::async_runtime::spawn(supervise_watcher(
-            inner.clone(),
-            raw_tx,
-            error_state,
-            health,
-        ));
+        // On inotify-style backends, NonRecursive watches don't cover newly
+        // created subdirs. Watch each new non-ignored dir (and any non-ignored
+        // subdirs already inside it) on demand, then pulse so files written in
+        // the brief watch-setup race window are still reflected via the git
+        // recompute. On macOS the recursive stream covers new dirs, so the
+        // callback never sends and this drain is never spawned (`dir_rx` is just
+        // dropped).
+        if PER_DIR_WATCHES {
+            let drain_inner = inner.clone();
+            let drain_pulse = deps.raw_tx.clone();
+            tauri::async_runtime::spawn(async move {
+                while let Some(new_dir) = dir_rx.recv().await {
+                    let dirs = watchable_dirs(&new_dir);
+                    if let Ok(mut guard) = drain_inner.lock() {
+                        for dir in &dirs {
+                            let _ = guard.watcher.watch(dir, RecursiveMode::NonRecursive);
+                        }
+                    }
+                    let _ = drain_pulse.send(());
+                }
+            });
+        }
+
+        let supervisor = tauri::async_runtime::spawn(supervise_watcher(inner.clone(), deps));
 
         Ok(Self {
             supervisor,
@@ -188,23 +238,20 @@ impl WorktreeFsWatcher {
     }
 }
 
-/// Build a recursive `RecommendedWatcher` rooted at `root`. The callback drops
-/// `.git/` and gitignore-matched paths, records health for the supervisor, and
-/// routes errors through the rate-limited reporter. Used by both initial start
-/// and the supervisor rebuild so the two paths can't drift.
-fn build_watcher(
-    root: PathBuf,
-    raw_tx: mpsc::UnboundedSender<()>,
-    error_state: Arc<Mutex<ErrorWindow>>,
-    health: Arc<Mutex<HealthState>>,
-) -> notify::Result<RecommendedWatcher> {
+/// Build a `RecommendedWatcher` rooted at `root`. The callback drops `.git/` and
+/// gitignore-matched paths, records health for the supervisor, routes errors
+/// through the rate-limited reporter, and (on inotify) forwards newly created
+/// non-ignored directories to the dir-add drain. Used by both initial start and
+/// the supervisor rebuild so the two paths can't drift.
+fn build_watcher(root: PathBuf, deps: &WatcherDeps) -> notify::Result<RecommendedWatcher> {
     let gitignore = build_gitignore(&root);
     let cb_root = root.clone();
+    let deps = deps.clone();
 
     let mut watcher =
         notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
             Ok(ev) => {
-                if let Ok(mut h) = health.lock() {
+                if let Ok(mut h) = deps.health.lock() {
                     h.record_ok();
                 }
                 if !matches!(
@@ -213,24 +260,81 @@ fn build_watcher(
                 ) {
                     return;
                 }
-                let relevant = ev
-                    .paths
-                    .iter()
-                    .any(|p| is_relevant(p, &cb_root, &gitignore));
-                if relevant {
-                    let _ = raw_tx.send(());
+                let mut pulse = false;
+                for path in &ev.paths {
+                    if !is_relevant(path, &cb_root, &gitignore) {
+                        continue;
+                    }
+                    pulse = true;
+                    // inotify only: a newly created non-ignored dir needs its own
+                    // watch (NonRecursive doesn't descend). `is_dir` stats the
+                    // path — cheap, and only on Create events.
+                    if PER_DIR_WATCHES && matches!(ev.kind, EventKind::Create(_)) && path.is_dir() {
+                        let _ = deps.dir_tx.send(path.clone());
+                    }
+                }
+                if pulse {
+                    let _ = deps.raw_tx.send(());
                 }
             }
             Err(e) => {
-                if let Ok(mut h) = health.lock() {
+                if let Ok(mut h) = deps.health.lock() {
                     h.record_err(Instant::now());
                 }
-                emit_rate_limited_error(&error_state, &cb_root, &e);
+                emit_rate_limited_error(&deps.error_state, &cb_root, &e);
             }
         })?;
 
-    watcher.watch(&root, RecursiveMode::Recursive)?;
+    register_watches(&mut watcher, &root)?;
     Ok(watcher)
+}
+
+/// Register the OS watches for `root`.
+///
+/// macOS (FSEvents): a single recursive stream — cheap, and ignored-subtree
+/// events are dropped later by the callback's gitignore filter.
+///
+/// inotify et al.: a recursive registration would add a descriptor per subdir,
+/// including the multi-GB ignored trees, risking `max_user_watches`/`ENOSPC` and
+/// starving `git_watcher`. So register `NonRecursive` watches only for the
+/// non-ignored directories (`watchable_dirs`). The root watch is propagated as
+/// an error if it fails (deliberate degrade to the fallback poll); per-subdir
+/// failures are skipped so one vanished dir can't disable the whole watcher.
+fn register_watches(watcher: &mut RecommendedWatcher, root: &Path) -> notify::Result<()> {
+    if PER_DIR_WATCHES {
+        watcher.watch(root, RecursiveMode::NonRecursive)?;
+        for dir in watchable_dirs(root) {
+            if dir == root {
+                continue;
+            }
+            let _ = watcher.watch(&dir, RecursiveMode::NonRecursive);
+        }
+        Ok(())
+    } else {
+        watcher.watch(root, RecursiveMode::Recursive)
+    }
+}
+
+/// Enumerate the non-ignored directories under `root` to watch on inotify-style
+/// backends. `ignore::WalkBuilder` honors root + nested `.gitignore`, the global
+/// excludesfile, and `.git/info/exclude`, and we prune `.git` itself — so the
+/// huge ignored trees (`target/`, `node_modules/`) are never descended into and
+/// never registered. Includes `root` as the first entry.
+fn watchable_dirs(root: &Path) -> Vec<PathBuf> {
+    WalkBuilder::new(root)
+        .hidden(false) // keep tracked dotdirs (.github, .vscode, .cargo)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .parents(false) // worktrees are self-contained; don't read above root
+        .require_git(false) // honor .gitignore even via a linked worktree's `.git` file
+        // prune the git dir/file, keep .github etc.
+        .filter_entry(|e| e.file_name() != std::ffi::OsStr::new(".git"))
+        .build()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_some_and(|t| t.is_dir()))
+        .map(ignore::DirEntry::into_path)
+        .collect()
 }
 
 /// Build a gitignore matcher from the worktree's root `.gitignore` and
@@ -303,12 +407,8 @@ fn emit_rate_limited_error(state: &Arc<Mutex<ErrorWindow>>, root: &Path, err: &n
 /// off exponentially when the rebuild itself fails (typically also EMFILE). The
 /// rebuilt watcher gets a fresh clone of `raw_tx` into the same debounce
 /// channel, so the debounce task (which holds the receiver) keeps working.
-async fn supervise_watcher(
-    inner: Arc<Mutex<Inner>>,
-    raw_tx: mpsc::UnboundedSender<()>,
-    error_state: Arc<Mutex<ErrorWindow>>,
-    health: Arc<Mutex<HealthState>>,
-) {
+async fn supervise_watcher(inner: Arc<Mutex<Inner>>, deps: WatcherDeps) {
+    let health = deps.health.clone();
     let mut tick = tokio::time::interval(SUPERVISOR_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     tick.tick().await; // interval fires immediately once; skip it.
@@ -340,12 +440,7 @@ async fn supervise_watcher(
             Ok(g) => g.root.clone(),
             Err(_) => continue,
         };
-        match build_watcher(
-            root.clone(),
-            raw_tx.clone(),
-            error_state.clone(),
-            health.clone(),
-        ) {
+        match build_watcher(root.clone(), &deps) {
             Ok(new_watcher) => {
                 if let Ok(mut g) = inner.lock() {
                     g.watcher = new_watcher;
@@ -459,5 +554,49 @@ mod tests {
         assert_eq!(backoff_for_attempt(4), Duration::from_secs(240));
         assert_eq!(backoff_for_attempt(5), Duration::from_secs(300));
         assert_eq!(backoff_for_attempt(99), Duration::from_secs(300));
+    }
+
+    /// The inotify watch-set must exclude ignored trees (`target/`,
+    /// `node_modules/`) and `.git/`, while keeping real source dirs — including
+    /// nested-gitignore'd ones and tracked dotdirs (`.github`). This is the
+    /// whole point of `watchable_dirs` vs. a blanket recursive watch.
+    #[test]
+    fn watchable_dirs_excludes_ignored_and_git_keeps_source() {
+        use std::fs;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // A worktree-shaped tree.
+        fs::write(root.join(".gitignore"), "target/\nnode_modules/\n").unwrap();
+        fs::create_dir_all(root.join("src/inner")).unwrap();
+        fs::create_dir_all(root.join(".github/workflows")).unwrap(); // tracked dotdir
+        fs::create_dir_all(root.join("target/debug/incremental")).unwrap(); // ignored
+        fs::create_dir_all(root.join("node_modules/pkg/sub")).unwrap(); // ignored
+        fs::create_dir_all(root.join(".git/objects/ab")).unwrap(); // git internals
+        // Nested-gitignore'd dir: only the inner .gitignore mentions `out/`.
+        fs::create_dir_all(root.join("pkg/out/blah")).unwrap();
+        fs::write(root.join("pkg/.gitignore"), "out/\n").unwrap();
+
+        let dirs = watchable_dirs(root);
+        let has = |rel: &str| dirs.iter().any(|d| d == &root.join(rel));
+
+        // Kept: root + real source + tracked dotdirs.
+        assert!(
+            dirs.iter().any(|d| d == root),
+            "root itself must be watched"
+        );
+        assert!(has("src"));
+        assert!(has("src/inner"));
+        assert!(has(".github"));
+        assert!(has(".github/workflows"));
+        assert!(has("pkg"));
+
+        // Dropped: ignored trees, .git, and nested-ignored dirs.
+        assert!(!has("target"), "target/ must not be registered");
+        assert!(!has("target/debug"));
+        assert!(!has("node_modules"));
+        assert!(!has(".git"));
+        assert!(!has(".git/objects"));
+        assert!(!has("pkg/out"), "nested-gitignore'd dir must be dropped");
     }
 }
