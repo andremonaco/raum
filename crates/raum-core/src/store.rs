@@ -751,7 +751,7 @@ mod tests {
         assert_eq!(cfg.multiplexer, "tmux");
         assert_eq!(
             cfg.worktree_config.path_pattern,
-            "{parent-dir}/{base-folder}-worktrees/{branch-slug}"
+            "{repo-root}/.raum/{branch-slug}"
         );
     }
 

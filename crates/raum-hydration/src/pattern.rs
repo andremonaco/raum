@@ -140,7 +140,7 @@ fn extract_tokens(pattern: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use raum_core::config::{
-        BranchPrefixMode, Config, DEFAULT_PATH_PATTERN, ProjectConfig, RaumToml, WorktreeConfig,
+        BranchPrefixMode, Config, NESTED_PATH_PATTERN, ProjectConfig, RaumToml, WorktreeConfig,
     };
     use std::path::PathBuf;
 
@@ -340,7 +340,7 @@ mod tests {
         let config = config_with("");
         let project = project_with("project/{branch-slug}");
         let resolved = resolve_worktree_pattern(&config, &project, None);
-        assert_eq!(resolved.path_pattern, DEFAULT_PATH_PATTERN);
+        assert_eq!(resolved.path_pattern, NESTED_PATH_PATTERN);
     }
 
     #[test]

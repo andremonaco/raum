@@ -48,6 +48,7 @@ pub struct Config {
     pub harnesses: HarnessesConfig,
     pub updater: UpdaterConfig,
     pub projects: ProjectsConfig,
+    pub terminals: TerminalsConfig,
     /// Catch-all for forward-compatible keys so unknown user-added settings
     /// survive a round-trip. Logged at INFO by the store when populated.
     #[serde(flatten, skip_serializing_if = "BTreeMap::is_empty")]
@@ -68,6 +69,7 @@ impl Default for Config {
             harnesses: HarnessesConfig::default(),
             updater: UpdaterConfig::default(),
             projects: ProjectsConfig::default(),
+            terminals: TerminalsConfig::default(),
             unknown: BTreeMap::new(),
         }
     }
@@ -162,7 +164,7 @@ impl Default for WorktreeConfig {
     fn default() -> Self {
         Self {
             path_strategy: PathStrategy::default(),
-            path_pattern: DEFAULT_PATH_PATTERN.to_string(),
+            path_pattern: NESTED_PATH_PATTERN.to_string(),
             branch_prefix_mode: BranchPrefixMode::None,
             branch_prefix_custom: None,
             hooks: WorktreeHooks::default(),
@@ -230,9 +232,10 @@ pub enum BranchPrefixMode {
 #[serde(rename_all = "kebab-case")]
 pub enum PathStrategy {
     /// Group all worktrees in a sibling folder next to the project root.
-    #[default]
     SiblingGroup,
-    /// Nest worktrees inside the project at `<root>/.raum/<branch>`.
+    /// Nest worktrees inside the project at `<root>/.raum/<branch>`. raum's
+    /// default — keeps every worktree under the project's own `.raum/` dir.
+    #[default]
     Nested,
     /// Freeform — `path_pattern` controls the layout.
     Custom,
@@ -321,7 +324,7 @@ impl WorktreeConfig {
     pub fn apply_global_path(&mut self, global: &WorktreeConfig) {
         let p = global.path_pattern.trim();
         self.path_pattern = if p.is_empty() {
-            DEFAULT_PATH_PATTERN.to_string()
+            NESTED_PATH_PATTERN.to_string()
         } else {
             p.to_string()
         };
@@ -400,6 +403,36 @@ impl Default for ProjectsConfig {
         Self {
             auto_hide_inactive: false,
             auto_hide_inactive_days: default_auto_hide_inactive_days(),
+        }
+    }
+}
+
+/// Terminal/harness lifecycle behaviour. `auto_dock_inactive` moves a harness or
+/// terminal that hasn't been used (a prompt sent, the pane focused, or just
+/// created) within `auto_dock_inactive_days` into the dock — per individual tab,
+/// so an idle tab is pulled out even when a sibling tab is still active. The
+/// staleness check is derived in the frontend (it holds the per-session activity
+/// timestamps); this only stores the preference. Disabled by default; a
+/// working/waiting harness is never auto-docked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TerminalsConfig {
+    /// Dock terminals/harnesses with no activity in the threshold window.
+    pub auto_dock_inactive: bool,
+    /// Days of inactivity before a terminal/harness is docked (min 1).
+    #[serde(default = "default_auto_dock_inactive_days")]
+    pub auto_dock_inactive_days: u32,
+}
+
+fn default_auto_dock_inactive_days() -> u32 {
+    1
+}
+
+impl Default for TerminalsConfig {
+    fn default() -> Self {
+        Self {
+            auto_dock_inactive: false,
+            auto_dock_inactive_days: default_auto_dock_inactive_days(),
         }
     }
 }
@@ -1064,8 +1097,8 @@ mod tests {
     }
 
     #[test]
-    fn path_strategy_default_is_sibling_group() {
-        assert_eq!(PathStrategy::default(), PathStrategy::SiblingGroup);
+    fn path_strategy_default_is_nested() {
+        assert_eq!(PathStrategy::default(), PathStrategy::Nested);
     }
 
     #[test]
@@ -1153,18 +1186,19 @@ mod tests {
     #[test]
     fn worktree_config_legacy_toml_omits_path_strategy() {
         // Older configs predate the field; serde default + normalize should
-        // recover a sensible strategy from the pattern alone.
+        // recover a sensible strategy from the pattern alone. Use the sibling
+        // pattern so the recovery is observable against the new Nested default.
         let raw = format!(
-            r#"pathPattern = "{NESTED_PATH_PATTERN}"
+            r#"pathPattern = "{SIBLING_GROUP_PATH_PATTERN}"
 branchPrefixMode = "none"
 "#
         );
         let mut cfg: WorktreeConfig = toml::from_str(&raw).expect("deserialize");
-        // Field absent → falls back to type default (SiblingGroup) until normalize.
-        assert_eq!(cfg.path_strategy, PathStrategy::SiblingGroup);
-        cfg.normalize();
-        // The pattern matches the Nested constant, so normalize re-classifies.
+        // Field absent → falls back to type default (Nested) until normalize.
         assert_eq!(cfg.path_strategy, PathStrategy::Nested);
+        cfg.normalize();
+        // The pattern matches the SiblingGroup constant, so normalize re-classifies.
+        assert_eq!(cfg.path_strategy, PathStrategy::SiblingGroup);
     }
 
     #[test]
