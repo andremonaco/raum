@@ -10,6 +10,7 @@
 
 pub mod coalescer;
 pub mod control;
+mod disclaim;
 pub mod manager;
 pub mod pty_bridge;
 pub mod transport;
