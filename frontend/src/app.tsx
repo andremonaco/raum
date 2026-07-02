@@ -1,5 +1,6 @@
 import { Show, createResource, createSignal, onCleanup, onMount, type Component } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { toast } from "solid-sonner";
 import { TopRow } from "./components/top-row";
 import { Sidebar } from "./components/sidebar";
@@ -30,7 +31,11 @@ import { installWebviewHealth } from "./lib/webviewHealth";
 import { installBackgroundRendererDemotion } from "./lib/rendererScheduler";
 import { previewOnboarding, setPreviewOnboarding } from "./lib/devOnboardingPreview";
 import { startShellContextPoller } from "./lib/shellContextPoller";
-import { hydrateActiveWorktreeScopes, prewarmAllWorktrees } from "./stores/worktreeStore";
+import {
+  hydrateActiveWorktreeScopes,
+  prewarmAllWorktrees,
+  resyncStatusSubscriptions,
+} from "./stores/worktreeStore";
 import { setActiveProjectSlug } from "./stores/projectStore";
 import "overlayscrollbars/overlayscrollbars.css";
 
@@ -330,6 +335,26 @@ const App: Component = () => {
         stopQuitFlush = unlisten;
       })
       .catch((e) => console.warn("installQuitFlush failed", e));
+    // On window focus, re-push the worktree-status subscription set. The push
+    // is declarative + idempotent, so this costs nothing when everything is
+    // healthy, but it lets the backend detect and respawn any watch task that
+    // died silently while the sidebar kept the same rows — the case where the
+    // sidebar diffstat freezes with no refcount change to trigger a fresh push.
+    let stopFocusResync: (() => void) | undefined;
+    void Promise.resolve()
+      .then(() =>
+        getCurrentWindow().onFocusChanged(({ payload: focused }) => {
+          if (focused) resyncStatusSubscriptions();
+        }),
+      )
+      .then((unlisten) => {
+        if (disposed) {
+          unlisten();
+          return;
+        }
+        stopFocusResync = unlisten;
+      })
+      .catch((e) => console.warn("status subscription focus resync failed", e));
     onCleanup(() => {
       disposed = true;
       stopFileDrop?.();
@@ -337,6 +362,7 @@ const App: Component = () => {
       stopBackgroundDemotion();
       stopShellContextPoller();
       stopQuitFlush?.();
+      stopFocusResync?.();
     });
   });
 
