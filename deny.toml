@@ -33,6 +33,14 @@ ignore = [
     "RUSTSEC-2025-0081",
     "RUSTSEC-2025-0098",
     "RUSTSEC-2025-0100",
+    # quick-xml DoS advisories (quadratic tag scan / unbounded namespace
+    # allocation). Reached only through Tauri's tree: plist -> tauri (parses
+    # local, trusted .plist files) and notify-rust -> tauri-winrt-notification
+    # (Windows-only; raum targets macOS/Linux). No patched quick-xml is
+    # reachable without a coordinated tauri/plist/notify-rust bump — same
+    # "resolved when upstream updates" situation as the entries above.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
 ]
 
 # ---------------------------------------------------------------------------
