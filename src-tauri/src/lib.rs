@@ -243,6 +243,9 @@ pub fn run() {
             commands::agent::agent_list,
             commands::agent::agent_spawn,
             commands::agent::agent_state,
+            // Record that the user saw a completion (rail dismiss) so it
+            // stays quiet across a webview reload / app restart.
+            commands::agent::agent_ack_state,
             // Cross-review picker: enumerate models per harness kind so the
             // overlay can present a real choice instead of a hardcoded list.
             commands::agent::list_harness_models,

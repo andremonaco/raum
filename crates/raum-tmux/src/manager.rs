@@ -361,6 +361,18 @@ impl TmuxManager {
         // already being set, and it's required even when manual is set
         // because the post-creation `resize-window` then matches the existing
         // size (no-op, but consistent).
+        // macOS: birth the tmux server with its TCC responsibility disclaimed
+        // *before* the `new-session` below can lazily fork a non-disclaimed one.
+        // This stops Sequoia's "raum would like to access data from other apps"
+        // prompt from firing for file access done by shells (and tools they run,
+        // e.g. `pulumi`) inside panes — those are all descendants of the server.
+        // No-op if a server is already running, and on non-macOS. Best-effort:
+        // on failure we fall through to the inline `start-server` below (today's
+        // inherited-responsibility behaviour) rather than block pane creation.
+        if let Err(e) = crate::disclaim::birth_server(&self.binary, &self.socket) {
+            warn!(error = %e, "disclaimed tmux server birth failed; TCC prompts may still appear");
+        }
+
         let (init_cols, init_rows) = initial_size.unwrap_or((200, 50));
         let init_cols_str = init_cols.to_string();
         let init_rows_str = init_rows.to_string();
@@ -999,5 +1011,40 @@ sess-windows-crlf\t1700000002\t100\t30\r
         // A genuine error (e.g. a bad session name) must NOT be swallowed.
         assert!(!is_no_server_stderr("can't find session: nope\n"));
         assert!(!is_no_server_stderr(""));
+    }
+
+    /// Guards the raw `posix_spawn` FFI in [`crate::disclaim`]: a malformed
+    /// argv/attr would make the spawn fail or produce a dead server. TCC
+    /// responsibility itself isn't observable from a test, so we assert the
+    /// weaker-but-meaningful property — the disclaimed birth returns `Ok` and
+    /// leaves a live server that can actually host a session. macOS-only (the
+    /// disclaim is a no-op elsewhere); skipped when `tmux` isn't installed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn disclaimed_birth_yields_usable_server() {
+        if std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let mgr = TmuxManager::with_socket(format!(
+            "raum-disclaim-test-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+
+        crate::disclaim::birth_server(&mgr.binary, &mgr.socket).expect("disclaimed birth");
+
+        mgr.new_session("disc-1", std::path::Path::new("/tmp"), None, Some((80, 24)))
+            .expect("new_session on the disclaimed server");
+        let sessions = mgr.list_sessions().expect("list on a live server");
+        assert!(sessions.iter().any(|s| s.id == "disc-1"));
+
+        let _ = mgr.kill_server();
     }
 }

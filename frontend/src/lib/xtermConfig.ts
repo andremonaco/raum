@@ -127,9 +127,13 @@ export const BASE_TERMINAL_OPTIONS = {
   // plans, big pastes) — leaving mid-sentence gaps the user couldn't
   // scroll back to recover. With `true` scrollback occasionally contains
   // a duplicate snapshot of the viewport at each repaint moment, but it
-  // never loses real output. Codex's alt-screen ED2s are unaffected
-  // because alt-screen is suppressed at the attached-client boundary
-  // (`crates/raum-tmux/src/manager.rs:179-184` strips smcup/rmcup).
+  // never loses real output. This only acts on the normal buffer: when a
+  // TUI enters its alternate buffer (Codex/OpenCode, or Claude Code under
+  // `CLAUDE_CODE_NO_FLICKER`) xterm follows it there, and the alt buffer
+  // has no scrollback for this setting to push into. (The smcup/rmcup strip
+  // in `crates/raum-tmux/src/manager.rs` only affects the *PTY* transport's
+  // rendered attach-client; raum's default control-mode transport has no
+  // such client, so the strip is not what makes alt-screen ED2s safe here.)
   scrollOnEraseInDisplay: true,
 } satisfies Partial<ITerminalOptions> & { fontLigatures: boolean };
 

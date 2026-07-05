@@ -348,6 +348,19 @@ export function releaseWorktreeStatusStream(path: string): void {
 }
 
 /**
+ * Force-push the current subscription set to the backend without any refcount
+ * change. The set is declarative and idempotent, so this is a cheap insurance
+ * call: paired with the backend's dead-task respawn in `set_subscriptions`, a
+ * window-focus resync revives any watch task that died silently (e.g. a panic
+ * Tokio swallowed) while the sidebar kept the same rows mounted — otherwise the
+ * refcount-transition-only push would never fire and the diffstat would stay
+ * frozen until a project switch.
+ */
+export function resyncStatusSubscriptions(): void {
+  pushStatusSubscriptions();
+}
+
+/**
  * Forget a worktree entirely — cache entry, loading flag, and any remaining
  * stream refcount. Called after delete/unlink so the dead path neither
  * lingers in memory nor keeps a backend watch task alive.

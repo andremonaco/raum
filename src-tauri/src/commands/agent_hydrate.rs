@@ -28,10 +28,8 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use raum_core::agent::{AgentKind, AgentState, SessionId};
-use raum_core::agent_state::AgentStateChanged;
+use raum_core::agent::{AgentKind, AgentState};
 use raum_core::config::TrackedSession;
-use raum_core::harness::Reliability;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Runtime};
 use tracing::{info, warn};
@@ -252,7 +250,11 @@ pub fn apply_rehydrate_plan<R: Runtime>(
                 project_slug,
                 worktree_id,
                 opencode_port,
-                last_state,
+                // The persisted seed is re-read from the config store inside
+                // `register_harness_session_runtime_opts`, which owns the seed
+                // `agent-state-changed` emit; the job carries `last_state` only
+                // for the plan classifier/tests, not for the applier.
+                last_state: _,
                 created_at_unix_ms,
             } => {
                 let outcome = apply_register_job(
@@ -263,7 +265,6 @@ pub fn apply_rehydrate_plan<R: Runtime>(
                     project_slug.as_deref(),
                     worktree_id.as_deref(),
                     opencode_port,
-                    last_state,
                     created_at_unix_ms,
                 );
                 match outcome {
@@ -343,7 +344,6 @@ fn apply_register_job<R: Runtime>(
     project_slug: Option<&str>,
     worktree_id: Option<&str>,
     opencode_port: Option<u16>,
-    last_state: Option<AgentState>,
     created_at_unix_ms: u64,
 ) -> Result<RegisterOutcome, String> {
     let project_dir: PathBuf = resolve_project_dir(state, project_slug, worktree_id);
@@ -356,7 +356,6 @@ fn apply_register_job<R: Runtime>(
     let pane_dead_status: Option<i32> = state.tmux.check_pane_dead(session_id).ok().flatten();
     let mut outcome = RegisterOutcome::Alive;
     let effective_opencode_port = opencode_port;
-    let state_seed = last_state;
     let mut ghost_dead = false;
 
     if let Some(exit_code) = pane_dead_status {
@@ -443,36 +442,15 @@ fn apply_register_job<R: Runtime>(
         return Err("terminals lock poisoned".to_string());
     }
 
-    // The `register_harness_session_runtime_opts` path emits a synthetic
-    // `agent-state-changed` when the persisted seed is non-`Idle`. That's
-    // enough for the agentStore; we don't duplicate here. For `Shell`
-    // (which skips state-machine registration), there's no state to
-    // broadcast either.
-    //
-    // Defensive: if the caller re-registers a session for which a
-    // machine was already present (e.g. second call in a test), we
-    // didn't emit the seed above. Explicitly emit once here for
-    // non-Idle seeds so the frontend's listener wakes up.
-    //
-    // Skip the seed entirely when we just revived the pane — the
-    // persisted state belonged to the dead process; the fresh harness
-    // is at Idle.
-    if let Some(seed) = state_seed
-        && seed != AgentState::Idle
-        && !matches!(harness, AgentKind::Shell)
-        && outcome != RegisterOutcome::DeadSkipped
-    {
-        let change = AgentStateChanged {
-            session_id: SessionId::new(session_id.to_string()),
-            harness,
-            from: AgentState::Idle,
-            to: seed,
-            reliability: Reliability::Deterministic,
-        };
-        if let Err(e) = app.emit("agent-state-changed", &change) {
-            warn!(error=%e, session_id=%session_id, "rehydrate: agent-state-changed emit failed");
-        }
-    }
+    // The seed `agent-state-changed` emit is owned entirely by the
+    // `register_harness_session_runtime_opts` call above: the bootstrap
+    // invokes it with default `RegisterOptions` (`skip_seed_emit: false`), so
+    // it fires the single synthetic `Idle → <persisted state>` transition
+    // (tagged `seeded: true`) for non-Idle seeds. We deliberately do NOT
+    // re-emit here — a second emit would double-count the transition in the
+    // frontend's state tracker and re-flood the attention rail on reload.
+    // `Shell` sessions and revived-but-dead panes skip state-machine
+    // registration above, so they have no seed to broadcast.
 
     Ok(outcome)
 }
@@ -563,6 +541,7 @@ mod tests {
             created_at_unix_ms: 1_000,
             last_state,
             last_state_at_unix_ms: last_state.map(|_| 2_000),
+            last_state_acked: false,
             last_prompt_text: None,
             last_prompt_at_unix_ms: None,
             harness_session_id: None,

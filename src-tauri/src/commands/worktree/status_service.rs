@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use tauri::Emitter;
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::fs_watcher::WorktreeFsWatcher;
 use super::status::compute_status;
@@ -144,26 +144,44 @@ impl WorktreeStatusService {
     /// Declarative subscription set: `paths` is the FULL set of worktree
     /// paths the UI currently displays. New paths spawn a watch task (with
     /// an immediate, always-emitted seed compute); paths no longer present
-    /// are aborted. Idempotent.
+    /// are aborted; a path whose watch task has died is respawned. Idempotent,
+    /// so the frontend can re-push the unchanged set (e.g. on window focus,
+    /// see `resyncStatusSubscriptions`) purely to self-heal.
     pub fn set_subscriptions(&self, paths: Vec<String>) {
         let wanted: HashSet<String> = paths.into_iter().filter(|p| !p.is_empty()).collect();
 
-        // Phase 1 (brief lock): drop removed paths; for each new path spawn its
-        // cheap, non-blocking watch task and insert a placeholder entry whose
-        // working-tree watcher is attached later. The seed status emits from the
-        // watch task immediately — the fs watcher only adds raw-edit liveness.
+        // Phase 1 (brief lock): drop removed and dead paths; for each missing
+        // path spawn its cheap, non-blocking watch task and insert a placeholder
+        // entry whose working-tree watcher is attached later. The seed status
+        // emits from the watch task immediately — the fs watcher only adds
+        // raw-edit liveness.
         let to_start: Vec<(String, mpsc::UnboundedSender<RefreshCause>)> = {
             let Ok(mut entries) = self.inner.entries.lock() else {
                 warn!("status_service: entries mutex poisoned");
                 return;
             };
+            let before = entries.len();
+            let mut respawned = 0usize;
             entries.retain(|path, entry| {
-                let keep = wanted.contains(path);
-                if !keep {
+                if !wanted.contains(path) {
                     debug!(path = %path, "status_service: unsubscribed");
                     entry.task.abort();
+                    return false;
                 }
-                keep
+                // A watch task normally runs forever (its `trigger_rx` never
+                // closes while this entry holds the sender). If it has finished
+                // it can only have panicked — Tokio aborts a panicking task and
+                // never surfaces the error. Leaving the stale entry in the map
+                // would make the `contains_key` check below skip respawning this
+                // path *forever*, freezing its diffstat until a project switch
+                // cleared the map. Drop it here (also releasing its fs watcher)
+                // so the loop below respawns a fresh task + watcher.
+                if entry.task.inner().is_finished() {
+                    warn!(path = %path, "status_service: watch task ended unexpectedly; respawning");
+                    respawned += 1;
+                    return false;
+                }
+                true
             });
             let mut to_start = Vec::new();
             for path in wanted {
@@ -181,6 +199,16 @@ impl WorktreeStatusService {
                     },
                 );
                 to_start.push((path, trigger_tx));
+            }
+            // Log only when the set actually shifted — a no-op focus resync
+            // (nothing added, removed, or dead) stays silent.
+            if entries.len() != before || !to_start.is_empty() || respawned > 0 {
+                info!(
+                    subscribed = entries.len(),
+                    started = to_start.len(),
+                    respawned = respawned,
+                    "status_service: reconciled subscriptions",
+                );
             }
             to_start
         };

@@ -563,6 +563,10 @@ pub fn register_harness_session_runtime_opts<R: Runtime>(
             from: raum_core::agent::AgentState::Idle,
             to: seed,
             reliability: Reliability::Deterministic,
+            // This is a replayed persisted seed, not a live transition — the
+            // frontend suppresses notification side effects (sound, banner)
+            // so a reload/restart doesn't fire stale "finished" chimes.
+            seeded: true,
         };
         if let Err(e) = app.emit("agent-state-changed", &change) {
             warn!(error=%e, "seed agent-state-changed emit failed");

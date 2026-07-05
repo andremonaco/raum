@@ -432,6 +432,19 @@ body,
 [data-dnd-root]:not(.dnd-active) .leaf-frame.pane-selected .pane-drag-handle .pane-header-tab {
   color: color-mix(in oklab, var(--background) 72%, var(--foreground));
 }
+/* Idle tabs keep a faint resting chip against the inverted (bright) header
+   so they read as tabs even when not hovered/active — the dark-header
+   counterpart is TabItem's resting `bg-hover`. Scoped to
+   `.text-foreground-subtle` so the warning/success-tinted tabs and the
+   active tab (both of which paint their own background) stay untouched.
+   Placed before the :hover rule so hover's stronger fill wins the
+   equal-specificity tie. */
+[data-dnd-root]:not(.dnd-active)
+  .leaf-frame.pane-selected
+  .pane-drag-handle
+  .pane-header-tab.text-foreground-subtle {
+  background: color-mix(in oklab, var(--background) 8%, transparent);
+}
 [data-dnd-root]:not(.dnd-active)
   .leaf-frame.pane-selected
   .pane-drag-handle

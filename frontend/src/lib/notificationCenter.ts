@@ -64,6 +64,13 @@ interface AgentStateChangedPayload {
    * transition lands, but the backend always writes it.
    */
   reliability?: Reliability;
+  /**
+   * True when the backend replayed this transition from persisted state at
+   * boot/rehydrate rather than a live machine change. Suppresses all
+   * notification side effects (sound/banner/permission) — see
+   * {@link handleAgentStateChanged}. Missing ⇒ `false` (a live transition).
+   */
+  seeded?: boolean;
 }
 
 /**
@@ -568,6 +575,15 @@ function sessionIdFromPayload(id: AgentStateChangedPayload["session_id"]): strin
 function handleAgentStateChanged(payload: AgentStateChangedPayload): void {
   const sessionId = sessionIdFromPayload(payload.session_id);
   if (!sessionId) return;
+
+  // Seeds are the backend replaying persisted state at boot/rehydrate, not a
+  // live transition — playing a "finished" sound or firing a banner for a
+  // completion the user saw before the reload is exactly the stale-flood we're
+  // fixing. Bail before any side effect. The badge/rail still update because
+  // agentStore consumes the same event independently. (Seed emits always carry
+  // `from: "idle"`, so the `from === "waiting"` cleanup below never applies to
+  // one anyway — returning here changes nothing for it.)
+  if (payload.seeded) return;
 
   // A session leaving `waiting` means any open permission requests it owned
   // have been resolved (possibly outside raum, e.g. answered in the TUI).

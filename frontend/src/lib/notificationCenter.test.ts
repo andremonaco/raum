@@ -249,6 +249,49 @@ describe("notification center", () => {
     });
   });
 
+  it("suppresses banner + sound for a seeded (replayed) transition", async () => {
+    // A completion the user already saw before a webview reload is replayed
+    // as a `seeded` transition on boot — it must not re-fire a banner or the
+    // done sound. Give `config_get` a real sound so the only reason nothing
+    // plays is the seed suppression, not a missing sound path.
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "config_get") return { notifications: { sound: "/tmp/ding.wav" } };
+      return undefined;
+    });
+    seedSession("seed-done", "codex", "raum");
+    __handleAgentStateChangedForTests({
+      session_id: "seed-done",
+      harness: "codex",
+      from: "idle",
+      to: "completed",
+      seeded: true,
+    });
+    // Flush every queued microtask (dispatch chain + sound + banner invokes).
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(sendCalls()).toHaveLength(0);
+    const soundCalls = mockInvoke.mock.calls.filter((c) => c[0] === "notifications_play_sound");
+    expect(soundCalls).toHaveLength(0);
+  });
+
+  it("still dispatches banner + sound for the same transition without seeded", async () => {
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "config_get") return { notifications: { sound: "/tmp/ding.wav" } };
+      return undefined;
+    });
+    seedSession("live-done", "codex", "raum");
+    __handleAgentStateChangedForTests({
+      session_id: "live-done",
+      harness: "codex",
+      from: "idle",
+      to: "completed",
+    });
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(sendCalls()).toHaveLength(1);
+    expect(sendCalls()[0]).toMatchObject({ sessionId: "live-done", kind: "done" });
+    const soundCalls = mockInvoke.mock.calls.filter((c) => c[0] === "notifications_play_sound");
+    expect(soundCalls).toHaveLength(1);
+  });
+
   it("suppresses the OS banner for waiting while the window is focused", async () => {
     seedSession("focus-wait", "claude-code", "raum");
     __setWindowFocusedForTests(true);

@@ -34,13 +34,14 @@ import { Terminal, type IDisposable } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
 import { SerializeAddon } from "@xterm/addon-serialize";
+import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import "@xterm/xterm/css/xterm.css";
 
 import type { AgentKind } from "../lib/agentKind";
 import { applyAgentStateToTerminal, isHarnessKind, markOutput } from "../stores/terminalStore";
-import { type AgentState, updateSessionState } from "../stores/agentStore";
+import { type AgentState, seedAcknowledged, updateSessionState } from "../stores/agentStore";
 import { isTabAlive, isTabPendingReset } from "../stores/runtimeLayoutStore";
 import {
   registerPane,
@@ -144,13 +145,30 @@ async function hydrateHarnessStateAfterReattach(
   kind: AgentKind,
 ): Promise<AgentState | null> {
   try {
-    const state = await invoke<AgentState | null>("agent_state", {
+    // `agent_state` returns the persisted reading: the state plus its true
+    // entry timestamp and whether the user already acknowledged it. We seed
+    // all three so the reattached pane restores the honest pre-reload picture
+    // instead of stamping `Date.now()` (stale "done 4s") and re-flooding the
+    // rail with already-seen completions.
+    const result = await invoke<{
+      state: AgentState;
+      entered_at_ms?: number | null;
+      acked: boolean;
+    } | null>("agent_state", {
       sessionId,
     });
-    if (!state) return null;
-    updateSessionState(sessionId, kind, state);
-    applyAgentStateToTerminal(sessionId, state);
-    return state;
+    if (!result) return null;
+    updateSessionState(sessionId, kind, result.state, undefined, {
+      enteredStateAtMs: result.entered_at_ms ?? undefined,
+      seeded: true,
+    });
+    // Restore the ack for a done-style state the user had already seen; the
+    // rail stays quiet across the reload. `waiting` is sticky, never acked.
+    if (result.acked && (result.state === "completed" || result.state === "errored")) {
+      seedAcknowledged(sessionId);
+    }
+    applyAgentStateToTerminal(sessionId, result.state);
+    return result.state;
   } catch (e) {
     console.warn("[TerminalPane] agent_state hydrate failed", e);
     return null;
@@ -684,6 +702,13 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       term.loadAddon(search);
       term.loadAddon(serializeAddon);
       term.loadAddon(webLinks);
+      // Match modern wcwidth so xterm's cell widths agree with tmux and the
+      // harness for wide glyphs, emoji, and box-drawing — otherwise the cursor
+      // column drifts and dense TUIs (agent-teams / FleetView) misalign. xterm
+      // defaults to Unicode 6; `allowProposedApi` (BASE_TERMINAL_OPTIONS) lets
+      // us register the v11 provider. The addon is disposed with the terminal.
+      term.loadAddon(new Unicode11Addon());
+      term.unicode.activeVersion = "11";
       // Expose the addon to the JSX-mounted find overlay.
       setSearchAddon(search);
 
