@@ -244,7 +244,9 @@ pub(super) fn resolve_claude_fullscreen(state: &AppHandleState) -> bool {
 
 /// Build the per-harness env-var pairs to inject into a fresh tmux session via
 /// `tmux new-session -e KEY=VALUE`. Currently this exists for one purpose:
-/// switching Claude Code into alt-screen via `CLAUDE_CODE_NO_FLICKER=1`. The
+/// putting Claude Code into a robust alt-screen render, via the pair
+/// `CLAUDE_CODE_NO_FLICKER=1` (switch inline → alt-screen) and
+/// `CLAUDE_CODE_ALT_SCREEN_FULL_REPAINT=1` (repaint every cell each frame). The
 /// returned vec owns its strings so the caller can build a `&[(&str, &str)]`
 /// slice without lifetime gymnastics.
 pub(super) fn harness_session_env_pairs(
@@ -254,6 +256,18 @@ pub(super) fn harness_session_env_pairs(
     let mut pairs = Vec::new();
     if matches!(kind, AgentKind::ClaudeCode) && resolve_claude_fullscreen(state) {
         pairs.push(("CLAUDE_CODE_NO_FLICKER".to_string(), "1".to_string()));
+        // Force full-frame repaints so Claude's incremental alt-screen updates
+        // can't drift out of sync with the real screen — the failure mode
+        // behind agent-teams / FleetView corruption (floating panels layered
+        // over stale scrollback) under heavy nested-subagent repaint load.
+        // Claude auto-enables this only for Windows agent-view/background
+        // sessions, never on macOS/Linux, so raum must opt in explicitly.
+        // Unrecognized by older Claude builds → harmlessly ignored. See
+        // anthropics/claude-code#69619.
+        pairs.push((
+            "CLAUDE_CODE_ALT_SCREEN_FULL_REPAINT".to_string(),
+            "1".to_string(),
+        ));
     }
     pairs
 }

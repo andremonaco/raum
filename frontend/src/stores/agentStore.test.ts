@@ -10,11 +10,13 @@ vi.mock("@tauri-apps/api/event", () => ({
 
 import {
   __resetAgentStoreForTests,
+  type AgentListItem,
   agentStore,
   attentionQueue,
   isAcknowledged,
   markAcknowledged,
   removeSession,
+  setAdapters,
   unmarkAcknowledged,
   unreadAgentCount,
   updateSessionState,
@@ -155,6 +157,105 @@ describe("agentStore enteredStateAt", () => {
     vi.setSystemTime(9_000);
     updateSessionState("s-1", "claude-code", "waiting");
     expect(agentStore.sessions["s-1"]?.enteredStateAt).toBe(9_000);
+    vi.useRealTimers();
+  });
+});
+
+describe("agentStore hydration seeding", () => {
+  beforeEach(() => {
+    __resetAgentStoreForTests();
+  });
+
+  function sessionItem(overrides: Partial<AgentListItem> & { session_id: string }): AgentListItem {
+    return {
+      harness: "claude-code",
+      state: "idle",
+      supports_native_events: false,
+      ...overrides,
+    };
+  }
+
+  it("maps state_entered_at_ms to enteredStateAt without fabricating Date.now()", () => {
+    setAdapters([sessionItem({ session_id: "s-1", state: "waiting", state_entered_at_ms: 1_234 })]);
+    expect(agentStore.sessions["s-1"]?.enteredStateAt).toBe(1_234);
+  });
+
+  it("leaves enteredStateAt undefined when state_entered_at_ms is absent", () => {
+    setAdapters([sessionItem({ session_id: "s-1", state: "completed" })]);
+    expect(agentStore.sessions["s-1"]?.enteredStateAt).toBeUndefined();
+  });
+
+  it("seeds acks for acked done/errored sessions, excluding them from attentionQueue", () => {
+    setAdapters([
+      sessionItem({
+        session_id: "done-acked",
+        state: "completed",
+        state_entered_at_ms: 5_000,
+        state_acked: true,
+      }),
+      sessionItem({
+        session_id: "done-unacked",
+        state: "completed",
+        state_entered_at_ms: 6_000,
+      }),
+    ]);
+    // The acked completion stays quiet across the reload; the unacked one
+    // still demands attention.
+    expect(isAcknowledged("done-acked")).toBe(true);
+    expect(isAcknowledged("done-unacked")).toBe(false);
+    expect(attentionQueue().map((i) => i.session.session_id)).toEqual(["done-unacked"]);
+    expect(unreadAgentCount()).toBe(1);
+  });
+
+  it("never seeds an ack for a waiting session even when state_acked is set", () => {
+    // `waiting` is sticky by design and must re-surface after a reload
+    // regardless of the persisted ack flag.
+    setAdapters([
+      sessionItem({
+        session_id: "wait",
+        state: "waiting",
+        state_entered_at_ms: 7_000,
+        state_acked: true,
+      }),
+    ]);
+    expect(isAcknowledged("wait")).toBe(false);
+    expect(attentionQueue().map((i) => i.session.session_id)).toEqual(["wait"]);
+  });
+});
+
+describe("agentStore seeded updateSessionState", () => {
+  beforeEach(() => {
+    __resetAgentStoreForTests();
+    vi.useRealTimers();
+  });
+
+  it("leaves enteredStateAt undefined for a seeded update with no timestamp", () => {
+    updateSessionState("s-1", "claude-code", "completed", null, { seeded: true });
+    expect(agentStore.sessions["s-1"]).toBeDefined();
+    expect(agentStore.sessions["s-1"]?.enteredStateAt).toBeUndefined();
+  });
+
+  it("honours an explicit enteredStateAtMs over Date.now() on a real change", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(9_999);
+    updateSessionState("s-1", "claude-code", "waiting", null, { enteredStateAtMs: 4_000 });
+    expect(agentStore.sessions["s-1"]?.enteredStateAt).toBe(4_000);
+    vi.useRealTimers();
+  });
+
+  it("preserves the existing timestamp on a same-state seeded update", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    updateSessionState("s-1", "claude-code", "waiting");
+    expect(agentStore.sessions["s-1"]?.enteredStateAt).toBe(1_000);
+
+    // Re-applying the same state via a seed must not clobber the original
+    // blocked-since stamp, even with a different explicit ms.
+    updateSessionState("s-1", "claude-code", "waiting", null, {
+      enteredStateAtMs: 8_000,
+      seeded: true,
+    });
+    expect(agentStore.sessions["s-1"]?.enteredStateAt).toBe(1_000);
     vi.useRealTimers();
   });
 });

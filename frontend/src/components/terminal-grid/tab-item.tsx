@@ -148,7 +148,11 @@ export const TabItem: Component<{
           "bg-selected text-warning font-medium": props.isActive && tabState() === "waiting",
           "bg-selected text-success font-medium":
             props.isActive && tabState() !== "waiting" && isUnreadCompleted(),
-          "text-foreground-subtle hover:bg-hover hover:text-foreground":
+          // Idle tabs still carry a faint resting chip (`bg-hover`) so they
+          // read as tabs at rest, not bare text; hover lifts to `bg-active`
+          // and the active tab (`bg-selected`) stays the brightest. The
+          // focused-pane inverted header overrides these in styles.css.
+          "bg-hover text-foreground-subtle hover:bg-active hover:text-foreground":
             !props.isActive && tabState() !== "waiting" && !isUnreadCompleted(),
           "bg-warning/15 text-warning hover:bg-warning/25":
             !props.isActive && tabState() === "waiting",

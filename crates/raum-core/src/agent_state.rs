@@ -48,6 +48,15 @@ pub struct AgentStateChanged {
     /// harness-native signal (hook, SSE, OSC); `Heuristic` transitions
     /// came from the silence fallback in `tick_silence`.
     pub reliability: Reliability,
+    /// `true` when this record is a *replayed persisted seed* — the synthetic
+    /// `Idle → <last persisted state>` emit the rehydrate bootstrap fires so a
+    /// reloaded webview re-learns a session's state, NOT a live transition the
+    /// user is seeing happen now. The frontend suppresses notification side
+    /// effects (completion sound, OS banner) for seeded records so an app
+    /// restart doesn't replay stale "finished" chimes, while badge/rail
+    /// (store-driven) still reflect the state. Machine-produced transitions
+    /// (`transition`) are always `false`.
+    pub seeded: bool,
 }
 
 /// The user's most recently submitted prompt for a session. Captured from
@@ -445,6 +454,9 @@ impl AgentStateMachine {
             from,
             to: next,
             reliability,
+            // A machine transition is always a live change, never a replayed
+            // persisted seed — only the rehydrate seed emit sets `seeded: true`.
+            seeded: false,
         })
     }
 }

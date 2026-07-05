@@ -565,9 +565,14 @@ export function placedSessionIds(): Set<string> {
  *  returned function unsubscribes. Runs in parallel with the existing
  *  `subscribeAgentEvents()` in `agentStore`. */
 export async function subscribePaneActivity(): Promise<UnlistenFn> {
-  const unlisten = await listen<{ session_id: string | Record<string, unknown> }>(
+  const unlisten = await listen<{ session_id: string | Record<string, unknown>; seeded?: boolean }>(
     "agent-state-changed",
     (ev) => {
+      // Seed emits replay persisted state at boot — treating them as fresh
+      // activity would stamp `lastActivityMs = now` on every restored pane and
+      // flatten the dock's Recent ordering to a single instant. Ignore them;
+      // only live transitions should bump activity.
+      if (ev.payload.seeded) return;
       const raw = ev.payload.session_id;
       const id =
         typeof raw === "string"

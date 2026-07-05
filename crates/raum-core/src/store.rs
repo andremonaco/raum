@@ -179,6 +179,11 @@ impl ConfigStore {
         if let Some(row) = st.sessions.iter_mut().find(|s| s.session_id == session_id) {
             row.last_state = Some(state);
             row.last_state_at_unix_ms = Some(at_unix_ms);
+            // A fresh transition is unread again — the user hasn't seen this
+            // state yet, so clear any prior acknowledgment. Otherwise a
+            // completion that later flips to working-then-done would inherit
+            // the old "seen" flag and never re-surface in the rail.
+            row.last_state_acked = false;
         } else {
             st.sessions.push(TrackedSession {
                 session_id: session_id.to_string(),
@@ -189,11 +194,32 @@ impl ConfigStore {
                 created_at_unix_ms: at_unix_ms,
                 last_state: Some(state),
                 last_state_at_unix_ms: Some(at_unix_ms),
+                last_state_acked: false,
                 last_prompt_text: None,
                 last_prompt_at_unix_ms: None,
                 harness_session_id: None,
             });
         }
+        self.write_sessions(&st)
+    }
+
+    /// Mark the tracked row's `last_state` as *seen* by the user (e.g. the
+    /// completion was dismissed in the attention rail). Best-effort: a
+    /// missing row is a no-op success — the frontend acks by session id and
+    /// a shell session (or a session torn down between the emit and the ack)
+    /// simply has nothing to flag. Mirrors `update_session_last_state`'s
+    /// read-modify-write + atomic save. The flag is cleared again on the next
+    /// state transition (see `update_session_last_state`), so an ack only
+    /// silences the exact state the user actually saw.
+    pub fn ack_session_last_state(&self, session_id: &str) -> Result<(), StoreError> {
+        let mut st = self.read_sessions().unwrap_or_default();
+        let Some(row) = st.sessions.iter_mut().find(|s| s.session_id == session_id) else {
+            return Ok(());
+        };
+        if row.last_state_acked {
+            return Ok(());
+        }
+        row.last_state_acked = true;
         self.write_sessions(&st)
     }
 
@@ -256,6 +282,7 @@ impl ConfigStore {
                 created_at_unix_ms: at_unix_ms,
                 last_state: None,
                 last_state_at_unix_ms: None,
+                last_state_acked: false,
                 last_prompt_text: None,
                 last_prompt_at_unix_ms: None,
                 harness_session_id: Some(harness_session_id.to_string()),
@@ -299,6 +326,22 @@ impl ConfigStore {
             .into_iter()
             .find(|s| s.session_id == session_id)
             .and_then(|s| s.last_state)
+    }
+
+    /// Fetch the persisted state metadata for `session_id`:
+    /// `(last_state_at_unix_ms, last_state_acked)`. Sibling of
+    /// [`last_session_state`] used by the `agent_list` / `agent_snapshot` /
+    /// `agent_state` join so the frontend can render the *true* completion
+    /// age (not a fabricated `Date.now()` on reload) and know whether the
+    /// user already dismissed it. Returns `None` when no tracked row exists.
+    #[must_use]
+    pub fn session_state_meta(&self, session_id: &str) -> Option<(Option<u64>, bool)> {
+        self.read_sessions()
+            .ok()?
+            .sessions
+            .into_iter()
+            .find(|s| s.session_id == session_id)
+            .map(|s| (s.last_state_at_unix_ms, s.last_state_acked))
     }
 
     /// Write-once metadata registration for a session. Called once per session
@@ -345,6 +388,7 @@ impl ConfigStore {
                 created_at_unix_ms,
                 last_state: None,
                 last_state_at_unix_ms: None,
+                last_state_acked: false,
                 last_prompt_text: None,
                 last_prompt_at_unix_ms: None,
                 harness_session_id: None,
@@ -889,6 +933,7 @@ mod tests {
                 created_at_unix_ms: 42,
                 last_state: None,
                 last_state_at_unix_ms: None,
+                last_state_acked: false,
                 last_prompt_text: None,
                 last_prompt_at_unix_ms: None,
                 harness_session_id: None,
@@ -944,6 +989,117 @@ created_at_unix_ms = 1
         assert_eq!(back.sessions.len(), 1);
         assert_eq!(back.sessions[0].last_state, Some(AgentState::Waiting));
         assert_eq!(back.sessions[0].last_state_at_unix_ms, Some(200));
+    }
+
+    #[test]
+    fn ack_session_last_state_sets_flag_and_survives_roundtrip() {
+        let dir = tempdir().unwrap();
+        let store = ConfigStore::new(dir.path());
+        store.ensure_layout().unwrap();
+
+        store
+            .update_session_last_state(
+                "raum-sess",
+                AgentKind::ClaudeCode,
+                AgentState::Completed,
+                100,
+            )
+            .unwrap();
+        // Fresh transition is unread.
+        assert_eq!(
+            store.session_state_meta("raum-sess"),
+            Some((Some(100), false))
+        );
+
+        store.ack_session_last_state("raum-sess").unwrap();
+        // Flag flips to true and survives a save/load roundtrip.
+        assert_eq!(
+            store.session_state_meta("raum-sess"),
+            Some((Some(100), true))
+        );
+        let back = store.read_sessions().unwrap();
+        assert!(back.sessions[0].last_state_acked);
+    }
+
+    #[test]
+    fn ack_session_last_state_on_missing_row_is_noop_ok() {
+        let dir = tempdir().unwrap();
+        let store = ConfigStore::new(dir.path());
+        store.ensure_layout().unwrap();
+        // Best-effort semantics: acking a session with no tracked row is a
+        // silent success, not an error.
+        store.ack_session_last_state("raum-nonexistent").unwrap();
+        assert!(store.read_sessions().unwrap().sessions.is_empty());
+    }
+
+    #[test]
+    fn update_session_last_state_resets_acked_flag() {
+        let dir = tempdir().unwrap();
+        let store = ConfigStore::new(dir.path());
+        store.ensure_layout().unwrap();
+
+        store
+            .update_session_last_state(
+                "raum-sess",
+                AgentKind::ClaudeCode,
+                AgentState::Completed,
+                100,
+            )
+            .unwrap();
+        store.ack_session_last_state("raum-sess").unwrap();
+        assert_eq!(
+            store.session_state_meta("raum-sess"),
+            Some((Some(100), true))
+        );
+
+        // A fresh transition marks the state unread again so it re-surfaces.
+        store
+            .update_session_last_state("raum-sess", AgentKind::ClaudeCode, AgentState::Working, 200)
+            .unwrap();
+        assert_eq!(
+            store.session_state_meta("raum-sess"),
+            Some((Some(200), false))
+        );
+    }
+
+    #[test]
+    fn session_state_meta_returns_none_for_missing_row() {
+        let dir = tempdir().unwrap();
+        let store = ConfigStore::new(dir.path());
+        store.ensure_layout().unwrap();
+        assert_eq!(store.session_state_meta("raum-nope"), None);
+    }
+
+    #[test]
+    fn last_state_acked_false_is_omitted_from_serialized_toml() {
+        // skip_serializing_if guarantees existing rows don't gain a churn-only
+        // `last_state_acked = false` line on upgrade; only an acked row writes
+        // the key.
+        let dir = tempdir().unwrap();
+        let store = ConfigStore::new(dir.path());
+        store.ensure_layout().unwrap();
+        store
+            .update_session_last_state(
+                "raum-sess",
+                AgentKind::ClaudeCode,
+                AgentState::Completed,
+                100,
+            )
+            .unwrap();
+
+        let path = dir.path().join("state").join("sessions.toml");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !raw.contains("last_state_acked"),
+            "unacked row must omit last_state_acked, got:\n{raw}"
+        );
+
+        store.ack_session_last_state("raum-sess").unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains("last_state_acked = true"),
+            "acked row must serialize last_state_acked = true, got:\n{raw}"
+        );
     }
 
     #[test]

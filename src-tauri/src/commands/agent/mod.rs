@@ -9,7 +9,10 @@
 //!   `hook-fallback` events as needed. The actual tmux session creation is
 //!   delegated to `terminal_spawn`; this command is responsible for adapter
 //!   preflight.
-//! * `agent_state(session_id)` — current `AgentState` for a tracked session.
+//! * `agent_state(session_id)` — current state + persisted `entered_at_ms` /
+//!   `acked` metadata for a tracked session.
+//! * `agent_ack_state(session_id)` — record that the user saw a completion so
+//!   it stays quiet across a webview reload / app restart.
 //!
 //! State propagation: the state machine in `raum-core::agent_state` publishes
 //! `AgentStateChanged` records onto a tokio broadcast channel owned by
@@ -39,7 +42,7 @@ pub use diagnostics::{harness_selftest, hooks_diagnostics, hooks_selftest};
 pub use helpers::{cleanup_harness_session, resolve_project_dir};
 pub use models::{ModelsCache, list_harness_models, list_harness_models_refresh};
 pub use persistence::infer_reattach_hook_fallback;
-pub use query::{agent_list, agent_snapshot, agent_state};
+pub use query::{agent_ack_state, agent_list, agent_snapshot, agent_state};
 pub use registry::{AgentEventBus, AgentRegistry};
 pub use runtime::{
     RegisterOptions, drive_event_socket, ensure_bridge_running, prepare_harness_launch_fast,
@@ -58,6 +61,8 @@ pub use diagnostics::{__cmd__harness_selftest, __cmd__hooks_diagnostics, __cmd__
 #[doc(hidden)]
 pub use models::{__cmd__list_harness_models, __cmd__list_harness_models_refresh};
 #[doc(hidden)]
-pub use query::{__cmd__agent_list, __cmd__agent_snapshot, __cmd__agent_state};
+pub use query::{
+    __cmd__agent_ack_state, __cmd__agent_list, __cmd__agent_snapshot, __cmd__agent_state,
+};
 #[doc(hidden)]
 pub use spawn::__cmd__agent_spawn;

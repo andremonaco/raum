@@ -30,6 +30,19 @@ pub struct AgentListItem {
     /// `pane:prompt-updated` emit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_prompt: Option<PromptEntry>,
+    /// Unix-ms timestamp this session *entered* its current `state`, joined
+    /// from the persisted `TrackedSession.last_state_at_unix_ms` by the query
+    /// layer (the in-memory machine doesn't track it). Lets the frontend show
+    /// the true completion age after a reload instead of a fabricated
+    /// `Date.now()`. `None` for adapter rows and sessions with no persisted
+    /// timestamp; omitted from the wire when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_entered_at_ms: Option<u64>,
+    /// Whether the user already dismissed this session's current completion
+    /// (persisted `TrackedSession.last_state_acked`). The frontend seeds its
+    /// acknowledged-set from this so an acked "done" stays quiet across a
+    /// webview reload / app restart. Always `false` on adapter rows.
+    pub state_acked: bool,
 }
 
 /// Shared agent registry + state-machine map. Stored behind `Arc<Mutex<_>>`
@@ -265,6 +278,11 @@ impl AgentRegistry {
                 state: raum_core::agent::AgentState::Idle,
                 supports_native_events: adapter.supports_native_events(),
                 last_prompt: None,
+                // Persisted state metadata is joined in by the query layer
+                // (`agent_list` / `agent_snapshot`) against the config store —
+                // the registry has no access to it. Leave defaults here.
+                state_entered_at_ms: None,
+                state_acked: false,
             });
         }
         for (id, machine) in &self.machines {
@@ -276,6 +294,8 @@ impl AgentRegistry {
                     .find_adapter(machine.harness())
                     .is_some_and(|a| a.supports_native_events()),
                 last_prompt: machine.last_prompt().cloned(),
+                state_entered_at_ms: None,
+                state_acked: false,
             });
         }
         out

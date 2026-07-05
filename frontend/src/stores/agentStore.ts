@@ -7,7 +7,7 @@
  * soon as a harness transitions between states.
  */
 
-import { type Accessor, createMemo, createRoot, createSignal } from "solid-js";
+import { type Accessor, batch, createMemo, createRoot, createSignal } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
@@ -41,6 +41,24 @@ export interface AgentListItem {
    * stuck waiting for minutes. Absent until the first transition lands.
    */
   enteredStateAt?: number;
+  /**
+   * Backend-persisted wall-clock (unix ms) the session entered its current
+   * state, read from `sessions.toml`'s `last_state_at_unix_ms`. Surfaced on
+   * `agent_list` / `agent_snapshot` so a reloaded webview can seed
+   * {@link enteredStateAt} with the *true* age instead of fabricating
+   * `Date.now()` at hydration (which read hours-old completions as "done
+   * 4s"). Omitted (`undefined`/`null`) when the backend has no timestamp.
+   */
+  state_entered_at_ms?: number | null;
+  /**
+   * Backend-persisted flag: the user already saw this session's terminal-state
+   * notification (mirrors `sessions.toml`'s `last_state_acked`). Seeded into
+   * the in-memory acknowledged set at hydration so a reload doesn't re-flood
+   * the attention rail with long-acked completions. Reset to `false` by the
+   * backend on every fresh transition. Absent (`undefined`) is treated as
+   * unacked.
+   */
+  state_acked?: boolean;
   /**
    * Most recent user-submitted prompt for this session, surfaced on the
    * snapshot so a freshly-launched raum can repopulate the per-tab
@@ -77,11 +95,35 @@ export { agentStore };
 const acknowledgedSessions = new Set<string>();
 const [acknowledgedTick, setAcknowledgedTick] = createSignal(0);
 
-export function markAcknowledged(sessionId: string): void {
+/**
+ * Restore a persisted acknowledgement without touching the backend: mutate
+ * the set + bump the reactive tick, nothing more. Used at hydration
+ * ({@link setAdapters}, the reattach path) to re-seed the exact pre-reload
+ * rail from `state_acked`, so a webview reload doesn't re-surface completions
+ * the user already dismissed. {@link markAcknowledged} builds on this and
+ * additionally persists the ack to disk.
+ */
+export function seedAcknowledged(sessionId: string): void {
   if (!sessionId) return;
   if (acknowledgedSessions.has(sessionId)) return;
   acknowledgedSessions.add(sessionId);
   setAcknowledgedTick((n) => n + 1);
+}
+
+export function markAcknowledged(sessionId: string): void {
+  if (!sessionId) return;
+  if (acknowledgedSessions.has(sessionId)) return;
+  seedAcknowledged(sessionId);
+  // Best-effort persistence so the ack survives a webview reload / app
+  // restart. Fire-and-forget: a failed (or absent) ack write must never break
+  // the in-memory acknowledgement or throw. Routing through
+  // `Promise.resolve().then(invoke)` also absorbs a synchronous throw and the
+  // non-thenable return `invoke` yields under vitest/jsdom (no Tauri runtime).
+  void Promise.resolve()
+    .then(() => invoke("agent_ack_state", { sessionId }))
+    .catch((e) => {
+      console.warn("agent_ack_state failed", e);
+    });
 }
 
 export function unmarkAcknowledged(sessionId: string): void {
@@ -110,10 +152,33 @@ export function setAdapters(items: AgentListItem[]): void {
   const adapters = items.filter((a) => a.session_id == null);
   const liveSessions: Record<string, AgentListItem> = {};
   for (const item of items) {
-    if (item.session_id) liveSessions[item.session_id] = item;
+    if (!item.session_id) continue;
+    // Seed `enteredStateAt` from the backend's persisted truth. Crucially we
+    // do NOT fall back to `Date.now()` when absent — a fabricated timestamp
+    // is what made stale completions read "done 4s" after a reload. Leaving
+    // it undefined lets the rail's `formatAge` render nothing instead.
+    liveSessions[item.session_id] = {
+      ...item,
+      enteredStateAt: item.state_entered_at_ms ?? undefined,
+    };
   }
-  setAgentStore("adapters", reconcile(adapters, { key: "harness" }));
-  setAgentStore("sessions", reconcile(liveSessions));
+  // `batch()` so `attentionQueue` / `unreadAgentCount` memos never observe an
+  // intermediate frame where the sessions have landed but their acks haven't
+  // been re-seeded — that half-applied state is exactly the "flood" we're
+  // fixing (every persisted completion momentarily unacked).
+  batch(() => {
+    setAgentStore("adapters", reconcile(adapters, { key: "harness" }));
+    setAgentStore("sessions", reconcile(liveSessions));
+    for (const item of items) {
+      if (!item.session_id) continue;
+      // Restore the pre-reload rail: an already-seen completion/error stays
+      // quiet. `waiting` is sticky by design and never acknowledged-away, so
+      // we only seed the terminal (`done`-style) states.
+      if (item.state_acked === true && (item.state === "completed" || item.state === "errored")) {
+        seedAcknowledged(item.session_id);
+      }
+    }
+  });
 }
 
 export function updateSessionState(
@@ -121,15 +186,42 @@ export function updateSessionState(
   harness: AgentKind,
   state: AgentState,
   reliability?: Reliability | null,
+  opts?: {
+    /**
+     * The backend's persisted wall-clock (unix ms) for this transition. Wins
+     * over `Date.now()` on an actual state change, so a hydration replay
+     * stamps the *true* age instead of "just now".
+     */
+    enteredStateAtMs?: number;
+    /**
+     * True when this update replays persisted state (a boot/reattach seed)
+     * rather than a live transition. A seeded update with no timestamp and no
+     * prior reading leaves `enteredStateAt` undefined — the rail's `formatAge`
+     * renders "" for a falsy value, so we show no age rather than a fake one.
+     */
+    seeded?: boolean;
+  },
 ): void {
   const existing = agentStore.sessions[sessionId];
   // Stamp `enteredStateAt` only when the state actually transitions, so it
   // tracks "blocked-since" rather than "last touched". A redundant
   // same-state update (e.g. a duplicate `waiting` emit) preserves the
   // original timestamp so the rail's age keeps climbing.
+  //
+  // Timestamp precedence on a real change: explicit `enteredStateAtMs` →
+  // `Date.now()`. On a same-state update: preserve the existing stamp, else
+  // fall back to `enteredStateAtMs`. A *seeded* creation without either an
+  // explicit ms or a prior value must stay `undefined` — we never fabricate
+  // `Date.now()` for replayed state (that's the stale "done 4s" bug).
   const stateChanged = existing?.state !== state;
-  const enteredStateAt =
-    stateChanged || existing?.enteredStateAt == null ? Date.now() : existing.enteredStateAt;
+  let enteredStateAt: number | undefined;
+  if (stateChanged) {
+    enteredStateAt = opts?.enteredStateAtMs ?? (opts?.seeded ? undefined : Date.now());
+  } else if (existing?.enteredStateAt != null) {
+    enteredStateAt = existing.enteredStateAt;
+  } else {
+    enteredStateAt = opts?.enteredStateAtMs ?? (opts?.seeded ? undefined : Date.now());
+  }
   const next: AgentListItem = existing
     ? {
         ...existing,
@@ -295,6 +387,13 @@ interface AgentStateChanged {
   to: AgentState;
   /** Per-harness notification plan, Phase 1: replaces `via_silence_heuristic`. */
   reliability?: Reliability;
+  /**
+   * True when the backend replayed this transition from persisted state at
+   * boot/rehydrate rather than emitting it from a live machine change. Lets
+   * the store stamp the true persisted age (not `Date.now()`) and lets
+   * `notificationCenter` stay silent for stale state. Missing ⇒ `false`.
+   */
+  seeded?: boolean;
 }
 
 interface AgentSessionRemoved {
@@ -320,7 +419,9 @@ export async function subscribeAgentEvents(): Promise<UnlistenFn> {
   const unlistenChanged = await listen<AgentStateChanged>("agent-state-changed", (ev) => {
     const id = sessionIdFromPayload(ev.payload.session_id);
     if (!id) return;
-    updateSessionState(id, ev.payload.harness, ev.payload.to, ev.payload.reliability ?? null);
+    updateSessionState(id, ev.payload.harness, ev.payload.to, ev.payload.reliability ?? null, {
+      seeded: ev.payload.seeded,
+    });
   });
   const unlistenRemoved = await listen<AgentSessionRemoved>("agent-session-removed", (ev) => {
     if (!ev.payload.session_id) return;

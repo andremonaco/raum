@@ -111,7 +111,11 @@ impl HarnessConfig {
 /// fullscreen (alt-screen) rendering: Claude Code 2.1.89+ honours
 /// `CLAUDE_CODE_NO_FLICKER=1` to switch from inline to alt-screen, which
 /// sidesteps Ink's hard-wrap-into-scrollback corruption on resize/reattach.
-/// raum defaults to fullscreen and exposes the inline path as an opt-out.
+/// When fullscreen is on, raum also injects `CLAUDE_CODE_ALT_SCREEN_FULL_REPAINT=1`
+/// so every frame repaints all cells — otherwise Claude's incremental alt-screen
+/// updates drift and corrupt heavy TUIs like agent-teams / FleetView (Claude only
+/// auto-enables full repaint on Windows). raum defaults to fullscreen and exposes
+/// the inline path as an opt-out.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ClaudeCodeConfig {
@@ -673,6 +677,17 @@ pub struct TrackedSession {
     pub last_state: Option<AgentState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_state_at_unix_ms: Option<u64>,
+    /// Whether the user has already *seen* this session's `last_state` — the
+    /// completion was surfaced (and dismissed) in the attention rail before
+    /// the last webview reload / app restart. Persisted so recovery restores
+    /// the pre-reload rail exactly: an acked completion stays quiet instead
+    /// of re-flooding "done" as if it just happened, while a completion that
+    /// fired *while* the app was gone (unacked) still surfaces once. Reset to
+    /// `false` by `update_session_last_state` on every fresh transition (a new
+    /// state is unread again). Skipped from the serialized TOML when `false`
+    /// so existing rows never gain a churn-only line on upgrade.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub last_state_acked: bool,
     /// Most recent user-submitted prompt for this session. Persisted so a
     /// freshly relaunched raum can repopulate the tab subtitle without
     /// waiting for the user to submit again. Truncated upstream by
@@ -1074,6 +1089,7 @@ mod tests {
                 created_at_unix_ms: 1_714_000_000_000,
                 last_state: None,
                 last_state_at_unix_ms: None,
+                last_state_acked: false,
                 last_prompt_text: None,
                 last_prompt_at_unix_ms: None,
                 harness_session_id: None,
