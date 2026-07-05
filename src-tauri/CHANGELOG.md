@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.14](https://github.com/andremonaco/raum/releases/tag/v0.1.14) - 2026-07-05
+
+### Fixed
+
+- fix(hooks): treat post-read peer close as delivered in reply()
+- fix(notifications): stop reload from replaying seen completions
+- fix(sidebar): self-heal frozen live git diffstat
+
+
 ## [0.1.13](https://github.com/andremonaco/raum/releases/tag/v0.1.13) - 2026-06-28
 
 ### Added
