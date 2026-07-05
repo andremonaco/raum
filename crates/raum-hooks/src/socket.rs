@@ -61,6 +61,20 @@ pub enum ReplyError {
     Transport(String),
 }
 
+/// True when an I/O error kind means the peer has already torn the
+/// connection down. Used to treat a best-effort `shutdown()` after a
+/// successful reply-write as delivered rather than failed: a hook-script
+/// client that reads its decision line and exits at once (e.g.
+/// `nc … | head -n1`) closes the socket before our half-close runs, which
+/// macOS surfaces as `ENOTCONN` and Linux as `EPIPE`. Neither is a
+/// delivery failure — the decision bytes were already flushed.
+fn is_peer_gone(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::NotConnected | std::io::ErrorKind::BrokenPipe
+    )
+}
+
 /// Shared registry of parked `PermissionRequest` connections. The
 /// event socket task inserts an entry when a `PermissionRequest` event
 /// arrives with a `request_id`; the Tauri side calls
@@ -131,7 +145,10 @@ impl PendingRequests {
 
     /// Write `decision` (followed by a newline) to the parked writer
     /// for `key` and drop it. Returns `Err` when no matching key is
-    /// registered, or when the underlying write failed.
+    /// registered, or when the write itself failed. A best-effort
+    /// `shutdown()` that fails only because the client already read the
+    /// decision and closed (see [`is_peer_gone`]) still counts as
+    /// delivered.
     pub async fn reply(&self, key: &PendingKey, decision: &str) -> Result<(), ReplyError> {
         let writer = {
             let mut guard = self
@@ -163,14 +180,28 @@ impl PendingRequests {
         if !line.ends_with('\n') {
             line.push('\n');
         }
+        // A failed write IS a delivery failure: the decision never reached the
+        // hook script, which then falls back to "ask". Surface it.
         writer
             .write_all(line.as_bytes())
             .await
             .map_err(|e| ReplyError::Transport(e.to_string()))?;
-        writer
-            .shutdown()
-            .await
-            .map_err(|e| ReplyError::Transport(e.to_string()))?;
+        // The decision bytes are now in the kernel socket buffer — the peer
+        // reads them even if it closes immediately after. The explicit
+        // `shutdown()` is best-effort half-close cleanup, NOT part of delivery:
+        // a well-behaved client that reads its one line and exits (the
+        // production `nc … | head -n1` path — `head` closes after line 1, `nc`
+        // tears down the socket) can disconnect before this runs, so macOS
+        // reports `ENOTCONN` (and Linux `EPIPE`). Those "peer already gone"
+        // kinds mean the reply landed and the client left, not a failure —
+        // swallow them. Dropping `writer` on return closes our half regardless.
+        // Any other shutdown error is still surfaced.
+        if let Err(e) = writer.shutdown().await {
+            if !is_peer_gone(e.kind()) {
+                return Err(ReplyError::Transport(e.to_string()));
+            }
+            debug!(error=%e, "reply: peer closed after reading decision; treating as delivered");
+        }
         Ok(())
     }
 
@@ -409,6 +440,20 @@ mod tests {
 
         // Registry emptied after reply.
         assert!(handle.pending.is_empty());
+    }
+
+    #[test]
+    fn is_peer_gone_classifies_post_read_close_kinds() {
+        use std::io::ErrorKind;
+        // A client that read its decision then closed (macOS `ENOTCONN`,
+        // Linux `EPIPE`) has still received the reply — shutdown swallows
+        // these so `reply()` reports success instead of a spurious flake.
+        assert!(is_peer_gone(ErrorKind::NotConnected));
+        assert!(is_peer_gone(ErrorKind::BrokenPipe));
+        // Genuine failures must still surface.
+        assert!(!is_peer_gone(ErrorKind::PermissionDenied));
+        assert!(!is_peer_gone(ErrorKind::ConnectionRefused));
+        assert!(!is_peer_gone(ErrorKind::Other));
     }
 
     #[tokio::test]
