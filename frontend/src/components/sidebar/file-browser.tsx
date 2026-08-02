@@ -6,6 +6,11 @@
  * live `WorktreeStatus.changes` by relative path — so letters update via
  * status pushes even though the tree itself is fetched once per expand.
  *
+ * Loaded levels live in one shared cache owned by this component rather than
+ * in per-node resources: the ⌘F name filter has to ask "does this directory
+ * contain a match?", which a parent can't answer when each child hoards its
+ * own resource.
+ *
  * Renders FLAT into the worktree tab's single Scrollable (no inner scroll region
  * of its own). Plain file explorer: crisp chevron carets, a right-click context
  * menu with parity to the Changes tab, restrained status-tinted filenames, and
@@ -15,30 +20,62 @@
  * to the OS opener.
  */
 
-import { Component, For, Show, createMemo, createResource, createSignal } from "solid-js";
+import {
+  Component,
+  For,
+  Show,
+  createEffect,
+  createMemo,
+  createSignal,
+  on,
+  onCleanup,
+  untrack,
+} from "solid-js";
 import { Portal } from "solid-js/web";
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 
-import { sortDirEntries, type DirEntry } from "../../lib/fileTreeModel";
+import {
+  filterTree,
+  sortDirEntries,
+  type DirEntry,
+  type FilterResult,
+} from "../../lib/fileTreeModel";
 import { isEditableFile } from "../../lib/fileUtils";
 import { FileTypeIcon } from "../../lib/fileTypeIcon";
 import { STATUS_LETTER, changesByPath } from "../../lib/gitChangeDisplay";
 import type { FileChange } from "../../stores/worktreeStore";
-import { ChevronDownIcon, ChevronRightIcon, FolderIcon, LoaderIcon } from "../icons";
+import { ChevronDownIcon, ChevronRightIcon, FolderIcon, LoaderIcon, SearchIcon } from "../icons";
 import { worktreeListDir } from "./git-commands";
 import { RaumLogo } from "./main-branch-picker";
 import { StatusLetter } from "./status-letter";
 import type { FileBrowserProps } from "./types";
 
-/** Shared per-tree expanded-dir registry + toggle, threaded through TreeNode
- *  so collapse-all can reset every level in one shot (re-expand stays instant
- *  because each node keeps its already-fetched children resource cached). */
+/** One fetched (or in-flight) directory level. */
+interface DirState {
+  entries?: DirEntry[];
+  loading: boolean;
+  error?: string;
+}
+
+/** Shared per-tree state, threaded through TreeNode so collapse-all can reset
+ *  every level in one shot and the filter can be resolved top-down (re-expand
+ *  stays instant because fetched levels stay in the cache). */
 interface TreeApi {
+  dirs: () => ReadonlyMap<string, DirState>;
+  loadDir: (relPath: string, force?: boolean) => void;
   expandedDirs: () => Set<string>;
-  toggleDir: (relPath: string) => void;
+  collapsedDirs: () => Set<string>;
+  setDirExpanded: (relPath: string, next: boolean) => void;
   badges: () => Map<string, FileChange>;
-  worktreePath: string;
-  activeEditorPath?: string | null;
+  // Accessors (not values) so the api object stays REFERENTIALLY STABLE:
+  // reading a reactive prop while building the object would subscribe every
+  // `props.api()` call site — i.e. every row's `level()`/`badge()`/`shown()`
+  // — to changes only `isActiveFile` cares about.
+  worktreePath: () => string;
+  activeEditorPath: () => string | null | undefined;
+  filtering: () => boolean;
+  visible: () => Set<string>;
+  autoExpand: () => Set<string>;
   onOpenFile: (entry: DirEntry) => void;
   onContextMenu: (e: MouseEvent, entry: DirEntry) => void;
 }
@@ -51,23 +88,139 @@ interface MenuState {
   y: number;
 }
 
+/** Root directory key used by `worktree_list_dir`. */
+const ROOT = "";
+
 export const FileBrowser: Component<FileBrowserProps> = (props) => {
   const badges = createMemo(() => changesByPath(props.status.changes));
-  const [root, { refetch }] = createResource(
-    () => props.worktree.path,
-    (path) => worktreeListDir(path, ""),
+
+  // Shared directory cache: relPath -> level. Replaced (not mutated) on every
+  // write so Solid sees the change.
+  const [dirs, setDirs] = createSignal<ReadonlyMap<string, DirState>>(new Map());
+  const putDir = (relPath: string, state: DirState): void => {
+    setDirs((prev) => new Map(prev).set(relPath, state));
+  };
+
+  const loadDir = (relPath: string, force = false): void => {
+    const current = dirs().get(relPath);
+    if (!force && (current?.loading || current?.entries)) return;
+    const worktreePath = props.worktree.path;
+    // A worktree switch may land while a call is in flight — drop stale results.
+    const stale = (): boolean => untrack(() => props.worktree.path) !== worktreePath;
+    putDir(relPath, { loading: true });
+    void worktreeListDir(worktreePath, relPath)
+      .then((entries) => {
+        if (stale()) return;
+        putDir(relPath, { loading: false, entries: sortDirEntries(entries) });
+      })
+      .catch((e: unknown) => {
+        if (stale()) return;
+        putDir(relPath, { loading: false, error: String(e) });
+      });
+  };
+
+  const [expandedDirs, setExpandedDirs] = createSignal<Set<string>>(new Set());
+  // Directories the user collapsed by hand. Needed because `autoExpand` also
+  // forces directories open during a filter: without an explicit override the
+  // chevron on an auto-expanded row would be inert.
+  const [collapsedDirs, setCollapsedDirs] = createSignal<Set<string>>(new Set());
+
+  const setDirExpanded = (relPath: string, next: boolean): void => {
+    const flip = (set: Set<string>, add: boolean): Set<string> => {
+      const copy = new Set(set);
+      if (add) copy.add(relPath);
+      else copy.delete(relPath);
+      return copy;
+    };
+    setExpandedDirs((prev) => flip(prev, next));
+    setCollapsedDirs((prev) => flip(prev, !next));
+    if (next) loadDir(relPath);
+  };
+
+  // Root level — refetched (and everything else dropped) when the worktree changes.
+  createEffect(
+    on(
+      () => props.worktree.path,
+      () => {
+        setDirs(new Map());
+        setExpandedDirs(new Set<string>());
+        setCollapsedDirs(new Set<string>());
+        loadDir(ROOT, true);
+      },
+    ),
   );
 
-  // Shared expanded-dir state, threaded through TreeNode.
-  const [expandedDirs, setExpandedDirs] = createSignal<Set<string>>(new Set());
-  const toggleDir = (relPath: string) => {
-    setExpandedDirs((prev) => {
-      const next = new Set(prev);
-      if (next.has(relPath)) next.delete(relPath);
-      else next.add(relPath);
-      return next;
+  // ---------------------------------------------------------------------
+  // Name filter (⌘F while focus is inside the tree)
+  // ---------------------------------------------------------------------
+
+  const [filterOpen, setFilterOpen] = createSignal(false);
+  const [filter, setFilter] = createSignal("");
+  let filterInput: HTMLInputElement | undefined;
+  let rootRef: HTMLDivElement | undefined;
+
+  const filtering = () => filterOpen() && filter().length > 0;
+
+  // `DirState` map → `DirCache` shape, keyed on `dirs()` only — hoisted out of
+  // `filtered` so a filter keystroke re-runs the walk but not this conversion
+  // (it used to rebuild the Map copy of every loaded level per character).
+  const dirCache = createMemo(() => {
+    const cache = new Map<string, readonly DirEntry[]>();
+    for (const [relPath, state] of dirs()) {
+      if (state.entries) cache.set(relPath, state.entries);
+    }
+    return cache;
+  });
+
+  const EMPTY_FILTER: FilterResult = {
+    visible: new Set<string>(),
+    autoExpand: new Set<string>(),
+    fileMatchCount: 0,
+  };
+
+  // Entries surviving the filter, the directories to force open, and the
+  // name-matched file count — one walk per keystroke. Only fetched levels
+  // participate — project-wide search is the spotlight dock's job.
+  const filtered = createMemo(() =>
+    filtering() ? filterTree(dirCache(), filter()) : EMPTY_FILTER,
+  );
+
+  // Files whose NAME matches (see `FilterResult.fileMatchCount`). The count is
+  // deliberately collapse-independent: it answers "how many files match the
+  // filter", and a subtree the user folded shut still holds its matches.
+  const matchCount = () => filtered().fileMatchCount;
+
+  const openFilter = (): void => {
+    setFilterOpen(true);
+    requestAnimationFrame(() => {
+      filterInput?.focus();
+      filterInput?.select();
     });
   };
+  const closeFilter = (): void => {
+    setFilterOpen(false);
+    setFilter("");
+    // Unmounting the focused input drops `document.activeElement` to <body>,
+    // which would make the next ⌘F miss the `.file-browser-root` ancestor
+    // check in the spotlight dock and open the global search instead of this
+    // tree's filter. Hand focus back to the tree root the user was in.
+    rootRef?.focus();
+  };
+
+  // A new query means a new auto-expand set; drop the collapses the user made
+  // against the previous one so folders don't stay shut for unrelated reasons.
+  createEffect(on(filter, () => setCollapsedDirs(new Set<string>()), { defer: true }));
+
+  // The spotlight dock routes ⌘F here when focus sits inside this tree, and
+  // dispatches on the matched element so the right worktree tab responds (all
+  // of them stay mounted).
+  createEffect(() => {
+    const el = rootRef;
+    if (!el) return;
+    const onRequest = (): void => openFilter();
+    el.addEventListener("raum:filter-requested", onRequest);
+    onCleanup(() => el.removeEventListener("raum:filter-requested", onRequest));
+  });
 
   // Right-click context menu. Coordinates are viewport-relative (clientX/Y);
   // the menu renders Portalled with `position: fixed` to escape the single
@@ -109,20 +262,86 @@ export const FileBrowser: Component<FileBrowserProps> = (props) => {
       .catch((e: unknown) => console.warn("clipboard.writeText failed", e));
   };
 
-  const api = (): TreeApi => ({
+  // One stable object for the tree's lifetime — every reactive read lives
+  // behind an accessor, so `props.api()` itself never becomes a dependency.
+  const treeApi: TreeApi = {
+    dirs,
+    loadDir,
     expandedDirs,
-    toggleDir,
+    collapsedDirs,
+    setDirExpanded,
     badges,
-    worktreePath: props.worktree.path,
-    activeEditorPath: props.activeEditorPath,
+    worktreePath: () => props.worktree.path,
+    activeEditorPath: () => props.activeEditorPath,
+    filtering,
+    visible: () => filtered().visible,
+    autoExpand: () => filtered().autoExpand,
     onOpenFile: openEntry,
     onContextMenu,
-  });
+  };
+  const api = (): TreeApi => treeApi;
+
+  const root = () => dirs().get(ROOT);
+  // No cache entry yet means the first fetch hasn't been dispatched — that's
+  // loading, not an empty worktree. (`createResource` reported the same thing
+  // synchronously before the cache was hoisted here.)
+  const rootLoading = () => {
+    const state = root();
+    return state === undefined || state.loading;
+  };
 
   return (
-    <div class="flex flex-col pt-1">
+    <div
+      class="file-browser-root flex flex-col pt-1"
+      ref={(el) => (rootRef = el)}
+      // Focusable so clicking anywhere in the tree (not just a row) counts as
+      // "the tree has focus" — that's what routes ⌘F to the filter instead of
+      // the spotlight dock.
+      tabIndex={-1}
+    >
+      <Show when={filterOpen()}>
+        <div class="mb-1 flex items-center gap-1 rounded border border-border-subtle bg-surface-sunken/50 px-1 py-0.5">
+          <SearchIcon class="size-3 shrink-0 text-foreground-dim" />
+          <input
+            ref={(el) => (filterInput = el)}
+            type="text"
+            value={filter()}
+            onInput={(e) => setFilter(e.currentTarget.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") {
+                e.preventDefault();
+                e.stopPropagation();
+                closeFilter();
+              }
+            }}
+            placeholder="Filter loaded files"
+            spellcheck={false}
+            autocapitalize="off"
+            autocomplete="off"
+            aria-label="Filter files"
+            class="focus-ring min-w-0 flex-1 rounded-sm bg-transparent px-0.5 py-0.5 font-mono text-[11px] text-foreground placeholder:text-foreground-dim"
+          />
+          <Show when={filtering()}>
+            <span class="select-none px-0.5 font-mono text-[10px] tabular-nums text-foreground-dim">
+              {matchCount()}
+            </span>
+          </Show>
+          <button
+            type="button"
+            class="focus-ring flex size-4 items-center justify-center rounded-sm text-foreground-dim transition-colors hover:bg-hover hover:text-foreground"
+            aria-label="Close filter"
+            title="Close (Esc)"
+            onClick={closeFilter}
+          >
+            <span aria-hidden="true" class="text-[12px] leading-none">
+              &times;
+            </span>
+          </button>
+        </div>
+      </Show>
+
       <Show
-        when={!root.loading}
+        when={!rootLoading()}
         fallback={
           <div class="flex items-center gap-1.5 px-1 py-1 font-mono text-[10px] text-foreground-dim">
             <LoaderIcon class="size-3 animate-spin" />
@@ -131,14 +350,14 @@ export const FileBrowser: Component<FileBrowserProps> = (props) => {
         }
       >
         <Show
-          when={!root.error}
+          when={!root()?.error}
           fallback={
             <div class="px-1 py-1 font-mono text-[10px] text-destructive/80">
-              <span class="line-clamp-2">{String(root.error)}</span>
+              <span class="line-clamp-2">{root()?.error}</span>
               <button
                 type="button"
                 class="mt-0.5 text-foreground-dim hover:text-foreground"
-                onClick={() => void refetch()}
+                onClick={() => loadDir(ROOT, true)}
               >
                 Retry
               </button>
@@ -146,18 +365,27 @@ export const FileBrowser: Component<FileBrowserProps> = (props) => {
           }
         >
           <Show
-            when={(root() ?? []).length > 0}
+            when={(root()?.entries ?? []).length > 0}
             fallback={
               <div class="px-1 py-1 font-mono text-[10px] italic text-foreground-dim">
                 Empty directory
               </div>
             }
           >
-            <ul>
-              <For each={sortDirEntries(root() ?? [])}>
-                {(entry) => <TreeNode entry={entry} depth={0} api={api} />}
-              </For>
-            </ul>
+            <Show
+              when={!filtering() || filtered().visible.size > 0}
+              fallback={
+                <div class="px-1 py-1 font-mono text-[10px] italic text-foreground-dim">
+                  No match in loaded folders — expand more, or use ⌘F search.
+                </div>
+              }
+            >
+              <ul>
+                <For each={root()?.entries ?? []}>
+                  {(entry) => <TreeNode entry={entry} depth={0} api={api} />}
+                </For>
+              </ul>
+            </Show>
           </Show>
         </Show>
       </Show>
@@ -262,24 +490,25 @@ interface TreeNodeProps {
 }
 
 const TreeNode: Component<TreeNodeProps> = (props) => {
-  // Children fetch starts on first expand and is kept afterwards —
-  // collapsing/re-expanding doesn't refetch (same once-only semantics as
-  // the hydration tree). Visibility is driven by the shared expanded-dir set
-  // so collapse-all can reset every level without touching this resource.
-  const [loadKey, setLoadKey] = createSignal<string | undefined>(undefined);
-  const [children, { refetch }] = createResource(loadKey, (rel) =>
-    worktreeListDir(props.api().worktreePath, rel),
-  );
+  const level = () => props.api().dirs().get(props.entry.relPath);
 
   const indent = () => `${props.depth * 12 + 4}px`;
   const badge = () => props.api().badges().get(props.entry.relPath);
-  const expanded = () => props.entry.isDir && props.api().expandedDirs().has(props.entry.relPath);
+  // While filtering, a directory holding a hit opens itself so the hit isn't
+  // buried behind a chevron — unless the user has explicitly closed that row,
+  // which always wins.
+  const expanded = () =>
+    props.entry.isDir &&
+    !props.api().collapsedDirs().has(props.entry.relPath) &&
+    (props.api().expandedDirs().has(props.entry.relPath) ||
+      props.api().autoExpand().has(props.entry.relPath));
+  const shown = () => !props.api().filtering() || props.api().visible().has(props.entry.relPath);
   const isActiveFile = () => {
-    const active = props.api().activeEditorPath;
+    const active = props.api().activeEditorPath();
     return (
       !props.entry.isDir &&
       active != null &&
-      `${props.api().worktreePath}/${props.entry.relPath}` === active
+      `${props.api().worktreePath()}/${props.entry.relPath}` === active
     );
   };
 
@@ -296,92 +525,94 @@ const TreeNode: Component<TreeNodeProps> = (props) => {
       props.api().onOpenFile(props.entry);
       return;
     }
-    const willExpand = !props.api().expandedDirs().has(props.entry.relPath);
-    props.api().toggleDir(props.entry.relPath);
-    if (willExpand && loadKey() === undefined) setLoadKey(props.entry.relPath);
+    // Toggle against what the row actually SHOWS, not just the user's own
+    // expanded set — otherwise clicking an auto-expanded row is a no-op.
+    props.api().setDirExpanded(props.entry.relPath, !expanded());
   };
 
   return (
-    <li>
-      <button
-        type="button"
-        class="flex w-full items-center gap-1.5 rounded py-0.5 pr-1 text-left hover:bg-hover"
-        classList={{ "sidebar-row-active": isActiveFile() }}
-        style={{ "padding-left": indent() }}
-        aria-expanded={props.entry.isDir ? expanded() : undefined}
-        title={props.entry.relPath}
-        onClick={toggle}
-        onContextMenu={(e) => props.api().onContextMenu(e, props.entry)}
-      >
-        <span class="flex h-4 w-3 shrink-0 items-center justify-center text-foreground-dim">
-          <Show when={props.entry.isDir} fallback={<span aria-hidden> </span>}>
-            <Show
-              when={expanded()}
-              fallback={<ChevronRightIcon class="size-3" aria-hidden="true" />}
-            >
-              <ChevronDownIcon class="size-3" aria-hidden="true" />
-            </Show>
-          </Show>
-        </span>
-        <Show
-          when={props.entry.isDir}
-          fallback={<FileTypeIcon name={props.entry.name} class="size-3.5 shrink-0 opacity-75" />}
+    <Show when={shown()}>
+      <li>
+        <button
+          type="button"
+          class="flex w-full items-center gap-1.5 rounded py-0.5 pr-1 text-left hover:bg-hover"
+          classList={{ "sidebar-row-active": isActiveFile() }}
+          style={{ "padding-left": indent() }}
+          aria-expanded={props.entry.isDir ? expanded() : undefined}
+          title={props.entry.relPath}
+          onClick={toggle}
+          onContextMenu={(e) => props.api().onContextMenu(e, props.entry)}
         >
-          <FolderIcon class="size-3.5 shrink-0 text-foreground-dim" />
-        </Show>
-        <span class={`min-w-0 flex-1 truncate font-mono text-[11px] ${nameClass()}`}>
-          {props.entry.name}
-        </span>
-        <Show when={!props.entry.isDir && badge()}>
-          {(change) => <StatusLetter kind={change().kind} />}
-        </Show>
-      </button>
-
-      <Show when={expanded()}>
-        <Show
-          when={!children.loading}
-          fallback={
-            <div
-              class="flex items-center gap-1.5 py-0.5 font-mono text-[10px] text-foreground-dim"
-              style={{ "padding-left": `${(props.depth + 1) * 12 + 4}px` }}
-            >
-              <LoaderIcon class="size-3 animate-spin" />
-            </div>
-          }
-        >
-          <Show
-            when={!children.error}
-            fallback={
-              <button
-                type="button"
-                class="py-0.5 font-mono text-[10px] text-destructive/80 hover:text-destructive"
-                style={{ "padding-left": `${(props.depth + 1) * 12 + 4}px` }}
-                onClick={() => void refetch()}
+          <span class="flex h-4 w-3 shrink-0 items-center justify-center text-foreground-dim">
+            <Show when={props.entry.isDir} fallback={<span aria-hidden> </span>}>
+              <Show
+                when={expanded()}
+                fallback={<ChevronRightIcon class="size-3" aria-hidden="true" />}
               >
-                Failed to load — retry
-              </button>
+                <ChevronDownIcon class="size-3" aria-hidden="true" />
+              </Show>
+            </Show>
+          </span>
+          <Show
+            when={props.entry.isDir}
+            fallback={<FileTypeIcon name={props.entry.name} class="size-3.5 shrink-0 opacity-75" />}
+          >
+            <FolderIcon class="size-3.5 shrink-0 text-foreground-dim" />
+          </Show>
+          <span class={`min-w-0 flex-1 truncate font-mono text-[11px] ${nameClass()}`}>
+            {props.entry.name}
+          </span>
+          <Show when={!props.entry.isDir && badge()}>
+            {(change) => <StatusLetter kind={change().kind} />}
+          </Show>
+        </button>
+
+        <Show when={expanded()}>
+          <Show
+            when={!level()?.loading}
+            fallback={
+              <div
+                class="flex items-center gap-1.5 py-0.5 font-mono text-[10px] text-foreground-dim"
+                style={{ "padding-left": `${(props.depth + 1) * 12 + 4}px` }}
+              >
+                <LoaderIcon class="size-3 animate-spin" />
+              </div>
             }
           >
             <Show
-              when={(children() ?? []).length > 0}
+              when={!level()?.error}
               fallback={
-                <div
-                  class="py-0.5 font-mono text-[10px] italic text-foreground-dim"
+                <button
+                  type="button"
+                  class="py-0.5 font-mono text-[10px] text-destructive/80 hover:text-destructive"
                   style={{ "padding-left": `${(props.depth + 1) * 12 + 4}px` }}
+                  onClick={() => props.api().loadDir(props.entry.relPath, true)}
                 >
-                  Empty directory
-                </div>
+                  Failed to load — retry
+                </button>
               }
             >
-              <ul>
-                <For each={sortDirEntries(children() ?? [])}>
-                  {(child) => <TreeNode entry={child} depth={props.depth + 1} api={props.api} />}
-                </For>
-              </ul>
+              <Show
+                when={(level()?.entries ?? []).length > 0}
+                fallback={
+                  <div
+                    class="py-0.5 font-mono text-[10px] italic text-foreground-dim"
+                    style={{ "padding-left": `${(props.depth + 1) * 12 + 4}px` }}
+                  >
+                    Empty directory
+                  </div>
+                }
+              >
+                <ul>
+                  <For each={level()?.entries ?? []}>
+                    {(child) => <TreeNode entry={child} depth={props.depth + 1} api={props.api} />}
+                  </For>
+                </ul>
+              </Show>
             </Show>
           </Show>
         </Show>
-      </Show>
-    </li>
+      </li>
+    </Show>
   );
 };

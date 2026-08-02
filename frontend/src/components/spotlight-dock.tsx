@@ -309,6 +309,14 @@ export const SpotlightDock: Component = () => {
       window.dispatchEvent(new CustomEvent("raum:pane-find-requested"));
       return;
     }
+    // Same idea one level down: focus inside a worktree's Files tree means
+    // "filter THIS tree". Every worktree tab stays mounted, so the event is
+    // dispatched on the matched tree rather than on `window`.
+    const fileTree = active instanceof HTMLElement ? active.closest(".file-browser-root") : null;
+    if (fileTree) {
+      fileTree.dispatchEvent(new CustomEvent("raum:filter-requested"));
+      return;
+    }
     toggleSpotlight();
   };
   useKeymapAction("global-search", openSearch);
