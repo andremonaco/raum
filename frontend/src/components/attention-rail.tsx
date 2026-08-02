@@ -15,7 +15,7 @@
 
 import { Component, For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
-import { attentionQueue, type AttentionItem } from "../stores/agentStore";
+import { attentionQueue, markAcknowledged, type AttentionItem } from "../stores/agentStore";
 import { projectBySlug } from "../stores/projectStore";
 import { terminalStore } from "../stores/terminalStore";
 import { resolveSessionTabLabel } from "../lib/harnessTabLabel";
@@ -126,6 +126,23 @@ export const AttentionRail: Component<AttentionRailProps> = (props) => {
       });
     }
     setPromptDraft("");
+  }
+
+  // Dismiss = acknowledge without focusing. Only completed/errored rows are
+  // dismissible ("waiting" is sticky — there is nothing to dismiss, the
+  // agent still wants input). This is the only way to clear a completion in
+  // a NON-active project without switching to it: the notification center
+  // auto-acks the active project only, by design.
+  function dismissSelected(): void {
+    const dismissible = new Set(
+      queue()
+        .filter((i) => i.session.state === "completed" || i.session.state === "errored")
+        .map((i) => i.session.session_id),
+    );
+    for (const sessionId of selectedIds()) {
+      if (dismissible.has(sessionId)) markAcknowledged(sessionId);
+    }
+    clearSelection();
   }
 
   function killSelected(): void {
@@ -241,6 +258,21 @@ export const AttentionRail: Component<AttentionRailProps> = (props) => {
                       {stateVerb(item.session.state)} {formatAge(item.blockedSince, now())}
                     </span>
                   </button>
+                  <Show when={id && item.session.state !== "waiting"}>
+                    <button
+                      type="button"
+                      class="focus-ring pointer-events-none shrink-0 rounded px-0.5 text-xs leading-none text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover:pointer-events-auto group-hover:opacity-100 focus-visible:pointer-events-auto focus-visible:opacity-100"
+                      title="Dismiss"
+                      aria-label="Dismiss"
+                      data-testid="attention-dismiss"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (id) markAcknowledged(id);
+                      }}
+                    >
+                      ×
+                    </button>
+                  </Show>
                 </div>
               );
             }}
@@ -295,6 +327,15 @@ export const AttentionRail: Component<AttentionRailProps> = (props) => {
               onClick={restartSelected}
             >
               Restart
+            </Button>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              class="h-6 flex-1 px-2 text-[11px]"
+              onClick={dismissSelected}
+            >
+              Dismiss
             </Button>
             <Button
               type="button"
