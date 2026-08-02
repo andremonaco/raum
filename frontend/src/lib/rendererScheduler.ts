@@ -9,6 +9,7 @@
  * event so the UI can show a banner.
  */
 
+import { invoke } from "@tauri-apps/api/core";
 import { CanvasAddon } from "@xterm/addon-canvas";
 import type { Terminal, ITerminalAddon } from "@xterm/xterm";
 
@@ -235,20 +236,100 @@ export function demoteAllForBackground(): void {
 }
 
 /**
+ * Best-effort backend log line so wake-phase costs land in the daily log
+ * next to the probe/reattach markers. The `Promise.resolve().then` wrapper
+ * absorbs the synchronous throw `invoke` produces under vitest/jsdom.
+ */
+function reportWakePhase(phase: string, ms: number): void {
+  void Promise.resolve()
+    .then(() => invoke("webview_wake_report", { phase, ms: Math.max(0, Math.round(ms)) }))
+    .catch(() => {});
+}
+
+/**
+ * One frame's worth of breathing room. rAF is raced against a short timeout
+ * because rAF never fires on a hidden page (and jsdom may not schedule it) —
+ * the yield must never become a stall.
+ */
+function yieldToFrame(): Promise<void> {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (): void => {
+      if (!done) {
+        done = true;
+        resolve();
+      }
+    };
+    try {
+      requestAnimationFrame(() => finish());
+    } catch {
+      /* non-DOM environment */
+    }
+    setTimeout(finish, 50);
+  });
+}
+
+/**
+ * Monotonic token for [`endBackgroundDemotion`] runs. The loop now spans
+ * real time (one frame-yield per pane), so a hide→show flicker can start a
+ * second run while the first is still awaiting — the stale run must stop
+ * touching entries the moment a newer one (or a re-hide) supersedes it.
+ */
+let repromoteGeneration = 0;
+
+/**
  * Page is visible again: re-promote the panes that held WebGL when it went
- * hidden. Promotion runs oldest-first so the pre-background LRU order
- * survives the mru re-stamping inside [`requestWebgl`].
+ * hidden. Each promotion is synchronous main-thread work (shader compile,
+ * glyph atlas, full repaint), so the loop yields a frame between panes to
+ * keep input responsive right after unlock, and runs MRU-first so the pane
+ * the user is looking at gets WebGL in the first frame. `requestWebgl`
+ * re-stamps `mru`; restoring it afterwards preserves the pre-background
+ * LRU order the eviction logic depends on.
+ *
+ * The loop is abortable: a re-hide mid-run (second lock, full occlusion)
+ * or a newer run supersedes it. Crucially each entry's `pendingRepromote`
+ * is cleared only at ITS turn, and the abort check runs before that clear
+ * — so panes the aborted run never reached keep their mark and are picked
+ * up by the next `endBackgroundDemotion` instead of being stranded on the
+ * canvas renderer for the session.
  */
 export async function endBackgroundDemotion(): Promise<void> {
   backgrounded = false;
+  const generation = ++repromoteGeneration;
   const marked = Array.from(panes.values())
     .filter((e) => e.pendingRepromote)
-    .sort((a, b) => a.mru - b.mru);
+    .sort((a, b) => b.mru - a.mru);
+  if (marked.length === 0) return;
+  // Warm the dynamic import off the first promotion's critical path.
+  void loadWebglAddon().catch(() => {});
+  const startedMs = performance.now();
+  // Aborted runs report under a distinct phase: the slow wakes are exactly
+  // the ones most likely to be interrupted (each pane adds up to a frame of
+  // wall time), and dropping them would bias the metric toward fast wakes.
+  const reportAborted = (): void => {
+    reportWakePhase("webgl-repromote-aborted", performance.now() - startedMs);
+  };
   for (const entry of marked) {
+    if (backgrounded || generation !== repromoteGeneration) {
+      reportAborted();
+      return;
+    }
     entry.pendingRepromote = false;
     if (!entry.visible || entry.forbidWebgl) continue;
+    const mru = entry.mru;
     await requestWebgl(entry.paneId);
+    entry.mru = mru;
+    if (backgrounded && entry.renderer !== "webgl") {
+      // A re-hide landed inside `requestWebgl` (it early-returns while
+      // backgrounded): this pane's mark was already cleared but it never
+      // got its context back — restore the mark for the next wake.
+      entry.pendingRepromote = true;
+      reportAborted();
+      return;
+    }
+    await yieldToFrame();
   }
+  reportWakePhase("webgl-repromote", performance.now() - startedMs);
 }
 
 /**
@@ -260,10 +341,18 @@ export async function endBackgroundDemotion(): Promise<void> {
  * check reloads the page. Returns a remover for `onCleanup`.
  */
 export function installBackgroundRendererDemotion(): () => void {
+  // Wall-clock (not performance.now): a suspended page's monotonic clock
+  // may not advance, and "how long was the screen locked" is wall time.
+  let hiddenAtMs: number | null = null;
   const onVisibilityChange = (): void => {
     if (document.hidden) {
+      hiddenAtMs = Date.now();
       demoteAllForBackground();
     } else {
+      if (hiddenAtMs !== null) {
+        reportWakePhase("hidden-for", Date.now() - hiddenAtMs);
+        hiddenAtMs = null;
+      }
       void endBackgroundDemotion();
     }
   };
