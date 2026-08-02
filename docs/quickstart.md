@@ -93,7 +93,7 @@ The new pane drops into the project root. If the harness binary is missing,
 raum shows a non-blocking toast pointing at the install instructions and
 skips the spawn.
 
-Output is rendered by xterm.js with a 10 000-line scrollback. xterm.js owns
+Output is rendered by xterm.js with a 100 000-line scrollback. xterm.js owns
 scrollback end-to-end via three tmux server options working together:
 
 - `terminal-overrides "*:smcup@:rmcup@"` — tmux never sends alt-screen

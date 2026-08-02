@@ -28,7 +28,7 @@
 - **Crash-safe by design.** Every pane runs inside a dedicated tmux socket (`-L raum`). Quit or crash the app, reopen it — your agents are still running, your scrollback is intact.
 - **Stay in flow on permission prompts.** raum hooks into each harness's notification surface, pops a notification when a pane needs permission, and focuses the right terminal so you can answer in-context.
 - **Git worktrees that hydrate themselves.** Create a worktree from the UI; raum copies or symlinks the dotfiles, caches, and env files you've marked — no manual `cp -r node_modules` ever again.
-- **Global scrollback search.** `⌘F` opens a spotlight dock that searches scrollback across every open pane (10 000 lines deep), jumps to project files, and switches harness sessions.
+- **Global scrollback search.** `⌘F` opens a spotlight dock that searches scrollback across every open pane (100 000 lines deep), jumps to project files, and switches harness sessions.
 - **Your config, your files.** Everything lives in plain TOML under `~/.config/raum/`. Commit a `.raum.toml` to a repo to share worktree and hydration defaults with your team.
 
 ## Install
