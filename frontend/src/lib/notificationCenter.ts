@@ -650,6 +650,17 @@ export async function startNotificationCenter(): Promise<UnlistenFn> {
     void dispatchPermissionNotification(ev.payload);
   });
 
+  // Socket-server GC signal: a parked permission request expired unanswered
+  // (the hook script timed out to "ask" or died). Drop the stale pending
+  // key so the Critical badge doesn't count a prompt that no longer exists.
+  const unlistenPermissionExpired = await listen<{
+    session_id: string | null;
+    permission_key: string;
+  }>("permission-expired", (ev) => {
+    if (!ev.payload.permission_key) return;
+    clearPendingPermission(ev.payload.permission_key);
+  });
+
   // §11.6 — click-to-focus. The Rust `UNUserNotificationCenterDelegate`
   // emits `notifications:clicked` with `{ sessionId }` when the user taps
   // a banner or a Notification Center entry.
@@ -705,6 +716,7 @@ export async function startNotificationCenter(): Promise<UnlistenFn> {
     unlistenState();
     unlistenRemoved();
     unlistenPermission();
+    unlistenPermissionExpired();
     unlistenClick();
     unlistenFocus();
     disposeReactive();

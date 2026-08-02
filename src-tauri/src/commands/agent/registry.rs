@@ -270,6 +270,24 @@ impl AgentRegistry {
         true
     }
 
+    /// Re-arm output-based recovery when a parked permission request expires
+    /// unanswered (`PermissionExpired`): the user will answer in the
+    /// harness's own TUI, so the resulting output burst must be able to
+    /// reclaim the machine out of `Waiting`. Resolves the target via
+    /// [`Self::route_target`] so the legacy no-`$RAUM_SESSION` sole-machine
+    /// case is covered too — those are exactly the sessions most likely to
+    /// park a session-less request.
+    pub fn arm_activity_for_permission_expiry(
+        &mut self,
+        kind: AgentKind,
+        session_id: Option<&str>,
+    ) -> bool {
+        let Some(target) = self.route_target(kind, session_id) else {
+            return false;
+        };
+        self.arm_activity_for_submit(&target)
+    }
+
     /// The user pressed the abort key (Ctrl-C) in this pane. No harness
     /// emits a cancellation hook, so this synthetic signal is the only way
     /// the state machine can return to `Idle` without waiting for the full

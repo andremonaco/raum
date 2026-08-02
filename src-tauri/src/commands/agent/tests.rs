@@ -260,6 +260,45 @@ fn known_session_with_harness_mismatch_does_not_broadcast() {
     }
 }
 
+/// Guards the `PermissionExpired` short-circuit in `drive_event_socket`:
+/// an expiry for a session that is no longer registered must be a quiet
+/// no-op, not a panic or a phantom arm.
+#[test]
+fn arm_activity_for_submit_returns_false_for_unknown_session() {
+    let mut r = AgentRegistry::with_defaults();
+    assert!(!r.arm_activity_for_submit("raum-missing"));
+    r.register_machine(AgentStateMachine::new(
+        SessionId::new("raum-known"),
+        AgentKind::ClaudeCode,
+    ));
+    assert!(r.arm_activity_for_submit("raum-known"));
+}
+
+/// `arm_activity_for_permission_expiry` mirrors the routing rules: exact
+/// session id arms it; a session-less expiry arms the sole machine of the
+/// harness; ambiguity (≥2) and stale concrete ids arm nothing.
+#[test]
+fn arm_activity_for_permission_expiry_follows_routing_rules() {
+    let mut r = AgentRegistry::with_defaults();
+    r.register_machine(AgentStateMachine::new(
+        SessionId::new("raum-cc-only"),
+        AgentKind::ClaudeCode,
+    ));
+    assert!(r.arm_activity_for_permission_expiry(AgentKind::ClaudeCode, Some("raum-cc-only")));
+    assert!(r.arm_activity_for_permission_expiry(AgentKind::ClaudeCode, None));
+    assert!(!r.arm_activity_for_permission_expiry(AgentKind::ClaudeCode, Some("raum-stale")));
+    assert!(!r.arm_activity_for_permission_expiry(AgentKind::Codex, None));
+
+    r.register_machine(AgentStateMachine::new(
+        SessionId::new("raum-cc-second"),
+        AgentKind::ClaudeCode,
+    ));
+    assert!(
+        !r.arm_activity_for_permission_expiry(AgentKind::ClaudeCode, None),
+        "two candidates: ambiguous, must not guess",
+    );
+}
+
 // Tests that mutate the process-wide environment serialize on this mutex so
 // parallel test threads don't clobber each other's `PATH`. Poisoning is
 // ignored so one failing test doesn't cascade into the others.

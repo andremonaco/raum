@@ -558,7 +558,7 @@ fn bootstrap_event_socket(app: &mut tauri::App) {
     let app_handle = app.handle().clone();
 
     tauri::async_runtime::spawn(async move {
-        let mut handle = match spawn_event_socket(&sock_path).await {
+        let mut handle = match spawn_event_socket(&sock_path) {
             Ok(h) => h,
             Err(e) => {
                 warn!(

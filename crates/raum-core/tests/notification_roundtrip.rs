@@ -144,7 +144,7 @@ async fn claude_code_notification_roundtrip_over_hook_script() {
 
     let tmp = tempfile::tempdir().unwrap();
     let sock_path = tmp.path().join("events.sock");
-    let mut handle = spawn_event_socket(&sock_path).await.unwrap();
+    let mut handle = spawn_event_socket(&sock_path).unwrap();
 
     let script = prepare_hook_scripts(&tmp, "claude-code.sh").await;
 
@@ -233,7 +233,7 @@ async fn claude_code_permission_request_replies_with_allow_decision_json() {
 
     let tmp = tempfile::tempdir().unwrap();
     let sock_path = tmp.path().join("events.sock");
-    let mut handle = spawn_event_socket(&sock_path).await.unwrap();
+    let mut handle = spawn_event_socket(&sock_path).unwrap();
 
     let script = prepare_hook_scripts(&tmp, "claude-code.sh").await;
 
@@ -512,7 +512,7 @@ async fn codex_notify_script_forwards_argv_payload_to_event_socket() {
 
     let tmp = tempfile::tempdir().unwrap();
     let sock_path = tmp.path().join("events.sock");
-    let mut handle = spawn_event_socket(&sock_path).await.unwrap();
+    let mut handle = spawn_event_socket(&sock_path).unwrap();
 
     let script = prepare_hook_scripts(&tmp, "codex-notify.sh").await;
 
@@ -578,7 +578,7 @@ async fn codex_hook_dispatcher_forwards_lifecycle_events_to_event_socket() {
 
     let tmp = tempfile::tempdir().unwrap();
     let sock_path = tmp.path().join("events.sock");
-    let mut handle = spawn_event_socket(&sock_path).await.unwrap();
+    let mut handle = spawn_event_socket(&sock_path).unwrap();
 
     let script = prepare_hook_scripts(&tmp, "codex.sh").await;
 

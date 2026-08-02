@@ -125,9 +125,41 @@ pub async fn drive_event_socket<R: Runtime>(
             payload: ev.payload.clone(),
         };
         let state: tauri::State<'_, crate::state::AppHandleState> = app.state();
+        // Synthetic socket-server GC signal: a parked PermissionRequest
+        // expired unanswered (hook script timed out to "ask" or died).
+        // Short-circuit BEFORE the registry block — this is load-bearing:
+        // in `silence_only` mode `on_hook_event` treats *any* event name as
+        // activity and would promote the machine to Working regardless of
+        // the classifier's `PermissionExpired => None`. Also before the
+        // `last_hook_at` diagnostic stamp: this event is raum's own, and
+        // recording it would make the Harness Health panel report a live
+        // hook pipeline using an event no harness ever emits. Here we (a)
+        // re-arm output-based recovery so the machine can leave `Waiting`
+        // once the user answers in the harness's own TUI and output flows,
+        // and (b) tell the frontend to drop the stale pending-permission
+        // badge entry.
+        if ev.event == raum_hooks::PERMISSION_EXPIRED_EVENT {
+            if let Ok(mut registry) = state.agents.lock() {
+                // Route-aware: covers the session-less legacy case via the
+                // sole-machine rule, mirroring `route_hook_event`.
+                registry.arm_activity_for_permission_expiry(kind, ev.session_id.as_deref());
+            }
+            let permission_key = ev.request_id.clone().or_else(|| ev.session_id.clone());
+            if let Some(permission_key) = permission_key {
+                let payload = serde_json::json!({
+                    "session_id": ev.session_id,
+                    "permission_key": permission_key,
+                });
+                if let Err(e) = app.emit("permission-expired", &payload) {
+                    warn!(error = %e, "permission-expired emit failed");
+                }
+            }
+            continue;
+        }
         // Diagnostic surface: record "we received a hook from X at T"
         // so the Harness Health panel can tell the user whether the
-        // pipeline is dead or merely quiet.
+        // pipeline is dead or merely quiet. (After the PermissionExpired
+        // short-circuit — only genuine harness traffic counts.)
         if let Ok(mut slot) = state.last_hook_at.lock() {
             *slot = Some(crate::state::LastHook {
                 at_unix: std::time::SystemTime::now()
