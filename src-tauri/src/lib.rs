@@ -344,6 +344,7 @@ pub fn run() {
             // (black, dead window until app restart otherwise).
             commands::webview_health::webview_ready,
             commands::webview_health::webview_pong,
+            commands::webview_health::webview_wake_report,
         ])
         .setup(|app| {
             let main_window = app.get_webview_window("main").unwrap();
@@ -1018,10 +1019,12 @@ fn bootstrap_reconciler(app: &mut tauri::App) {
 /// WebContent process while the screen is locked (suspension + memory/GPU
 /// pressure); wry receives `webViewWebContentProcessDidTerminate:` but
 /// Tauri never registers wry's handler, so the page stays black and dead.
-/// On every `Focused(true)` we ping the page and reload the webview if no
-/// pong arrives — see `commands::webview_health` for the full story.
-/// Registered as a second `on_window_event` handler; Tauri appends
-/// listeners, so this never disturbs the orphan reaper's focus hook.
+/// On every `Focused(true)` we run a patient probe sequence and reload
+/// only after ~12 s of total silence — a suspended-but-alive page answers
+/// late, a dead one never does; see `commands::webview_health` for the
+/// full story. Registered as a second `on_window_event` handler; Tauri
+/// appends listeners, so this never disturbs the orphan reaper's focus
+/// hook.
 fn bootstrap_webview_health(app: &mut tauri::App) {
     let Some(win) = app.get_webview_window("main") else {
         warn!("bootstrap_webview_health: main window not found");
