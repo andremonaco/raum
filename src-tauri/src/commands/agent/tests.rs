@@ -96,8 +96,20 @@ fn agent_kind_wire_mapping_covers_every_harness_filename() {
     assert_eq!(agent_kind_from_wire("unknown-harness"), None);
 }
 
-#[test]
-fn apply_hook_to_matching_advances_machines_of_matching_harness() {
+fn claude_event(name: &str) -> CoreHookEvent {
+    CoreHookEvent {
+        harness: "claude-code".into(),
+        event: name.into(),
+        source: None,
+        reliability: None,
+        payload: serde_json::Value::Null,
+    }
+}
+
+/// Fixture: two Claude machines (different projects in real life) plus one
+/// OpenCode machine — the minimal registry where a broadcast would flip
+/// more than one pane.
+fn registry_with_two_claude_machines() -> AgentRegistry {
     let mut r = AgentRegistry::with_defaults();
     r.register_machine(AgentStateMachine::new(
         SessionId::new("raum-cc-1"),
@@ -111,22 +123,141 @@ fn apply_hook_to_matching_advances_machines_of_matching_harness() {
         SessionId::new("raum-oc-1"),
         AgentKind::OpenCode,
     ));
+    r
+}
 
-    let event = CoreHookEvent {
-        harness: "claude-code".into(),
-        event: "UserPromptSubmit".into(),
-        source: None,
-        reliability: None,
-        payload: serde_json::Value::Null,
-    };
-    let changes = r.apply_hook_to_matching(AgentKind::ClaudeCode, &event);
-    assert_eq!(changes.len(), 2, "both CC machines must advance");
-    assert!(changes.iter().all(|c| c.harness == AgentKind::ClaudeCode));
+/// The attention-storm regression test: one stray `Stop` without a session
+/// id must not flip every Claude pane to Completed across all projects.
+#[test]
+fn unknown_session_with_multiple_machines_drops_event() {
+    let mut r = registry_with_two_claude_machines();
+    let routed = r.route_hook_event(AgentKind::ClaudeCode, None, &claude_event("Stop"));
+    assert!(routed.is_none(), "no broadcast for a session-less event");
+    for sid in ["raum-cc-1", "raum-cc-2", "raum-oc-1"] {
+        assert_eq!(
+            r.state_for(sid),
+            Some(raum_core::agent::AgentState::Idle),
+            "{sid} must be untouched",
+        );
+    }
+}
+
+#[test]
+fn stale_session_id_with_multiple_machines_drops_event() {
+    let mut r = registry_with_two_claude_machines();
+    let routed = r.route_hook_event(
+        AgentKind::ClaudeCode,
+        Some("raum-gone"),
+        &claude_event("Stop"),
+    );
+    assert!(routed.is_none());
+    assert_eq!(
+        r.state_for("raum-cc-1"),
+        Some(raum_core::agent::AgentState::Idle),
+    );
+    assert_eq!(
+        r.state_for("raum-cc-2"),
+        Some(raum_core::agent::AgentState::Idle),
+    );
+}
+
+/// A concrete-but-unknown session id must NOT fall back to the sole
+/// machine: a stale `$RAUM_SESSION` (killed pane A whose dying harness
+/// fires a last `Stop`) would otherwise flip the unrelated surviving pane.
+/// Only a truly session-less event may use the sole-machine route.
+#[test]
+fn stale_session_id_with_single_machine_drops_event() {
+    let mut r = AgentRegistry::with_defaults();
+    r.register_machine(AgentStateMachine::new(
+        SessionId::new("raum-cc-survivor"),
+        AgentKind::ClaudeCode,
+    ));
+    let routed = r.route_hook_event(
+        AgentKind::ClaudeCode,
+        Some("raum-cc-killed"),
+        &claude_event("Stop"),
+    );
+    assert!(routed.is_none());
+    assert_eq!(
+        r.state_for("raum-cc-survivor"),
+        Some(raum_core::agent::AgentState::Idle),
+        "the survivor must not inherit the dead session's Stop",
+    );
+}
+
+/// Legacy no-`$RAUM_SESSION` case: with exactly one machine of the harness
+/// there is no ambiguity, so the event still routes.
+#[test]
+fn unknown_session_with_single_machine_routes_to_it() {
+    let mut r = AgentRegistry::with_defaults();
+    r.register_machine(AgentStateMachine::new(
+        SessionId::new("raum-cc-only"),
+        AgentKind::ClaudeCode,
+    ));
+    r.register_machine(AgentStateMachine::new(
+        SessionId::new("raum-oc-1"),
+        AgentKind::OpenCode,
+    ));
+    let changes = r
+        .route_hook_event(AgentKind::ClaudeCode, None, &claude_event("Stop"))
+        .expect("session-less event routes to the sole machine");
+    assert_eq!(changes.len(), 1);
+    assert_eq!(
+        r.state_for("raum-cc-only"),
+        Some(raum_core::agent::AgentState::Completed),
+    );
     assert_eq!(
         r.state_for("raum-oc-1"),
         Some(raum_core::agent::AgentState::Idle),
-        "OpenCode machine must be untouched",
+        "other harness untouched",
     );
+}
+
+#[test]
+fn known_session_routes_only_to_that_machine() {
+    let mut r = registry_with_two_claude_machines();
+    let changes = r
+        .route_hook_event(
+            AgentKind::ClaudeCode,
+            Some("raum-cc-1"),
+            &claude_event("UserPromptSubmit"),
+        )
+        .expect("known session routes");
+    assert_eq!(changes.len(), 1);
+    assert_eq!(
+        r.state_for("raum-cc-1"),
+        Some(raum_core::agent::AgentState::Working),
+    );
+    assert_eq!(
+        r.state_for("raum-cc-2"),
+        Some(raum_core::agent::AgentState::Idle),
+        "sibling machine must be untouched",
+    );
+}
+
+/// A session id resolving to a machine of a *different* harness is stale or
+/// wrong — with multiple candidates the event must be dropped, not applied
+/// to the mismatched machine and not broadcast.
+#[test]
+fn known_session_with_harness_mismatch_does_not_broadcast() {
+    let mut r = registry_with_two_claude_machines();
+    r.register_machine(AgentStateMachine::new(
+        SessionId::new("raum-codex-1"),
+        AgentKind::Codex,
+    ));
+    let routed = r.route_hook_event(
+        AgentKind::ClaudeCode,
+        Some("raum-codex-1"),
+        &claude_event("Stop"),
+    );
+    assert!(routed.is_none());
+    for sid in ["raum-cc-1", "raum-cc-2", "raum-codex-1"] {
+        assert_eq!(
+            r.state_for(sid),
+            Some(raum_core::agent::AgentState::Idle),
+            "{sid} must be untouched",
+        );
+    }
 }
 
 // Tests that mutate the process-wide environment serialize on this mutex so

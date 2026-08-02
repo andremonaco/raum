@@ -99,11 +99,10 @@ pub(super) fn build_permission_notification_event(
 /// Runs until `rx` closes. The caller owns spawning; invoke it once from
 /// Tauri `setup` after `spawn_event_socket` binds the UDS socket.
 ///
-/// Routing is currently broadcast-by-harness — the hook-event wire
-/// shape does not yet carry a session id, so every machine with the
-/// matching `AgentKind` advances. This is a Phase 1 limitation; Phase 2
-/// adds session-scoped routing once `raum-hooks` embeds `$RAUM_SESSION`
-/// in the event payload.
+/// Routing is session-scoped via `AgentRegistry::route_hook_event`: an
+/// event with an unknown session id reaches at most the *sole* machine of
+/// its harness and is otherwise dropped — never broadcast (see the routing
+/// rationale on `route_hook_event`).
 pub async fn drive_event_socket<R: Runtime>(
     mut rx: mpsc::Receiver<HookEvent>,
     bus: AgentEventBus,
@@ -149,35 +148,55 @@ pub async fn drive_event_socket<R: Runtime>(
         //
         // For UserPromptSubmit only: this also produces a
         // `PromptUpdated` to drive the `pane:prompt-updated` broadcast.
-        let (changes, prompt_update, harness_session_id): (
-            Vec<AgentStateChanged>,
-            Option<PromptUpdated>,
-            Option<(String, String)>,
-        ) = {
+        // What one drained hook event produced while the registry lock was
+        // held (a struct rather than a tuple purely for clippy's
+        // type-complexity budget).
+        struct Drained {
+            changes: Vec<AgentStateChanged>,
+            prompt_update: Option<PromptUpdated>,
+            harness_session_id: Option<(String, String)>,
+            /// Whether `route_target` resolved a machine — gates the
+            /// permission notification below.
+            routable: bool,
+        }
+        let Drained {
+            changes,
+            prompt_update,
+            harness_session_id,
+            routable,
+        } = {
             let Ok(mut registry) = state.agents.lock() else {
                 warn!("event-socket drain: agent registry lock poisoned; dropping event");
                 continue;
             };
-            let changes = match ev.session_id.as_deref() {
-                Some(sid) => registry.apply_hook_for_session(kind, sid, &core_event),
-                None => registry.apply_hook_to_matching(kind, &core_event),
-            };
+            // `None` = unroutable (dropped); `Some` = reached a machine.
+            // Every session-keyed side effect below is gated on the SAME
+            // decision: an id `route_target` refused (stale, or resolving
+            // to a different harness's machine) must not record prompts
+            // onto the wrong machine or insert phantom rows into
+            // sessions.toml via `update_session_harness_id`.
+            let routed = registry.route_hook_event(kind, ev.session_id.as_deref(), &core_event);
+            let routable = routed.is_some();
+            let changes = routed.unwrap_or_default();
             // The harness pipes its full hook payload to the script
             // (Claude on stdin, Codex on argv). The forwarder
             // JSON-encodes that as a string, so `ev.payload` is a
             // `Value::String("{...}")` rather than a parsed object.
             // `decode_payload` unwraps that wrapper.
             let decoded = decode_payload(&ev.payload);
-            let harness_session_id = ev
-                .session_id
-                .as_deref()
-                .zip(extract_harness_session_id(kind, decoded.as_ref()))
-                .map(|(sid, hid)| (sid.to_string(), hid));
+            let harness_session_id = if routable {
+                ev.session_id
+                    .as_deref()
+                    .zip(extract_harness_session_id(kind, decoded.as_ref()))
+                    .map(|(sid, hid)| (sid.to_string(), hid))
+            } else {
+                None
+            };
             // The `session_id` route is strict — without it,
             // broadcast routing can't distinguish multiple Claude
             // panes, so we silently skip the prompt update rather
             // than over-write the wrong tab's subtitle.
-            let prompt_update = if ev.event == "UserPromptSubmit" {
+            let prompt_update = if routable && ev.event == "UserPromptSubmit" {
                 let extracted = extract_user_prompt(kind, decoded.as_ref());
                 debug!(
                     harness = %ev.harness,
@@ -199,7 +218,12 @@ pub async fn drive_event_socket<R: Runtime>(
             } else {
                 None
             };
-            (changes, prompt_update, harness_session_id)
+            Drained {
+                changes,
+                prompt_update,
+                harness_session_id,
+                routable,
+            }
         };
         // Persist `harness_session_id` BEFORE emitting any prompt
         // update on the bus. The bridge task that re-emits
@@ -239,13 +263,30 @@ pub async fn drive_event_socket<R: Runtime>(
             let _ = bus.prompt_tx.send(update);
         }
 
-        // Surface every permission-needed event to the webview. Some
-        // harnesses provide a replyable `request_id`; others are observation-
-        // only and should still produce a focus-the-pane notification.
-        if let Some(payload) = build_permission_notification_event(&ev) {
-            if let Err(e) = app.emit("notification-event", &payload) {
-                warn!(error=%e, "notification-event emit failed");
+        // Surface permission-needed events to the webview. Some harnesses
+        // provide a replyable `request_id`; others are observation-only and
+        // should still produce a focus-the-pane notification.
+        //
+        // Gate: routable (a machine will enter `waiting`, whose exit clears
+        // the badge) OR replyable (`request_id` present — the request is
+        // parked, so the user can answer it from the UI even when no state
+        // machine exists, e.g. an adopted orphan/ghost session; and if
+        // ignored, the socket sweeper's `PermissionExpired` clears the
+        // badge). Only an unroutable AND unreplyable request is suppressed:
+        // no pane would ever show it as waiting and nothing could ever
+        // clear its badge.
+        if routable || ev.request_id.is_some() {
+            if let Some(payload) = build_permission_notification_event(&ev) {
+                if let Err(e) = app.emit("notification-event", &payload) {
+                    warn!(error=%e, "notification-event emit failed");
+                }
             }
+        } else if ev.event == "PermissionRequest" {
+            debug!(
+                harness = %ev.harness,
+                session_id = ?ev.session_id,
+                "permission request for unroutable, unreplyable session; notification suppressed",
+            );
         }
     }
 }
