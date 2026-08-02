@@ -110,24 +110,63 @@ export function seedAcknowledged(sessionId: string): void {
   setAcknowledgedTick((n) => n + 1);
 }
 
-export function markAcknowledged(sessionId: string): void {
-  if (!sessionId) return;
-  if (acknowledgedSessions.has(sessionId)) return;
-  seedAcknowledged(sessionId);
-  // Best-effort persistence so the ack survives a webview reload / app
-  // restart. Fire-and-forget: a failed (or absent) ack write must never break
-  // the in-memory acknowledgement or throw. Routing through
-  // `Promise.resolve().then(invoke)` also absorbs a synchronous throw and the
-  // non-thenable return `invoke` yields under vitest/jsdom (no Tauri runtime).
-  void Promise.resolve()
+/**
+ * Acks whose `agent_ack_state` persist has not yet been confirmed on disk.
+ * The in-memory acknowledgement applies immediately; this set exists so
+ * {@link flushPendingAcks} can retry unconfirmed writes at the last-write
+ * moment before the page dies (pagehide / hidden / quit). Without it, acks
+ * queued when macOS reaps the WebContent process during a screen lock never
+ * reach `sessions.toml`, and the post-unlock reload re-surfaces every
+ * completion the user had already dismissed — the "everything needs
+ * attention" storm.
+ */
+const pendingAcks = new Set<string>();
+
+/**
+ * Persist one ack, tracking it in {@link pendingAcks} until the backend
+ * confirms. Routing through `Promise.resolve().then(invoke)` absorbs a
+ * synchronous throw and the non-thenable return `invoke` yields under
+ * vitest/jsdom (no Tauri runtime). Rejections keep the id queued for the
+ * next {@link flushPendingAcks} pass.
+ */
+function sendAck(sessionId: string): Promise<void> {
+  pendingAcks.add(sessionId);
+  return Promise.resolve()
     .then(() => invoke("agent_ack_state", { sessionId }))
+    .then(() => {
+      pendingAcks.delete(sessionId);
+    })
     .catch((e) => {
       console.warn("agent_ack_state failed", e);
     });
 }
 
+/**
+ * One bounded retry pass over every unconfirmed ack. Wired to pagehide /
+ * visibilitychange→hidden (screen lock drives the page hidden *before* the
+ * OS can reap the WebContent process) and to the quit flush — the
+ * last-write-wins moments for ack durability.
+ */
+export async function flushPendingAcks(): Promise<void> {
+  if (pendingAcks.size === 0) return;
+  await Promise.allSettled(Array.from(pendingAcks, (sessionId) => sendAck(sessionId)));
+}
+
+export function markAcknowledged(sessionId: string): void {
+  if (!sessionId) return;
+  if (acknowledgedSessions.has(sessionId)) return;
+  seedAcknowledged(sessionId);
+  void sendAck(sessionId);
+}
+
 export function unmarkAcknowledged(sessionId: string): void {
   if (!sessionId) return;
+  // Revoking the ack must also cancel any queued retry: if the original
+  // `agent_ack_state` invoke failed and the session has since re-armed
+  // (working/idle) or been removed, a later flush replaying the stale ack
+  // would mark a NEWER completion as seen — silently suppressing it from
+  // the attention rail after the next reload.
+  pendingAcks.delete(sessionId);
   if (!acknowledgedSessions.delete(sessionId)) return;
   setAcknowledgedTick((n) => n + 1);
 }
@@ -439,5 +478,6 @@ export function __resetAgentStoreForTests(): void {
     sessions: {},
   });
   acknowledgedSessions.clear();
+  pendingAcks.clear();
   setAcknowledgedTick(0);
 }
