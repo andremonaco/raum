@@ -10,15 +10,34 @@
  * CodeMirror extension set).
  */
 
-import { Component, Show, createEffect, createSignal, onCleanup } from "solid-js";
+import {
+  Component,
+  Show,
+  createEffect,
+  createMemo,
+  createSignal,
+  on,
+  onCleanup,
+  untrack,
+} from "solid-js";
 import { Portal } from "solid-js/web";
 import { invoke } from "@tauri-apps/api/core";
 
 // CodeMirror 6 core
 import { basicSetup } from "codemirror";
 import { EditorView, keymap } from "@codemirror/view";
-import { EditorState, type Extension } from "@codemirror/state";
+import { EditorState, Prec, type Extension } from "@codemirror/state";
 import { defaultKeymap, historyKeymap } from "@codemirror/commands";
+import {
+  SearchQuery,
+  findNext,
+  findPrevious,
+  getSearchQuery,
+  replaceAll,
+  replaceNext,
+  search,
+  setSearchQuery,
+} from "@codemirror/search";
 
 // Languages
 import { javascript } from "@codemirror/lang-javascript";
@@ -30,7 +49,16 @@ import { json } from "@codemirror/lang-json";
 import { python } from "@codemirror/lang-python";
 
 import { Button } from "./ui/button";
+import { FindBar, type FindBarHandle } from "./ui/find-bar";
 import { loadCodeMirrorTheme } from "../lib/theme/cmTheme";
+import {
+  EMPTY_SEARCH_STATS,
+  MATCH_COUNT_CAP,
+  matchIndexAt,
+  searchStats,
+  selectionIsMatch,
+} from "../lib/editorSearch";
+import { useKeymap } from "../lib/keymapContext";
 import { tildify } from "../lib/pathDisplay";
 import { getCurrentTheme, subscribeThemeChange } from "../lib/theme/themeController";
 
@@ -96,6 +124,16 @@ const raumEditorTheme = EditorView.theme({
   ".cm-focused": {
     outline: "none",
   },
+  // Find-bar match highlights. Sourced from raum's own tokens rather than the
+  // loaded VSCode theme so they read the same across every theme.
+  ".cm-searchMatch": {
+    backgroundColor: "color-mix(in oklab, var(--warning) 22%, transparent)",
+    borderRadius: "2px",
+  },
+  ".cm-searchMatch.cm-searchMatch-selected": {
+    backgroundColor: "color-mix(in oklab, var(--warning) 45%, transparent)",
+    outline: "1px solid color-mix(in oklab, var(--warning) 70%, transparent)",
+  },
 });
 
 // ---------------------------------------------------------------------------
@@ -125,8 +163,23 @@ export const FileEditorModal: Component<FileEditorModalProps> = (props) => {
   // the modal renders immediately on open).
   const [cmTheme, setCmTheme] = createSignal<Extension | null>(null);
 
+  // Find / replace bar state. The bar is presentational; the query lives here
+  // and is pushed into CodeMirror's search state on every change.
+  const [findOpen, setFindOpen] = createSignal(false);
+  const [findQuery, setFindQuery] = createSignal("");
+  const [replaceText, setReplaceText] = createSignal("");
+  const [showReplace, setShowReplace] = createSignal(false);
+  const [caseSensitive, setCaseSensitive] = createSignal(false);
+  const [useRegexp, setUseRegexp] = createSignal(false);
+  const [stats, setStats] = createSignal(EMPTY_SEARCH_STATS);
+  // Bumped whenever the EditorView is rebuilt (theme / content change) so the
+  // query-sync effect re-applies against the fresh instance instead of
+  // silently detaching.
+  const [viewVersion, setViewVersion] = createSignal(0);
+
   let editorContainerRef: HTMLDivElement | undefined;
   let editorView: EditorView | undefined;
+  let findBar: FindBarHandle | undefined;
   let initialContent = "";
   let flashTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -187,11 +240,68 @@ export const FileEditorModal: Component<FileEditorModalProps> = (props) => {
     const extensions: Extension[] = [
       basicSetup,
       keymap.of([...defaultKeymap, ...historyKeymap]),
+      // Installs the search state field + match decorations. We never call
+      // `openSearchPanel`, so CodeMirror's own panel never renders — the raum
+      // find bar drives the same state through `setSearchQuery`.
+      search({ top: true }),
+      // Take find-related keys away from `basicSetup`'s search keymap (which
+      // would pop CodeMirror's own unstyled panel) and route them to the raum
+      // bar. `Prec.high` is required: `basicSetup` sits earlier in the array
+      // and would otherwise win.
+      Prec.high(
+        keymap.of([
+          {
+            key: "Mod-f",
+            preventDefault: true,
+            run: () => {
+              openFind();
+              return true;
+            },
+          },
+          {
+            key: "Mod-Alt-f",
+            preventDefault: true,
+            run: () => {
+              setShowReplace(true);
+              openFind();
+              return true;
+            },
+          },
+          {
+            key: "Mod-g",
+            preventDefault: true,
+            run: (view) => {
+              if (findOpen()) findNext(view);
+              else openFind();
+              return true;
+            },
+          },
+          {
+            key: "Shift-Mod-g",
+            preventDefault: true,
+            run: (view) => {
+              if (findOpen()) findPrevious(view);
+              else openFind();
+              return true;
+            },
+          },
+        ]),
+      ),
       raumEditorTheme,
       EditorView.lineWrapping,
       EditorView.updateListener.of((update) => {
         if (update.docChanged) {
           setDirty(update.state.doc.toString() !== initialContent);
+        }
+        // Keep the match counter honest after navigation and replacements.
+        // A cursor move can't change the total, so it only re-derives the
+        // ordinal — walking the prefix instead of rescanning the document on
+        // every arrow key.
+        if ((update.docChanged || update.selectionSet) && untrack(findOpen)) {
+          const query = getSearchQuery(update.state);
+          if (!query.valid) setStats(EMPTY_SEARCH_STATS);
+          else if (update.docChanged) setStats(searchStats(update.state, query));
+          else setStats((prev) => ({ ...prev, index: matchIndexAt(update.state, query) }));
         }
       }),
     ];
@@ -202,7 +312,123 @@ export const FileEditorModal: Component<FileEditorModalProps> = (props) => {
       state: EditorState.create({ doc: text, extensions }),
       parent: editorContainerRef,
     });
+    setViewVersion((v) => v + 1);
   });
+
+  // ---------------------------------------------------------------------
+  // Find / replace
+  // ---------------------------------------------------------------------
+
+  const buildQuery = (): SearchQuery =>
+    new SearchQuery({
+      search: findQuery(),
+      // Untracked: the replacement string cannot change the match set, so it
+      // must not be a dependency of the query-sync effect below — otherwise
+      // every Replace-box keystroke re-dispatches the query, jumps the
+      // selection via `findNext`, and re-walks the document in
+      // `searchStats`. A dedicated effect (further down) pushes replacement
+      // changes into CodeMirror without any of those side effects.
+      replace: untrack(replaceText),
+      caseSensitive: caseSensitive(),
+      regexp: useRegexp(),
+      // Without this, CodeMirror rewrites `\n`, `\r`, `\t` and `\\` in BOTH
+      // the query and the replacement: searching for a Windows path would
+      // silently look for a tab, and `\\` in Replace All would eat backslashes
+      // out of the file. Plain mode therefore stays literal — matching the
+      // diff viewer behind the same-looking bar. Regexp mode keeps the escapes,
+      // where users expect `\n` and `$1` to mean something.
+      literal: !useRegexp(),
+    });
+
+  // Push the bar's query into the editor whenever it changes, and re-apply it
+  // after a view rebuild. Closing the bar clears the query so the highlights
+  // go with it.
+  createEffect(() => {
+    viewVersion();
+    const open = findOpen();
+    const query = open ? buildQuery() : new SearchQuery({ search: "" });
+    const view = editorView;
+    if (!view) return;
+    view.dispatch({ effects: setSearchQuery.of(query) });
+    if (!open || !query.valid) {
+      setStats(EMPTY_SEARCH_STATS);
+      return;
+    }
+    // Find-as-you-type: jump to the next match unless we're already on one.
+    if (!selectionIsMatch(view.state, query)) findNext(view);
+    setStats(searchStats(view.state, query));
+  });
+
+  // Replacement-only sync: push the new replace string into CodeMirror's
+  // query (replaceNext/replaceAll read it from there) WITHOUT the find
+  // side effects above — no selection jump, no document re-walk.
+  createEffect(
+    on(
+      replaceText,
+      () => {
+        if (!untrack(findOpen)) return;
+        const view = editorView;
+        if (!view) return;
+        view.dispatch({ effects: setSearchQuery.of(untrack(buildQuery)) });
+      },
+      { defer: true },
+    ),
+  );
+
+  // Memoized so the find bar's `invalid` prop doesn't compile a fresh
+  // SearchQuery (a RegExp in regexp mode) on every unrelated re-evaluation.
+  const queryInvalid = createMemo(() => findQuery().length > 0 && !buildQuery().valid);
+
+  const openFind = (): void => {
+    if (findOpen()) {
+      findBar?.focus();
+      return;
+    }
+    // Seed from a short single-line selection, like every other editor.
+    const view = editorView;
+    const sel = view?.state.selection.main;
+    if (view && sel && !sel.empty && sel.to - sel.from <= 200) {
+      const selected = view.state.sliceDoc(sel.from, sel.to);
+      if (!selected.includes("\n")) setFindQuery(selected);
+    }
+    setFindOpen(true);
+  };
+
+  const closeFind = (): void => {
+    setFindOpen(false);
+    editorView?.focus();
+  };
+
+  const replaceOne = (): void => {
+    const view = editorView;
+    if (!view) return;
+    const query = getSearchQuery(view.state);
+    if (!query.valid) return;
+    // `replaceNext` only replaces when the selection exactly covers a match;
+    // otherwise it just steps. Land on one first so the button always replaces.
+    if (!selectionIsMatch(view.state, query)) findNext(view);
+    replaceNext(view);
+  };
+
+  // ⌘F routes here while the modal is open. The keymap stack is
+  // last-registered-wins, so the spotlight dock gets the binding back the
+  // moment this modal closes.
+  const keymapApi = useKeymap();
+  createEffect(() => {
+    if (!props.open) return;
+    onCleanup(keymapApi.register("global-search", openFind));
+  });
+
+  // Reset the bar between files.
+  createEffect(
+    on(
+      () => props.path,
+      () => {
+        setFindOpen(false);
+        setStats(EMPTY_SEARCH_STATS);
+      },
+    ),
+  );
 
   onCleanup(() => {
     unsubscribeTheme();
@@ -236,9 +462,17 @@ export const FileEditorModal: Component<FileEditorModalProps> = (props) => {
       e.preventDefault();
       void save();
     }
-    if (e.key === "Escape" && !dirty()) {
-      e.preventDefault();
-      props.onClose();
+    if (e.key === "Escape") {
+      // The find bar goes first — only a second Escape closes the modal.
+      if (findOpen()) {
+        e.preventDefault();
+        closeFind();
+        return;
+      }
+      if (!dirty()) {
+        e.preventDefault();
+        props.onClose();
+      }
     }
   }
 
@@ -315,6 +549,35 @@ export const FileEditorModal: Component<FileEditorModalProps> = (props) => {
               class="h-full w-full overflow-auto"
               classList={{ "opacity-0": loading() || !!error() }}
             />
+            {/* Mounted purely on `findOpen` — gating on `error()` too would
+                let a failed save tear the bar down while `findOpen` stays
+                true, stranding the handle and swallowing the next Escape. */}
+            <Show when={findOpen()}>
+              <FindBar
+                ref={(handle) => (findBar = handle)}
+                query={findQuery()}
+                onQueryChange={setFindQuery}
+                placeholder="Find in file"
+                caseSensitive={caseSensitive()}
+                onToggleCaseSensitive={() => setCaseSensitive((v) => !v)}
+                regexp={useRegexp()}
+                onToggleRegexp={() => setUseRegexp((v) => !v)}
+                count={stats().count}
+                index={stats().index}
+                capped={stats().capped}
+                capNote={`Counting stopped at ${MATCH_COUNT_CAP} matches — navigation still covers the whole file.`}
+                invalid={queryInvalid()}
+                onNext={() => editorView && findNext(editorView)}
+                onPrev={() => editorView && findPrevious(editorView)}
+                onClose={closeFind}
+                replace={replaceText()}
+                onReplaceChange={setReplaceText}
+                showReplace={showReplace()}
+                onToggleReplace={() => setShowReplace((v) => !v)}
+                onReplaceOne={replaceOne}
+                onReplaceAll={() => editorView && replaceAll(editorView)}
+              />
+            </Show>
           </div>
 
           {/* Footer */}
