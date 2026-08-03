@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.15](https://github.com/andremonaco/raum/releases/tag/v0.1.15) - 2026-08-03
+
+### Fixed
+
+- fix(lint): drop redundant refs flagged by clippy 1.97
+- perf(snapshots): move terminal snapshots over raw-byte IPC
+- perf(wake): thin out the focus edge — throttle reconcile, stagger WebGL restore
+- fix(webview): probe patiently before reloading a page that may just be waking
+- fix(hooks): expire parked permission requests instead of leaking them
+- fix(agents): drop unroutable hook events instead of broadcasting them
+
+### Other
+
+- docs: correct stale constants and architecture notes
+
+
 ## [0.1.14](https://github.com/andremonaco/raum/releases/tag/v0.1.14) - 2026-07-05
 
 ### Fixed
