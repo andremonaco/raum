@@ -29,6 +29,14 @@
  * *uncompressed* payload, so the cap is reached at the real byte size of the VT
  * text, not an imagined compressed size.
  *
+ * Transport: the payload rides the IPC as raw bytes in both directions (the
+ * on-disk format is unchanged). Persist passes the `Uint8Array` as the whole
+ * invoke payload — Tauri sends ArrayBuffer views as the raw request body —
+ * with the session id in an `x-raum-session-id` header; load resolves to an
+ * `ArrayBuffer` (empty = no snapshot). The `number[]` shapes are kept as
+ * fallbacks for the postMessage transport, where raw bodies degrade to JSON
+ * number arrays.
+ *
  * Trim story: truncating a VT stream at an arbitrary byte boundary corrupts the
  * parser (a partial CSI/OSC eats the next few KB of input as parameters), so we
  * never byte-trim. On overflow we re-serialize with a smaller scrollback budget
@@ -132,9 +140,8 @@ export async function persistTerminalSnapshot(
     const bytes = serializeAt(source.addon, scrollback, excludeAltBuffer);
     if (!bytes || bytes.byteLength === 0) return;
     try {
-      const accepted = await invoke<boolean>("terminal_snapshot_persist", {
-        sessionId,
-        bytes: Array.from(bytes),
+      const accepted = await invoke<boolean>("terminal_snapshot_persist", bytes, {
+        headers: { "x-raum-session-id": sessionId },
       });
       if (accepted) return;
     } catch (err) {
@@ -261,9 +268,15 @@ export async function flushAllTerminalSnapshotsNow(): Promise<void> {
 export async function loadTerminalSnapshotBytes(sessionId: string): Promise<Uint8Array | null> {
   if (!sessionId) return null;
   try {
-    const result = await invoke<number[] | null>("terminal_snapshot_load", { sessionId });
-    if (!result || result.length === 0) return null;
-    return Uint8Array.from(result);
+    const result = await invoke<ArrayBuffer | number[] | null>("terminal_snapshot_load", {
+      sessionId,
+    });
+    if (!result) return null;
+    // `Array.isArray` (not `instanceof ArrayBuffer`) so the discrimination
+    // survives cross-realm buffers (e.g. Node-realm ArrayBuffers under jsdom).
+    const bytes = Array.isArray(result) ? Uint8Array.from(result) : new Uint8Array(result);
+    if (bytes.byteLength === 0) return null;
+    return bytes;
   } catch (err) {
     if (import.meta.env.DEV) {
       console.warn("[snapshot] load failed", { sessionId, err });
@@ -285,9 +298,8 @@ export async function moveTerminalSnapshot(
   const bytes = await loadTerminalSnapshotBytes(oldSessionId);
   if (!bytes) return;
   try {
-    await invoke<boolean>("terminal_snapshot_persist", {
-      sessionId: newSessionId,
-      bytes: Array.from(bytes),
+    await invoke<boolean>("terminal_snapshot_persist", bytes, {
+      headers: { "x-raum-session-id": newSessionId },
     });
     await invoke("terminal_snapshot_delete", { sessionId: oldSessionId }).catch(() => {});
   } catch (err) {

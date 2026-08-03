@@ -120,6 +120,61 @@ describe("rendererScheduler", () => {
     expect(snapshot().find((s) => s.paneId === "a")?.renderer).toBe("webgl");
   });
 
+  it("re-promotion runs MRU-first and preserves pre-background mru order", async () => {
+    // Track the order WebGL addons are installed. The mocked WebglAddon is
+    // recognizable by its `onContextLoss` method.
+    const webglOrder: string[] = [];
+    const trackingTerminal = (id: string): Terminal =>
+      ({
+        loadAddon: (addon: { onContextLoss?: unknown }) => {
+          if (typeof addon.onContextLoss === "function") webglOrder.push(id);
+        },
+      }) as unknown as Terminal;
+
+    registerPane("a", trackingTerminal("a"));
+    registerPane("b", trackingTerminal("b"));
+    registerPane("c", trackingTerminal("c"));
+    await requestWebgl("a");
+    await requestWebgl("b");
+    await requestWebgl("c"); // c is most recently used
+
+    const mruBefore = new Map(snapshot().map((s) => [s.paneId, s.mru]));
+    demoteAllForBackground();
+    webglOrder.length = 0;
+    await endBackgroundDemotion();
+
+    // The pane the user last touched gets its WebGL context back first…
+    expect(webglOrder).toEqual(["c", "b", "a"]);
+    // …and the LRU bookkeeping is untouched by the re-promotion pass.
+    for (const s of snapshot()) {
+      expect(s.mru).toBe(mruBefore.get(s.paneId));
+    }
+  });
+
+  it("a re-hide mid-re-promotion leaves unreached panes marked for the next wake", async () => {
+    registerPane("a", fakeTerminal());
+    registerPane("b", fakeTerminal());
+    registerPane("c", fakeTerminal());
+    await requestWebgl("a");
+    await requestWebgl("b");
+    await requestWebgl("c");
+    demoteAllForBackground();
+
+    // Wake begins, then a second hide lands while the loop is mid-flight
+    // (second lock, occlusion flicker). The aborted run must not strip the
+    // pendingRepromote marks of panes it never reached.
+    const firstRun = endBackgroundDemotion();
+    demoteAllForBackground();
+    await firstRun;
+    const midCount = snapshot().filter((s) => s.renderer === "webgl").length;
+    expect(midCount).toBeLessThanOrEqual(1);
+
+    // The next wake must recover ALL panes, not just the ones the aborted
+    // run happened to reach.
+    await endBackgroundDemotion();
+    expect(snapshot().every((s) => s.renderer === "webgl")).toBe(true);
+  });
+
   it("re-promotion skips canvas-only panes and untouched ones", async () => {
     registerPane("webgl-pane", fakeTerminal());
     registerPane("canvas-pane", fakeTerminal());

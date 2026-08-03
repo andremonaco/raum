@@ -23,11 +23,15 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
+import { flushPendingAcks } from "../stores/agentStore";
 import { flushActiveLayoutNow } from "../stores/runtimeLayoutStore";
 import { flushAllTerminalSnapshotsNow } from "./terminalSnapshotPersistence";
 
 /** Flush every debounced writer, swallowing per-writer errors so one failure
- *  doesn't skip the others (or the ack). Exposed for tests. */
+ *  doesn't skip the others (or the ack). Ordered by importance against the
+ *  backend's bounded quit-flush wait: layout first (losing it resurrects
+ *  panes as dock orphans), snapshots second, agent-state acks last (losing
+ *  one only re-surfaces an already-seen completion). Exposed for tests. */
 export async function flushAllForQuit(): Promise<void> {
   try {
     await flushActiveLayoutNow();
@@ -38,6 +42,11 @@ export async function flushAllForQuit(): Promise<void> {
     await flushAllTerminalSnapshotsNow();
   } catch (e) {
     console.warn("flushAllTerminalSnapshotsNow (quit) failed", e);
+  }
+  try {
+    await flushPendingAcks();
+  } catch (e) {
+    console.warn("flushPendingAcks (quit) failed", e);
   }
 }
 

@@ -2,12 +2,14 @@ import { Component, Show, createMemo } from "solid-js";
 
 import { kindDisplayLabel } from "../../lib/agentKind";
 import { type Rect } from "../../lib/layoutTree";
+import { formatPromptPreview } from "../../lib/promptPreview";
 import { resolveHarnessAutoLabel } from "../../lib/terminalTabLabel";
 import { agentStore } from "../../stores/agentStore";
 import { projectBySlug } from "../../stores/projectStore";
 import { terminalStore } from "../../stores/terminalStore";
 import { HARNESS_ICONS } from "../icons";
-import { Tooltip, TooltipContent, TooltipPortal, TooltipTrigger } from "../ui/tooltip";
+import { Tooltip, TooltipPortal, TooltipTrigger } from "../ui/tooltip";
+import { TabTooltipContent } from "./tab-tooltip";
 import { rectStyle } from "./utils";
 
 export const ProjectedSessionFrame: Component<{ sessionId: string; rect: Rect | null }> = (
@@ -82,21 +84,10 @@ export const ProjectedSessionFrame: Component<{ sessionId: string; rect: Rect | 
                       <span class="min-w-0 flex-1 truncate normal-case">{label()}</span>
                     </TooltipTrigger>
                     <TooltipPortal>
-                      <TooltipContent class="max-w-md">
-                        <Show when={label()}>
-                          <div class="text-[10px] font-medium uppercase tracking-wide">
-                            {label()}
-                          </div>
-                        </Show>
-                        <Show when={terminal()?.lastPrompt?.text}>
-                          <div
-                            class="whitespace-pre-wrap text-[11px] leading-snug text-popover-foreground/85"
-                            classList={{ "mt-1": !!label() }}
-                          >
-                            {terminal()?.lastPrompt?.text}
-                          </div>
-                        </Show>
-                      </TooltipContent>
+                      <TabTooltipContent
+                        label={label()}
+                        prompt={formatPromptPreview(terminal()?.lastPrompt?.text)}
+                      />
                     </TooltipPortal>
                   </Tooltip>
                 </div>

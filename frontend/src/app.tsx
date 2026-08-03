@@ -10,6 +10,8 @@ import { SpotlightDock } from "./components/spotlight-dock";
 import { Toaster } from "./components/ui/sonner";
 import { KeymapProvider, useKeymapAction } from "./lib/keymapContext";
 import {
+  flushActiveLayoutNow,
+  hasPendingActiveSave,
   markActiveLayoutHydrated,
   markActiveLayoutHydrationSettled,
   openActiveLayoutSaveGate,
@@ -29,6 +31,7 @@ import { installFileDrop } from "./lib/fileDrop";
 import { installPaneFocusAcknowledger } from "./lib/paneFocusAcknowledger";
 import { installWebviewHealth } from "./lib/webviewHealth";
 import { installBackgroundRendererDemotion } from "./lib/rendererScheduler";
+import { flushPendingAcks } from "./stores/agentStore";
 import { previewOnboarding, setPreviewOnboarding } from "./lib/devOnboardingPreview";
 import { startShellContextPoller } from "./lib/shellContextPoller";
 import {
@@ -316,6 +319,32 @@ const App: Component = () => {
         stopWebviewHealth = unlisten;
       })
       .catch((e) => console.warn("installWebviewHealth failed", e));
+    // Durability at the page-death edge: retry unconfirmed
+    // `agent_ack_state` writes and force the debounced layout save at the
+    // last-write moments before the page can die. Screen lock drives the
+    // page hidden *before* macOS can reap the WebContent process, so
+    // writes queued here still land — otherwise the post-unlock reload
+    // re-surfaces completions the user already dismissed, and a layout
+    // mutation inside its 500 ms debounce is lost (the dock-orphan bug).
+    // Registered BEFORE the renderer demotion below on purpose: listeners
+    // run in registration order, and these IPC calls must be queued before
+    // the demotion's synchronous canvas-rebuild work eats the remaining
+    // pre-suspension time. (Terminal snapshots are deliberately NOT
+    // flushed here — visibilitychange fires on every app switch, and a
+    // full SerializeAddon pass over every pane per Cmd-Tab is too heavy;
+    // their debounce plus the quit flush cover them.)
+    const flushBeforePageDeath = (): void => {
+      void flushPendingAcks();
+      // Only when a debounced save is actually pending — visibilitychange
+      // fires on every app switch, and rewriting an unchanged
+      // active-layout.toml per Cmd-Tab would be pure churn.
+      if (hasPendingActiveSave()) void flushActiveLayoutNow().catch(() => {});
+    };
+    const flushWhenHidden = (): void => {
+      if (document.visibilityState === "hidden") flushBeforePageDeath();
+    };
+    window.addEventListener("pagehide", flushBeforePageDeath);
+    document.addEventListener("visibilitychange", flushWhenHidden);
     // Shed WebGL contexts while the page is hidden (screen lock) to make
     // that WebContent kill less likely in the first place.
     const stopBackgroundDemotion = installBackgroundRendererDemotion();
@@ -360,6 +389,8 @@ const App: Component = () => {
       stopFileDrop?.();
       stopWebviewHealth?.();
       stopBackgroundDemotion();
+      window.removeEventListener("pagehide", flushBeforePageDeath);
+      document.removeEventListener("visibilitychange", flushWhenHidden);
       stopShellContextPoller();
       stopQuitFlush?.();
       stopFocusResync?.();

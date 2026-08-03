@@ -13,9 +13,9 @@
 | Frontend framework | Solid.js + TypeScript (ES2022) |
 | Frontend build | Vite + bun |
 | Styling | Tailwind CSS + Kobalte UI primitives + CVA |
-| Terminal renderer | xterm.js (10 000-line scrollback) |
+| Terminal renderer | xterm.js (100 000-line scrollback) |
 | Code editor | CodeMirror v6 |
-| Grid layout | gridstack |
+| Grid layout | custom BSP split-tree grid (`frontend/src/components/terminal-grid/`) |
 | Async runtime | Tokio (full features) |
 | File watching | notify (macOS kqueue) |
 | Package manager | bun (frontend), Cargo workspace resolver v2 |
@@ -25,7 +25,7 @@
 ```
 crates/
   raum-core/       # shared types, config model, AgentAdapter trait, state machine
-  raum-tmux/       # tmux session lifecycle, PTY output coalescer (12 ms tick / 16 KB flush)
+  raum-tmux/       # tmux session lifecycle, PTY output coalescer (4 ms quiet-gap / 16 ms max-hold / 128 KB flush)
   raum-hydration/  # worktree creation, copy/symlink manifests, path-pattern grammar
   raum-hooks/      # harness hook-script writer, Unix domain IPC socket server
 src-tauri/
@@ -113,11 +113,11 @@ Install hooks once with `task hooks:install` so the chain runs automatically on 
 ## Architecture: how the pieces connect
 
 1. **Config & Projects** (`raum-core`) — `ConfigStore` debounces TOML writes (500 ms) and performs atomic file swaps. Projects have worktrees defined in the TOML; config is reloaded by the file-watcher.
-2. **Terminals** (`raum-tmux`) — `TmuxManager` owns the tmux socket. Each pane is a named tmux session. Pane I/O streams through a control-mode tmux client (`tmux -C attach`): tmux delivers the raw pane bytes losslessly (no redraw-compression) and xterm.js is the sole terminal emulator. `RAUM_TERMINAL_TRANSPORT=pty` falls back to the legacy PTY-rendered client. `StreamCoalescer` batches output (8 ms tick, 128 KB flush) before forwarding to the Tauri event bus.
+2. **Terminals** (`raum-tmux`) — `TmuxManager` owns the tmux socket. Each pane is a named tmux session. Pane I/O streams through a control-mode tmux client (`tmux -C attach`): tmux delivers the raw pane bytes losslessly (no redraw-compression) and xterm.js is the sole terminal emulator. `RAUM_TERMINAL_TRANSPORT=pty` falls back to the legacy PTY-rendered client. `StreamCoalescer` batches output (flushes on a 4 ms quiet gap, capped at 16 ms max-hold, or 128 KB flush) before forwarding to the Tauri event bus.
 3. **Hook injection** (`raum-hooks`) — `HookScriptWriter` injects `<raum-managed>…</raum-managed>` JSON blocks into harness config files (Claude Code `settings.json`, Codex config, etc.) so hooks survive edits outside raum.
 4. **Worktree hydration** (`raum-hydration`) — copies or symlinks files into new git worktrees using a path-pattern DSL; branch slugs derived from a configurable prefix (none / username / custom).
 5. **Tauri IPC** (`src-tauri/commands/`) — thin handlers that delegate to the four crates via `AppHandleState`. Frontend talks exclusively through `invoke()` calls.
-6. **Frontend** (`frontend/`) — Solid.js stores mirror backend state. `TerminalGrid` uses gridstack for drag-and-resize pane layout. `TerminalPane` wraps xterm.js and streams PTY output via Tauri events.
+6. **Frontend** (`frontend/`) — Solid.js stores mirror backend state. `TerminalGrid` is a custom BSP split-tree grid (absolute-positioned persistent panes, drag-and-drop splits/dividers). `TerminalPane` wraps xterm.js and streams PTY output via Tauri events.
 
 ## CI
 
@@ -132,11 +132,12 @@ Install hooks once with `task hooks:install` so the chain runs automatically on 
 
 | Constant | Value | Location |
 |---|---|---|
-| Coalesce tick | 8 ms | `raum-tmux` |
+| Coalesce quiet gap | 4 ms | `raum-tmux` |
+| Coalesce max-hold | 16 ms | `raum-tmux` |
 | Flush threshold | 131 072 bytes | `raum-tmux` |
-| Silence threshold | 500 ms | `raum-core` |
+| Silence threshold (default) | 10 000 ms | `raum-core` |
 | Config write debounce | 500 ms | `raum-core` |
-| xterm scrollback | 10 000 lines | frontend |
+| xterm scrollback | 100 000 lines | frontend + `raum-core` |
 | Quickfire history | 100 entries | frontend |
 
 ## Dependencies & Licensing

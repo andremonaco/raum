@@ -130,48 +130,102 @@ impl AgentRegistry {
         self.machines.remove(session_id).is_some()
     }
 
-    /// Apply a hook event to every state machine whose harness matches
-    /// `kind`. Returns the subset of resulting transitions (`None` when
-    /// the machine's state did not change). Called by the event-socket
-    /// drain task when no session_id is present on the wire (legacy
-    /// fire-and-forget events).
-    pub fn apply_hook_to_matching(
-        &mut self,
-        kind: AgentKind,
-        event: &CoreHookEvent,
-    ) -> Vec<AgentStateChanged> {
-        let mut out = Vec::new();
-        for machine in self.machines.values_mut() {
-            if machine.harness() != kind {
-                continue;
-            }
-            if let Some(change) = machine.on_hook_event(event) {
-                out.push(change);
-            }
+    /// Resolve which registered machine a hook event for `kind` /
+    /// `session_id` routes to, if any. The single source of truth for the
+    /// routing rules — used by [`Self::route_hook_event`] and by the
+    /// event-socket drain to decide whether a permission notification may
+    /// be surfaced at all (a badge for a session no machine represents
+    /// would be un-clearable).
+    ///
+    /// 1. A `Some(sid)` that resolves to a machine of the matching harness
+    ///    routes to that machine.
+    /// 2. Any other `Some(sid)` — unknown or harness-mismatched — routes
+    ///    **nowhere**. A concrete-but-wrong id means the sender's env is
+    ///    stale (killed pane, respawned session); applying its events to a
+    ///    *different* session's machine would flip an unrelated pane.
+    /// 3. `None` routes to the **sole** machine of that harness if exactly
+    ///    one exists — the legacy no-`$RAUM_SESSION` case, where a single
+    ///    candidate leaves no room for ambiguity *within the registry*.
+    ///    With zero or ≥2 candidates it routes nowhere. Known limitation:
+    ///    the registry is cross-project, so a session-less sender that is
+    ///    NOT the sole registered machine (a harness hand-started with the
+    ///    socket env but no session env, in another project) would be
+    ///    attributed to it. Accepted: it requires deliberately running a
+    ///    harness outside raum's spawn path while exactly one managed pane
+    ///    of that harness exists, and the blast radius is that one pane.
+    #[must_use]
+    pub fn route_target(&self, kind: AgentKind, session_id: Option<&str>) -> Option<String> {
+        if let Some(sid) = session_id {
+            return self
+                .machines
+                .get(sid)
+                .filter(|m| m.harness() == kind)
+                .map(|_| sid.to_string());
         }
-        out
+        let mut it = self.machines.iter().filter(|(_, m)| m.harness() == kind);
+        match (it.next(), it.next()) {
+            (Some((sid, _)), None) => Some(sid.clone()),
+            _ => None,
+        }
     }
 
-    /// Phase-2 session-scoped routing: apply `event` to only the
-    /// machine matching `session_id`, if one exists. Falls back to
-    /// broadcasting by harness when the session is unknown — some
-    /// hook events race the spawn path and arrive before
-    /// `agent_spawn` has registered the state machine.
-    pub fn apply_hook_for_session(
+    /// Route a hook event to the state machine it belongs to (per
+    /// [`Self::route_target`]). `None` means the event was **unroutable**
+    /// and has been dropped; `Some(transitions)` means it reached a machine
+    /// (the vec is empty when the machine's state did not change). The
+    /// distinction lets callers gate side effects — permission
+    /// notifications, prompt recording — on the same routing decision
+    /// without resolving the route twice.
+    ///
+    /// Unroutable events are **dropped**, never broadcast. The old
+    /// behavior — applying an unknown-session event to every machine of
+    /// the harness across all projects — meant a single stray `Stop` /
+    /// `PermissionRequest` (harness run outside raum, stale env after a
+    /// respawn, killed session) flipped *every* pane at once: the
+    /// post-screen-lock "everything needs attention" storm. A wrong
+    /// routing is strictly worse than a missed one here; the silence
+    /// heuristic still recovers coarse Working/Idle state.
+    pub fn route_hook_event(
         &mut self,
         kind: AgentKind,
-        session_id: &str,
+        session_id: Option<&str>,
         event: &CoreHookEvent,
-    ) -> Vec<AgentStateChanged> {
-        if let Some(machine) = self.machines.get_mut(session_id) {
-            if machine.harness() == kind {
-                if let Some(change) = machine.on_hook_event(event) {
-                    return vec![change];
-                }
-                return Vec::new();
+    ) -> Option<Vec<AgentStateChanged>> {
+        let Some(target) = self.route_target(kind, session_id) else {
+            let machine_count = self
+                .machines
+                .values()
+                .filter(|m| m.harness() == kind)
+                .count();
+            if session_id.is_none() && machine_count == 0 {
+                // Normal during boot, before rehydrate has registered
+                // machines — not worth a warn.
+                tracing::debug!(
+                    harness = ?kind,
+                    event = %event.event,
+                    "hook event with no session and no machines of this harness; dropped",
+                );
+            } else {
+                tracing::warn!(
+                    harness = ?kind,
+                    event = %event.event,
+                    session_id = ?session_id,
+                    machine_count,
+                    "hook event for unroutable session dropped; refusing to broadcast or guess",
+                );
             }
+            return None;
+        };
+        if session_id.is_none() {
+            tracing::debug!(
+                harness = ?kind,
+                event = %event.event,
+                routed_to = %target,
+                "session-less hook event routed to the sole machine of this harness",
+            );
         }
-        self.apply_hook_to_matching(kind, event)
+        let machine = self.machines.get_mut(&target)?;
+        Some(machine.on_hook_event(event).into_iter().collect())
     }
 
     /// Walk every registered machine and advance it via the silence
@@ -214,6 +268,24 @@ impl AgentRegistry {
         };
         machine.arm_activity();
         true
+    }
+
+    /// Re-arm output-based recovery when a parked permission request expires
+    /// unanswered (`PermissionExpired`): the user will answer in the
+    /// harness's own TUI, so the resulting output burst must be able to
+    /// reclaim the machine out of `Waiting`. Resolves the target via
+    /// [`Self::route_target`] so the legacy no-`$RAUM_SESSION` sole-machine
+    /// case is covered too — those are exactly the sessions most likely to
+    /// park a session-less request.
+    pub fn arm_activity_for_permission_expiry(
+        &mut self,
+        kind: AgentKind,
+        session_id: Option<&str>,
+    ) -> bool {
+        let Some(target) = self.route_target(kind, session_id) else {
+            return false;
+        };
+        self.arm_activity_for_submit(&target)
     }
 
     /// The user pressed the abort key (Ctrl-C) in this pane. No harness

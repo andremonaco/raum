@@ -68,11 +68,12 @@ Internal constants (not exposed as keys, documented here for reference):
 
 | Constant                         | Value    | Purpose |
 | -------------------------------- | -------- | ------- |
-| `DEFAULT_COALESCE_INTERVAL_MS`   | `12`     | Output-coalescer tick (§3.3). |
-| `DEFAULT_COALESCE_BYTES`         | `16384`  | Coalescer flush threshold (§3.3). |
-| `DEFAULT_SILENCE_THRESHOLD_MS`   | `500`    | Silence-heuristic fallback (§7.7). |
+| `QUIET_MS` (raum-tmux)           | `4`      | Coalescer quiet-gap flush: ship a batch once output pauses this long (§3.3). |
+| `MAX_HOLD_MS` (raum-tmux)        | `16`     | Coalescer max-hold cap: bound latency for output that never goes quiet (§3.3). |
+| `FLUSH_BYTES` (raum-tmux)        | `131072` | Coalescer size-triggered flush threshold (§3.3). |
+| `DEFAULT_SILENCE_THRESHOLD_MS`   | `10000`  | Silence-heuristic fallback, per-harness overridable (§7.7). |
 | `DEFAULT_DEBOUNCE_MS`            | `500`    | TOML write debounce (§10.9). |
-| `XTERM_SCROLLBACK_LINES`         | `10000`  | xterm.js scrollback cap (§3.8). |
+| `XTERM_SCROLLBACK_LINES`         | `100000` | xterm.js scrollback cap (§3.8). |
 | `QUICKFIRE_HISTORY_LIMIT`        | `100`    | Quick-fire history size (§9.6). |
 
 ---

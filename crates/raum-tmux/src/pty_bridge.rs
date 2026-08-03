@@ -264,10 +264,10 @@ pub fn attach_via_pty(
     //   bounded channel. Stays decoupled from downstream send latency so the
     //   kernel PTY buffer keeps draining even if the WebView is busy.
     // - Coalescer thread: owns `on_data` and a `StreamCoalescer`. Batches
-    //   reads into [`FLUSH_BYTES`]-sized (or [`FLUSH_MS`]-aged) frames before
-    //   invoking the callback, so a bursty agent (e.g. Claude Code emitting a
-    //   plan as one ~50 KB write) crosses the IPC as a few large messages
-    //   instead of dozens of ~16 KB ones.
+    //   reads into [`FLUSH_BYTES`]-sized (or quiescence-bounded, see
+    //   `coalescer.rs`) frames before invoking the callback, so a bursty
+    //   agent (e.g. Claude Code emitting a plan as one ~50 KB write) crosses
+    //   the IPC as a few large messages instead of dozens of ~16 KB ones.
     //
     // Both detach. They exit cleanly on master EOF or on `on_data` returning
     // false. The coalescer force-flushes its tail buffer on shutdown so the

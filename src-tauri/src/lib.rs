@@ -19,7 +19,7 @@ use tauri::{Emitter, Manager, Runtime};
 #[cfg(target_os = "macos")]
 use tauri_plugin_decorum::WebviewWindowExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// ID of the "Settings…" item in the macOS app submenu. Clicking it emits
 /// `menu-action` with this string as the payload so the frontend can route
@@ -344,6 +344,7 @@ pub fn run() {
             // (black, dead window until app restart otherwise).
             commands::webview_health::webview_ready,
             commands::webview_health::webview_pong,
+            commands::webview_health::webview_wake_report,
         ])
         .setup(|app| {
             let main_window = app.get_webview_window("main").unwrap();
@@ -558,7 +559,7 @@ fn bootstrap_event_socket(app: &mut tauri::App) {
     let app_handle = app.handle().clone();
 
     tauri::async_runtime::spawn(async move {
-        let mut handle = match spawn_event_socket(&sock_path).await {
+        let mut handle = match spawn_event_socket(&sock_path) {
             Ok(h) => h,
             Err(e) => {
                 warn!(
@@ -977,11 +978,26 @@ fn current_nofile_soft_limit() -> u64 {
 /// that appear *after* launch (e.g. a spawn whose tracking write lost to a
 /// crash).
 fn bootstrap_reconciler(app: &mut tauri::App) {
-    use std::time::Duration;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
     const PERIODIC_INTERVAL: Duration = Duration::from_secs(300);
+    // Focus fires on every unlock and app-switch — the most contended
+    // instant of a wake (webview probes, status catch-up, frontend resync
+    // all land there). Forking `tmux list-sessions` into that stampede is
+    // redundant when a pass ran within the last minute, and even a due
+    // pass can wait out the wake edge.
+    const FOCUS_MIN_INTERVAL: Duration = Duration::from_secs(60);
+    const FOCUS_SETTLE: Duration = Duration::from_millis(1500);
 
     let handle = app.handle().clone();
     let main_window = app.get_webview_window("main");
+    // Tracks FOCUS-triggered passes only. The periodic timer deliberately
+    // does not stamp it: `run_reconcile` can block up to 60 s on the
+    // rehydrate gate, so a timer stamp taken after completion would push
+    // the focus-suppression window out by an unpredictable amount — and
+    // an occasional timer-adjacent focus pass is harmless (reconcile is
+    // idempotent and never destructive).
+    let last_focus_run: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
 
     // Periodic reconcile every 5 minutes.
     let timer_handle = handle.clone();
@@ -1003,8 +1019,21 @@ fn bootstrap_reconciler(app: &mut tauri::App) {
         let focus_handle = handle.clone();
         win.on_window_event(move |event| {
             if let tauri::WindowEvent::Focused(true) = event {
+                // Check-and-stamp before the settle sleep so rapid focus
+                // cycling collapses to one pass instead of queueing several.
+                {
+                    let Ok(mut last) = last_focus_run.lock() else {
+                        return;
+                    };
+                    if last.is_some_and(|at| at.elapsed() < FOCUS_MIN_INTERVAL) {
+                        debug!("reconcile: focus pass skipped — ran recently");
+                        return;
+                    }
+                    *last = Some(Instant::now());
+                }
                 let h = focus_handle.clone();
                 tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(FOCUS_SETTLE).await;
                     run_reconcile(&h, "focus").await;
                 });
             }
@@ -1018,10 +1047,12 @@ fn bootstrap_reconciler(app: &mut tauri::App) {
 /// WebContent process while the screen is locked (suspension + memory/GPU
 /// pressure); wry receives `webViewWebContentProcessDidTerminate:` but
 /// Tauri never registers wry's handler, so the page stays black and dead.
-/// On every `Focused(true)` we ping the page and reload the webview if no
-/// pong arrives — see `commands::webview_health` for the full story.
-/// Registered as a second `on_window_event` handler; Tauri appends
-/// listeners, so this never disturbs the orphan reaper's focus hook.
+/// On every `Focused(true)` we run a patient probe sequence and reload
+/// only after ~12 s of total silence — a suspended-but-alive page answers
+/// late, a dead one never does; see `commands::webview_health` for the
+/// full story. Registered as a second `on_window_event` handler; Tauri
+/// appends listeners, so this never disturbs the orphan reaper's focus
+/// hook.
 fn bootstrap_webview_health(app: &mut tauri::App) {
     let Some(win) = app.get_webview_window("main") else {
         warn!("bootstrap_webview_health: main window not found");

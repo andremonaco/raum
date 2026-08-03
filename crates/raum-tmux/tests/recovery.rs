@@ -542,7 +542,7 @@ async fn capture_pane_snapshot_preserves_long_scrollback() {
     assert!(
         captured.contains("raum-long-0001"),
         "full snapshot should include the oldest retained marker, got prefix: {:?}",
-        &captured.chars().take(200).collect::<String>()
+        captured.chars().take(200).collect::<String>()
     );
     assert!(
         captured.contains("raum-long-5200"),

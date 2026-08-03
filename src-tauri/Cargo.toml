@@ -77,6 +77,9 @@ notify-rust = "4"
 
 [dev-dependencies]
 tempfile = "3"
+# test-util enables tokio::test(start_paused) for the webview-health probe
+# tests, which fast-forward through the 12 s patience budget.
+tokio = { version = "1", features = ["full", "test-util"] }
 tracing-test = "0.2"
 
 [package.metadata.cargo-machete]

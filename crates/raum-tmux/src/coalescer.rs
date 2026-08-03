@@ -11,11 +11,22 @@
 //! 2. xterm.js sees each `term.write` synchronously; a long parade of small
 //!    writes blows past its internal write-buffer pacing.
 //!
-//! The coalescer batches consecutive reads into either a size-bounded
-//! ([`FLUSH_BYTES`]) or time-bounded ([`FLUSH_MS`]) frame before the IPC
-//! send, so the downstream sees fewer, uniformly-sized messages. It is pure
-//! logic — driven from the reader pipeline by `feed`, `flush_if_due`, and
-//! `force_flush`.
+//! The coalescer batches consecutive reads into a size-bounded
+//! ([`FLUSH_BYTES`]) or quiescence-bounded ([`QUIET_MS`], capped by
+//! [`MAX_HOLD_MS`]) frame before the IPC send, so the downstream sees fewer,
+//! uniformly-sized messages. It is pure logic — driven from the reader
+//! pipeline by `feed`, `flush_if_due`, and `force_flush`.
+//!
+//! The quiescence bound exists because some TUI progress renderers (e.g.
+//! `uv`, `pnpm`) redraw a multi-line block as several small, separately
+//! timed writes — one cursor-move+erase+rewrite per line — instead of one
+//! atomic write per frame. A blind fixed-interval flush can slice such a
+//! redraw in half, forwarding a partially-updated frame that xterm.js then
+//! paints, which reads as flicker/tearing even though the bytes themselves
+//! are never corrupted. Waiting for a short quiet gap after the last byte
+//! lets a whole redraw settle before it is shipped, while [`MAX_HOLD_MS`]
+//! still bounds latency for output that never goes quiet (e.g. a busy log
+//! tail).
 //!
 //! See `pty_bridge.rs` for the wiring.
 use std::time::{Duration, Instant};
@@ -24,28 +35,41 @@ use std::time::{Duration, Instant};
 ///
 /// Sized to halve the number of IPC events on heavy bursts (e.g. a shell
 /// pane running `pulumi up` or a tight `for` loop printing thousands of
-/// lines). The 8 ms time bound still drains small/interactive output
-/// promptly, so this threshold only kicks in when the producer is
-/// actually saturating the pipe.
+/// lines). The quiescence/max-hold bounds below still drain small/
+/// interactive output promptly, so this threshold only kicks in when the
+/// producer is actually saturating the pipe.
 pub const FLUSH_BYTES: usize = 128 * 1024;
 
-/// Time threshold (ms): flush a non-empty buffer when this much wall time
-/// has elapsed since the last flush.
-pub const FLUSH_MS: u64 = 8;
+/// Quiet-gap threshold (ms): flush a non-empty buffer once this much wall
+/// time has elapsed since the *last byte was fed*, i.e. output has gone
+/// quiet. Lets a redraw made of several back-to-back small writes settle
+/// into one frame instead of being cut mid-way by a fixed timer.
+pub const QUIET_MS: u64 = 4;
+
+/// Max-hold threshold (ms): flush a non-empty buffer once this much wall
+/// time has elapsed since its *first* byte, regardless of the quiet gap.
+/// Bounds worst-case latency for output that never pauses long enough to
+/// satisfy [`QUIET_MS`] on its own.
+pub const MAX_HOLD_MS: u64 = 16;
 
 /// Accumulates raw PTY bytes and flushes them into a single IPC frame when
-/// either the size or the time threshold is reached.
+/// the size threshold, the quiet gap, or the max-hold cap is reached.
 #[derive(Debug)]
 pub struct StreamCoalescer {
     buf: Vec<u8>,
-    last_flush: Instant,
+    /// When the current batch's first byte was fed; `None` while `buf` is
+    /// empty.
+    first_pending: Option<Instant>,
+    /// When the most recent byte was fed; drives the quiet-gap check.
+    last_byte: Instant,
 }
 
 impl StreamCoalescer {
     pub fn new() -> Self {
         Self {
             buf: Vec::with_capacity(FLUSH_BYTES * 2),
-            last_flush: Instant::now(),
+            first_pending: None,
+            last_byte: Instant::now(),
         }
     }
 
@@ -60,9 +84,23 @@ impl StreamCoalescer {
     where
         F: FnMut(Vec<u8>) -> bool,
     {
+        self.feed_at(chunk, Instant::now(), sink)
+    }
+
+    /// [`Self::feed`] with an injected clock — the timing tests drive the
+    /// quiet-gap / max-hold semantics with synthetic instants so they are
+    /// deterministic under CI load instead of racing `thread::sleep`.
+    fn feed_at<F>(&mut self, chunk: &[u8], now: Instant, sink: &mut F) -> bool
+    where
+        F: FnMut(Vec<u8>) -> bool,
+    {
         if chunk.is_empty() {
             return true;
         }
+        if self.buf.is_empty() {
+            self.first_pending = Some(now);
+        }
+        self.last_byte = now;
         self.buf.extend_from_slice(chunk);
         if self.buf.len() >= FLUSH_BYTES {
             return self.flush(sink);
@@ -70,17 +108,32 @@ impl StreamCoalescer {
         true
     }
 
-    /// Flush if [`FLUSH_MS`] has elapsed since the last flush and the buffer
-    /// is non-empty. Driven from the consumer side between reads so a burst
-    /// that stops below [`FLUSH_BYTES`] doesn't get stranded.
+    /// Flush if the buffer is non-empty and either the quiet gap
+    /// ([`QUIET_MS`] since the last byte) or the max-hold cap
+    /// ([`MAX_HOLD_MS`] since the first byte of this batch) has elapsed.
+    /// Driven from the consumer side between reads so a burst that stops
+    /// below [`FLUSH_BYTES`] doesn't get stranded.
     pub fn flush_if_due<F>(&mut self, sink: &mut F) -> bool
+    where
+        F: FnMut(Vec<u8>) -> bool,
+    {
+        self.flush_if_due_at(Instant::now(), sink)
+    }
+
+    /// [`Self::flush_if_due`] with an injected clock; see [`Self::feed_at`].
+    fn flush_if_due_at<F>(&mut self, now: Instant, sink: &mut F) -> bool
     where
         F: FnMut(Vec<u8>) -> bool,
     {
         if self.buf.is_empty() {
             return true;
         }
-        if self.last_flush.elapsed() >= Duration::from_millis(FLUSH_MS) {
+        let quiet =
+            now.saturating_duration_since(self.last_byte) >= Duration::from_millis(QUIET_MS);
+        let held_too_long = self.first_pending.is_some_and(|t| {
+            now.saturating_duration_since(t) >= Duration::from_millis(MAX_HOLD_MS)
+        });
+        if quiet || held_too_long {
             self.flush(sink)
         } else {
             true
@@ -109,7 +162,7 @@ impl StreamCoalescer {
         // owned by `payload`, so a plain re-init is the cheapest way to
         // restore the pre-allocated capacity for the next batch.
         self.buf = Vec::with_capacity(FLUSH_BYTES * 2);
-        self.last_flush = Instant::now();
+        self.first_pending = None;
         sink(payload)
     }
 }
@@ -133,7 +186,10 @@ pub fn drain_coalesced(
 
     let mut sink = move |bytes: Vec<u8>| -> bool { on_data(bytes) };
     let mut coalescer = StreamCoalescer::new();
-    let timeout = Duration::from_millis(FLUSH_MS);
+    // Poll at the quiet-gap granularity (not MAX_HOLD_MS) so a burst that
+    // goes quiet gets flushed promptly instead of waiting for the max-hold
+    // cap to expire.
+    let timeout = Duration::from_millis(QUIET_MS);
     loop {
         match data_rx.recv_timeout(timeout) {
             Ok(chunk) => {
@@ -197,18 +253,87 @@ mod tests {
         assert!(frames[0].iter().all(|&b| b == 0xAA));
     }
 
+    /// Synthetic clock helper: `t0 + n` ms. The timing tests drive the
+    /// `_at` entry points with these so they are exact under any CI load —
+    /// `thread::sleep(1ms)` routinely overshoots to 4-15 ms on a loaded
+    /// runner, which made the previous sleep-based versions flake in both
+    /// directions (and pass without exercising the branch they named).
+    fn at(t0: Instant, ms: u64) -> Instant {
+        t0 + Duration::from_millis(ms)
+    }
+
     #[test]
-    fn flush_if_due_waits_for_time_window() {
+    fn flush_if_due_waits_for_quiet_gap() {
         let out = RefCell::new(Vec::new());
         let mut sink = collect_sink(&out);
         let mut c = StreamCoalescer::new();
-        c.feed(b"hello", &mut sink);
-        // Same instant as feed — no flush yet.
-        c.flush_if_due(&mut sink);
+        let t0 = Instant::now();
+        c.feed_at(b"hello", t0, &mut sink);
+        // Same instant as the feed — no flush yet.
+        c.flush_if_due_at(t0, &mut sink);
         assert!(out.borrow().is_empty());
-        thread::sleep(Duration::from_millis(FLUSH_MS + 4));
-        c.flush_if_due(&mut sink);
+        // One tick short of the gap — still pending.
+        c.flush_if_due_at(at(t0, QUIET_MS - 1), &mut sink);
+        assert!(out.borrow().is_empty());
+        c.flush_if_due_at(at(t0, QUIET_MS), &mut sink);
         assert_eq!(out.borrow().as_slice(), &[b"hello".to_vec()]);
+    }
+
+    #[test]
+    fn flush_if_due_holds_through_repeated_bytes_within_quiet_gap() {
+        // Regression for the flicker fix: several small writes arriving a
+        // few ms apart (a redraw split across writes) must settle into ONE
+        // frame, not get sliced by a check firing between them. The feeds
+        // deliberately span 10 ms — past the pre-fix implementation's fixed
+        // 8 ms since-last-flush threshold — so this test FAILS against the
+        // old semantics instead of passing vacuously.
+        let out = RefCell::new(Vec::new());
+        let mut sink = collect_sink(&out);
+        let mut c = StreamCoalescer::new();
+        let t0 = Instant::now();
+        for step in 0..6u64 {
+            let now = at(t0, step * 2); // 0,2,4,…,10 ms — gaps below QUIET_MS
+            c.feed_at(b"line", now, &mut sink);
+            c.flush_if_due_at(now, &mut sink);
+            c.flush_if_due_at(at(t0, step * 2 + 1), &mut sink);
+        }
+        assert!(
+            out.borrow().is_empty(),
+            "quiet gap kept resetting; batch should still be pending"
+        );
+        // Last byte at 10 ms → quiet at 14 ms, still under MAX_HOLD (16 ms).
+        c.flush_if_due_at(at(t0, 10 + QUIET_MS), &mut sink);
+        assert_eq!(out.borrow().as_slice(), &[b"line".repeat(6)]);
+    }
+
+    #[test]
+    fn flush_if_due_caps_latency_at_max_hold_even_if_never_quiet() {
+        // A producer that keeps writing faster than the quiet gap (e.g. a
+        // continuous log tail) must still be flushed within MAX_HOLD_MS so
+        // latency stays bounded — and via the max-hold branch specifically:
+        // every check below runs at a feed instant, where the quiet gap is
+        // zero by construction, so only max-hold can fire.
+        let out = RefCell::new(Vec::new());
+        let mut sink = collect_sink(&out);
+        let mut c = StreamCoalescer::new();
+        let t0 = Instant::now();
+        let mut flushed_at_ms = None;
+        for step in 0..12u64 {
+            let ms = step * 2; // 0,2,4,…,22 ms — never quiet
+            let now = at(t0, ms);
+            c.feed_at(b"x", now, &mut sink);
+            c.flush_if_due_at(now, &mut sink);
+            if !out.borrow().is_empty() {
+                flushed_at_ms = Some(ms);
+                break;
+            }
+        }
+        // First feed instant at or past the cap: 16 ms exactly.
+        assert_eq!(
+            flushed_at_ms,
+            Some(MAX_HOLD_MS),
+            "max-hold cap must fire at the cap"
+        );
     }
 
     #[test]
@@ -287,7 +412,7 @@ mod tests {
             let mut accept = |_bytes: Vec<u8>| true;
             c.feed(b"x", &mut accept);
         }
-        thread::sleep(Duration::from_millis(FLUSH_MS + 4));
+        thread::sleep(Duration::from_millis(QUIET_MS + 4));
         let mut reject = |_bytes: Vec<u8>| false;
         assert!(!c.flush_if_due(&mut reject));
     }

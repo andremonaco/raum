@@ -11,8 +11,9 @@ use tauri::{AppHandle, Manager, Runtime};
 use tracing::warn;
 
 /// Silence-heuristic tick interval. 250 ms is well below the state
-/// machine's 500 ms silence threshold, so fallback state recovery
-/// reacts within a tick of a meaningful PTY activity/silence change.
+/// machine's silence threshold (default 10 s, per-harness configurable),
+/// so fallback state recovery reacts within a tick of a meaningful PTY
+/// activity/silence change.
 const SILENCE_TICK_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Spawn the periodic silence-tick task. Idempotent: guarded by a

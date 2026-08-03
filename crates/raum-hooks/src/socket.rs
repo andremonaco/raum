@@ -30,6 +30,33 @@ pub const RAUM_PROJECT_ROOT_ENV: &str = "RAUM_PROJECT_ROOT";
 pub const RAUM_WORKTREE_ID_ENV: &str = "RAUM_WORKTREE_ID";
 pub const PER_AGENT_BACKLOG: usize = 8_000;
 
+/// Synthetic event emitted by the socket server itself when a parked
+/// `PermissionRequest` was still unanswered [`PERMISSION_GC_AFTER`] after
+/// parking — i.e. the hook script hit its client-side timeout (and answered
+/// "ask" to the harness) or was killed. Consumers use it to garbage-collect
+/// any per-request UI state (pending-permission badges) and to re-arm the
+/// session's activity heuristic; it must never be classified as a state
+/// transition of its own.
+pub const PERMISSION_EXPIRED_EVENT: &str = "PermissionExpired";
+
+/// How long a parked `PermissionRequest` may sit unanswered before the
+/// sweeper drops its writer and emits [`PERMISSION_EXPIRED_EVENT`].
+///
+/// Deliberately a **deadline**, not a connection-close trigger: read-half
+/// EOF is not evidence the client stopped waiting. The socat fallback path
+/// (`printf … | socat -T… - UNIX-CONNECT:…`, used when python3 is absent)
+/// half-closes the socket's write side the moment its stdin drains — the
+/// server sees EOF milliseconds after the request while the client is still
+/// blocked reading its decision line. Reaping on EOF would drop the writer
+/// out from under that live client and dismiss a prompt the user never
+/// answered. The deadline sits above every client-side wait (default 55 s,
+/// `DEFAULT_PERMISSION_TIMEOUT_SECS` in raum-core) so by the time it fires
+/// the script has provably given up. Tests pass an explicit deadline via
+/// [`spawn_event_socket_with_gc`] — a global test-mode shortening would
+/// race the park-then-assert tests, whose writers must stay parked across
+/// multi-hundred-ms poll windows.
+const PERMISSION_GC_AFTER: std::time::Duration = std::time::Duration::from_secs(90);
+
 /// A single hook event delivered over the UDS.
 ///
 /// Phase 2 added `session_id` (populated from `$RAUM_SESSION` in the
@@ -231,8 +258,22 @@ pub struct EventSocketHandle {
 /// is parsed line-by-line; a single connection may send multiple
 /// events. When an event carries a `request_id` (i.e. a blocking
 /// `PermissionRequest`), the writer half of the connection is parked
-/// on [`PendingRequests`] for the Tauri side to reply on.
-pub async fn spawn_event_socket(path: &Path) -> Result<EventSocketHandle, std::io::Error> {
+/// on [`PendingRequests`] for the Tauri side to reply on, guarded by a
+/// [`PERMISSION_GC_AFTER`] deadline sweeper.
+///
+/// Sync on purpose (nothing here awaits — bind is synchronous), but must
+/// be called from within a tokio runtime: it spawns the accept task.
+pub fn spawn_event_socket(path: &Path) -> Result<EventSocketHandle, std::io::Error> {
+    spawn_event_socket_with_gc(path, PERMISSION_GC_AFTER)
+}
+
+/// [`spawn_event_socket`] with an explicit sweeper deadline. Tests use
+/// short deadlines to exercise the expiry path and long ones to keep
+/// writers parked across their assertion windows.
+pub fn spawn_event_socket_with_gc(
+    path: &Path,
+    gc_after: std::time::Duration,
+) -> Result<EventSocketHandle, std::io::Error> {
     if path.exists() {
         std::fs::remove_file(path).ok();
     }
@@ -268,7 +309,14 @@ pub async fn spawn_event_socket(path: &Path) -> Result<EventSocketHandle, std::i
                                 if let Some(wh) = write_half_slot.take() {
                                     let key =
                                         PendingKey::new(ev.session_id.clone(), req_id.to_string());
-                                    pending.park(key, wh);
+                                    pending.park(key.clone(), wh);
+                                    spawn_permission_sweeper(
+                                        pending.clone(),
+                                        tx.clone(),
+                                        key,
+                                        ev.harness.clone(),
+                                        gc_after,
+                                    );
                                 }
                             }
                             let send_ok = tx.send(ev).await.is_ok();
@@ -297,6 +345,12 @@ pub async fn spawn_event_socket(path: &Path) -> Result<EventSocketHandle, std::i
                 // return EOF. This path fires when the script wrote
                 // its request then immediately EOF'd its stdin (rare
                 // but possible for buggy scripts).
+                //
+                // Deliberately NO parked-writer GC here: read-half EOF is
+                // not proof the client stopped waiting (the socat fallback
+                // half-closes immediately after sending — see
+                // [`PERMISSION_GC_AFTER`]). Unanswered parked writers are
+                // reaped by the per-request deadline sweeper instead.
                 drop(write_half_slot);
             });
         }
@@ -307,6 +361,44 @@ pub async fn spawn_event_socket(path: &Path) -> Result<EventSocketHandle, std::i
         pending,
         _task: task,
     })
+}
+
+/// Per-request deadline sweeper: after `gc_after`, if the request is
+/// *still parked* (never replied), drop its writer — closing the
+/// connection, which is a no-op if the client already left — and emit the
+/// synthetic [`PERMISSION_EXPIRED_EVENT`] so the app can clear per-request
+/// UI state and re-arm the session's activity heuristic. A replied request
+/// was removed from the registry by `reply()`, so `drop_key` returns false
+/// and nothing is emitted. Best-effort: a full channel just loses the GC
+/// signal, never blocks anything.
+fn spawn_permission_sweeper(
+    pending: PendingRequests,
+    tx: mpsc::Sender<HookEvent>,
+    key: PendingKey,
+    harness: String,
+    gc_after: std::time::Duration,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(gc_after).await;
+        if !pending.drop_key(&key) {
+            return;
+        }
+        debug!(
+            ?key,
+            "permission request expired unanswered; writer collected"
+        );
+        let _ = tx
+            .send(HookEvent {
+                harness,
+                event: PERMISSION_EXPIRED_EVENT.to_string(),
+                session_id: key.session_id.clone(),
+                request_id: Some(key.request_id.clone()),
+                source: Some("raum-socket".to_string()),
+                reliability: None,
+                payload: serde_json::Value::Null,
+            })
+            .await;
+    });
 }
 
 /// Export the event socket path via `RAUM_EVENT_SOCK` so child processes
@@ -337,7 +429,7 @@ mod tests {
     async fn set_env_exports_socket_path() {
         let dir = tempdir().unwrap();
         let sock_path = dir.path().join("events.sock");
-        let handle = spawn_event_socket(&sock_path).await.unwrap();
+        let handle = spawn_event_socket(&sock_path).unwrap();
         set_env(&handle);
         let got = std::env::var(RAUM_EVENT_SOCK_ENV).unwrap();
         assert_eq!(std::path::PathBuf::from(got), handle.path);
@@ -347,7 +439,7 @@ mod tests {
     async fn delivers_parsed_hook_event_over_uds() {
         let dir = tempdir().unwrap();
         let sock_path = dir.path().join("events.sock");
-        let mut handle = spawn_event_socket(&sock_path).await.unwrap();
+        let mut handle = spawn_event_socket(&sock_path).unwrap();
 
         let mut client = UnixStream::connect(&sock_path).await.unwrap();
         client
@@ -374,7 +466,7 @@ mod tests {
     async fn malformed_line_is_dropped_connection_stays_open() {
         let dir = tempdir().unwrap();
         let sock_path = dir.path().join("events.sock");
-        let mut handle = spawn_event_socket(&sock_path).await.unwrap();
+        let mut handle = spawn_event_socket(&sock_path).unwrap();
 
         let mut client = UnixStream::connect(&sock_path).await.unwrap();
         // A malformed JSON line, followed by a valid one on the same connection.
@@ -399,7 +491,7 @@ mod tests {
     async fn permission_request_parks_writer_and_reply_delivers_decision() {
         let dir = tempdir().unwrap();
         let sock_path = dir.path().join("events.sock");
-        let mut handle = spawn_event_socket(&sock_path).await.unwrap();
+        let mut handle = spawn_event_socket(&sock_path).unwrap();
 
         let client = UnixStream::connect(&sock_path).await.unwrap();
         let (client_read, mut client_write) = client.into_split();
@@ -460,7 +552,7 @@ mod tests {
     async fn reply_unknown_request_errors() {
         let dir = tempdir().unwrap();
         let sock_path = dir.path().join("events.sock");
-        let handle = spawn_event_socket(&sock_path).await.unwrap();
+        let handle = spawn_event_socket(&sock_path).unwrap();
         let key = PendingKey::new(Some("raum-abc".into()), "nope");
         let err = handle.pending.reply(&key, "allow").await.unwrap_err();
         assert!(matches!(err, ReplyError::UnknownRequest(_, _)));
@@ -473,7 +565,7 @@ mod tests {
         // a session_id should still find them.
         let dir = tempdir().unwrap();
         let sock_path = dir.path().join("events.sock");
-        let mut handle = spawn_event_socket(&sock_path).await.unwrap();
+        let mut handle = spawn_event_socket(&sock_path).unwrap();
 
         let client = UnixStream::connect(&sock_path).await.unwrap();
         let (client_read, mut client_write) = client.into_split();
@@ -506,7 +598,7 @@ mod tests {
     async fn drop_session_evicts_only_matching_session() {
         let dir = tempdir().unwrap();
         let sock_path = dir.path().join("events.sock");
-        let handle = spawn_event_socket(&sock_path).await.unwrap();
+        let handle = spawn_event_socket(&sock_path).unwrap();
 
         // Park three writers: two for session "a", one for session "b",
         // plus one session-less entry.
@@ -553,6 +645,154 @@ mod tests {
                 .drop_key(&PendingKey::new(Some("b".into()), "r3"))
         );
         assert!(handle.pending.drop_key(&PendingKey::new(None, "legacy")));
+        assert!(handle.pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn expired_permission_request_collects_writer_and_emits_expiry() {
+        let dir = tempdir().unwrap();
+        let sock_path = dir.path().join("events.sock");
+        // Short explicit deadline: this test IS the expiry path.
+        let mut handle =
+            spawn_event_socket_with_gc(&sock_path, std::time::Duration::from_millis(200)).unwrap();
+
+        let client = UnixStream::connect(&sock_path).await.unwrap();
+        let (client_read, mut client_write) = client.into_split();
+        let raw = "{\"harness\":\"claude-code\",\"event\":\"PermissionRequest\",\
+                   \"session_id\":\"raum-exp\",\"request_id\":\"req-exp\",\"payload\":{}}\n";
+        client_write.write_all(raw.as_bytes()).await.unwrap();
+        client_write.flush().await.unwrap();
+
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(2), handle.rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ev.event, "PermissionRequest");
+        for _ in 0..50 {
+            if !handle.pending.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(handle.pending.len(), 1);
+
+        // Client goes away without ever receiving a reply — the hook script
+        // hit its timeout and exited. After the sweeper deadline the parked
+        // writer must be collected and the synthetic expiry emitted with
+        // the same ids. Note the trigger is the DEADLINE, not the
+        // disconnect — the disconnect alone must do nothing (see the
+        // half-close test below).
+        drop(client_read);
+        drop(client_write);
+
+        let expiry = tokio::time::timeout(std::time::Duration::from_secs(2), handle.rx.recv())
+            .await
+            .expect("timed out waiting for expiry event")
+            .expect("channel closed before expiry arrived");
+        assert_eq!(expiry.event, PERMISSION_EXPIRED_EVENT);
+        assert_eq!(expiry.harness, "claude-code");
+        assert_eq!(expiry.session_id.as_deref(), Some("raum-exp"));
+        assert_eq!(expiry.request_id.as_deref(), Some("req-exp"));
+        assert_eq!(expiry.source.as_deref(), Some("raum-socket"));
+        assert!(handle.pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn replied_permission_request_emits_no_expiry() {
+        let dir = tempdir().unwrap();
+        let sock_path = dir.path().join("events.sock");
+        // Deadline long enough that the reply below always lands first
+        // (park + poll can take a few hundred ms on a loaded runner), but
+        // short enough that the quiet window can span it and prove the
+        // sweeper found nothing.
+        let gc_after = std::time::Duration::from_secs(1);
+        let mut handle = spawn_event_socket_with_gc(&sock_path, gc_after).unwrap();
+
+        let client = UnixStream::connect(&sock_path).await.unwrap();
+        let (client_read, mut client_write) = client.into_split();
+        let raw = "{\"harness\":\"claude-code\",\"event\":\"PermissionRequest\",\
+                   \"session_id\":\"raum-ok\",\"request_id\":\"req-ok\",\"payload\":{}}\n";
+        client_write.write_all(raw.as_bytes()).await.unwrap();
+        client_write.flush().await.unwrap();
+
+        let _ev = tokio::time::timeout(std::time::Duration::from_secs(2), handle.rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        for _ in 0..50 {
+            if !handle.pending.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let key = PendingKey::new(Some("raum-ok".into()), "req-ok");
+        handle.pending.reply(&key, "allow").await.unwrap();
+
+        // The client reads its decision and closes normally.
+        let mut reader = tokio::io::BufReader::new(client_read);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        assert_eq!(line.trim(), "allow");
+        drop(reader);
+        drop(client_write);
+
+        // An answered request must NOT produce an expiry event. The quiet
+        // window deliberately spans the sweeper deadline, so this proves
+        // the sweeper found nothing — not merely that the expiry hadn't
+        // fired yet.
+        let quiet = tokio::time::timeout(gc_after * 3, handle.rx.recv()).await;
+        assert!(quiet.is_err(), "no event expected after a replied request");
+        assert!(handle.pending.is_empty());
+    }
+
+    /// Regression test for the socat fallback: `printf … | socat -T - …`
+    /// half-closes the socket's write side as soon as its stdin drains, so
+    /// the server sees read-EOF milliseconds after the request while the
+    /// client is still blocked reading its decision. The parked writer must
+    /// survive that EOF — a reply landing before the sweeper deadline still
+    /// has to reach the client.
+    #[tokio::test]
+    async fn half_closed_client_still_receives_reply() {
+        let dir = tempdir().unwrap();
+        let sock_path = dir.path().join("events.sock");
+        // Long deadline: the writer must provably stay parked across the
+        // read-EOF and the poll window below without sweeper interference.
+        let mut handle =
+            spawn_event_socket_with_gc(&sock_path, std::time::Duration::from_secs(60)).unwrap();
+
+        let client = UnixStream::connect(&sock_path).await.unwrap();
+        let (client_read, mut client_write) = client.into_split();
+        let raw = "{\"harness\":\"claude-code\",\"event\":\"PermissionRequest\",\
+                   \"session_id\":\"raum-socat\",\"request_id\":\"req-socat\",\"payload\":{}}\n";
+        client_write.write_all(raw.as_bytes()).await.unwrap();
+        client_write.flush().await.unwrap();
+        // socat's stdin-EOF: write side closes, read side keeps waiting.
+        drop(client_write);
+
+        let _ev = tokio::time::timeout(std::time::Duration::from_secs(2), handle.rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        for _ in 0..50 {
+            if !handle.pending.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            handle.pending.len(),
+            1,
+            "writer must stay parked across read-EOF"
+        );
+
+        let key = PendingKey::new(Some("raum-socat".into()), "req-socat");
+        handle.pending.reply(&key, "allow").await.unwrap();
+
+        let mut reader = tokio::io::BufReader::new(client_read);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        assert_eq!(line.trim(), "allow");
         assert!(handle.pending.is_empty());
     }
 

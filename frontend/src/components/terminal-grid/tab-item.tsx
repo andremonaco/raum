@@ -1,6 +1,7 @@
 import { Component, For, Show, createEffect, createMemo, createSignal } from "solid-js";
 
 import { type AgentKind } from "../../lib/agentKind";
+import { formatPromptPreview } from "../../lib/promptPreview";
 import { resolveDisplayedTabLabel } from "../../lib/terminalTabLabel";
 import { agentStore, isAcknowledgedReactive } from "../../stores/agentStore";
 import type { AgentState } from "../../stores/agentStore";
@@ -12,10 +13,11 @@ import {
 } from "../../stores/runtimeLayoutStore";
 import { terminalStore } from "../../stores/terminalStore";
 import { HARNESS_ICONS } from "../icons";
-import { Tooltip, TooltipContent, TooltipPortal, TooltipTrigger } from "../ui/tooltip";
+import { Tooltip, TooltipPortal, TooltipTrigger } from "../ui/tooltip";
 import { KIND_LABELS } from "./constants";
 import { CloseGlyph } from "./glyphs";
 import { startReviewFromDrop } from "./review-spawn";
+import { TabTooltipContent } from "./tab-tooltip";
 
 export const TabItem: Component<{
   cellId: string;
@@ -97,9 +99,7 @@ export const TabItem: Component<{
   const lastPromptText = (): string | undefined => {
     const sid = props.tab.sessionId;
     if (!sid) return undefined;
-    const text = terminalStore.byId[sid]?.lastPrompt?.text;
-    if (!text) return undefined;
-    return text;
+    return formatPromptPreview(terminalStore.byId[sid]?.lastPrompt?.text);
   };
 
   function openMenu(e: MouseEvent) {
@@ -279,19 +279,7 @@ export const TabItem: Component<{
         </Show>
       </TooltipTrigger>
       <TooltipPortal>
-        <TooltipContent class="max-w-md">
-          <Show when={tabLabel()}>
-            <div class="text-[10px] font-medium uppercase tracking-wide">{tabLabel()}</div>
-          </Show>
-          <Show when={lastPromptText()}>
-            <div
-              class="whitespace-pre-wrap text-[11px] leading-snug text-popover-foreground/85"
-              classList={{ "mt-1": !!tabLabel() }}
-            >
-              {lastPromptText()}
-            </div>
-          </Show>
-        </TooltipContent>
+        <TabTooltipContent label={tabLabel()} prompt={lastPromptText()} />
       </TooltipPortal>
     </Tooltip>
   );

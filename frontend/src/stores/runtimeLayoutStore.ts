@@ -834,6 +834,15 @@ export function scheduleActiveSave(): void {
  *  save gate is closed (hydration never opened it) or when the payload would
  *  destructively blank a never-hydrated layout. Errors are swallowed by the
  *  caller (`quitFlush.ts`) so one failing flush still acks the quit. */
+/** True while a debounced layout save is pending — i.e. the layout mutated
+ *  since the last write (`scheduleActiveSave` armed the timer). Lets
+ *  opportunistic flush points (page-hide / occlusion) skip the serialize +
+ *  TOML rewrite entirely when the layout is clean; the quit flush always
+ *  writes regardless. */
+export function hasPendingActiveSave(): boolean {
+  return _saveTimer !== null;
+}
+
 export async function flushActiveLayoutNow(): Promise<void> {
   if (_saveTimer !== null) {
     clearTimeout(_saveTimer);

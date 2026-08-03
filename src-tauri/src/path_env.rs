@@ -197,7 +197,7 @@ fn probe_with(
     if env.is_empty() {
         return Err(format!(
             "no markers found; stdout (truncated): {}",
-            &stdout.chars().take(200).collect::<String>()
+            stdout.chars().take(200).collect::<String>()
         ));
     }
 

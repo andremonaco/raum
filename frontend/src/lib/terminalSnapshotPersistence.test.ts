@@ -77,15 +77,16 @@ describe("terminalSnapshotPersistence", () => {
     expect(serializeTerminalSnapshot(source)).toBeNull();
   });
 
-  it("persists bytes via the Tauri invoke command", async () => {
+  it("persists raw bytes with the session id in a header", async () => {
     invokeMock.mockResolvedValueOnce(true);
     const source = makeSource({ 100_000: "hello" });
     await persistTerminalSnapshot("sess-1", source);
     expect(invokeMock).toHaveBeenCalledTimes(1);
-    expect(invokeMock).toHaveBeenCalledWith("terminal_snapshot_persist", {
-      sessionId: "sess-1",
-      bytes: Array.from(new TextEncoder().encode("hello")),
-    });
+    expect(invokeMock).toHaveBeenCalledWith(
+      "terminal_snapshot_persist",
+      new TextEncoder().encode("hello"),
+      { headers: { "x-raum-session-id": "sess-1" } },
+    );
   });
 
   it("retries with smaller scrollback when backend rejects on size", async () => {
@@ -104,10 +105,7 @@ describe("terminalSnapshotPersistence", () => {
     });
     await persistTerminalSnapshot("sess-overflow", source);
     expect(invokeMock).toHaveBeenCalledTimes(3);
-    const sentSizes = invokeMock.mock.calls.map((call) => {
-      const args = call[1] as { bytes: number[] };
-      return args.bytes.length;
-    });
+    const sentSizes = invokeMock.mock.calls.map((call) => (call[1] as Uint8Array).byteLength);
     // Each retry must send a smaller payload; we never byte-trim a single
     // blob — the loop re-serializes from xterm with a smaller scrollback.
     for (let i = 1; i < sentSizes.length; i += 1) {
@@ -121,9 +119,9 @@ describe("terminalSnapshotPersistence", () => {
     await expect(persistTerminalSnapshot("sess-err", source)).resolves.toBeUndefined();
   });
 
-  it("loads bytes from the backend and returns a Uint8Array", async () => {
-    const stored = Array.from(new TextEncoder().encode("\x1b[Hhello"));
-    invokeMock.mockResolvedValueOnce(stored);
+  it("loads an ArrayBuffer response and returns a Uint8Array", async () => {
+    const stored = new TextEncoder().encode("\x1b[Hhello");
+    invokeMock.mockResolvedValueOnce(stored.buffer.slice(0, stored.byteLength));
     const result = await loadTerminalSnapshotBytes("sess-load");
     expect(invokeMock).toHaveBeenCalledWith("terminal_snapshot_load", {
       sessionId: "sess-load",
@@ -132,9 +130,21 @@ describe("terminalSnapshotPersistence", () => {
     expect(new TextDecoder().decode(result!)).toBe("\x1b[Hhello");
   });
 
+  it("loads a number[] fallback response (postMessage transport)", async () => {
+    invokeMock.mockResolvedValueOnce(Array.from(new TextEncoder().encode("fallback")));
+    const result = await loadTerminalSnapshotBytes("sess-json");
+    expect(result).toBeInstanceOf(Uint8Array);
+    expect(new TextDecoder().decode(result!)).toBe("fallback");
+  });
+
   it("returns null when the backend has nothing", async () => {
     invokeMock.mockResolvedValueOnce(null);
     expect(await loadTerminalSnapshotBytes("missing")).toBeNull();
+  });
+
+  it("returns null for an empty-body response (raw transport's None)", async () => {
+    invokeMock.mockResolvedValueOnce(new ArrayBuffer(0));
+    expect(await loadTerminalSnapshotBytes("empty")).toBeNull();
   });
 
   it("returns null when the backend errors", async () => {
@@ -143,7 +153,8 @@ describe("terminalSnapshotPersistence", () => {
   });
 
   it("moves a snapshot from the old session to the new one", async () => {
-    const stored = Array.from(new TextEncoder().encode("payload"));
+    const payload = new TextEncoder().encode("payload");
+    const stored = payload.buffer.slice(0, payload.byteLength);
     invokeMock
       // load(old) returns bytes
       .mockResolvedValueOnce(stored)
@@ -207,10 +218,11 @@ describe("terminalSnapshotPersistence", () => {
       // Timer hasn't fired yet — nothing persisted.
       expect(invokeMock).not.toHaveBeenCalled();
       await flushAllTerminalSnapshotsNow();
-      expect(invokeMock).toHaveBeenCalledWith("terminal_snapshot_persist", {
-        sessionId: "sess-flush",
-        bytes: Array.from(new TextEncoder().encode("tail")),
-      });
+      expect(invokeMock).toHaveBeenCalledWith(
+        "terminal_snapshot_persist",
+        new TextEncoder().encode("tail"),
+        { headers: { "x-raum-session-id": "sess-flush" } },
+      );
     });
 
     it("cancel clears the pending timer so it never persists after unmount", async () => {
@@ -240,7 +252,7 @@ describe("terminalSnapshotPersistence", () => {
       await flushAllTerminalSnapshotsNow();
       const flushedIds = invokeMock.mock.calls
         .filter((c) => c[0] === "terminal_snapshot_persist")
-        .map((c) => (c[1] as { sessionId: string }).sessionId);
+        .map((c) => (c[2] as { headers: Record<string, string> }).headers["x-raum-session-id"]);
       expect(flushedIds).toContain("sess-B");
       expect(flushedIds).not.toContain("sess-A");
     });
@@ -255,10 +267,11 @@ describe("terminalSnapshotPersistence", () => {
       scheduleTerminalSnapshotPersist("sess-burst", source);
       await Promise.resolve();
       await Promise.resolve();
-      expect(invokeMock).toHaveBeenCalledWith("terminal_snapshot_persist", {
-        sessionId: "sess-burst",
-        bytes: Array.from(new TextEncoder().encode("burst")),
-      });
+      expect(invokeMock).toHaveBeenCalledWith(
+        "terminal_snapshot_persist",
+        new TextEncoder().encode("burst"),
+        { headers: { "x-raum-session-id": "sess-burst" } },
+      );
       // Clean up the re-armed timer so afterEach doesn't double-fire.
       cancelTerminalSnapshotPersist("sess-burst");
     });

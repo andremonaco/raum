@@ -8,11 +8,13 @@ vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn().mockResolvedValue(() => undefined),
 }));
 
+import { invoke } from "@tauri-apps/api/core";
 import {
   __resetAgentStoreForTests,
   type AgentListItem,
   agentStore,
   attentionQueue,
+  flushPendingAcks,
   isAcknowledged,
   markAcknowledged,
   removeSession,
@@ -305,5 +307,91 @@ describe("agentStore attention ranking", () => {
     const order = attentionQueue().map((i) => i.session.session_id);
     expect(order).toEqual(["wait"]);
     vi.useRealTimers();
+  });
+});
+
+describe("agentStore ack durability", () => {
+  const invokeMock = vi.mocked(invoke);
+
+  beforeEach(() => {
+    __resetAgentStoreForTests();
+    invokeMock.mockReset();
+  });
+
+  function sessionItem(overrides: Partial<AgentListItem> & { session_id: string }): AgentListItem {
+    return {
+      harness: "claude-code",
+      state: "idle",
+      supports_native_events: false,
+      ...overrides,
+    };
+  }
+
+  /** Let the fire-and-forget sendAck promise chain settle. */
+  const settle = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+  it("flushPendingAcks retries an ack whose persist rejected", async () => {
+    invokeMock.mockRejectedValueOnce(new Error("webview dying"));
+    invokeMock.mockResolvedValue(undefined as never);
+
+    markAcknowledged("done-1");
+    await settle();
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+
+    // The rejected ack stayed queued: the flush must retry exactly it.
+    await flushPendingAcks();
+    expect(invokeMock).toHaveBeenCalledTimes(2);
+    expect(invokeMock).toHaveBeenLastCalledWith("agent_ack_state", { sessionId: "done-1" });
+
+    // Confirmed now — a second flush has nothing to do.
+    await flushPendingAcks();
+    expect(invokeMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("a revoked ack is never replayed by a later flush", async () => {
+    invokeMock.mockRejectedValueOnce(new Error("webview dying"));
+    invokeMock.mockResolvedValue(undefined as never);
+
+    markAcknowledged("done-1");
+    await settle();
+    expect(invokeMock).toHaveBeenCalledTimes(1); // failed, so still queued
+
+    // The agent resumes: the ack is revoked and must leave the retry queue
+    // with it — otherwise a later flush would mark the agent's NEXT
+    // completion as already-seen.
+    unmarkAcknowledged("done-1");
+    await flushPendingAcks();
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("flushPendingAcks is a no-op once every ack is confirmed", async () => {
+    invokeMock.mockResolvedValue(undefined as never);
+    markAcknowledged("done-1");
+    await settle();
+    await flushPendingAcks();
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("a webview reload never grows the attention set", async () => {
+    invokeMock.mockResolvedValue(undefined as never);
+    setAdapters([
+      sessionItem({ session_id: "done-a", state: "completed" }),
+      sessionItem({ session_id: "done-b", state: "completed" }),
+      sessionItem({ session_id: "wait-1", state: "waiting" }),
+    ]);
+    markAcknowledged("done-a");
+    await settle();
+    const before = attentionQueue().map((i) => i.session.session_id);
+
+    // Simulate the post-lock reload: fresh page, store rebuilt from the
+    // backend truth in which the ack reached disk.
+    __resetAgentStoreForTests();
+    setAdapters([
+      sessionItem({ session_id: "done-a", state: "completed", state_acked: true }),
+      sessionItem({ session_id: "done-b", state: "completed" }),
+      sessionItem({ session_id: "wait-1", state: "waiting" }),
+    ]);
+
+    expect(attentionQueue().map((i) => i.session.session_id)).toEqual(before);
   });
 });

@@ -205,6 +205,10 @@ pub fn classify_notification_kind(event_name: &str) -> Option<NotificationKind> 
         // `AgentStateMachine::on_hook_event` so real PTY activity can
         // later flip Idle → Working.
         "SessionStart" => None,
+        // Synthetic socket-server GC signal (see raum-hooks): a permission
+        // request expired unanswered. Not a state transition — without this
+        // arm the catch-all below would promote the machine to Working.
+        "PermissionExpired" => None,
         // Everything else (UserPromptSubmit, PreToolUse, …) counts as the
         // harness working.
         _ => Some(NotificationKind::TurnStart),
@@ -231,6 +235,9 @@ pub fn classify_notification_event(
         // (Idle for a fresh session) while the state machine separately
         // arms output-based recovery on this event name.
         "SessionStart" => None,
+        // Synthetic socket-server GC signal (see raum-hooks): not a state
+        // transition, and the catch-all must not turn it into Working.
+        "PermissionExpired" => None,
         _ => Some(NotificationKind::TurnStart),
     }
 }
@@ -515,6 +522,25 @@ mod tests {
             ),
             Some(NotificationKind::PermissionNeeded)
         );
+    }
+
+    #[test]
+    fn permission_expired_is_not_classified() {
+        // The synthetic socket-server GC signal must fall through the
+        // catch-all arm of BOTH classifiers — otherwise it would promote
+        // the machine to Working the moment a permission prompt times out.
+        assert_eq!(classify_notification_kind("PermissionExpired"), None);
+        for harness in [AgentKind::ClaudeCode, AgentKind::Codex, AgentKind::OpenCode] {
+            assert_eq!(
+                classify_notification_event(
+                    harness,
+                    "PermissionExpired",
+                    Some("raum-socket"),
+                    &serde_json::Value::Null,
+                ),
+                None,
+            );
+        }
     }
 
     #[test]
