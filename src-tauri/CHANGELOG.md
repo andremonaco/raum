@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.16](https://github.com/andremonaco/raum/releases/tag/v0.1.16) - 2026-08-04
+
+
 ## [0.1.15](https://github.com/andremonaco/raum/releases/tag/v0.1.15) - 2026-08-03
 
 ### Fixed

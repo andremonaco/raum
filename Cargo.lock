@@ -3823,7 +3823,7 @@ dependencies = [
 
 [[package]]
 name = "raum"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "block2",
  "dirs",
