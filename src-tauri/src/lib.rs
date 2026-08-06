@@ -415,6 +415,11 @@ pub fn run() {
             // up through `merged_keymap` so user overrides take effect.
             register_global_shortcuts(app.handle());
 
+            // Must come before the first pane can be created: the flag is
+            // consulted at tmux-server birth, which is whatever `new_session`
+            // runs first.
+            bootstrap_tmux_tcc_policy(app);
+
             // Must come before `bootstrap_git_watchers` — the watchers take
             // the service's pulse sender so terminal-driven commits/stages
             // refresh the sidebar status.
@@ -1127,6 +1132,37 @@ async fn run_reconcile(handle: &tauri::AppHandle, trigger: &'static str) {
         Err(e) => {
             warn!(trigger = trigger, error = %e, "reconcile: failed");
         }
+    }
+}
+
+/// Push `terminals.disclaim_tcc_responsibility` onto the tmux manager before
+/// any pane can be created.
+///
+/// macOS attributes a pane's foreign app-data reads to the tmux server's TCC
+/// "responsible process". Default (`false`) leaves that as raum.app — a
+/// Developer-ID identity TCC can pin an "Allow" to permanently, and one Full
+/// Disk Access tick covers every shell. `true` disclaims, matching iTerm2 /
+/// WezTerm / Ghostty, at the cost of grants hanging off an ad-hoc-signed
+/// Homebrew binary that TCC re-prompts for.
+///
+/// Read once here rather than at every `new_session`: the flag only matters at
+/// server *birth*, and a running server can't be re-parented anyway. Changing
+/// it therefore takes effect on the next cold server (relaunch after
+/// `tmux -L raum kill-server`).
+fn bootstrap_tmux_tcc_policy(app: &mut tauri::App) {
+    let state: tauri::State<'_, state::AppHandleState> = app.state();
+    // A poisoned lock or an unreadable config must not block startup — recover
+    // the guard (same convention as `config_get`) and fall back to `false`,
+    // which is the safe, prompt-once-then-durable behaviour.
+    let disclaim = state
+        .config_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .read_config()
+        .is_ok_and(|cfg| cfg.terminals.disclaim_tcc_responsibility);
+    state.tmux.set_disclaim_tcc(disclaim);
+    if disclaim {
+        info!("tmux server will be born with TCC responsibility disclaimed (opt-in)");
     }
 }
 

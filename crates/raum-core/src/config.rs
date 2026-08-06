@@ -426,6 +426,37 @@ pub struct TerminalsConfig {
     /// Days of inactivity before a terminal/harness is docked (min 1).
     #[serde(default = "default_auto_dock_inactive_days")]
     pub auto_dock_inactive_days: u32,
+    /// macOS only — birth the `-L raum` tmux server with its TCC "responsible
+    /// process" disclaimed. Off by default.
+    ///
+    /// Sequoia's App Data protection charges a foreign-container read to the
+    /// *responsible process* of whoever performed it. Every shell in a pane —
+    /// and every tool it runs (`docker`, `pulumi`, …) — is a descendant of the
+    /// tmux server, so that's the process the prompt names.
+    ///
+    /// `false` (default): responsibility stays with raum.app. Its Developer-ID
+    /// signature gives TCC a stable identity to pin the decision to, so one
+    /// "Allow" sticks — and ticking raum.app in System Settings ▸ Privacy &
+    /// Security ▸ Full Disk Access silences the whole class permanently.
+    ///
+    /// `true`: the server disclaims and becomes its own responsible process
+    /// (what iTerm2 / WezTerm / Ghostty do), keeping shell-earned grants off
+    /// raum.app's identity. The cost is that grants then hang off the `tmux`
+    /// binary, which Homebrew ships ad-hoc signed (`TeamIdentifier=not set`) —
+    /// TCC has nothing durable to pin them to and re-prompts, and any
+    /// Full Disk Access entry is bound to a Cellar path a `brew upgrade`
+    /// invalidates.
+    ///
+    /// Opting in also sets `exit-empty off` on the raum socket — without it the
+    /// freshly disclaimed server reaps itself before the first session can
+    /// reach it — so the server outlives its last session instead of exiting.
+    ///
+    /// Snapshotted at app launch and applied when the server is *born*, so a
+    /// change needs both: raum relaunched (to re-read it) and a cold socket
+    /// (`tmux -L raum kill-server`, which ends every live session — do it
+    /// deliberately). Editing the file alone changes nothing.
+    #[serde(default)]
+    pub disclaim_tcc_responsibility: bool,
 }
 
 fn default_auto_dock_inactive_days() -> u32 {
@@ -437,6 +468,7 @@ impl Default for TerminalsConfig {
         Self {
             auto_dock_inactive: false,
             auto_dock_inactive_days: default_auto_dock_inactive_days(),
+            disclaim_tcc_responsibility: false,
         }
     }
 }
@@ -807,6 +839,25 @@ mod tests {
     #[test]
     fn config_roundtrip_defaults() {
         roundtrip(Config::default());
+    }
+
+    /// The macOS TCC disclaim is opt-in and must stay that way: with it off,
+    /// App Data prompts are charged to raum.app, whose Developer-ID signature
+    /// lets TCC pin one "Allow" permanently (and lets Full Disk Access silence
+    /// the class). Flipping the default would hand responsibility to an
+    /// ad-hoc-signed Homebrew `tmux` that TCC re-prompts for indefinitely.
+    #[test]
+    fn tcc_disclaim_defaults_off_and_survives_a_missing_key() {
+        assert!(!TerminalsConfig::default().disclaim_tcc_responsibility);
+
+        // Pre-existing configs written before the key existed.
+        let legacy: Config = toml::from_str("[terminals]\nauto_dock_inactive = true\n")
+            .expect("legacy config parses");
+        assert!(!legacy.terminals.disclaim_tcc_responsibility);
+
+        let opted_in: Config = toml::from_str("[terminals]\ndisclaim_tcc_responsibility = true\n")
+            .expect("opt-in config parses");
+        assert!(opted_in.terminals.disclaim_tcc_responsibility);
     }
 
     #[test]

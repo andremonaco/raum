@@ -42,6 +42,11 @@ notifications_hint_shown = false   # set true after the "permission denied" bann
 width_px  = 280
 collapsed = false
 
+[terminals]
+auto_dock_inactive      = false     # dock tabs idle for auto_dock_inactive_days
+auto_dock_inactive_days = 1
+disclaim_tcc_responsibility = false # macOS TCC; see "macOS App Data prompts"
+
 [keybindings]
 # overrides is an action-name -> accelerator map; see "keybindings.toml" below.
 [keybindings.overrides]
@@ -62,6 +67,9 @@ collapsed = false
 | `notifications.notifications_hint_shown`  | `false`                                                          | Marks the one-time in-app banner as shown. |
 | `sidebar.width_px`                        | `280`                                                            | Persisted drag width (§9.7). |
 | `sidebar.collapsed`                       | `false`                                                          | Persisted collapse toggle. |
+| `terminals.auto_dock_inactive`            | `false`                                                          | Dock a terminal/harness tab with no activity in the threshold window. |
+| `terminals.auto_dock_inactive_days`       | `1`                                                              | Days of inactivity before a tab is auto-docked (min 1). |
+| `terminals.disclaim_tcc_responsibility`   | `false`                                                          | macOS only. Birth the tmux server with its TCC responsibility disclaimed — see [macOS App Data prompts](#macos-app-data-prompts). |
 | `keybindings.overrides`                   | `{}`                                                             | Accelerator overrides; see below. |
 
 Internal constants (not exposed as keys, documented here for reference):
@@ -75,6 +83,46 @@ Internal constants (not exposed as keys, documented here for reference):
 | `DEFAULT_DEBOUNCE_MS`            | `500`    | TOML write debounce (§10.9). |
 | `XTERM_SCROLLBACK_LINES`         | `100000` | xterm.js scrollback cap (§3.8). |
 | `QUICKFIRE_HISTORY_LIMIT`        | `100`    | Quick-fire history size (§9.6). |
+
+### macOS App Data prompts
+
+On macOS Sequoia and later, reading another app's container
+(`~/Library/Containers/…`, `~/Library/Group Containers/…`,
+`~/Library/Application Support/<other app>/…`) triggers a *"… would like to
+access data from other apps"* dialog. Plenty of ordinary tooling does this —
+`docker` reaches into Docker Desktop's container, `pulumi` walks several app
+dirs for credentials and plugins.
+
+macOS charges that access to the **responsible process**, not to the process
+that performed it. Every shell in a pane, and everything it runs, descends from
+the one `-L raum` tmux server, so that server's responsibility is what the
+prompt names.
+
+By default raum leaves responsibility with **raum.app**. Its Developer-ID
+signature is a stable identity, so a single *Allow* is remembered — and the
+prompts stop entirely once raum is ticked in **System Settings ▸ Privacy &
+Security ▸ Full Disk Access**, which covers every pane at once.
+
+Setting `terminals.disclaim_tcc_responsibility = true` opts into the behaviour
+of standalone terminal emulators (iTerm2, WezTerm, Ghostty): the server
+disclaims and becomes its own responsible process, keeping grants earned by
+shell commands off raum.app's identity. The trade-off is real — prompts then
+name `tmux`, and a Homebrew tmux is ad-hoc signed at a version-pinned Cellar
+path, so TCC has nothing durable to attach the decision to and asks again and
+again. Grant Full Disk Access to the tmux binary itself if you use this mode,
+and re-add it after every `brew upgrade tmux`.
+
+Opting in also sets `exit-empty off` on the raum socket. That is required, not
+incidental: a session-less tmux server exits the instant the client that
+birthed it detaches, so the disclaimed server would die before the first
+`new-session` reached it and the session would land on a second,
+non-disclaimed server — silently undoing the whole thing. The visible effect is
+that the raum tmux server stays resident after its last session is killed.
+
+The setting is read once at app launch and applied when the tmux server is
+**born**, so changing it needs both: relaunch raum, and start from a cold
+socket (`tmux -L raum kill-server`, which ends every live session). Editing
+`config.toml` on its own changes nothing.
 
 ---
 

@@ -10,6 +10,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use raum_core::config::{SessionState, XTERM_SCROLLBACK_LINES};
@@ -135,6 +136,11 @@ pub struct RecoveryReport {
 pub struct TmuxManager {
     pub socket: String,
     pub binary: PathBuf,
+    /// macOS TCC policy for the server birth — see
+    /// [`set_disclaim_tcc`](Self::set_disclaim_tcc). Shared across clones so
+    /// the startup sync reaches every holder of the manager; only consulted at
+    /// the moment the server is born.
+    disclaim_tcc: Arc<AtomicBool>,
 }
 
 impl Default for TmuxManager {
@@ -142,6 +148,7 @@ impl Default for TmuxManager {
         Self {
             socket: default_socket_name(),
             binary: PathBuf::from("tmux"),
+            disclaim_tcc: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -153,7 +160,23 @@ impl TmuxManager {
         Self {
             socket: socket.into(),
             binary: PathBuf::from("tmux"),
+            disclaim_tcc: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Set the macOS TCC responsibility policy applied when the tmux server is
+    /// born (`config.toml` → `terminals.disclaim_tcc_responsibility`).
+    ///
+    /// `false` (default) leaves raum.app as the TCC "responsible process" for
+    /// every shell under the server, so App Data prompts name raum — a
+    /// Developer-ID-signed identity TCC can pin a decision to, and one that
+    /// Full Disk Access can silence for good. `true` disclaims, making the
+    /// server its own responsible process (prompts name `tmux`).
+    ///
+    /// Consulted only at server birth, so this has no effect on a server that
+    /// is already running — the socket has to go cold first. A no-op off macOS.
+    pub fn set_disclaim_tcc(&self, on: bool) {
+        self.disclaim_tcc.store(on, Ordering::Relaxed);
     }
 
     /// §3.1 — starting the server is a no-op in practice: `tmux -L raum new-session -d`
@@ -361,16 +384,27 @@ impl TmuxManager {
         // already being set, and it's required even when manual is set
         // because the post-creation `resize-window` then matches the existing
         // size (no-op, but consistent).
-        // macOS: birth the tmux server with its TCC responsibility disclaimed
-        // *before* the `new-session` below can lazily fork a non-disclaimed one.
-        // This stops Sequoia's "raum would like to access data from other apps"
-        // prompt from firing for file access done by shells (and tools they run,
-        // e.g. `pulumi`) inside panes — those are all descendants of the server.
+        // macOS, opt-in: birth the tmux server with its TCC responsibility
+        // disclaimed *before* the `new-session` below can lazily fork a
+        // non-disclaimed one. Sequoia charges a pane's foreign app-data reads
+        // (`docker`, `pulumi`, …) to the responsible process of the server that
+        // parents every shell; disclaiming moves that from raum.app to `tmux`.
+        //
+        // Off by default because the Homebrew `tmux` is ad-hoc signed, so TCC
+        // has no durable identity to pin an "Allow" to and re-prompts forever —
+        // whereas raum.app is Developer-ID signed and can simply be granted
+        // Full Disk Access once. See `terminals.disclaim_tcc_responsibility`.
+        //
         // No-op if a server is already running, and on non-macOS. Best-effort:
-        // on failure we fall through to the inline `start-server` below (today's
-        // inherited-responsibility behaviour) rather than block pane creation.
-        if let Err(e) = crate::disclaim::birth_server(&self.binary, &self.socket) {
-            warn!(error = %e, "disclaimed tmux server birth failed; TCC prompts may still appear");
+        // on failure we fall through to the inline `start-server` below
+        // (inherited responsibility) rather than block pane creation.
+        if self.disclaim_tcc.load(Ordering::Relaxed) {
+            if let Err(e) = crate::disclaim::birth_server(&self.binary, &self.socket) {
+                warn!(
+                    error = %e,
+                    "disclaimed tmux server birth failed; TCC prompts may still appear"
+                );
+            }
         }
 
         let (init_cols, init_rows) = initial_size.unwrap_or((200, 50));
@@ -949,6 +983,24 @@ fn parse_pane_context(stdout: &str) -> PaneContext {
 mod tests {
     use super::*;
 
+    /// The disclaim is opt-in, and the flag is shared across clones — the
+    /// startup sync sets it on the managed `Arc<TmuxManager>` while the spawn
+    /// paths hold their own clones, so a per-instance copy would silently
+    /// ignore the user's setting.
+    #[test]
+    fn tcc_disclaim_is_off_by_default_and_shared_across_clones() {
+        assert!(!TmuxManager::default().disclaim_tcc.load(Ordering::Relaxed));
+
+        let mgr = TmuxManager::with_socket("raum-tcc-flag-test");
+        assert!(!mgr.disclaim_tcc.load(Ordering::Relaxed));
+
+        let clone = mgr.clone();
+        mgr.set_disclaim_tcc(true);
+        assert!(clone.disclaim_tcc.load(Ordering::Relaxed));
+        clone.set_disclaim_tcc(false);
+        assert!(!mgr.disclaim_tcc.load(Ordering::Relaxed));
+    }
+
     #[test]
     fn parse_sessions_handles_missing_fields() {
         let stdout = "\
@@ -1013,15 +1065,21 @@ sess-windows-crlf\t1700000002\t100\t30\r
         assert!(!is_no_server_stderr(""));
     }
 
-    /// Guards the raw `posix_spawn` FFI in [`crate::disclaim`]: a malformed
-    /// argv/attr would make the spawn fail or produce a dead server. TCC
-    /// responsibility itself isn't observable from a test, so we assert the
-    /// weaker-but-meaningful property — the disclaimed birth returns `Ok` and
-    /// leaves a live server that can actually host a session. macOS-only (the
-    /// disclaim is a no-op elsewhere); skipped when `tmux` isn't installed.
+    /// Guards the raw `posix_spawn` FFI in [`crate::disclaim`] AND the property
+    /// that makes it worth anything: the session must be hosted by *the server
+    /// the disclaimed spawn birthed*.
+    ///
+    /// TCC responsibility isn't observable from a test, but the failure mode
+    /// that silently voids it is: under tmux's default `exit-empty on` a
+    /// session-less server exits as soon as the birthing client detaches, so
+    /// the disclaimed server dies in the gap before `new-session` and the
+    /// session lands on a second, non-disclaimed server. Every assertion below
+    /// still passed in that state — sessions existed, they were just parented
+    /// by the wrong server — so we pin the server PID across the gap instead.
+    /// macOS-only (the disclaim is a no-op elsewhere); skipped without `tmux`.
     #[cfg(target_os = "macos")]
     #[test]
-    fn disclaimed_birth_yields_usable_server() {
+    fn disclaimed_birth_survives_to_host_the_first_session() {
         if std::process::Command::new("tmux")
             .arg("-V")
             .output()
@@ -1037,13 +1095,39 @@ sess-windows-crlf\t1700000002\t100\t30\r
             std::process::id(),
             nanos
         ));
+        // The PID tmux reports for the server currently on this socket, or
+        // `None` when nothing is listening.
+        let server_pid = |mgr: &TmuxManager| -> Option<String> {
+            let out = mgr
+                .cmd()
+                .args(["display-message", "-p", "#{pid}"])
+                .output()
+                .ok()?;
+            let pid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            (out.status.success() && !pid.is_empty()).then_some(pid)
+        };
 
         crate::disclaim::birth_server(&mgr.binary, &mgr.socket).expect("disclaimed birth");
+
+        // Sleep past the window in which an `exit-empty on` server reaps
+        // itself, so a regression fails deterministically rather than racing.
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let born = server_pid(&mgr).expect(
+            "the disclaimed server must still be alive when `new-session` arrives — \
+             otherwise the session is hosted by a non-disclaimed server and TCC \
+             responsibility stays with raum.app",
+        );
 
         mgr.new_session("disc-1", std::path::Path::new("/tmp"), None, Some((80, 24)))
             .expect("new_session on the disclaimed server");
         let sessions = mgr.list_sessions().expect("list on a live server");
         assert!(sessions.iter().any(|s| s.id == "disc-1"));
+
+        assert_eq!(
+            server_pid(&mgr).as_deref(),
+            Some(born.as_str()),
+            "the session must be hosted by the disclaimed server, not a replacement",
+        );
 
         let _ = mgr.kill_server();
     }

@@ -20,21 +20,43 @@
 //! parents every shell. Client commands (`capture-pane`, `attach-session`,
 //! `load-buffer`, …) never parent a shell, so they don't need it.
 //!
+//! **This is opt-in** (`config.toml` → `terminals.disclaim_tcc_responsibility`,
+//! default `false`), because moving responsibility onto `tmux` trades a
+//! durable identity for a disposable one: raum.app is Developer-ID signed, so
+//! TCC pins an "Allow" to it permanently and one Full Disk Access tick silences
+//! the class outright — while the Homebrew `tmux` is ad-hoc signed
+//! (`TeamIdentifier=not set`) at a version-pinned Cellar path, so decisions
+//! don't stick and the same prompt returns over and over. Users who prefer the
+//! emulator behaviour — shell-earned grants kept off raum.app's identity — turn
+//! it on and pay that cost knowingly.
+//!
 //! Non-macOS targets have no TCC framework (Linux file access is plain Unix
 //! permissions), so this is a no-op there.
 
 /// Birth the `-L <socket>` tmux server with its TCC responsibility disclaimed.
 ///
-/// On macOS this runs `<binary> -L <socket> start-server` through `posix_spawn`
-/// with `responsibility_spawnattrs_setdisclaim`, so the server daemon — and
+/// On macOS this runs `<binary> -L <socket> start-server ; set-option -s
+/// exit-empty off` through `posix_spawn` with
+/// `responsibility_spawnattrs_setdisclaim`, so the server daemon — and
 /// therefore every shell and tool that runs under it — is its own TCC
 /// "responsible process" instead of inheriting raum.app's.
+///
+/// The `exit-empty off` is load-bearing, not a tweak. Under tmux's default
+/// (`exit-empty on`) a server with no sessions and no attached clients exits
+/// the moment the birthing client detaches — which is *before* the caller's
+/// `new-session` can reach it, since that's a whole fork+exec away. The
+/// disclaimed server would die and the session would silently land on a second,
+/// non-disclaimed server forked by the `new-session` client, leaving
+/// responsibility with raum.app and this call a no-op. Turning it off keeps the
+/// disclaimed server alive across the gap; the cost is that an opted-in socket
+/// keeps its (idle, near-free) server after the last session is killed instead
+/// of reaping it.
 ///
 /// `start-server` is a no-op when a server already exists, so this is safe to
 /// call on every session creation; the guarantee it provides is only that
 /// *whenever the server is born, it's born disclaimed*. A server left alive by
-/// an older (non-disclaimed) build is not retroactively fixed — it self-heals
-/// the next time the server is created from cold.
+/// a non-disclaimed birth is not retroactively fixed — it self-heals the next
+/// time the server is created from cold.
 ///
 /// Non-macOS targets have no TCC; this is a no-op that returns `Ok(())`.
 #[cfg(target_os = "macos")]
@@ -88,13 +110,26 @@ mod imp {
         let arg_socket = CString::new(socket.as_bytes()).map_err(|_| nul("socket"))?;
         let arg_cmd = CString::new("start-server").expect("literal has no NUL");
         let devnull = CString::new("/dev/null").expect("literal has no NUL");
+        // `start-server ; set-option -s exit-empty off` — the option keeps the
+        // freshly born, session-less server from exiting before the caller's
+        // `new-session` client can reach it. See the fn doc.
+        let arg_sep = CString::new(";").expect("literal has no NUL");
+        let arg_set = CString::new("set-option").expect("literal has no NUL");
+        let arg_server_scope = CString::new("-s").expect("literal has no NUL");
+        let arg_exit_empty = CString::new("exit-empty").expect("literal has no NUL");
+        let arg_off = CString::new("off").expect("literal has no NUL");
 
         // NUL-terminated argv; entries borrow the CStrings above for the call.
-        let mut argv: [*mut libc::c_char; 5] = [
+        let mut argv: [*mut libc::c_char; 10] = [
             path.as_ptr().cast_mut(),
             arg_l.as_ptr().cast_mut(),
             arg_socket.as_ptr().cast_mut(),
             arg_cmd.as_ptr().cast_mut(),
+            arg_sep.as_ptr().cast_mut(),
+            arg_set.as_ptr().cast_mut(),
+            arg_server_scope.as_ptr().cast_mut(),
+            arg_exit_empty.as_ptr().cast_mut(),
+            arg_off.as_ptr().cast_mut(),
             std::ptr::null_mut(),
         ];
 
