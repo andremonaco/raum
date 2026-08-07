@@ -1428,7 +1428,7 @@ export const TopRow: Component = () => {
                     >
                       <AlertCircleIcon class={has() ? "size-3.5 shrink-0" : "size-3 shrink-0"} />
                       <Show when={has()} fallback={<>0</>}>
-                        {attentionCount()} need attention
+                        {attentionCount()} need you
                       </Show>
                     </PopoverTrigger>
                     {/* Caret: cross-project awaiting view toggle (the legacy
