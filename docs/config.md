@@ -70,6 +70,8 @@ disclaim_tcc_responsibility = false # macOS TCC; see "macOS App Data prompts"
 | `terminals.auto_dock_inactive`            | `false`                                                          | Dock a terminal/harness tab with no activity in the threshold window. |
 | `terminals.auto_dock_inactive_days`       | `1`                                                              | Days of inactivity before a tab is auto-docked (min 1). |
 | `terminals.disclaim_tcc_responsibility`   | `false`                                                          | macOS only. Birth the tmux server with its TCC responsibility disclaimed — see [macOS App Data prompts](#macos-app-data-prompts). |
+| `terminals.restart_server_on_next_launch` | `false`                                                          | Written by raum, not by hand. One-shot: set when the user accepts the tmux-server restart prompt, consumed at the next launch. Removed at 0.2.0. |
+| `terminals.server_restart_hint_dismissed` | `false`                                                          | Written by raum, not by hand. Set when the user dismisses that prompt for good. Removed at 0.2.0. |
 | `keybindings.overrides`                   | `{}`                                                             | Accelerator overrides; see below. |
 
 Internal constants (not exposed as keys, documented here for reference):
