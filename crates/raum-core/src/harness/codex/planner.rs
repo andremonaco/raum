@@ -1,6 +1,6 @@
 //! Pure render helpers for Codex setup artifacts.
 //!
-//! Splits out the TOML/JSON managed-block builders and the `notify`
+//! Splits out the TOML/JSON merge builders and the `notify`
 //! shell-script body so [`super::adapter`] can stay focused on the
 //! plan-orchestration shape. All functions in here are pure — no IO, no
 //! global state — so they are exercised both by `mod tests` and by the
@@ -17,98 +17,166 @@ use crate::harness::setup::SetupError;
 
 use super::RAUM_CODEX_HOOK_EVENTS;
 
-pub(super) fn render_codex_toml_managed_body(
+/// Merge raum's keys into an existing Codex `config.toml`, preserving
+/// every byte the user wrote — formatting, comments, and unrelated keys
+/// survive untouched (`toml_edit` is format-preserving). Returns the
+/// full new file contents for `SetupAction::WriteToml`.
+///
+/// A sentinel-block splice cannot work here: raum owns the top-level
+/// `notify` key, and TOML scopes bare keys to the nearest preceding
+/// `[table]` header — a block appended after user content would silently
+/// re-scope `notify` into the user's last table. Targeted key writes
+/// have no placement problem, so raum overlays exactly the keys it owns:
+///
+/// * `notify = ["<codex-notify.sh>"]` — turn-complete forwarder.
+/// * `[tui] notifications / notification_method = "osc9"` — approval
+///   prompts are the only `Waiting` signal raum has on Codex, and they
+///   arrive solely as OSC 9 from the TUI.
+/// * `[tui] notification_condition = "always"` — Codex defaults to
+///   `unfocused` and boots with `terminal_focused = true`
+///   (codex-rs/tui/src/tui.rs); inside tmux focus events rarely arrive,
+///   so every OSC 9 would be suppressed. raum's notification center
+///   applies its own focus gating downstream.
+/// * `[features] hooks = true` (renamed from `codex_hooks` in Codex
+///   0.130 — openai/codex#20684) and `[hooks.state."<key>"].trusted_hash`
+///   pre-approvals (openai/codex#20321), both gated on `enable_hooks`.
+/// * `[projects."<abs-path>"] trust_level = "trusted"` for the project
+///   root and every raum-known worktree, so Codex never re-prompts for
+///   a registered path. User-added `[projects]` entries are untouched.
+///
+/// A legacy `# <raum-managed>` sentinel block from earlier raum versions
+/// is stripped first — every key it carried is re-asserted as a targeted
+/// write, so the block migrates away on first contact.
+///
+/// Errors instead of clobbering when the existing file is not valid
+/// TOML, or when a key raum needs as a table exists as something else.
+// ponytail: stale [hooks.state] / [projects] entries from renamed or
+// de-registered projects linger (harmless — they reference paths Codex
+// no longer discovers); add prefix-scoped cleanup if they ever bother.
+pub(super) fn merge_codex_config_toml(
+    existing: Option<&str>,
     notify_script: &Path,
     enable_hooks: bool,
     trusted_paths: &[PathBuf],
     hooks_json_path: &Path,
     hook_script: &Path,
-) -> String {
-    // TOML arrays are top-level; the `[features]` and `[tui]` tables are
-    // siblings. We emit them in a single managed block so the whole raum
-    // configuration sits between the sentinels.
-    //
-    // `[tui] notifications / notification_method` is written **always**
-    // (not gated on `enable_hooks`): approval prompts are the only
-    // signal raum has for `Waiting` state on Codex, and that signal
-    // only arrives as OSC 9 from the TUI. Older Codex builds that
-    // don't recognise the key ignore it harmlessly; newer builds that
-    // do need it would otherwise silently stay in `Working` through
-    // every approval prompt.
-    //
-    // `[features] hooks` (renamed from `codex_hooks` in Codex 0.130 —
-    // openai/codex#20684) and the `[hooks.state]` trust entries below
-    // are both gated on `enable_hooks`: they only take effect on
-    // versions that know about hooks at all, and the trust entries
-    // pre-approve raum's own hooks.json so Codex's `/hooks` review
-    // queue (openai/codex#20321) doesn't strand them in `Untrusted`.
-    //
-    // `[projects."<abs-path>"]` tables pre-declare every raum-registered
-    // project + worktree as trusted. Codex keys its trust prompt on the
-    // spawn cwd; without this raum users would re-accept per project and
-    // per worktree.
-    let path_json = serde_json::to_string(&notify_script.display().to_string())
-        .unwrap_or_else(|_| "\"\"".into());
-    let mut body = format!("notify = [{path_json}]\n");
-    body.push_str("\n[tui]\nnotifications = true\nnotification_method = \"osc9\"\n");
+) -> Result<String, SetupError> {
+    use toml_edit::{DocumentMut, value};
+
+    let base = existing.map(|raw| {
+        crate::config_io::managed_toml::remove_managed_block(raw).unwrap_or_else(|| raw.to_string())
+    });
+    let mut doc: DocumentMut = base.as_deref().unwrap_or("").parse().map_err(|e| {
+        SetupError::Planner(format!(
+            "existing Codex config.toml is not valid TOML ({e}); refusing to modify it"
+        ))
+    })?;
+
+    doc["notify"] = value(toml_edit::Array::from_iter([notify_script
+        .display()
+        .to_string()]));
+    let tui = table_at(&mut doc, &["tui"])?;
+    tui["notifications"] = value(true);
+    tui["notification_method"] = value("osc9");
+    tui["notification_condition"] = value("always");
     if enable_hooks {
-        body.push_str("\n[features]\nhooks = true\n");
+        table_at(&mut doc, &["features"])?["hooks"] = value(true);
         // Pre-seed `[hooks.state."<key>"].trusted_hash` so each raum
         // hook lands as `Trusted` instead of `Untrusted` on first
-        // launch. The key + hash format must mirror Codex's
-        // `hook_key` / `version_for_toml` exactly — see the helpers
-        // below.
-        // Each event raum subscribes to is written as a single
-        // matcher-group with a single handler in `hooks.json`, so the
-        // positional indices Codex hashes into the state key are
-        // always (0, 0).
+        // launch. raum's entry is always the first matcher-group /
+        // first handler in hooks.json (see `merge_codex_hooks_json`),
+        // so the positional indices in the state key are (0, 0).
         for event in RAUM_CODEX_HOOK_EVENTS {
             let key = codex_hook_state_key(hooks_json_path, event, 0, 0);
             let hash = codex_hook_trusted_hash(event, hook_script);
-            let key_json = serde_json::to_string(&key).unwrap_or_else(|_| "\"\"".into());
-            let hash_json = serde_json::to_string(&hash).unwrap_or_else(|_| "\"\"".into());
-            let _ = write!(
-                body,
-                "\n[hooks.state.{key_json}]\ntrusted_hash = {hash_json}\n",
-            );
+            table_at(&mut doc, &["hooks", "state", &key])?.insert("trusted_hash", value(hash));
         }
     }
     // De-duplicate while preserving insertion order (project root first,
-    // worktrees in caller order) so the rendered body is stable across
-    // runs — otherwise a HashSet would make the managed block churn.
+    // worktrees in caller order) so re-runs stay byte-stable.
     let mut seen: std::collections::HashSet<&Path> = std::collections::HashSet::new();
     for path in trusted_paths {
         if path.as_os_str().is_empty() || !seen.insert(path.as_path()) {
             continue;
         }
-        let key =
-            serde_json::to_string(&path.display().to_string()).unwrap_or_else(|_| "\"\"".into());
-        let _ = write!(body, "\n[projects.{key}]\ntrust_level = \"trusted\"\n");
+        table_at(&mut doc, &["projects", &path.display().to_string()])?
+            .insert("trust_level", value("trusted"));
     }
-    let rendered = crate::config_io::managed_toml::render(None, body.trim_end());
-    // Strip the begin/end sentinel frames — the `SetupAction::WriteToml`
-    // executor currently does an atomic full-file write, not a managed
-    // splice, so we have to frame the whole file here. Rather than add a
-    // new "apply_managed_block" executor variant, the content we pass
-    // to `WriteToml` is the *entire file* with the managed block in it.
-    // An existing user file is not preserved through `WriteToml`.
-    // Callers that need preservation call `apply_managed_toml_block`
-    // directly from an integration test or runtime shim.
-    rendered
+    Ok(doc.to_string())
 }
 
-pub(super) fn render_codex_hooks_json(hook_script: &Path) -> Result<String, SetupError> {
-    // Build the Codex-shaped top-level object: `{ "hooks": {...} }`.
-    let mut hooks_obj = serde_json::Map::new();
-    for event in RAUM_CODEX_HOOK_EVENTS {
-        hooks_obj.insert(
-            (*event).to_string(),
-            Value::Array(vec![codex_hook_entry(event, hook_script)]),
-        );
+/// Walk (creating as needed) nested tables at `path`. Newly created
+/// intermediates are marked implicit so `[hooks]` headers without direct
+/// keys are not emitted. Errors when an existing key is not a table —
+/// the graceful alternative to `toml_edit`'s panicking index operators.
+fn table_at<'a>(
+    doc: &'a mut toml_edit::DocumentMut,
+    path: &[&str],
+) -> Result<&'a mut toml_edit::Table, SetupError> {
+    let mut tbl = doc.as_table_mut();
+    for seg in path {
+        let item = tbl.entry(seg).or_insert_with(|| {
+            let mut t = toml_edit::Table::new();
+            t.set_implicit(true);
+            toml_edit::Item::Table(t)
+        });
+        tbl = item.as_table_mut().ok_or_else(|| {
+            SetupError::Planner(format!(
+                "Codex config.toml key `{seg}` exists but is not a table; refusing to overwrite"
+            ))
+        })?;
     }
-    let root = json!({
-        "hooks": Value::Object(hooks_obj),
-    });
+    Ok(tbl)
+}
+
+/// Merge raum's hook entries into an existing Codex `hooks.json`,
+/// preserving user-authored entries. Returns the full new file contents
+/// for `SetupAction::WriteJson`.
+///
+/// raum's entry is **inserted at index 0** of each event array, not
+/// appended: Codex keys per-hook trust state positionally
+/// (`<path>:<event>:<group_index>:<handler_index>`), and the
+/// `trusted_hash` entries raum pre-seeds in config.toml assume (0, 0).
+/// Appending after user entries would make raum's indices depend on how
+/// many hooks the user has — and shift whenever that changes.
+///
+/// Errors instead of clobbering when the existing file is not valid
+/// JSON.
+pub(super) fn merge_codex_hooks_json(
+    existing: Option<&str>,
+    hook_script: &Path,
+) -> Result<String, SetupError> {
+    let mut root: Value = match existing {
+        Some(raw) => serde_json::from_str(raw).map_err(|e| {
+            SetupError::Planner(format!(
+                "existing Codex hooks.json is not valid JSON ({e}); refusing to modify it"
+            ))
+        })?,
+        None => json!({}),
+    };
+    if !root.is_object() {
+        root = json!({});
+    }
+    let hooks = root
+        .as_object_mut()
+        .expect("root is object")
+        .entry("hooks")
+        .or_insert_with(|| json!({}));
+    if !hooks.is_object() {
+        *hooks = json!({});
+    }
+    let hooks_obj = hooks.as_object_mut().expect("hooks is object");
+    for event in RAUM_CODEX_HOOK_EVENTS {
+        let arr_entry = hooks_obj
+            .entry((*event).to_string())
+            .or_insert_with(|| json!([]));
+        if !arr_entry.is_array() {
+            *arr_entry = json!([]);
+        }
+        let arr = arr_entry.as_array_mut().expect("hooks.<event> is array");
+        arr.retain(|v| !crate::config_io::managed_json::is_raum_managed(v));
+        arr.insert(0, codex_hook_entry(event, hook_script));
+    }
     serde_json::to_string_pretty(&root).map_err(|e| SetupError::Serialize(e.to_string()))
 }
 
@@ -171,15 +239,24 @@ pub(super) fn codex_hook_state_key(
 /// `codex-rs/hooks/src/engine/discovery.rs` and
 /// `codex-rs/config/src/fingerprint.rs`: SHA-256 over a canonical-JSON
 /// serialisation (recursively sorted object keys) of the normalised
-/// `{event_name, matcher, hooks: [Command]}` identity, hex-lowercase,
-/// prefixed `sha256:`. The handler matches what
-/// [`render_codex_hooks_json`] writes after Codex's discovery
-/// normalisation step (timeout `None` → 600, `async` defaulted to
-/// `false`).
+/// `{event_name, hooks: [Command]}` identity, hex-lowercase, prefixed
+/// `sha256:`. The handler matches what [`render_codex_hooks_json`]
+/// writes after Codex's discovery normalisation step (timeout `None` →
+/// 600, `async` defaulted to `false`).
+///
+/// No `matcher` key: `matcher_pattern_for_event` in
+/// `codex-rs/hooks/src/events/common.rs` normalises the matcher to
+/// `None` for `UserPromptSubmit` and `Stop` (matchers are meaningless
+/// for those events), and `toml::Value` serialisation drops `None`
+/// fields — so the matcher never enters the hash for the events raum
+/// subscribes to. Including `"matcher": ".*"` here made every hash
+/// mismatch, stranding raum's hooks in Codex's "new or changed" review
+/// prompt on every launch. If `RAUM_CODEX_HOOK_EVENTS` ever grows an
+/// event listed in upstream `HOOK_EVENT_NAMES_WITH_MATCHERS`, the
+/// matcher must be re-added for that event only.
 pub(super) fn codex_hook_trusted_hash(event: &str, hook_script: &Path) -> String {
     let identity = json!({
         "event_name": codex_hook_event_label(event),
-        "matcher": ".*",
         "hooks": [
             {
                 "type": "command",

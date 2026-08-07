@@ -533,7 +533,10 @@ pub fn inspect_json_path(path: &Path) -> (bool, bool) {
     (true, managed)
 }
 
-/// Inspect a Codex `config.toml` for the raum `# <raum-managed>` block.
+/// Inspect a Codex `config.toml` for raum management. Current installs
+/// write targeted keys via `toml_edit` (detected by the notify-script
+/// reference); older installs wrapped a `# <raum-managed>` sentinel
+/// block, still recognised until migration strips it.
 #[must_use]
 pub fn inspect_toml_path(path: &Path) -> (bool, bool) {
     if !path.exists() {
@@ -542,7 +545,8 @@ pub fn inspect_toml_path(path: &Path) -> (bool, bool) {
     let Ok(raw) = std::fs::read_to_string(path) else {
         return (true, false);
     };
-    (true, managed_toml::contains_managed_block(&raw))
+    let managed = managed_toml::contains_managed_block(&raw) || raw.contains("codex-notify.sh");
+    (true, managed)
 }
 
 /// `Arc` wrapper for contexts that need to share one executor across tasks.

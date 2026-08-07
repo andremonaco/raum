@@ -83,7 +83,10 @@ async fn plan_on_supported_version_emits_notify_and_dispatcher_scripts() {
         panic!("expected WriteToml at index 2, got {:?}", plan.actions[2]);
     };
     assert_eq!(path, &config_toml);
-    assert!(content.contains("# <raum-managed>"));
+    // Targeted toml_edit writes replaced the legacy sentinel block —
+    // no sentinels in fresh output, just the keys raum owns.
+    assert!(!content.contains("# <raum-managed>"));
+    assert!(content.contains("codex-notify.sh"));
     // Renamed flag (was `codex_hooks` pre-Codex-0.130, now `hooks` —
     // openai/codex#20684).
     assert!(content.contains("hooks = true"));
@@ -91,6 +94,10 @@ async fn plan_on_supported_version_emits_notify_and_dispatcher_scripts() {
     assert!(content.contains("notify = ["));
     assert!(content.contains("notifications = true"));
     assert!(content.contains("notification_method = \"osc9\""));
+    // Codex defaults `notification_condition` to `unfocused` and boots
+    // with `terminal_focused = true`; inside tmux focus events rarely
+    // arrive, so without `always` every OSC 9 is suppressed.
+    assert!(content.contains("notification_condition = \"always\""));
     // Pre-seeded trust state for each raum hook (openai/codex#20321).
     // The state-key + hash must match what Codex computes at discovery
     // time, so derive both from the same helpers production code uses.
@@ -267,6 +274,7 @@ async fn plan_on_old_version_skips_hooks_json() {
     assert!(content.contains("notify = ["));
     assert!(content.contains("notifications = true"));
     assert!(content.contains("notification_method = \"osc9\""));
+    assert!(content.contains("notification_condition = \"always\""));
     assert!(!content.contains("codex_hooks"));
     // No `[features] hooks` flip and no `[hooks.state]` trust entries
     // when the binary is too old to know about hooks.
@@ -329,16 +337,19 @@ fn codex_hook_trusted_hash_matches_known_canonical_input() {
     // verbatim (see `command_hook_hash` in
     // `codex-rs/hooks/src/engine/discovery.rs`).
     //
-    // Identity (canonical-JSON, sorted keys):
+    // Identity (canonical-JSON, sorted keys). No `matcher` key: Codex
+    // normalises the matcher to `None` for `UserPromptSubmit` / `Stop`
+    // before hashing (`matcher_pattern_for_event`), and `None` fields
+    // are dropped from the TOML identity — see
+    // `codex_hook_trusted_hash` docs.
     //   {"event_name":"user_prompt_submit",
     //    "hooks":[{"async":false,
     //              "command":"/tmp/codex.sh UserPromptSubmit",
     //              "statusMessage":"raum: forwarding UserPromptSubmit",
     //              "timeout":600,
-    //              "type":"command"}],
-    //    "matcher":".*"}
+    //              "type":"command"}]}
     use sha2::{Digest, Sha256};
-    let canonical = br#"{"event_name":"user_prompt_submit","hooks":[{"async":false,"command":"/tmp/codex.sh UserPromptSubmit","statusMessage":"raum: forwarding UserPromptSubmit","timeout":600,"type":"command"}],"matcher":".*"}"#;
+    let canonical = br#"{"event_name":"user_prompt_submit","hooks":[{"async":false,"command":"/tmp/codex.sh UserPromptSubmit","statusMessage":"raum: forwarding UserPromptSubmit","timeout":600,"type":"command"}]}"#;
     let digest = Sha256::digest(canonical);
     let mut expected = String::from("sha256:");
     for byte in digest {
@@ -350,6 +361,192 @@ fn codex_hook_trusted_hash_matches_known_canonical_input() {
         actual, expected,
         "trusted_hash diverged from canonical-JSON SHA-256",
     );
+}
+
+#[tokio::test]
+async fn plan_preserves_user_config_toml_and_hooks_json() {
+    // The graceful-merge contract: a user's own config.toml keys,
+    // comments, and hooks.json entries survive plan regeneration.
+    let dir = tempdir().unwrap();
+    let config_toml = dir.path().join("codex-config.toml");
+    let hooks_json = dir.path().join("codex-hooks.json");
+    std::fs::write(
+        &config_toml,
+        "# my comment\nmodel = \"gpt-5\"\n\n[mcp_servers.foo]\ncommand = \"bar\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &hooks_json,
+        r#"{ "hooks": { "Stop": [ { "matcher": "user-kept", "hooks": [{ "type": "command", "command": "/user.sh" }] } ] } }"#,
+    )
+    .unwrap();
+    let adapter = CodexAdapter::with_paths(
+        config_toml.clone(),
+        hooks_json.clone(),
+        Some(semver_lite::Version {
+            major: 0,
+            minor: 130,
+            patch: 0,
+        }),
+    );
+    let ctx = test_ctx(dir.path(), "demo");
+    let plan = <CodexAdapter as NotificationSetup>::plan(&adapter, &ctx)
+        .await
+        .unwrap();
+
+    let SetupAction::WriteToml { ref content, .. } = plan.actions[2] else {
+        panic!("expected WriteToml at index 2");
+    };
+    // User content intact — comment, key, and table.
+    assert!(content.contains("# my comment"));
+    assert!(content.contains("model = \"gpt-5\""));
+    assert!(content.contains("[mcp_servers.foo]"));
+    // raum keys present alongside.
+    assert!(content.contains("codex-notify.sh"));
+    assert!(content.contains("notification_condition = \"always\""));
+    // Output is valid TOML with user + raum keys at the right scope.
+    let parsed: toml::Value = content.parse().unwrap();
+    assert_eq!(parsed["model"].as_str().unwrap(), "gpt-5");
+    assert!(
+        parsed["notify"].as_array().is_some(),
+        "notify must stay top-level"
+    );
+    assert!(parsed["mcp_servers"]["foo"]["command"].as_str().is_some());
+
+    let SetupAction::WriteJson { ref content, .. } = plan.actions[4] else {
+        panic!("expected WriteJson at index 4");
+    };
+    let parsed: Value = serde_json::from_str(content).unwrap();
+    let stop = parsed["hooks"]["Stop"].as_array().unwrap();
+    // raum first (positional trust keys assume group 0), user kept after.
+    assert_eq!(stop.len(), 2);
+    assert_eq!(stop[0][MARKER_KEY].as_str().unwrap(), MARKER_BEGIN);
+    assert_eq!(stop[1]["matcher"].as_str().unwrap(), "user-kept");
+}
+
+#[tokio::test]
+async fn plan_migrates_legacy_sentinel_block_out_of_config_toml() {
+    let dir = tempdir().unwrap();
+    let config_toml = dir.path().join("codex-config.toml");
+    let hooks_json = dir.path().join("codex-hooks.json");
+    std::fs::write(
+        &config_toml,
+        "model = \"gpt-5\"\n\n# <raum-managed>\nnotify = [\"/old/notify.sh\"]\n\n[features]\nhooks = true\n# </raum-managed>\n",
+    )
+    .unwrap();
+    let adapter = CodexAdapter::with_paths(
+        config_toml.clone(),
+        hooks_json,
+        Some(semver_lite::Version {
+            major: 0,
+            minor: 130,
+            patch: 0,
+        }),
+    );
+    let ctx = test_ctx(dir.path(), "demo");
+    let plan = <CodexAdapter as NotificationSetup>::plan(&adapter, &ctx)
+        .await
+        .unwrap();
+    let SetupAction::WriteToml { ref content, .. } = plan.actions[2] else {
+        panic!("expected WriteToml at index 2");
+    };
+    assert!(!content.contains("# <raum-managed>"));
+    assert!(!content.contains("/old/notify.sh"));
+    assert!(content.contains("model = \"gpt-5\""));
+    assert!(content.contains("codex-notify.sh"));
+}
+
+#[tokio::test]
+async fn plan_refuses_to_clobber_unparsable_user_files() {
+    // Broken TOML → plan errors instead of planning a destructive write.
+    let dir = tempdir().unwrap();
+    let config_toml = dir.path().join("codex-config.toml");
+    let hooks_json = dir.path().join("codex-hooks.json");
+    std::fs::write(&config_toml, "model = [unclosed\n").unwrap();
+    let adapter = CodexAdapter::with_paths(
+        config_toml,
+        hooks_json.clone(),
+        Some(semver_lite::Version {
+            major: 0,
+            minor: 130,
+            patch: 0,
+        }),
+    );
+    let ctx = test_ctx(dir.path(), "demo");
+    let err = <CodexAdapter as NotificationSetup>::plan(&adapter, &ctx).await;
+    assert!(err.is_err(), "expected refusal on broken TOML: {err:?}");
+
+    // Broken hooks.json → same refusal.
+    let dir = tempdir().unwrap();
+    let config_toml = dir.path().join("codex-config.toml");
+    let hooks_json = dir.path().join("codex-hooks.json");
+    std::fs::write(&hooks_json, "{ not json").unwrap();
+    let adapter = CodexAdapter::with_paths(
+        config_toml,
+        hooks_json,
+        Some(semver_lite::Version {
+            major: 0,
+            minor: 130,
+            patch: 0,
+        }),
+    );
+    let ctx = test_ctx(dir.path(), "demo");
+    let err = <CodexAdapter as NotificationSetup>::plan(&adapter, &ctx).await;
+    assert!(err.is_err(), "expected refusal on broken JSON: {err:?}");
+}
+
+#[tokio::test]
+async fn plan_rerun_is_idempotent_over_own_output() {
+    let dir = tempdir().unwrap();
+    let config_toml = dir.path().join("codex-config.toml");
+    let hooks_json = dir.path().join("codex-hooks.json");
+    let adapter = CodexAdapter::with_paths(
+        config_toml.clone(),
+        hooks_json.clone(),
+        Some(semver_lite::Version {
+            major: 0,
+            minor: 130,
+            patch: 0,
+        }),
+    );
+    let ctx = test_ctx(dir.path(), "demo");
+    let plan = <CodexAdapter as NotificationSetup>::plan(&adapter, &ctx)
+        .await
+        .unwrap();
+    let (
+        SetupAction::WriteToml {
+            content: first_toml,
+            ..
+        },
+        SetupAction::WriteJson {
+            content: first_json,
+            ..
+        },
+    ) = (&plan.actions[2], &plan.actions[4])
+    else {
+        panic!("unexpected plan shape: {plan:?}");
+    };
+    // Persist round 1 output as the "existing" files, re-plan, compare.
+    std::fs::write(&config_toml, first_toml).unwrap();
+    std::fs::write(&hooks_json, first_json).unwrap();
+    let plan2 = <CodexAdapter as NotificationSetup>::plan(&adapter, &ctx)
+        .await
+        .unwrap();
+    let (
+        SetupAction::WriteToml {
+            content: second_toml,
+            ..
+        },
+        SetupAction::WriteJson {
+            content: second_json,
+            ..
+        },
+    ) = (&plan2.actions[2], &plan2.actions[4])
+    else {
+        panic!("unexpected plan shape: {plan2:?}");
+    };
+    assert_eq!(first_toml, second_toml);
+    assert_eq!(first_json, second_json);
 }
 
 #[test]
