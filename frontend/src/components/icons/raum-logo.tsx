@@ -1,8 +1,8 @@
 import { splitProps, type ComponentProps } from "solid-js";
 
 /**
- * Raum logo — square with three rays from the top-right corner,
- * each targeting a different point on the opposite edges.
+ * Raum logo — square with three rays fanning from the top-left corner,
+ * tilted +10°, each ray targeting a different point on the opposite edges.
  */
 export const RaumLogo = (props: ComponentProps<"svg">) => {
   const [local, rest] = splitProps(props, ["class"]);
@@ -19,12 +19,14 @@ export const RaumLogo = (props: ComponentProps<"svg">) => {
       aria-hidden="true"
       {...rest}
     >
-      <rect x="2" y="2" width="96" height="96" />
+      <g transform="translate(50 50) rotate(10) scale(0.85) translate(-50 -50) translate(100 0) scale(-1 1)">
+        <rect x="2" y="2" width="96" height="96" />
 
-      {/* 3 rays from top-right corner (98, 2) */}
-      <line x1="98" y1="2" x2="2" y2="50" />
-      <line x1="98" y1="2" x2="2" y2="98" />
-      <line x1="98" y1="2" x2="50" y2="98" />
+        {/* 3 rays from the (mirrored) origin corner */}
+        <line x1="98" y1="2" x2="2" y2="50" />
+        <line x1="98" y1="2" x2="2" y2="98" />
+        <line x1="98" y1="2" x2="50" y2="98" />
+      </g>
     </svg>
   );
 };

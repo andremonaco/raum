@@ -1,30 +1,17 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
   <!--
-    Squircle background: 900x900 centered in 1024x1024 canvas.
-    62px transparent margin on all sides — tighter than Apple's
-    minimum 100px gutter (used by Safari/Finder) so the overall
-    icon reads at the same visual weight as other Dock icons.
-    rx="201" ≈ 22.37% of 900px (standard Apple squircle proportion).
+    Squircle background: 900x900 centered in 1024x1024 canvas, light fill.
+    rx="201" ~ 22.37% of 900px (standard Apple squircle proportion).
+    Mark: dark mini logo (square + 3 rays), mirrored so rays fan from the
+    top-left corner, tilted +10 deg, 14% gap to top/left tile edges.
+    The 100-unit design box maps onto the 900px squircle (factor 9).
   -->
-  <rect x="62" y="62" width="900" height="900" rx="201" ry="201" fill="#141418"/>
-
-  <!--
-    Logo art: 420x420 centered at (512,512) inside the 900x900 squircle.
-    Mark kept at its canonical 420px size — only the *background* grows
-    so the Dock icon's opaque area matches native apps without
-    inflating the key-visual itself.
-    Grid corners: TL=(302,302)  TR=(722,302)  BR=(722,722)  BL=(302,722)
-    2x2 grid midpoints: center=(512,512)
-  -->
-  <g stroke="white" stroke-width="24" fill="none" stroke-linecap="round" stroke-linejoin="round">
-
-    <!-- Outer border -->
-    <rect x="302" y="302" width="420" height="420"/>
-
-    <!-- 3 rays from top-right corner (722, 302) -->
-    <line x1="722" y1="302" x2="302" y2="512"/>
-    <line x1="722" y1="302" x2="302" y2="722"/>
-    <line x1="722" y1="302" x2="512" y2="722"/>
-
+  <rect x="62" y="62" width="900" height="900" rx="201" ry="201" fill="#f5f5f5"/>
+  <g transform="translate(62 62) scale(9) translate(13.4 13.4) scale(0.32) rotate(10 50 50) translate(100 0) scale(-1 1)"
+     stroke="#141418" stroke-width="13" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="2" y="2" width="96" height="96"/>
+    <line x1="98" y1="2" x2="2" y2="50"/>
+    <line x1="98" y1="2" x2="2" y2="98"/>
+    <line x1="98" y1="2" x2="50" y2="98"/>
   </g>
 </svg>
