@@ -107,6 +107,29 @@ pub fn begin_quit_flush_for_exit<R: Runtime>(app: &tauri::AppHandle<R>) -> bool 
     true
 }
 
+/// Run the frontend-flush half of the quit dance and return, without exiting.
+///
+/// Anything that tears down live state while raum keeps running needs the same
+/// guarantee a quit does — the frontend's debounced active-layout (500 ms) and
+/// terminal-snapshot (2 s) writers have to land first, or the next launch
+/// rehydrates a stale grid and stale scrollback. Extracted from
+/// [`spawn_quit_task`] so those paths reuse the tested protocol instead of
+/// approximating it.
+///
+/// Deliberately does *not* touch [`QUIT_IN_PROGRESS`]: this is not a quit, and
+/// latching it would make a later real quit skip its own flush.
+pub async fn flush_frontend_writers<R: Runtime>(app: &tauri::AppHandle<R>) {
+    if let Err(e) = app.emit("app-will-quit", ()) {
+        warn!(error = %e, "flush: app-will-quit emit failed; continuing after grace");
+    }
+    let notified = quit_ack().notified();
+    match tokio::time::timeout(QUIT_FLUSH_TIMEOUT, notified).await {
+        Ok(()) => info!("flush: frontend flush acked"),
+        Err(_) => warn!("flush: timed out waiting for frontend ack; continuing anyway"),
+    }
+    tokio::time::sleep(QUIT_DRAIN_GRACE).await;
+}
+
 fn spawn_quit_task<R: Runtime>(app: tauri::AppHandle<R>) {
     tauri::async_runtime::spawn(async move {
         // Ask the frontend to flush its debounced writers (active-layout

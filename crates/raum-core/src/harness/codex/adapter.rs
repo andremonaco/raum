@@ -24,9 +24,7 @@ use crate::harness::traits::{
 };
 
 use super::hook_script_path;
-use super::planner::{
-    codex_notify_script_body, render_codex_hooks_json, render_codex_toml_managed_body,
-};
+use super::planner::{codex_notify_script_body, merge_codex_config_toml, merge_codex_hooks_json};
 use super::{
     CODEX_HOOKS_MINIMUM_VERSION, CODEX_NOTIFY_SCRIPT_NAME, CodexAdapter, legacy_hooks_json_path,
 };
@@ -58,6 +56,20 @@ impl HarnessIdentity for CodexAdapter {
     }
 }
 
+/// Read a config file the plan is about to merge into. Missing file is
+/// fine (fresh install); an existing-but-unreadable file is an error —
+/// planning blind and then overwriting would destroy user content.
+fn read_optional(path: &std::path::Path) -> Result<Option<String>, SetupError> {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => Ok(Some(raw)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(SetupError::Planner(format!(
+            "cannot read {}: {e}; refusing to overwrite unread content",
+            path.display()
+        ))),
+    }
+}
+
 #[async_trait]
 impl NotificationSetup for CodexAdapter {
     /// Build the Codex setup plan:
@@ -67,15 +79,18 @@ impl NotificationSetup for CodexAdapter {
     /// 2. `WriteShellScript { codex-notify.sh, 0o700 }` — invoked by
     ///    Codex with the JSON payload appended as `argv[1]`. Forwards
     ///    the payload to the raum event socket tagged `source: "notify"`.
-    /// 3. `WriteToml { ~/.codex/config.toml }` — managed block setting
-    ///    `notify = ["<script>"]`, `[tui] notifications = true /
-    ///    notification_method = "osc9"` (always), `[features] hooks =
-    ///    true` (only when the installed Codex supports hooks), and a
-    ///    pre-computed `[hooks.state."<path>:..."].trusted_hash` for
-    ///    each raum hook so they bypass Codex's `/hooks` review queue
+    /// 3. `WriteToml { ~/.codex/config.toml }` — the user's existing
+    ///    file with raum's keys merged in (`merge_codex_config_toml`):
+    ///    `notify = ["<script>"]`, the `[tui]` notification keys
+    ///    (always), `[features] hooks = true` (only when the installed
+    ///    Codex supports hooks), and a pre-computed
+    ///    `[hooks.state."<path>:..."].trusted_hash` for each raum hook
+    ///    so they bypass Codex's `/hooks` review queue
     ///    (openai/codex#20321).
-    /// 4. `WriteJson { <project>/.codex/hooks.json }` — managed entries
-    ///    for `UserPromptSubmit` and `Stop`. **Skipped** when
+    /// 4. `WriteJson { <project>/.codex/hooks.json }` — the user's
+    ///    existing file with raum's `UserPromptSubmit` and `Stop`
+    ///    entries merged in at group index 0
+    ///    (`merge_codex_hooks_json`). **Skipped** when
     ///    `detect_version()` reports < [`CODEX_HOOKS_MINIMUM_VERSION`];
     ///    the `notify` path + OSC 9 scraper stay as the observation
     ///    channels on older hosts.
@@ -107,13 +122,12 @@ impl NotificationSetup for CodexAdapter {
             mode: 0o700,
         });
 
-        // config.toml — features + notify + trusted-project tables.
-        // When hooks are unsupported the managed block still flips the
-        // feature flag (harmless on older builds that ignore unknown
-        // feature flags) so upgrading the Codex binary does not require
-        // a re-install. Trust tables cover the project root and every
-        // worktree raum knows about so Codex never re-prompts for a
-        // registered path on launch.
+        // config.toml — features + notify + trusted-project tables,
+        // merged into the user's existing file (their keys, comments,
+        // and formatting survive — see `merge_codex_config_toml`).
+        // Trust tables cover the project root and every worktree raum
+        // knows about so Codex never re-prompts for a registered path
+        // on launch.
         let mut trusted: Vec<PathBuf> = Vec::new();
         if !ctx.project_dir.as_os_str().is_empty() {
             trusted.push(ctx.project_dir.clone());
@@ -128,20 +142,25 @@ impl NotificationSetup for CodexAdapter {
         // again as the `WriteJson` target below — so resolve it up
         // front.
         let project_hooks_path = self.hooks_json_path_for_ctx(ctx);
-        let notify_body = render_codex_toml_managed_body(
+        let config_toml_path = self.config_toml_path_for_ctx(ctx);
+        let merged_config = merge_codex_config_toml(
+            read_optional(&config_toml_path)?.as_deref(),
             &notify_script_path,
             supports_hooks,
             &trusted,
             &project_hooks_path,
             &hook_script,
-        );
+        )?;
         plan.push(SetupAction::WriteToml {
-            path: self.config_toml_path_for_ctx(ctx),
-            content: notify_body,
+            path: config_toml_path,
+            content: merged_config,
         });
 
         if supports_hooks {
-            let hooks_content = render_codex_hooks_json(&hook_script)?;
+            let hooks_content = merge_codex_hooks_json(
+                read_optional(&project_hooks_path)?.as_deref(),
+                &hook_script,
+            )?;
             // Phase 6 migration: strip raum-managed entries out of the
             // user-global `~/.codex/hooks.json` if a prior raum install
             // wrote them there. Skipped when we are already writing to

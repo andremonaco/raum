@@ -2,10 +2,11 @@
  * Webview liveness answering side of the focus-gated health check.
  *
  * macOS sometimes kills the WKWebView WebContent process while the screen
- * is locked; the backend cannot observe that directly (wry never surfaces
- * `webViewWebContentProcessDidTerminate:` to Tauri), so on every window
- * focus it runs a probe sequence: up to six `raum:ping` emits spread over
- * ~12 s, reloading the webview only if every one goes unanswered. A
+ * is locked. On macOS the backend now observes the kill directly (a
+ * swizzled `webViewWebContentProcessDidTerminate:`) and reloads at once;
+ * this probe is the fallback for missed callbacks and for Linux: on every
+ * window focus the backend emits up to three `raum:ping`s spread over
+ * ~6 s, reloading the webview only if every one goes unanswered. A
  * suspended-then-resumed page answers late; a dead one never answers —
  * so any pong, however stale, proves life. This module is the page's half
  * of that handshake: echo every ping via `webview_pong`, and announce

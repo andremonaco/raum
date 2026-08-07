@@ -89,6 +89,21 @@ pub fn contains_managed_block(contents: &str) -> bool {
     split_around_block(contents).is_some()
 }
 
+/// Return `contents` with the `<raum-managed>` block removed, or `None`
+/// when no block is present. Used by the Codex planner to migrate away
+/// from the legacy sentinel-block layout: the block's keys are
+/// re-asserted as targeted `toml_edit` writes, so the block itself is
+/// stripped on first contact.
+#[must_use]
+pub fn remove_managed_block(contents: &str) -> Option<String> {
+    split_around_block(contents).map(|(before, after)| {
+        let mut out = String::with_capacity(before.len() + after.len());
+        out.push_str(before);
+        out.push_str(after);
+        out
+    })
+}
+
 /// Pure rendering step — exposed separately so tests can exercise every
 /// branch without touching the filesystem.
 #[must_use]

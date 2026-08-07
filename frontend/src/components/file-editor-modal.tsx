@@ -47,6 +47,14 @@ import { html } from "@codemirror/lang-html";
 import { markdown } from "@codemirror/lang-markdown";
 import { json } from "@codemirror/lang-json";
 import { python } from "@codemirror/lang-python";
+import { StreamLanguage } from "@codemirror/language";
+import { yaml } from "@codemirror/legacy-modes/mode/yaml";
+import { toml } from "@codemirror/legacy-modes/mode/toml";
+import { properties } from "@codemirror/legacy-modes/mode/properties";
+import { shell } from "@codemirror/legacy-modes/mode/shell";
+import { xml } from "@codemirror/legacy-modes/mode/xml";
+import { dockerFile } from "@codemirror/legacy-modes/mode/dockerfile";
+import { standardSQL } from "@codemirror/legacy-modes/mode/sql";
 
 import { Button } from "./ui/button";
 import { FindBar, type FindBarHandle } from "./ui/find-bar";
@@ -67,7 +75,23 @@ import { getCurrentTheme, subscribeThemeChange } from "../lib/theme/themeControl
 // ---------------------------------------------------------------------------
 
 function getLanguageExtension(path: string) {
-  const ext = path.split(".").pop()?.toLowerCase() ?? "";
+  const name = path.split("/").pop()?.toLowerCase() ?? "";
+
+  // Extension-less config files that are still highlightable.
+  if (name === "dockerfile" || name.startsWith("dockerfile.")) {
+    return StreamLanguage.define(dockerFile);
+  }
+  if (name === ".env" || name.startsWith(".env.") || name === ".editorconfig") {
+    return StreamLanguage.define(properties);
+  }
+  if (name === ".gitignore" || name === ".dockerignore" || name === ".npmrc") {
+    return StreamLanguage.define(properties);
+  }
+  if (name === ".bashrc" || name === ".zshrc" || name === ".profile") {
+    return StreamLanguage.define(shell);
+  }
+
+  const ext = name.includes(".") ? name.split(".").pop()! : "";
   switch (ext) {
     case "js":
     case "mjs":
@@ -97,6 +121,28 @@ function getLanguageExtension(path: string) {
     case "py":
     case "pyw":
       return python();
+    case "yaml":
+    case "yml":
+      return StreamLanguage.define(yaml);
+    case "toml":
+      return StreamLanguage.define(toml);
+    case "ini":
+    case "cfg":
+    case "conf":
+    case "properties":
+    case "env":
+      return StreamLanguage.define(properties);
+    case "sh":
+    case "bash":
+    case "zsh":
+    case "fish":
+      return StreamLanguage.define(shell);
+    case "xml":
+    case "svg":
+    case "plist":
+      return StreamLanguage.define(xml);
+    case "sql":
+      return StreamLanguage.define(standardSQL);
     default:
       return null;
   }

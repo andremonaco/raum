@@ -1,6 +1,10 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="160" height="160" fill="none" stroke="#f5f5f5" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
-  <rect x="2" y="2" width="96" height="96"/>
-  <line x1="98" y1="2" x2="2" y2="50"/>
-  <line x1="98" y1="2" x2="2" y2="98"/>
-  <line x1="98" y1="2" x2="50" y2="98"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="160" height="160">
+  <rect x="2" y="2" width="96" height="96" rx="12" fill="#f5f5f5"/>
+  <g transform="translate(13.4 13.4) scale(0.32) rotate(10 50 50) translate(100 0) scale(-1 1)"
+     stroke="#141418" stroke-width="13" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="2" y="2" width="96" height="96"/>
+    <line x1="98" y1="2" x2="2" y2="50"/>
+    <line x1="98" y1="2" x2="2" y2="98"/>
+    <line x1="98" y1="2" x2="50" y2="98"/>
+  </g>
 </svg>

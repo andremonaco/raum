@@ -215,6 +215,11 @@ pub fn run() {
             commands::keymap_clear_override,
             commands::prereqs_check,
             commands::harnesses_check,
+            commands::server_restart::server_restart_status,
+            commands::server_restart::server_restart_dismiss,
+            commands::server_restart::server_restart_now,
+            commands::tmux_health::tmux_version_status,
+            commands::tmux_health::tmux_version_dismiss,
             commands::terminal::terminal_spawn,
             commands::terminal::terminal_reattach,
             commands::terminal::terminal_provider_replace,
@@ -415,6 +420,11 @@ pub fn run() {
             // up through `merged_keymap` so user overrides take effect.
             register_global_shortcuts(app.handle());
 
+            // Must come before the first pane can be created: the flag is
+            // consulted at tmux-server birth, which is whatever `new_session`
+            // runs first.
+            bootstrap_tmux_tcc_policy(app);
+
             // Must come before `bootstrap_git_watchers` — the watchers take
             // the service's pulse sender so terminal-driven commits/stages
             // refresh the sidebar status.
@@ -437,6 +447,13 @@ pub fn run() {
             // `tmux attach-session` client transparent (no prefix key, no
             // status bar, zero ESC delay, no synthesized focus/title escapes).
             // Idempotent — safe to re-run on every launch.
+            // Consume an accepted "restart the terminal server" prompt. Must
+            // run BEFORE the rehydrate below reads the socket: the whole point
+            // is that rehydrate then sees a cold server and takes its
+            // recover-after-reboot path, resuming each harness conversation.
+            // No-op unless the user explicitly accepted the prompt last run.
+            commands::server_restart::apply_pending_server_restart(app);
+
             bootstrap_apply_server_options(app);
 
             // Rehydrate harness state for tmux sessions that survived the
@@ -1043,22 +1060,25 @@ fn bootstrap_reconciler(app: &mut tauri::App) {
     }
 }
 
-/// Focus-gated webview health check. macOS sometimes kills the WKWebView
-/// WebContent process while the screen is locked (suspension + memory/GPU
-/// pressure); wry receives `webViewWebContentProcessDidTerminate:` but
-/// Tauri never registers wry's handler, so the page stays black and dead.
-/// On every `Focused(true)` we run a patient probe sequence and reload
-/// only after ~12 s of total silence — a suspended-but-alive page answers
-/// late, a dead one never does; see `commands::webview_health` for the
-/// full story. Registered as a second `on_window_event` handler; Tauri
-/// appends listeners, so this never disturbs the orphan reaper's focus
-/// hook.
+/// Webview health check. macOS sometimes kills the WKWebView WebContent
+/// process while the screen is locked (suspension + memory/GPU pressure);
+/// the page then stays black and dead. Two layers of recovery: on macOS a
+/// swizzled `webViewWebContentProcessDidTerminate:` reloads the instant
+/// WebKit reports the kill (usually still mid-lock), and on every
+/// `Focused(true)` a patient probe sequence catches anything the callback
+/// missed, reloading after ~6 s of total silence — a suspended-but-alive
+/// page answers late, a dead one never does; see
+/// `commands::webview_health` for the full story. Registered as a second
+/// `on_window_event` handler; Tauri appends listeners, so this never
+/// disturbs the orphan reaper's focus hook.
 fn bootstrap_webview_health(app: &mut tauri::App) {
     let Some(win) = app.get_webview_window("main") else {
         warn!("bootstrap_webview_health: main window not found");
         return;
     };
     let handle = app.handle().clone();
+    #[cfg(target_os = "macos")]
+    commands::webview_health::install_terminate_hook(&win, handle.clone());
     win.on_window_event(move |event| {
         if let tauri::WindowEvent::Focused(true) = event {
             commands::webview_health::on_focus_gained(&handle);
@@ -1127,6 +1147,37 @@ async fn run_reconcile(handle: &tauri::AppHandle, trigger: &'static str) {
         Err(e) => {
             warn!(trigger = trigger, error = %e, "reconcile: failed");
         }
+    }
+}
+
+/// Push `terminals.disclaim_tcc_responsibility` onto the tmux manager before
+/// any pane can be created.
+///
+/// macOS attributes a pane's foreign app-data reads to the tmux server's TCC
+/// "responsible process". Default (`false`) leaves that as raum.app — a
+/// Developer-ID identity TCC can pin an "Allow" to permanently, and one Full
+/// Disk Access tick covers every shell. `true` disclaims, matching iTerm2 /
+/// WezTerm / Ghostty, at the cost of grants hanging off an ad-hoc-signed
+/// Homebrew binary that TCC re-prompts for.
+///
+/// Read once here rather than at every `new_session`: the flag only matters at
+/// server *birth*, and a running server can't be re-parented anyway. Changing
+/// it therefore takes effect on the next cold server (relaunch after
+/// `tmux -L raum kill-server`).
+fn bootstrap_tmux_tcc_policy(app: &mut tauri::App) {
+    let state: tauri::State<'_, state::AppHandleState> = app.state();
+    // A poisoned lock or an unreadable config must not block startup — recover
+    // the guard (same convention as `config_get`) and fall back to `false`,
+    // which is the safe, prompt-once-then-durable behaviour.
+    let disclaim = state
+        .config_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .read_config()
+        .is_ok_and(|cfg| cfg.terminals.disclaim_tcc_responsibility);
+    state.tmux.set_disclaim_tcc(disclaim);
+    if disclaim {
+        info!("tmux server will be born with TCC responsibility disclaimed (opt-in)");
     }
 }
 

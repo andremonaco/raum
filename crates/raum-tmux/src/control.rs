@@ -193,8 +193,13 @@ struct PaneMeta {
     mouse_utf8: bool,
 }
 
-/// Comma-separated so the control-mode command line needs no quoting.
-const META_FORMAT: &str = "#{alternate_on},#{cursor_x},#{cursor_y},#{cursor_flag},\
+/// Comma-separated so the control-mode command line needs no quoting. The
+/// leading `#{pane_id}` is peeled off by the parser before [`PaneMeta::parse`]
+/// sees the rest — it identifies the session's own pane so live `%output` can
+/// be filtered to it (a foreign tool running `split-window` in our window,
+/// e.g. Claude Code's tmux teammate mode, must not bleed its panes' bytes
+/// into this xterm).
+const META_FORMAT: &str = "#{pane_id},#{alternate_on},#{cursor_x},#{cursor_y},#{cursor_flag},\
 #{keypad_cursor_flag},#{keypad_flag},#{wrap_flag},#{origin_flag},#{insert_flag},\
 #{mouse_standard_flag},#{mouse_button_flag},#{mouse_any_flag},#{mouse_sgr_flag},\
 #{mouse_utf8_flag}";
@@ -244,6 +249,10 @@ enum ControlEvent {
     Data(Vec<u8>),
     /// The control client announced it is exiting (`%exit`).
     Exit,
+    /// A `%layout-change` reported more than one pane in the window: some
+    /// outside tool split our one-pane session. Surfaced once so the bridge
+    /// can log it; foreign panes' output is dropped either way.
+    ForeignSplit,
     /// Nothing actionable (notification we ignore, block bookkeeping, …).
     None,
 }
@@ -253,6 +262,14 @@ struct ControlParser {
     /// Lines of the currently open `%begin` block, when inside one.
     block: Option<Vec<Vec<u8>>>,
     meta: Option<PaneMeta>,
+    /// The session's own pane id (`%N`), learned from the meta reply. Live
+    /// `%output` for any other pane is discarded: raum sessions are one
+    /// window/one pane by construction, so another pane can only be a foreign
+    /// split (Claude Code agent teams in tmux mode) whose bytes would
+    /// otherwise interleave into the same xterm.
+    lead_pane: Option<Vec<u8>>,
+    /// Debounces [`ControlEvent::ForeignSplit`] to once per bridge.
+    foreign_split_seen: bool,
 }
 
 impl ControlParser {
@@ -261,6 +278,8 @@ impl ControlParser {
             phase: SyncPhase::AwaitGreeting,
             block: None,
             meta: None,
+            lead_pane: None,
+            foreign_split_seen: false,
         }
     }
 
@@ -283,12 +302,17 @@ impl ControlParser {
             return ControlEvent::None;
         }
         if let Some(rest) = line.strip_prefix(b"%output ") {
-            // `%output %<pane-id> <escaped-data>` — skip the pane-id token.
-            let data = match rest.iter().position(|&b| b == b' ') {
-                Some(idx) => &rest[idx + 1..],
+            // `%output %<pane-id> <escaped-data>`.
+            let (pane, data) = match rest.iter().position(|&b| b == b' ') {
+                Some(idx) => (&rest[..idx], &rest[idx + 1..]),
                 None => return ControlEvent::None,
             };
             if self.phase == SyncPhase::Live {
+                // Foreign panes (see `lead_pane`) never reach xterm. Unknown
+                // lead (meta reply errored) degrades to forwarding everything.
+                if self.lead_pane.as_deref().is_some_and(|lead| lead != pane) {
+                    return ControlEvent::None;
+                }
                 return ControlEvent::Data(unescape_output(data));
             }
             // Pre-sync output is already contained in the capture the server
@@ -299,8 +323,18 @@ impl ControlParser {
         if line == b"%exit" || line.starts_with(b"%exit ") {
             return ControlEvent::Exit;
         }
-        // %session-changed, %window-renamed, %layout-change, %pause, … —
-        // nothing raum consumes today.
+        if line.starts_with(b"%layout-change ") {
+            // A `{`/`[` in the layout string means the window now holds more
+            // than one pane — someone split our one-pane window. Single-pane
+            // layout changes (raum's own resize-window) stay silent.
+            if !self.foreign_split_seen && (line.contains(&b'{') || line.contains(&b'[')) {
+                self.foreign_split_seen = true;
+                return ControlEvent::ForeignSplit;
+            }
+            return ControlEvent::None;
+        }
+        // %session-changed, %window-renamed, %pause, … — nothing raum
+        // consumes today.
         ControlEvent::None
     }
 
@@ -313,7 +347,16 @@ impl ControlParser {
             SyncPhase::AwaitMeta => {
                 self.phase = SyncPhase::AwaitCapture;
                 if !errored {
-                    self.meta = lines.first().and_then(|l| PaneMeta::parse(l));
+                    if let Some((pane, meta)) = lines.first().and_then(|l| {
+                        // `%N,<meta fields…>` — the pane id, then PaneMeta.
+                        let idx = l.iter().position(|&b| b == b',')?;
+                        Some(l.split_at(idx))
+                    }) {
+                        if pane.starts_with(b"%") {
+                            self.lead_pane = Some(pane.to_vec());
+                        }
+                        self.meta = PaneMeta::parse(&meta[1..]);
+                    }
                 }
                 ControlEvent::None
             }
@@ -601,6 +644,14 @@ pub fn attach_via_control(
                                     "control bridge: %exit received",
                                 );
                             }
+                            ControlEvent::ForeignSplit => {
+                                tracing::warn!(
+                                    session_id = %reader_session,
+                                    "control bridge: foreign split-window detected in a raum \
+                                     window (tmux-mode agent teams?); dropping other panes' \
+                                     output — the lead pane will render at reduced width",
+                                );
+                            }
                             ControlEvent::None => {}
                         }
                     }
@@ -731,7 +782,7 @@ mod tests {
         events
     }
 
-    const META_SHELL: &str = "0,7,2,1,0,0,1,0,0,0,0,0,0,0";
+    const META_SHELL: &str = "%0,0,7,2,1,0,0,1,0,0,0,0,0,0,0";
 
     #[test]
     fn unescape_decodes_octal_backslash_and_cstyle() {
@@ -808,7 +859,7 @@ mod tests {
     fn alt_screen_replay_switches_buffers_and_positions_cursor() {
         let mut p = ControlParser::new();
         // alt on, cursor 4,1; cursor hidden; mouse any+sgr on.
-        let meta = "1,4,1,0,0,0,1,0,0,0,0,1,1,0";
+        let meta = "%0,1,4,1,0,0,0,1,0,0,0,0,1,1,0";
         let events = drive_to_live(&mut p, meta, &["┌ TUI ┐", "└─────┘"]);
         let replay = events
             .into_iter()
@@ -877,6 +928,69 @@ mod tests {
         assert_eq!(line(&mut p, "%exit"), ControlEvent::Exit);
         let mut p = ControlParser::new();
         assert_eq!(line(&mut p, "%exit detached"), ControlEvent::Exit);
+    }
+
+    #[test]
+    fn foreign_pane_output_is_dropped_in_live_phase() {
+        let mut p = ControlParser::new();
+        drive_to_live(&mut p, META_SHELL, &["x"]);
+        // Lead pane (%0 per META_SHELL) passes.
+        match line(&mut p, "%output %0 lead") {
+            ControlEvent::Data(bytes) => assert_eq!(bytes, b"lead"),
+            other => panic!("expected lead output, got {other:?}"),
+        }
+        // A teammate pane from a foreign split-window must not reach xterm.
+        assert_eq!(line(&mut p, "%output %7 intruder"), ControlEvent::None);
+        // Lead output still flows afterwards.
+        match line(&mut p, "%output %0 more") {
+            ControlEvent::Data(bytes) => assert_eq!(bytes, b"more"),
+            other => panic!("expected lead output, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_lead_pane_forwards_all_output() {
+        let mut p = ControlParser::new();
+        // Meta reply errored: no pane id learned, filtering degrades off.
+        assert_eq!(line(&mut p, "%begin 1 0 0"), ControlEvent::None);
+        assert_eq!(line(&mut p, "%end 1 0 0"), ControlEvent::None);
+        assert_eq!(line(&mut p, "%begin 1 1 1"), ControlEvent::None);
+        assert_eq!(line(&mut p, "%error 1 1 1"), ControlEvent::None);
+        assert_eq!(line(&mut p, "%begin 1 2 1"), ControlEvent::None);
+        let _replay = line(&mut p, "%end 1 2 1");
+        match line(&mut p, "%output %3 data") {
+            ControlEvent::Data(bytes) => assert_eq!(bytes, b"data"),
+            other => panic!("expected forwarded output, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multi_pane_layout_change_surfaces_once() {
+        let mut p = ControlParser::new();
+        drive_to_live(&mut p, META_SHELL, &["x"]);
+        // Single-pane layout change (raum's own resize-window): silent.
+        assert_eq!(
+            line(
+                &mut p,
+                "%layout-change @1 b25d,80x24,0,0,1 b25d,80x24,0,0,1 *"
+            ),
+            ControlEvent::None
+        );
+        // Split layout: surfaced once, then debounced.
+        assert_eq!(
+            line(
+                &mut p,
+                "%layout-change @1 c5bd,80x24,0,0{40x24,0,0,1,39x24,41,0,2} same *"
+            ),
+            ControlEvent::ForeignSplit
+        );
+        assert_eq!(
+            line(
+                &mut p,
+                "%layout-change @1 c5bd,80x24,0,0{40x24,0,0,1,39x24,41,0,2} same *"
+            ),
+            ControlEvent::None
+        );
     }
 
     #[test]

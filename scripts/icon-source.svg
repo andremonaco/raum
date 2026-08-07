@@ -1,30 +1,21 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
   <!--
-    Squircle background: 900x900 centered in 1024x1024 canvas.
-    62px transparent margin on all sides — tighter than Apple's
-    minimum 100px gutter (used by Safari/Finder) so the overall
-    icon reads at the same visual weight as other Dock icons.
-    rx="201" ≈ 22.37% of 900px (standard Apple squircle proportion).
+    Native macOS icon geometry: 824x824 artwork centered in the 1024
+    canvas (Apple's 100px grid margin), corner radius 185.4 drawn as a
+    continuous-curvature squircle (figma-squircle, cornerSmoothing 0.6)
+    to match the Big Sur+ system mask.
+    Mark: dark mini logo (square + 3 rays), mirrored so rays fan from the
+    top-left corner, tilted +10 deg, 14% gap to top/left tile edges.
+    The 100-unit design box maps onto the 824px squircle (factor 8.24).
   -->
-  <rect x="62" y="62" width="900" height="900" rx="201" ry="201" fill="#0a0a0a"/>
-
-  <!--
-    Logo art: 420x420 centered at (512,512) inside the 900x900 squircle.
-    Mark kept at its canonical 420px size — only the *background* grows
-    so the Dock icon's opaque area matches native apps without
-    inflating the key-visual itself.
-    Grid corners: TL=(302,302)  TR=(722,302)  BR=(722,722)  BL=(302,722)
-    2x2 grid midpoints: center=(512,512)
-  -->
-  <g stroke="white" stroke-width="24" fill="none" stroke-linecap="round" stroke-linejoin="round">
-
-    <!-- Outer border -->
-    <rect x="302" y="302" width="420" height="420"/>
-
-    <!-- 3 rays from top-right corner (722, 302) -->
-    <line x1="722" y1="302" x2="302" y2="512"/>
-    <line x1="722" y1="302" x2="302" y2="722"/>
-    <line x1="722" y1="302" x2="512" y2="722"/>
-
+  <g transform="translate(100 100)">
+    <path fill="#f5f5f5" d="M 527.36 0 c 103.8337 0 155.7506 0 195.4098 20.2074 a 185.4 185.4 0 0 1 81.0228 81.0228 c 20.2074 39.6592 20.2074 91.5761 20.2074 195.4098 L 824 527.36 c 0 103.8337 0 155.7506 -20.2074 195.4098 a 185.4 185.4 0 0 1 -81.0228 81.0228 c -39.6592 20.2074 -91.5761 20.2074 -195.4098 20.2074 L 296.64 824 c -103.8337 0 -155.7506 0 -195.4098 -20.2074 a 185.4 185.4 0 0 1 -81.0228 -81.0228 c -20.2074 -39.6592 -20.2074 -91.5761 -20.2074 -195.4098 L 0 296.64 c 0 -103.8337 0 -155.7506 20.2074 -195.4098 a 185.4 185.4 0 0 1 81.0228 -81.0228 c 39.6592 -20.2074 91.5761 -20.2074 195.4098 -20.2074 Z"/>
+    <g transform="scale(8.24) translate(13.4 13.4) scale(0.32) rotate(10 50 50) translate(100 0) scale(-1 1)"
+       stroke="#141418" stroke-width="13" fill="none" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="2" y="2" width="96" height="96"/>
+      <line x1="98" y1="2" x2="2" y2="50"/>
+      <line x1="98" y1="2" x2="2" y2="98"/>
+      <line x1="98" y1="2" x2="50" y2="98"/>
+    </g>
   </g>
 </svg>
