@@ -2,18 +2,20 @@
   <!--
     RaumLogo mark — white artwork on transparent background.
     Used as the foreground layer in the macOS 26 Liquid Glass icon.
-    560x560 centered at (512,512): fills ~54.7% of the 1024px canvas.
-    macOS handles the squircle shape and glass material on top of this.
+    672x672 centered at (512,512): 720px incl. stroke ≈ 70% of the
+    1024px canvas — Apple's keyline size for square glyphs (safe zone
+    tops out at ~80%). macOS handles the squircle shape and glass
+    material on top of this.
   -->
-  <g stroke="white" stroke-width="40" fill="none" stroke-linecap="round" stroke-linejoin="round">
+  <g stroke="white" stroke-width="48" fill="none" stroke-linecap="round" stroke-linejoin="round">
 
     <!-- Outer border -->
-    <rect x="232" y="232" width="560" height="560"/>
+    <rect x="176" y="176" width="672" height="672"/>
 
-    <!-- 3 rays from top-right corner (792, 232) -->
-    <line x1="792" y1="232" x2="232" y2="512"/>
-    <line x1="792" y1="232" x2="232" y2="792"/>
-    <line x1="792" y1="232" x2="512" y2="792"/>
+    <!-- 3 rays from top-right corner (848, 176) -->
+    <line x1="848" y1="176" x2="176" y2="512"/>
+    <line x1="848" y1="176" x2="176" y2="848"/>
+    <line x1="848" y1="176" x2="512" y2="848"/>
 
   </g>
 </svg>

@@ -6,7 +6,7 @@
     icon reads at the same visual weight as other Dock icons.
     rx="201" ≈ 22.37% of 900px (standard Apple squircle proportion).
   -->
-  <rect x="62" y="62" width="900" height="900" rx="201" ry="201" fill="#0a0a0a"/>
+  <rect x="62" y="62" width="900" height="900" rx="201" ry="201" fill="#141418"/>
 
   <!--
     Logo art: 420x420 centered at (512,512) inside the 900x900 squircle.
