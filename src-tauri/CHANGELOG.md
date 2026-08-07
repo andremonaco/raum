@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.17](https://github.com/andremonaco/raum/releases/tag/v0.1.17) - 2026-08-07
+
+### Added
+
+- feat(brand): new app mark — white tile, tilted corner-ray glyph
+- feat(codex): merge raum keys into user config instead of a managed block
+- feat(tmux): server-restart prompt and version health check
+
+### Fixed
+
+- fix(webview): reload the instant WebKit reports WebContent death
+- fix(tmux): isolate control-mode output to the session's own pane
+
+### Other
+
+- chore(icons): retilt the mark and regenerate every icon size
+- chore(icons): regenerate app icons from updated mark
+
+
 ## [0.1.16](https://github.com/andremonaco/raum/releases/tag/v0.1.16) - 2026-08-04
 
 ### Fixed
