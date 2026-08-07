@@ -1,4 +1,4 @@
-//! Focus-gated webview liveness check.
+//! Webview liveness: a macOS death callback plus a focus-gated probe.
 //!
 //! macOS sometimes kills the WKWebView WebContent process while the screen
 //! is locked (suspension + memory/GPU pressure under RunningBoard/jetsam).
@@ -8,29 +8,38 @@
 //! the app is restarted. Since every pixel and event handler lives in that
 //! page, the whole app appears frozen.
 //!
-//! Detection is therefore indirect, and it must separate two states that
-//! look identical for the first few seconds after unlock: a *dead*
-//! WebContent process (never answers, at any deadline) and a
-//! *suspended-then-resumed* one (drains its queued event deliveries and
-//! answers whenever the OS reschedules it — late, but it answers). Patience
-//! can never produce a false negative here, only a slightly later true
-//! positive, so on every window focus the backend runs a probe sequence:
-//! after a short [`WAKE_GRACE`] it emits up to [`MAX_MISSES`] `raum:ping`s,
-//! each with a [`PROBE_TIMEOUT`] wait and [`PROBE_BACKOFF`] spacing. Any
-//! pong from the sequence — even a stale one for an earlier ping — proves
-//! the page alive. Only ~12 s of total silence across six independently
-//! queued deliveries declares the page dead, and we issue
+//! **Primary path (macOS):** [`install_terminate_hook`] swizzles
+//! `webViewWebContentProcessDidTerminate:` on wry's navigation delegate so
+//! the kill is observed the instant WebKit reports it — often while the
+//! screen is still locked — and the reload runs immediately. By the time
+//! the user unlocks, the page has already rebuilt and reattached.
+//!
+//! **Fallback path (all platforms):** the callback can be missed (app
+//! process napping at kill time, Linux/webkit2gtk has no hook wired), so
+//! the indirect probe stays. It must separate two states that look
+//! identical for the first few seconds after unlock: a *dead* WebContent
+//! process (never answers, at any deadline) and a *suspended-then-resumed*
+//! one (drains its queued event deliveries and answers whenever the OS
+//! reschedules it — late, but it answers). Patience can never produce a
+//! false negative here, only a slightly later true positive, so on every
+//! window focus the backend runs a probe sequence: after a short
+//! [`WAKE_GRACE`] it emits up to [`MAX_MISSES`] `raum:ping`s, each with a
+//! [`PROBE_TIMEOUT`] wait and [`PROBE_BACKOFF`] spacing. Any pong from the
+//! sequence — even a stale one for an earlier ping — proves the page
+//! alive. Only ~6 s of total silence across three independently queued
+//! deliveries declares the page dead, and we issue
 //! [`tauri::webview::Webview::reload`] — the native `-[WKWebView reload]`,
 //! Apple's documented recovery, which relaunches the content process.
 //! Downstream recovery is the proven Cmd+R path: `app.tsx` rehydrates the
 //! layout and every pane runs `terminal_reattach`, while the tmux sessions
 //! (and the agents inside them) survive untouched.
 //!
-//! The cost of that patience: a genuinely dead page sits black ~12 s
-//! instead of ~3 s before auto-recovery (Cmd+R remains the manual escape).
-//! In exchange, a live page that is merely slow to wake is never reloaded —
-//! a false-positive reload throws away the whole page and costs a full
-//! rehydrate, far worse than the extra seconds on the rare true death.
+//! The probe's patience budget is calibrated from six days of real wake
+//! data: every alive wake answered its *first* ping, worst observed lag
+//! 726 ms — so three probes (~6 s) keep >8× margin while halving how long
+//! a dead page sits black when the macOS callback was missed. A
+//! false-positive reload throws away the whole page and costs a full
+//! rehydrate, far worse than an extra second on a rare true death.
 //!
 //! Kept cross-platform on purpose: webkit2gtk has the same web-process-crash
 //! failure mode on Linux, and the check is free while the page is healthy.
@@ -51,17 +60,18 @@ const WAKE_GRACE: Duration = Duration::from_millis(500);
 /// short: a miss is cheap now — it's just the next probe.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 
-/// Spacing between probes, so the sequence emits six pings over ~12 s
-/// instead of six in a burst.
+/// Spacing between probes, so the sequence emits its pings spread over
+/// several seconds instead of in a burst.
 const PROBE_BACKOFF: Duration = Duration::from_millis(500);
 
 /// Consecutive misses before the page is presumed dead:
-/// ~`6 × (1.5 s + 0.5 s) = 12 s` of total silence. The one observed
-/// false positive answered 225 ms after the (unnecessary) reload — orders
-/// of magnitude inside this budget. A page that runs no JS at all across
-/// six independently queued deliveries for 12 s is beyond any credible
-/// suspension; a dead process stays dead forever, so waiting costs little.
-const MAX_MISSES: u32 = 6;
+/// ~`3 × (1.5 s + 0.5 s) = 6 s` of total silence. Real wake data (six
+/// days of daily logs) shows every alive wake answered its first ping,
+/// worst lag 726 ms — the first probe alone already carries ~2.7× margin,
+/// and three independently queued deliveries over 6 s are beyond any
+/// credible suspension. A dead process stays dead forever, so the cost of
+/// a miss is only the next probe.
+const MAX_MISSES: u32 = 3;
 
 /// Pongs slower than this get logged — the "we nearly false-positived"
 /// signal used to tune [`MAX_MISSES`] from real-world wake data.
@@ -228,6 +238,42 @@ impl WebviewHealthState {
     }
 }
 
+/// Arm the gate and reload the webview. Shared by the probe's death verdict
+/// and the macOS terminate callback; owns the cooldown, the gate close, and
+/// the failed-reload rollback.
+fn reload_webview(app: &AppHandle, health: &WebviewHealthState) {
+    let now = Instant::now();
+    if health.cooldown_active(now) {
+        tracing::warn!(
+            "webview health: page presumed dead, but a reload ran moments ago — \
+             suppressing to avoid a reload loop",
+        );
+        return;
+    }
+    let Some(win) = app.get_webview_window("main") else {
+        tracing::warn!("webview health: main window not found; cannot reload");
+        return;
+    };
+    // Snapshot before closing the gate: the terminate callback can fire
+    // before the first `webview_ready`, and the failed-reload rollback must
+    // restore the gate to what it was, not unconditionally open it.
+    let was_ready = health.ready.load(Ordering::SeqCst);
+    health.arm_reload();
+    match win.reload() {
+        Ok(()) => health.record_reload(now),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "webview health: reload failed — reopening gate so future \
+                 probes (and recovery) still run",
+            );
+            if was_ready {
+                health.reopen_after_failed_reload();
+            }
+        }
+    }
+}
+
 /// Page boot signal. Invoked from `installWebviewHealth` in
 /// `frontend/src/lib/webviewHealth.ts` after its ping listener is
 /// registered, on every page load — including the post-reload boot, which
@@ -321,39 +367,132 @@ pub fn on_focus_gained(handle: &AppHandle) {
                     );
                     return;
                 }
-                let now = Instant::now();
-                if health.cooldown_active(now) {
-                    tracing::warn!(
-                        "webview health: no pong, but a reload ran moments ago — \
-                         suppressing to avoid a reload loop",
-                    );
-                    return;
-                }
-                let Some(win) = app.get_webview_window("main") else {
-                    tracing::warn!("webview health: main window not found; cannot reload");
-                    return;
-                };
                 tracing::warn!(
                     misses = MAX_MISSES,
                     "webview health: no pong across the whole probe sequence — reloading \
                      webview (WebContent process presumed dead after screen lock)",
                 );
-                health.arm_reload();
-                match win.reload() {
-                    Ok(()) => health.record_reload(now),
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "webview health: reload failed — reopening gate so future \
-                             probes (and recovery) still run",
-                        );
-                        health.reopen_after_failed_reload();
-                    }
-                }
+                reload_webview(&app, health);
             }
         }
     });
 }
+
+/// macOS: observe WebContent death directly instead of inferring it.
+///
+/// wry 0.54 implements `webViewWebContentProcessDidTerminate:` on its
+/// navigation delegate and offers an optional callback
+/// (`WebViewBuilderExtDarwin::with_on_web_content_process_terminate_handler`),
+/// but Tauri never wires or exposes it. Rather than fork the runtime, swap
+/// the method's implementation on the delegate class at runtime: the
+/// replacement triggers [`reload_webview`] and then calls wry's original
+/// implementation (a no-op while wry's own handler is unset). WebKit sends
+/// the delegate message the moment the kill happens — typically while the
+/// screen is still locked — so the page has already rebuilt and reattached
+/// by the time the user unlocks, instead of sitting black through the
+/// probe sequence.
+#[cfg(target_os = "macos")]
+mod terminate_hook {
+    use std::sync::OnceLock;
+
+    use objc2::ffi::{class_getInstanceMethod, method_setImplementation};
+    use objc2::runtime::{AnyObject, Imp, Sel};
+    use objc2::{msg_send, sel};
+    use tauri::{AppHandle, Manager};
+
+    /// AppHandle for the replacement implementation. Doubles as the
+    /// install-once guard: a second swizzle would capture our own hook as
+    /// "original" and recurse forever.
+    static HOOK_APP: OnceLock<AppHandle> = OnceLock::new();
+    /// wry's original `webViewWebContentProcessDidTerminate:` implementation.
+    static ORIGINAL_IMP: OnceLock<Imp> = OnceLock::new();
+
+    /// Replacement delegate method. Runs on the main thread, so it only
+    /// hands off to the async runtime and forwards to wry's original.
+    #[allow(unsafe_code)]
+    unsafe extern "C-unwind" fn did_terminate_hook(
+        this: *mut AnyObject,
+        cmd: Sel,
+        webview: *mut AnyObject,
+    ) {
+        if let Some(app) = HOOK_APP.get() {
+            tracing::warn!(
+                "webview health: WebContent process terminated (WebKit delegate \
+                 callback) — reloading immediately",
+            );
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let state: tauri::State<'_, crate::state::AppHandleState> = app.state();
+                super::reload_webview(&app, &state.webview_health);
+            });
+        }
+        if let Some(original) = ORIGINAL_IMP.get() {
+            #[allow(unsafe_code)]
+            // SAFETY: `original` is the implementation previously installed
+            // for this exact selector, whose ObjC signature is
+            // `(id self, SEL _cmd, WKWebView *webview) -> void`.
+            unsafe {
+                let original = std::mem::transmute::<
+                    Imp,
+                    unsafe extern "C-unwind" fn(*mut AnyObject, Sel, *mut AnyObject),
+                >(*original);
+                original(this, cmd, webview);
+            }
+        }
+    }
+
+    /// Swizzle the terminate method on the main window's navigation
+    /// delegate. Best-effort: on any unexpected shape (no delegate, method
+    /// missing) it logs and leaves the probe fallback as sole recovery.
+    pub fn install_terminate_hook(win: &tauri::WebviewWindow, app: AppHandle) {
+        if HOOK_APP.set(app).is_err() {
+            return;
+        }
+        let result = win.with_webview(|platform_webview| {
+            #[allow(unsafe_code)]
+            // SAFETY: `inner()` is the WKWebView pointer, valid for the
+            // closure's main-thread execution. `navigationDelegate` is
+            // wry's delegate object; the runtime calls are the documented
+            // swizzle sequence on its class.
+            unsafe {
+                let wk = platform_webview.inner().cast::<AnyObject>();
+                let delegate: *mut AnyObject = msg_send![wk, navigationDelegate];
+                if delegate.is_null() {
+                    tracing::warn!("webview health: no navigation delegate; terminate hook off");
+                    return;
+                }
+                let class = (*delegate).class();
+                let method = class_getInstanceMethod(
+                    std::ptr::from_ref(class),
+                    sel!(webViewWebContentProcessDidTerminate:),
+                );
+                if method.is_null() {
+                    tracing::warn!("webview health: delegate lacks terminate method; hook off");
+                    return;
+                }
+                let replacement = std::mem::transmute::<
+                    unsafe extern "C-unwind" fn(*mut AnyObject, Sel, *mut AnyObject),
+                    Imp,
+                >(did_terminate_hook);
+                match method_setImplementation(method, replacement) {
+                    Some(original) => {
+                        let _ = ORIGINAL_IMP.set(original);
+                        tracing::info!("webview health: WebContent terminate hook installed");
+                    }
+                    None => {
+                        tracing::warn!("webview health: method_setImplementation returned null");
+                    }
+                }
+            }
+        });
+        if let Err(e) = result {
+            tracing::warn!(error = %e, "webview health: with_webview failed; terminate hook off");
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub use terminate_hook::install_terminate_hook;
 
 #[cfg(test)]
 mod tests {
@@ -479,8 +618,8 @@ mod tests {
 
         assert!(matches!(outcome, ProbeOutcome::Dead));
         assert_eq!(pings, MAX_MISSES);
-        // 6 × (1.5 s timeout + 0.5 s backoff) — the full patience budget.
-        assert_eq!(started.elapsed(), Duration::from_secs(12));
+        // 3 × (1.5 s timeout + 0.5 s backoff) — the full patience budget.
+        assert_eq!(started.elapsed(), Duration::from_secs(6));
     }
 
     #[tokio::test(start_paused = true)]

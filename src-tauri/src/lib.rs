@@ -1060,22 +1060,25 @@ fn bootstrap_reconciler(app: &mut tauri::App) {
     }
 }
 
-/// Focus-gated webview health check. macOS sometimes kills the WKWebView
-/// WebContent process while the screen is locked (suspension + memory/GPU
-/// pressure); wry receives `webViewWebContentProcessDidTerminate:` but
-/// Tauri never registers wry's handler, so the page stays black and dead.
-/// On every `Focused(true)` we run a patient probe sequence and reload
-/// only after ~12 s of total silence — a suspended-but-alive page answers
-/// late, a dead one never does; see `commands::webview_health` for the
-/// full story. Registered as a second `on_window_event` handler; Tauri
-/// appends listeners, so this never disturbs the orphan reaper's focus
-/// hook.
+/// Webview health check. macOS sometimes kills the WKWebView WebContent
+/// process while the screen is locked (suspension + memory/GPU pressure);
+/// the page then stays black and dead. Two layers of recovery: on macOS a
+/// swizzled `webViewWebContentProcessDidTerminate:` reloads the instant
+/// WebKit reports the kill (usually still mid-lock), and on every
+/// `Focused(true)` a patient probe sequence catches anything the callback
+/// missed, reloading after ~6 s of total silence — a suspended-but-alive
+/// page answers late, a dead one never does; see
+/// `commands::webview_health` for the full story. Registered as a second
+/// `on_window_event` handler; Tauri appends listeners, so this never
+/// disturbs the orphan reaper's focus hook.
 fn bootstrap_webview_health(app: &mut tauri::App) {
     let Some(win) = app.get_webview_window("main") else {
         warn!("bootstrap_webview_health: main window not found");
         return;
     };
     let handle = app.handle().clone();
+    #[cfg(target_os = "macos")]
+    commands::webview_health::install_terminate_hook(&win, handle.clone());
     win.on_window_event(move |event| {
         if let tauri::WindowEvent::Focused(true) = event {
             commands::webview_health::on_focus_gained(&handle);
