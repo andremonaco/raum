@@ -215,6 +215,11 @@ pub fn run() {
             commands::keymap_clear_override,
             commands::prereqs_check,
             commands::harnesses_check,
+            commands::server_restart::server_restart_status,
+            commands::server_restart::server_restart_dismiss,
+            commands::server_restart::server_restart_now,
+            commands::tmux_health::tmux_version_status,
+            commands::tmux_health::tmux_version_dismiss,
             commands::terminal::terminal_spawn,
             commands::terminal::terminal_reattach,
             commands::terminal::terminal_provider_replace,
@@ -442,6 +447,13 @@ pub fn run() {
             // `tmux attach-session` client transparent (no prefix key, no
             // status bar, zero ESC delay, no synthesized focus/title escapes).
             // Idempotent — safe to re-run on every launch.
+            // Consume an accepted "restart the terminal server" prompt. Must
+            // run BEFORE the rehydrate below reads the socket: the whole point
+            // is that rehydrate then sees a cold server and takes its
+            // recover-after-reboot path, resuming each harness conversation.
+            // No-op unless the user explicitly accepted the prompt last run.
+            commands::server_restart::apply_pending_server_restart(app);
+
             bootstrap_apply_server_options(app);
 
             // Rehydrate harness state for tmux sessions that survived the

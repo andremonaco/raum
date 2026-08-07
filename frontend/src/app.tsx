@@ -22,6 +22,8 @@ import {
 import type { TerminalListItem } from "./stores/terminalStore";
 import { installQuitFlush } from "./lib/quitFlush";
 import { startNotificationCenter } from "./lib/notificationCenter";
+import { maybeShowServerRestartNotice } from "./lib/serverRestartNotice";
+import { maybeShowTmuxVersionNotice } from "./lib/tmuxVersionNotice";
 import { runUpdateCheck } from "./lib/updateNotifier";
 import { installGlobalContextMenuSuppressor } from "./lib/suppressContextMenu";
 import { installDevtoolsShortcut } from "./lib/devtoolsShortcut";
@@ -429,6 +431,13 @@ const App: Component = () => {
     void notifyRecoveredSessions(placed);
     void prewarmAllWorktrees();
     void scheduleBackgroundUpdateCheck(c);
+    // After `notifyRecoveredSessions` above, so a launch that already had
+    // recovery news isn't competing with this for the user's attention. No-op
+    // on every install except one still running a pre-0.1.13 tmux server.
+    void maybeShowServerRestartNotice();
+    // Same shape: no-op unless the running server is a known-buggy tmux
+    // version. Shares the toast slot priority-last for the same reason.
+    void maybeShowTmuxVersionNotice();
     return c;
   });
   const showWizard = (): boolean => {

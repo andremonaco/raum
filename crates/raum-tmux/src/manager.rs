@@ -53,6 +53,21 @@ pub fn default_socket_name() -> String {
 ///   server's exit and the socket teardown is wide enough to hit.
 ///
 /// All four are functionally "no live sessions" for recovery purposes.
+/// True when a tmux server's argv is the pre-0.1.13 disclaimed birth.
+///
+/// tmux servers carry the argv of the client that forked them, so the birthing
+/// command is readable off the running process. Only the legacy form is a bare
+/// `start-server`; every other birth raum performs chains further commands
+/// after a `;`. Split out from
+/// [`TmuxManager::server_born_legacy_disclaimed`] so both directions are
+/// testable — the positive case cannot be staged against a live server, because
+/// a bare `start-server` reaps itself under `exit-empty` before anything can
+/// observe it (which is exactly why the legacy birth was unreliable).
+fn is_legacy_birth_argv(argv: &str) -> bool {
+    let argv = argv.trim();
+    !argv.contains(';') && argv.ends_with("start-server")
+}
+
 fn is_no_server_stderr(stderr: &str) -> bool {
     stderr.contains("no server running")
         || stderr.contains("error connecting")
@@ -191,6 +206,98 @@ impl TmuxManager {
             Err(TmuxError::Io(_)) => Ok(()),
             Err(e) => Err(e),
         }
+    }
+
+    /// True when the live server on this socket was born by the *legacy*
+    /// disclaimed spawn — the pre-0.1.13 `birth_server`, which ran a bare
+    /// `start-server` and left the server as its own TCC responsible process.
+    ///
+    /// Such a server makes macOS attribute every pane's app-data access to
+    /// `tmux` rather than raum.app, and no amount of updating raum fixes it:
+    /// responsibility is fixed at birth and the server outlives the app. The
+    /// only cure is a cold server, which costs the user their live sessions —
+    /// so raum has to *find* these and ask, never assume.
+    ///
+    /// Detection is the server's own argv, which tmux inherits from whichever
+    /// client forked it:
+    ///
+    /// | Born by                         | argv                                          |
+    /// |---------------------------------|-----------------------------------------------|
+    /// | legacy disclaim (pre-0.1.13)    | `tmux -L raum start-server`                   |
+    /// | current disclaim (opt-in)       | `… start-server ; set-option -s exit-empty …` |
+    /// | normal lazy birth               | `… start-server ; set-option … ; new-session …`|
+    ///
+    /// So "no `;` and ends with `start-server`" identifies exactly the legacy
+    /// shape. Any error — no server, no `ps`, unparsable pid — answers `false`:
+    /// this drives a prompt to destroy sessions, so it must never fire on a
+    /// guess.
+    ///
+    /// macOS-only. The disclaim was always a no-op elsewhere, so no Linux
+    /// server can be in this state.
+    #[must_use]
+    pub fn server_born_legacy_disclaimed(&self) -> bool {
+        if !cfg!(target_os = "macos") {
+            return false;
+        }
+        let Some(pid) = self.server_pid() else {
+            return false;
+        };
+        let Ok(out) = Command::new("ps")
+            .args(["-o", "command=", "-p", &pid.to_string()])
+            .output()
+        else {
+            return false;
+        };
+        if !out.status.success() {
+            return false;
+        }
+        is_legacy_birth_argv(&String::from_utf8_lossy(&out.stdout))
+    }
+
+    /// PID of the server currently listening on this socket, or `None` when
+    /// nothing is (or tmux answered something unparsable).
+    fn server_pid(&self) -> Option<u32> {
+        let out = self
+            .cmd()
+            .args(["display-message", "-p", "#{pid}"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+    }
+
+    /// Version of the server currently listening on this socket (`#{version}`:
+    /// `3.6a`, `3.7b`, `next-3.8`), or `None` when nothing is. Distinct from
+    /// [`Self::client_version`] — after a package upgrade the two diverge
+    /// until the server is reborn.
+    #[must_use]
+    pub fn server_version(&self) -> Option<String> {
+        let out = self
+            .cmd()
+            .args(["display-message", "-p", "#{version}"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!v.is_empty()).then_some(v)
+    }
+
+    /// Version of the tmux binary itself (`tmux -V`, prefix stripped) — what a
+    /// freshly born server would run.
+    #[must_use]
+    pub fn client_version(&self) -> Option<String> {
+        let out = Command::new(&self.binary).arg("-V").output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&out.stdout);
+        let s = s.trim();
+        let v = s.strip_prefix("tmux ").unwrap_or(s).to_string();
+        (!v.is_empty()).then_some(v)
     }
 
     /// §3.1 — tear down the entire `-L raum` tmux server. Returns Ok(()) if no
@@ -999,6 +1106,62 @@ mod tests {
         assert!(clone.disclaim_tcc.load(Ordering::Relaxed));
         clone.set_disclaim_tcc(false);
         assert!(!mgr.disclaim_tcc.load(Ordering::Relaxed));
+    }
+
+    /// The legacy detector drives a prompt that destroys the user's live
+    /// sessions, so a false positive is expensive. These are argv strings
+    /// captured verbatim from real tmux servers born each of the three ways.
+    #[test]
+    fn legacy_birth_argv_matches_only_the_bare_start_server_form() {
+        // Pre-0.1.13 disclaimed birth — the one that needs a restart.
+        assert!(is_legacy_birth_argv("tmux -L raum start-server"));
+        assert!(is_legacy_birth_argv("tmux -L raum start-server\n"));
+        assert!(is_legacy_birth_argv(
+            "/opt/homebrew/bin/tmux -L raum-dev start-server"
+        ));
+
+        // Current disclaimed birth — already correct, must not be flagged.
+        assert!(!is_legacy_birth_argv(
+            "tmux -L raum start-server ; set-option -s exit-empty off"
+        ));
+        // Normal lazy birth via `new_session`.
+        assert!(!is_legacy_birth_argv(
+            "tmux -L raum start-server ; set-option -g history-limit 100000 ; \
+             new-session -d -s raum-sh-1 -c /tmp"
+        ));
+        // A plain client, and noise, must never read as a server birth.
+        assert!(!is_legacy_birth_argv("tmux -L raum attach-session -t x"));
+        assert!(!is_legacy_birth_argv(""));
+    }
+
+    /// The live-server side of the same check: no server, and a normally-born
+    /// server, must both answer `false`. (The positive case can't be staged —
+    /// see [`is_legacy_birth_argv`].)
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_normally_born_server_is_never_flagged_as_legacy() {
+        if std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let stamp = format!("{}-{}", std::process::id(), nanos);
+
+        // Cold socket: nothing to flag.
+        let cold = TmuxManager::with_socket(format!("raum-legacy-cold-{stamp}"));
+        assert!(!cold.server_born_legacy_disclaimed());
+
+        let normal = TmuxManager::with_socket(format!("raum-legacy-new-{stamp}"));
+        normal
+            .new_session("norm-1", std::path::Path::new("/tmp"), None, Some((80, 24)))
+            .expect("new_session");
+        assert!(!normal.server_born_legacy_disclaimed());
+        let _ = normal.kill_server();
     }
 
     #[test]

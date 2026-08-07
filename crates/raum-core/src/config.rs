@@ -457,6 +457,31 @@ pub struct TerminalsConfig {
     /// deliberately). Editing the file alone changes nothing.
     #[serde(default)]
     pub disclaim_tcc_responsibility: bool,
+    /// Set when the user accepts the one-time "restart the terminal server"
+    /// prompt; consumed and cleared on the next launch, before rehydrate.
+    ///
+    /// The restart cannot happen in place: killing the server ends every live
+    /// session, and doing it while raum is running would tear panes down under
+    /// their attached control-mode clients. Deferring it to the next boot puts
+    /// it at the one quiet point where raum already knows how to rebuild
+    /// everything — the cold-server path a reboot takes, which reclassifies
+    /// tracked harness rows as recoverable and resumes them.
+    #[serde(default)]
+    pub restart_server_on_next_launch: bool,
+    /// Set when the user dismisses that prompt for good.
+    ///
+    /// Only needed for someone who declines: accepting is self-clearing,
+    /// because the restart replaces the legacy server and the detector stops
+    /// matching. A fresh install never sets either flag.
+    #[serde(default)]
+    pub server_restart_hint_dismissed: bool,
+    /// The tmux server version whose "known display bug — restart/upgrade"
+    /// notice the user dismissed. Keyed by version, not a bool, so a later
+    /// server that is *differently* buggy re-notifies while the dismissed one
+    /// stays quiet. Cleared implicitly by upgrading: a fixed version never
+    /// matches the buggy-range check, so the stale value is inert.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmux_version_hint_dismissed_for: Option<String>,
 }
 
 fn default_auto_dock_inactive_days() -> u32 {
@@ -469,6 +494,9 @@ impl Default for TerminalsConfig {
             auto_dock_inactive: false,
             auto_dock_inactive_days: default_auto_dock_inactive_days(),
             disclaim_tcc_responsibility: false,
+            restart_server_on_next_launch: false,
+            server_restart_hint_dismissed: false,
+            tmux_version_hint_dismissed_for: None,
         }
     }
 }
