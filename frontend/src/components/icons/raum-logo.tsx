@@ -15,7 +15,7 @@ export const RaumLogo = (props: ComponentProps<"svg">) => {
       stroke-width="5"
       stroke-linecap="round"
       stroke-linejoin="round"
-      class={`text-black dark:text-white ${local.class ?? ""}`}
+      class={`text-[#141418] dark:text-[#f5f5f5] ${local.class ?? ""}`}
       aria-hidden="true"
       {...rest}
     >
