@@ -4,6 +4,7 @@ use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use serde::Deserialize;
 use serde_json::Value;
 use tracing::warn;
 
@@ -13,50 +14,64 @@ use super::transcript_contains_prompt;
 /// The first line of each rollout is a `session_meta` event whose
 /// payload carries the `cwd` the session was launched in, so we walk the
 /// date hierarchy, match by cwd, and pick the newest match.
+///
+/// "Newest" is by file mtime across the whole tree, not by day directory:
+/// `codex resume` appends to the rollout of the day the session was
+/// *created*, so a resumed old session outranks a newer-dated sibling. See
+/// [`newest_rollout_by`] — candidates are cheaply enumerated first and only
+/// opened until the first match.
 pub(super) fn discover_codex_transcript(cwd: &Path, home_dir: &Path) -> Option<PathBuf> {
+    let cwd_str = cwd.to_str()?;
+    newest_rollout_by(home_dir, |path| {
+        codex_rollout_matches_cwd(path, cwd_str).then(|| path.to_path_buf())
+    })
+}
+
+pub(super) fn discover_codex_session_id_by_prompt(
+    cwd: &Path,
+    home_dir: &Path,
+    prompt: &str,
+) -> Option<String> {
+    let cwd_str = cwd.to_str()?;
+    newest_rollout_by(home_dir, |path| {
+        if !codex_rollout_matches_cwd(path, cwd_str) {
+            return None;
+        }
+        if !transcript_contains_prompt(&parse_codex_user_prompts(path), prompt) {
+            return None;
+        }
+        codex_session_id_from_rollout(path)
+            .or_else(|| codex_session_id_from_filename(path))
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+    })
+}
+
+/// Walk `~/.codex/sessions/<Y>/<M>/<D>/`, collect every `rollout-*.jsonl`
+/// with its mtime, then apply `pick` to the candidates newest-mtime-first
+/// and return the first value it produces.
+///
+/// The day hierarchy records when a session was *created*, but `codex
+/// resume` appends to the original file — so an older day can hold the
+/// most recently touched rollout and day order alone cannot decide the
+/// winner. Ordering by mtime across the whole tree keeps that rule while
+/// still opening/parsing only as many rollouts as it takes to hit the
+/// first match (the old walk parsed the first line of *every* rollout the
+/// user had ever recorded, oldest first, on every call).
+fn newest_rollout_by<T, F>(home_dir: &Path, mut pick: F) -> Option<T>
+where
+    F: FnMut(&Path) -> Option<T>,
+{
     let sessions = home_dir.join(".codex").join("sessions");
     if !sessions.is_dir() {
         return None;
     }
-    let cwd_str = cwd.to_str()?;
 
-    let mut best: Option<(PathBuf, SystemTime)> = None;
-    let mut consider = |path: PathBuf| {
-        let modified = std::fs::metadata(&path)
-            .and_then(|m| m.modified())
-            .unwrap_or(SystemTime::UNIX_EPOCH);
-        if !codex_rollout_matches_cwd(&path, cwd_str) {
-            return;
-        }
-        match &best {
-            Some((_, t)) if *t >= modified => {}
-            _ => best = Some((path, modified)),
-        }
-    };
-
-    // Walk year/month/day three deep. The structure is fixed by Codex.
-    let Ok(years) = std::fs::read_dir(&sessions) else {
-        return None;
-    };
-    for year in years.flatten() {
-        if !year.file_type().is_ok_and(|t| t.is_dir()) {
-            continue;
-        }
-        let Ok(months) = std::fs::read_dir(year.path()) else {
-            continue;
-        };
-        for month in months.flatten() {
-            if !month.file_type().is_ok_and(|t| t.is_dir()) {
-                continue;
-            }
-            let Ok(days) = std::fs::read_dir(month.path()) else {
-                continue;
-            };
-            for day in days.flatten() {
-                if !day.file_type().is_ok_and(|t| t.is_dir()) {
-                    continue;
-                }
-                let Ok(files) = std::fs::read_dir(day.path()) else {
+    let mut candidates: Vec<(SystemTime, PathBuf)> = Vec::new();
+    for year in subdirs_newest_first(&sessions) {
+        for month in subdirs_newest_first(&year) {
+            for day in subdirs_newest_first(&month) {
+                let Ok(files) = std::fs::read_dir(&day) else {
                     continue;
                 };
                 for entry in files.flatten() {
@@ -71,89 +86,35 @@ pub(super) fn discover_codex_transcript(cwd: &Path, home_dir: &Path) -> Option<P
                     if !is_rollout {
                         continue;
                     }
-                    consider(path);
+                    let modified = entry
+                        .metadata()
+                        .and_then(|m| m.modified())
+                        .unwrap_or(SystemTime::UNIX_EPOCH);
+                    candidates.push((modified, path));
                 }
             }
         }
     }
-    best.map(|(p, _)| p)
+    // Newest mtime first; the descending directory walk above already put
+    // same-mtime siblings in newest-day order, so this stays stable there.
+    candidates.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    candidates.into_iter().find_map(|(_, path)| pick(&path))
 }
 
-pub(super) fn discover_codex_session_id_by_prompt(
-    cwd: &Path,
-    home_dir: &Path,
-    prompt: &str,
-) -> Option<String> {
-    let sessions = home_dir.join(".codex").join("sessions");
-    if !sessions.is_dir() {
-        return None;
-    }
-    let cwd_str = cwd.to_str()?;
-    let mut best: Option<(String, SystemTime)> = None;
-    let mut consider = |path: PathBuf| {
-        if !codex_rollout_matches_cwd(&path, cwd_str) {
-            return;
-        }
-        if !transcript_contains_prompt(parse_codex_user_prompts(&path), prompt) {
-            return;
-        }
-        let Some(id) = codex_session_id_from_rollout(&path)
-            .or_else(|| codex_session_id_from_filename(&path))
-            .map(|id| id.trim().to_string())
-            .filter(|id| !id.is_empty())
-        else {
-            return;
-        };
-        let modified = std::fs::metadata(&path)
-            .and_then(|m| m.modified())
-            .unwrap_or(SystemTime::UNIX_EPOCH);
-        match &best {
-            Some((_, t)) if *t >= modified => {}
-            _ => best = Some((id, modified)),
-        }
+/// Immediate subdirectories of `dir`, sorted by name descending. Codex's
+/// `YYYY` / `MM` / `DD` names are zero-padded, so descending name order is
+/// descending chronological order.
+pub(super) fn subdirs_newest_first(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
     };
-
-    let Ok(years) = std::fs::read_dir(&sessions) else {
-        return None;
-    };
-    for year in years.flatten() {
-        if !year.file_type().is_ok_and(|t| t.is_dir()) {
-            continue;
-        }
-        let Ok(months) = std::fs::read_dir(year.path()) else {
-            continue;
-        };
-        for month in months.flatten() {
-            if !month.file_type().is_ok_and(|t| t.is_dir()) {
-                continue;
-            }
-            let Ok(days) = std::fs::read_dir(month.path()) else {
-                continue;
-            };
-            for day in days.flatten() {
-                if !day.file_type().is_ok_and(|t| t.is_dir()) {
-                    continue;
-                }
-                let Ok(files) = std::fs::read_dir(day.path()) else {
-                    continue;
-                };
-                for entry in files.flatten() {
-                    let path = entry.path();
-                    if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
-                        continue;
-                    }
-                    let is_rollout = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|s| s.starts_with("rollout-"));
-                    if is_rollout {
-                        consider(path);
-                    }
-                }
-            }
-        }
-    }
-    best.map(|(id, _)| id)
+    let mut out: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.path())
+        .collect();
+    out.sort_unstable_by(|a, b| b.file_name().cmp(&a.file_name()));
+    out
 }
 
 /// Read just the first line of `path` and check whether the
@@ -237,8 +198,8 @@ pub(super) fn codex_session_id_from_filename(path: &Path) -> Option<String> {
 /// so the very oldest rollouts — which logged only the API shape —
 /// still produce something useful.
 pub(super) fn parse_codex_user_prompts(jsonl_path: &Path) -> Vec<String> {
-    let raw = match std::fs::read_to_string(jsonl_path) {
-        Ok(r) => r,
+    let file = match std::fs::File::open(jsonl_path) {
+        Ok(f) => f,
         Err(e) => {
             warn!(path = %jsonl_path.display(), error = %e, "codex transcript read failed");
             return Vec::new();
@@ -246,25 +207,27 @@ pub(super) fn parse_codex_user_prompts(jsonl_path: &Path) -> Vec<String> {
     };
     let mut event_prompts: Vec<String> = Vec::new();
     let mut response_prompts: Vec<String> = Vec::new();
-    for line in raw.lines() {
+    // Streamed line-by-line: rollouts grow to megabytes and the old
+    // `read_to_string` held the whole file plus a full `Value` tree per line.
+    for line in std::io::BufReader::new(file).lines() {
+        let Ok(line) = line else { break };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
-        let entry: Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let Some(payload) = entry.get("payload") else {
+        let Ok(entry) = serde_json::from_str::<RolloutLine>(trimmed) else {
             continue;
         };
-        let entry_type = entry.get("type").and_then(|v| v.as_str());
-        let payload_type = payload.get("type").and_then(|v| v.as_str());
+        let Some(payload) = entry.payload else {
+            continue;
+        };
+        let payload_type = payload.r#type.as_deref();
 
         // Shape A — clean signal, prefer when present.
         if payload_type == Some("user_message") {
             if let Some(text) = payload
-                .get("message")
+                .message
+                .as_ref()
                 .and_then(|v| v.as_str())
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
@@ -275,12 +238,13 @@ pub(super) fn parse_codex_user_prompts(jsonl_path: &Path) -> Vec<String> {
         }
 
         // Shape B — fallback; filter synthetic context.
-        if entry_type == Some("response_item")
+        if entry.r#type.as_deref() == Some("response_item")
             && payload_type == Some("message")
-            && payload.get("role").and_then(|v| v.as_str()) == Some("user")
+            && payload.role.as_deref() == Some("user")
         {
             if let Some(text) = payload
-                .get("content")
+                .content
+                .as_ref()
                 .and_then(extract_codex_content_blocks)
                 .filter(|t| !is_synthetic_codex_user_text(t))
             {
@@ -293,6 +257,33 @@ pub(super) fn parse_codex_user_prompts(jsonl_path: &Path) -> Vec<String> {
     } else {
         event_prompts
     }
+}
+
+/// The handful of fields [`parse_codex_user_prompts`] actually reads.
+///
+/// Deserializing into this instead of a full [`Value`] means the (frequently
+/// enormous) assistant / tool-call lines are lexed past rather than
+/// materialised as a JSON tree. `message` and `content` stay `Value` because
+/// their shape varies across Codex versions and a stricter type here would
+/// make an unrelated payload fail the whole line.
+#[derive(Deserialize)]
+struct RolloutLine {
+    #[serde(default)]
+    r#type: Option<String>,
+    #[serde(default)]
+    payload: Option<RolloutPayload>,
+}
+
+#[derive(Deserialize)]
+struct RolloutPayload {
+    #[serde(default)]
+    r#type: Option<String>,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    message: Option<Value>,
+    #[serde(default)]
+    content: Option<Value>,
 }
 
 /// Recognises Codex's synthetic `role=user` injections so the rollout

@@ -1,6 +1,7 @@
 //! OpenCode transcript + session discovery helpers.
 
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -14,6 +15,22 @@ use super::TRANSCRIPT_HTTP_TIMEOUT;
 /// stalls, recovery should degrade to "unavailable" instead of hanging the
 /// pane bootstrap.
 const SESSION_LIST_CLI_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// Shared client for the transcript GETs. Building one per call throws away
+/// the connection pool and re-reads the system TLS roots every time.
+/// `None` only if the builder itself fails, which is a process-wide condition.
+fn transcript_http_client() -> Option<&'static reqwest::Client> {
+    static CLIENT: OnceLock<Option<reqwest::Client>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(TRANSCRIPT_HTTP_TIMEOUT)
+                .build()
+                .inspect_err(|e| warn!(error = %e, "opencode reqwest client build failed"))
+                .ok()
+        })
+        .as_ref()
+}
 
 /// Pull user prompts from a running OpenCode session via its local HTTP
 /// API. Two GETs:
@@ -36,15 +53,8 @@ pub(super) async fn read_opencode_user_prompts(
     let Some(cwd_str) = cwd.to_str() else {
         return Vec::new();
     };
-    let client = match reqwest::Client::builder()
-        .timeout(TRANSCRIPT_HTTP_TIMEOUT)
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(error = %e, "opencode reqwest client build failed");
-            return Vec::new();
-        }
+    let Some(client) = transcript_http_client() else {
+        return Vec::new();
     };
 
     // 1) Look up the session id for this cwd.

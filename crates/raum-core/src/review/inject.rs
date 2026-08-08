@@ -81,17 +81,13 @@ pub async fn inject_opencode_brief(base_url: &str, port: u16, cwd: &Path, brief:
             return;
         }
     };
-    let client = match reqwest::Client::builder().timeout(REQUEST_TIMEOUT).build() {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(error = %e, "opencode reqwest client build failed");
-            return;
-        }
+    let Some(client) = shared_client() else {
+        return;
     };
 
     let deadline = Instant::now() + TOTAL_BUDGET;
 
-    if !wait_for_http(&client, base_url, port, deadline).await {
+    if !wait_for_http(client, base_url, port, deadline).await {
         warn!(port, "opencode TUI did not become ready before timeout");
         return;
     }
@@ -103,13 +99,13 @@ pub async fn inject_opencode_brief(base_url: &str, port: u16, cwd: &Path, brief:
     // one it's >=1 and our submit pushes it to baseline+1 by creating a
     // new session — OpenCode creates a new session on first submit
     // even mid-TUI when there's no active session.)
-    let baseline = list_session_count(&client, base_url, port, cwd_str).await;
+    let baseline = list_session_count(client, base_url, port, cwd_str).await;
     debug!(port, baseline, "opencode session baseline recorded");
 
     let mut attempt = 0u32;
     while Instant::now() < deadline {
         attempt += 1;
-        publish_brief(&client, base_url, port, brief).await;
+        publish_brief(client, base_url, port, brief).await;
 
         // Observe for OBSERVE_WINDOW. A successful publish surfaces as
         // a session count > baseline within ~200-500 ms once the TUI is
@@ -118,7 +114,7 @@ pub async fn inject_opencode_brief(base_url: &str, port: u16, cwd: &Path, brief:
         let observe_until = Instant::now() + OBSERVE_WINDOW;
         loop {
             sleep(OBSERVE_POLL_INTERVAL).await;
-            let current = list_session_count(&client, base_url, port, cwd_str).await;
+            let current = list_session_count(client, base_url, port, cwd_str).await;
             if current > baseline {
                 debug!(port, attempt, "opencode brief submitted (session created)");
                 return;
@@ -133,6 +129,29 @@ pub async fn inject_opencode_brief(base_url: &str, port: u16, cwd: &Path, brief:
         port,
         attempt, "opencode brief submission timed out; user can submit manually"
     );
+}
+
+/// Process-wide `reqwest::Client` for the inject path.
+///
+/// A `Client` owns a connection pool and a TLS config; building one per
+/// call threw both away after a single injection and re-paid the setup on
+/// the next. Cloning (or sharing) one is the documented usage. Returns
+/// `None` only if the very first build failed, in which case every caller
+/// degrades the same way it did before: log once, leave the user with an
+/// interactive TUI they can prompt themselves.
+fn shared_client() -> Option<&'static reqwest::Client> {
+    static CLIENT: std::sync::OnceLock<Option<reqwest::Client>> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(
+            || match reqwest::Client::builder().timeout(REQUEST_TIMEOUT).build() {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    warn!(error = %e, "opencode reqwest client build failed");
+                    None
+                }
+            },
+        )
+        .as_ref()
 }
 
 /// Poll until `/session` answers (any status < 500) or the deadline

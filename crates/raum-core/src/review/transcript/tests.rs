@@ -572,6 +572,37 @@ async fn codex_picks_newest_matching_cwd() {
     assert_eq!(prompts, vec!["new"]);
 }
 
+/// `codex resume` appends to the rollout of the day the session was
+/// *created*, so the newest-mtime match can live in an older day directory
+/// than a session started later.
+#[tokio::test]
+async fn codex_prefers_resumed_rollout_from_an_older_day() {
+    let cwd = "/Users/foo/repo";
+    let home = tempdir().unwrap();
+    let sessions = home.path().join(".codex").join("sessions").join("2026");
+    let old_day = sessions.join("08").join("01");
+    let new_day = sessions.join("08").join("05");
+    fs::create_dir_all(&old_day).unwrap();
+    fs::create_dir_all(&new_day).unwrap();
+
+    let line = |text: &str| {
+        format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":\"{cwd}\"}}}}\n\
+{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"{text}\"}}]}}}}\n",
+        )
+    };
+
+    // Started later, but not touched since.
+    fs::write(new_day.join("rollout-bbbb.jsonl"), line("newer session")).unwrap();
+    sleep(Duration::from_millis(50));
+    // Started earlier, resumed just now — newest mtime wins.
+    fs::write(old_day.join("rollout-aaaa.jsonl"), line("resumed session")).unwrap();
+
+    let prompts =
+        read_session_user_prompts(AgentKind::Codex, Path::new(cwd), home.path(), None).await;
+    assert_eq!(prompts, vec!["resumed session"]);
+}
+
 #[test]
 fn codex_session_id_discovery_reads_newest_matching_rollout_meta() {
     let cwd = "/Users/foo/repo";
