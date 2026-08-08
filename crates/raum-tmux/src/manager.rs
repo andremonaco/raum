@@ -145,8 +145,21 @@ pub struct PaneContext {
 /// instead of N.
 const DEAD_POLL_CACHE_TTL: Duration = Duration::from_millis(200);
 
+/// Field separator for every batched `list-panes -a` format.
+///
+/// A tab, not the ASCII unit separator it reads like it should be: tmux 3.4
+/// (what Debian and Ubuntu ship) runs list output through
+/// `utf8_stravisx(VIS_OCTAL|…)`, which rewrites a literal `\x1f` into the
+/// four printable characters `\037` — every split then misses and the whole
+/// listing parses as zero rows. tmux 3.7 passes the byte through untouched,
+/// so the breakage is invisible on a Homebrew tmux. Tab survives verbatim on
+/// both. Parsers below bound the damage from a tab inside a free-form value
+/// (a pane title, a path) by splitting a fixed number of times and letting
+/// the last field keep the remainder.
+const SEP: char = '\t';
+
 /// `list-panes -a` format backing [`TmuxManager::check_pane_dead_polled`].
-const DEAD_POLL_FORMAT: &str = "#{session_name}\u{1f}#{pane_dead}\u{1f}#{pane_dead_status}";
+const DEAD_POLL_FORMAT: &str = "#{session_name}\t#{pane_dead}\t#{pane_dead_status}";
 
 /// A batched pane-death listing plus the instant it was taken. `None` inside
 /// the map means the pane is still running.
@@ -817,11 +830,11 @@ impl TmuxManager {
     /// pane's, and a helper that exits would read as the session itself dying.
     ///
     /// The two flags are prepended to the caller's format and matched here
-    /// rather than passed to `list-panes -f`: tmux 3.4 returns an empty
-    /// listing for the equivalent `#{&&:...}` filter, so the server-side form
-    /// silently reports every session as gone on the distro tmux.
+    /// rather than passed to `list-panes -f`, so the narrowing depends on
+    /// nothing but the format fields themselves. Rows are separated by
+    /// [`SEP`].
     fn list_panes_all(&self, format: &str) -> Result<String, TmuxError> {
-        let with_flags = format!("#{{pane_active}}\u{1f}#{{window_active}}\u{1f}{format}");
+        let with_flags = format!("#{{pane_active}}\t#{{window_active}}\t{format}");
         let out = self
             .cmd()
             .args(["list-panes", "-a", "-F", &with_flags])
@@ -840,10 +853,10 @@ impl TmuxManager {
         let mut kept = String::with_capacity(stdout.len());
         for raw in stdout.lines() {
             let line = raw.trim_end_matches('\r');
-            let Some((pane_active, rest)) = line.split_once('\u{1f}') else {
+            let Some((pane_active, rest)) = line.split_once(SEP) else {
                 continue;
             };
-            let Some((window_active, row)) = rest.split_once('\u{1f}') else {
+            let Some((window_active, row)) = rest.split_once(SEP) else {
                 continue;
             };
             if pane_active.trim() != "1" || window_active.trim() != "1" {
@@ -947,7 +960,7 @@ impl TmuxManager {
                 "-p",
                 "-t",
                 id,
-                "#{pane_current_command}\u{1f}#{pane_current_path}\u{1f}#{pane_title}\u{1f}#{window_name}",
+                "#{pane_current_command}\t#{pane_current_path}\t#{pane_title}\t#{window_name}",
             ])
             .output()?;
         if !out.status.success() {
@@ -970,12 +983,12 @@ impl TmuxManager {
     /// key even when a harness split the window.
     pub fn pane_context_all(&self) -> Result<HashMap<String, PaneContext>, TmuxError> {
         let listing = self.list_panes_all(
-            "#{session_name}\u{1f}#{pane_current_command}\u{1f}#{pane_current_path}\u{1f}#{pane_title}\u{1f}#{window_name}",
+            "#{session_name}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_title}\t#{window_name}",
         )?;
         let mut out = HashMap::new();
         for raw in listing.lines() {
             let line = raw.trim_end_matches('\r');
-            let Some((name, rest)) = line.split_once('\u{1f}') else {
+            let Some((name, rest)) = line.split_once(SEP) else {
                 continue;
             };
             let name = name.trim();
@@ -1254,7 +1267,7 @@ fn decode_lossy(bytes: Vec<u8>) -> String {
 fn parse_panes_dead(stdout: &str) -> HashMap<String, Option<i32>> {
     let mut out = HashMap::new();
     for raw in stdout.lines() {
-        let mut parts = raw.trim_end_matches('\r').split('\u{1f}');
+        let mut parts = raw.trim_end_matches('\r').splitn(4, SEP);
         let Some(name) = parts.next().map(str::trim).filter(|s| !s.is_empty()) else {
             continue;
         };
@@ -1272,7 +1285,7 @@ fn parse_panes_dead(stdout: &str) -> HashMap<String, Option<i32>> {
 
 fn parse_pane_context(stdout: &str) -> PaneContext {
     let trimmed = stdout.trim_end_matches(['\r', '\n']);
-    let mut parts = trimmed.splitn(4, '\u{1f}');
+    let mut parts = trimmed.splitn(4, SEP);
     let current_command = parts.next().unwrap_or("").trim().to_string();
     let current_path = parts.next().unwrap_or("").trim().to_string();
     let pane_title = parts.next().unwrap_or("").trim().to_string();
@@ -1326,7 +1339,23 @@ mod tests {
                 .expect("new_session");
         }
 
-        let ctx = mgr.pane_context_all().expect("pane_context_all");
+        // tmux fills `pane_current_command` / `pane_current_path` from the
+        // pane's process once its shell has exec'd, so a read taken in the
+        // same millisecond as `new-session` can legitimately come back blank
+        // under load. Poll for the populated state instead of racing it — a
+        // genuinely broken format never populates and still fails here.
+        let mut ctx = HashMap::new();
+        for _ in 0..40 {
+            ctx = mgr.pane_context_all().expect("pane_context_all");
+            let ready = ["batch-a", "batch-b"].iter().all(|id| {
+                ctx.get(*id)
+                    .is_some_and(|p| !p.current_command.is_empty() && !p.current_path.is_empty())
+            });
+            if ready {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
         assert_eq!(ctx.len(), 2, "one row per live session, got {ctx:?}");
         for id in ["batch-a", "batch-b"] {
             let pane = ctx.get(id).expect("session present in the batch");
@@ -1456,9 +1485,29 @@ sess-windows-crlf\t1700000002\t100\t30\r
         assert_eq!(parsed[4].height, 30);
     }
 
+    /// tmux 3.4 rewrites a non-printable byte in list output into its octal
+    /// escape (`\x1f` becomes the four characters `\037`), so a format that
+    /// separates fields with one parses as zero rows there while looking
+    /// perfect on a 3.7 dev box. CI's macOS runner cannot catch that, so pin
+    /// the invariant on the format strings themselves.
+    #[test]
+    fn batched_formats_separate_fields_with_a_printable_byte() {
+        assert_eq!(SEP, '\t');
+        for format in [
+            DEAD_POLL_FORMAT,
+            "#{session_name}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_title}\t#{window_name}",
+        ] {
+            assert!(
+                !format.chars().any(|c| c.is_control() && c != SEP),
+                "non-printable separator would be octal-escaped by tmux 3.4: {format:?}"
+            );
+            assert!(format.contains(SEP), "no separator at all: {format:?}");
+        }
+    }
+
     #[test]
     fn parse_pane_context_handles_extended_fields() {
-        let stdout = "node\u{1f}/tmp/raum\u{1f}⠋ raum\u{1f}node\r\n";
+        let stdout = "node\t/tmp/raum\t⠋ raum\tnode\r\n";
         let parsed = parse_pane_context(stdout);
         assert_eq!(parsed.current_command, "node");
         assert_eq!(parsed.current_path, "/tmp/raum");
@@ -1472,13 +1521,13 @@ sess-windows-crlf\t1700000002\t100\t30\r
     #[test]
     fn parse_panes_dead_matches_per_session_semantics() {
         let stdout = "\
-alive\u{1f}0\u{1f}
-clean\u{1f}1\u{1f}0
-failed\u{1f}1\u{1f}130
-nostatus\u{1f}1\u{1f}
-garbage\u{1f}1\u{1f}nope
-crlf\u{1f}0\u{1f}\r
-\u{1f}1\u{1f}0
+alive\t0\t
+clean\t1\t0
+failed\t1\t130
+nostatus\t1\t
+garbage\t1\tnope
+crlf\t0\t\r
+\t1\t0
 ";
         let parsed = parse_panes_dead(stdout);
         assert_eq!(parsed.get("alive"), Some(&None));
