@@ -1,15 +1,16 @@
 //! Permission reply command (Phase 2, per-harness notification plan).
 //!
-//! Exposes a single Tauri command `reply_permission(request_id,
-//! decision)` that can deliver a decision back to a parked harness
-//! permission request. The default notification UX is focus-only, so
-//! this command is currently retained as a transport surface rather
-//! than being called from desktop notifications.
+//! Exposes the Tauri command `reply_permission(request_id, decision)`
+//! plus [`deliver_permission_decision`], the transport-agnostic core it
+//! wraps. The core is generic over the Tauri runtime so native code —
+//! notably the macOS notification delegate's Allow/Deny action handler,
+//! which only has an `AppHandle` — can answer a parked request without
+//! going through the webview.
 
 use raum_core::harness::Decision;
 use raum_hooks::PendingKey;
 use serde::Deserialize;
-use tauri::{Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tracing::{info, warn};
 
 use crate::commands::harness_runtime::deliver_decision;
@@ -44,28 +45,48 @@ pub async fn reply_permission(
         return Err(format!("unknown decision tag: {}", args.decision));
     };
 
-    let state: tauri::State<'_, AppHandleState> = app.state();
+    deliver_permission_decision(&app, args.session_id.as_deref(), &args.request_id, decision).await
+}
 
-    // Demote the state machine Waiting → Working so the NEXT
-    // `PermissionRequest` produces a visible state transition. Without
-    // this, the machine gets stuck at Waiting and every follow-up
-    // request is a silent Waiting → Waiting no-op. We do this BEFORE
-    // dispatching the reply so the transition is already visible by
-    // the time the harness starts emitting new PTY output.
-    if let Some(session_id) = &args.session_id {
-        let change = {
-            let Ok(mut agents) = state.agents.lock() else {
-                warn!("reply_permission: agent registry lock poisoned");
-                return Err("agent registry lock poisoned".into());
-            };
-            agents.on_permission_reply(session_id)
+/// Demote the state machine Waiting → Working so the NEXT
+/// `PermissionRequest` produces a visible state transition. Without this,
+/// the machine gets stuck at Waiting and every follow-up request is a
+/// silent Waiting → Waiting no-op.
+///
+/// Runs only AFTER a transport accepted the decision: a reply for a
+/// request that is no longer parked (stale OS banner still armed in
+/// Notification Center, duplicate click) must not demote a session that
+/// is Waiting on a *different*, still-live request — the frontend treats
+/// `waiting → !waiting` as "this session's prompts are resolved".
+fn demote_after_reply<R: Runtime>(app: &AppHandle<R>, session_id: &str) {
+    let state: tauri::State<'_, AppHandleState> = app.state();
+    let change = {
+        let Ok(mut agents) = state.agents.lock() else {
+            warn!("reply_permission: agent registry lock poisoned");
+            return;
         };
-        if let Some(change) = change
-            && let Err(e) = app.emit("agent-state-changed", &change)
-        {
-            warn!(error = %e, "agent-state-changed emit on permission reply failed");
-        }
+        agents.on_permission_reply(session_id)
+    };
+    if let Some(change) = change
+        && let Err(e) = app.emit("agent-state-changed", &change)
+    {
+        warn!(error = %e, "agent-state-changed emit on permission reply failed");
     }
+}
+
+/// Deliver `decision` to the parked request `request_id`.
+///
+/// `Ok(true)` — a transport accepted it. `Ok(false)` — nothing was
+/// parked under that id any more, which is the benign duplicate-click /
+/// raum-restarted case, not an error. Callers on every path (webview
+/// button, OS notification action) must treat repeats as no-ops.
+pub async fn deliver_permission_decision<R: Runtime>(
+    app: &AppHandle<R>,
+    session_id: Option<&str>,
+    request_id: &str,
+    decision: Decision,
+) -> Result<bool, String> {
+    let state: tauri::State<'_, AppHandleState> = app.state();
 
     // Phase 6: prefer the harness-runtime replier when we have a
     // session id. The replier dispatches on the adapter's configured
@@ -75,19 +96,13 @@ pub async fn reply_permission(
     // session predates the per-session registry — fall through to the
     // raum-hooks `PendingRequests` path so the pre-Phase-6 behaviour
     // is preserved.
-    if let Some(session_id) = &args.session_id {
-        match deliver_decision(
-            &state.harness_runtimes,
-            session_id,
-            &args.request_id,
-            decision,
-        )
-        .await
-        {
+    if let Some(session_id) = session_id {
+        match deliver_decision(&state.harness_runtimes, session_id, request_id, decision).await {
             Ok(true) => {
+                demote_after_reply(app, session_id);
                 info!(
-                    request_id = %args.request_id,
-                    session_id = %session_id,
+                    request_id,
+                    session_id,
                     decision = %decision.wire_tag(),
                     "reply_permission: delivered via harness runtime replier",
                 );
@@ -96,10 +111,11 @@ pub async fn reply_permission(
             Ok(false) => {
                 // No replier registered for this session; fall through
                 // to the raum-hooks socket path. This handles Claude
-                // Code (hook-response replier not yet wired through the
-                // harness runtime) and Codex (observation-only — the
-                // socket path also returns UnknownRequest, which maps
-                // to `Ok(false)` below).
+                // Code and Codex alike: both answer through the blocking
+                // hook script parked on the event socket, not through a
+                // harness-runtime replier. A request that is no longer
+                // parked yields `UnknownRequest`, mapped to `Ok(false)`
+                // below.
             }
             Err(e) => {
                 warn!(error=%e, "reply_permission: harness-runtime replier failed");
@@ -121,12 +137,15 @@ pub async fn reply_permission(
         return Err("event socket not bound; raum is running in silence-heuristic fallback".into());
     };
 
-    let key = PendingKey::new(args.session_id.clone(), args.request_id.clone());
+    let key = PendingKey::new(session_id.map(str::to_string), request_id.to_string());
     match pending.reply(&key, decision.wire_tag()).await {
         Ok(()) => {
+            if let Some(session_id) = session_id {
+                demote_after_reply(app, session_id);
+            }
             info!(
-                request_id = %args.request_id,
-                session_id = ?args.session_id,
+                request_id,
+                session_id = ?session_id,
                 decision = %decision.wire_tag(),
                 "reply_permission: delivered via raum-hooks socket",
             );
