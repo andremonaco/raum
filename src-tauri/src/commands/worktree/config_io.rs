@@ -80,6 +80,20 @@ pub(super) fn rescan_git_watcher(
     }
 }
 
+/// Reject slugs that could escape the config root when joined into a path.
+///
+/// Mirrors `raum_core::store::validate_slug` (which is private to that crate):
+/// a slug is a single path component, never empty, never containing a
+/// separator or a parent-dir hop. Frontend-supplied slugs reach
+/// [`worktree_config_write`] verbatim, so without this a slug like
+/// `../../../tmp/x` would let the editor write anywhere on disk.
+fn ensure_safe_slug(slug: &str) -> Result<(), String> {
+    if slug.is_empty() || slug.contains('/') || slug.contains('\\') || slug.contains("..") {
+        return Err(format!("invalid project slug: {slug}"));
+    }
+    Ok(())
+}
+
 /// §6.8 — in-app TOML-fragment editor.
 ///
 /// Writes the provided TOML text verbatim to either
@@ -99,6 +113,7 @@ pub fn worktree_config_write(
     in_repo: bool,
     toml_fragment: String,
 ) -> Result<(), String> {
+    ensure_safe_slug(&project_slug)?;
     let store = state.config_store.lock().map_err(|e| e.to_string())?;
     let target: PathBuf = if in_repo {
         let project = store
