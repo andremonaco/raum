@@ -7,11 +7,12 @@
  *      in `terminalRegistry`). Cheap, and the only source that produces
  *      accurate row/col coordinates we can later use to scroll the
  *      viewport when the user activates a match.
- *   2. `terminal_capture_text` tmux captures, fetched for every session
- *      the frontend knows about — including harnesses belonging to
+ *   2. `terminal_capture_text` tmux captures, grepped in Rust for every
+ *      session the frontend knows about — including harnesses belonging to
  *      inactive projects (whose xterm instances aren't mounted). This
  *      also recovers lines that have scrolled out of xterm's buffer but
- *      still live in tmux's `history-limit`.
+ *      still live in tmux's `history-limit`. Only matching lines cross IPC;
+ *      the captures themselves are 100k lines per pane.
  *
  * Shell kinds are excluded; the dock is intentionally focused on harness
  * history. Results are capped per-session and globally so a noisy harness
@@ -46,16 +47,38 @@ export interface ScrollbackMatch {
 const MAX_MATCHES_PER_SESSION = 8;
 /** Hard cap across all panes. Spotlight scrolls but still shouldn't balloon. */
 const MAX_MATCHES_TOTAL = 60;
+/**
+ * How many rows back from the newest line we walk per xterm buffer. Buffers are
+ * bounded at 100k lines, and lowercasing every one of them blocks the main
+ * thread for hundreds of ms per pane while the user is still typing the query.
+ * Recent output is what a ⌘F search is nearly always after, so scan newest-first
+ * and stop here.
+ */
+const MAX_SCAN_ROWS_PER_BUFFER = 10_000;
+/** Rows between main-thread yields inside a single buffer walk. */
+const SCAN_YIELD_INTERVAL = 2_000;
+
+/** Real macrotask yield — a microtask would keep the render loop blocked. */
+function yieldToRenderer(): Promise<void> {
+  return new Promise<void>((resolve) => setTimeout(resolve, 0));
+}
 
 interface LineMatch {
   col: number;
   length: number;
 }
 
+interface PaneLineMatch {
+  row: number;
+  col: number;
+  length: number;
+  line: string;
+  buffer: "tmux-history" | "tmux-live";
+}
+
 interface PaneTextHit {
   sessionId: string;
-  normal: string;
-  alternate: string | null;
+  matches: PaneLineMatch[];
 }
 
 function buildMatcher(needle: string): ((line: string) => LineMatch[]) | null {
@@ -76,12 +99,16 @@ function buildMatcher(needle: string): ((line: string) => LineMatch[]) | null {
   };
 }
 
-async function fetchTmuxCaptures(sessionIds: string[]): Promise<Map<string, PaneTextHit>> {
+/** Server-side grep over the tmux captures — see `commands::search`. */
+async function fetchTmuxMatches(
+  sessionIds: string[],
+  query: string,
+): Promise<Map<string, PaneLineMatch[]>> {
   if (sessionIds.length === 0) return new Map();
   try {
-    const hits = await invoke<PaneTextHit[]>("terminal_capture_text", { sessionIds });
-    const byId = new Map<string, PaneTextHit>();
-    for (const hit of hits) byId.set(hit.sessionId, hit);
+    const hits = await invoke<PaneTextHit[]>("terminal_capture_text", { sessionIds, query });
+    const byId = new Map<string, PaneLineMatch[]>();
+    for (const hit of hits) byId.set(hit.sessionId, hit.matches);
     return byId;
   } catch {
     return new Map();
@@ -113,7 +140,7 @@ export async function runScrollbackSearch(
   if (harnesses.length === 0) return [];
 
   const sessionIds = harnesses.map((t) => t.session_id);
-  const tmuxByIdPromise = fetchTmuxCaptures(sessionIds);
+  const tmuxByIdPromise = fetchTmuxMatches(sessionIds, query);
 
   const registered = new Map(
     listTerminals()
@@ -146,8 +173,19 @@ export async function runScrollbackSearch(
     if (reg) {
       for (const view of listTerminalBuffers(reg.terminal)) {
         const buf = view.buffer;
-        for (let y = 0; y < buf.length; y++) {
+        // Newest-first, bounded depth: a 100k-row buffer would otherwise be
+        // ~100k `translateToString` + `toLowerCase` calls on the main thread
+        // per keystroke-debounced query.
+        const stopAt = Math.max(0, buf.length - MAX_SCAN_ROWS_PER_BUFFER);
+        let scanned = 0;
+        for (let y = buf.length - 1; y >= stopAt; y--) {
           if (perSession >= MAX_MATCHES_PER_SESSION) break;
+          scanned += 1;
+          if (scanned % SCAN_YIELD_INTERVAL === 0) {
+            // Real macrotask yield so the renderer can paint mid-walk.
+            await yieldToRenderer();
+            if (cancel.aborted) return [];
+          }
           const line = buf.getLine(y);
           if (!line) continue;
           const text = line.translateToString(true);
@@ -179,42 +217,30 @@ export async function runScrollbackSearch(
     }
 
     // 2) Augment with tmux capture lines that xterm never saw (other projects,
-    //    or history that scrolled past xterm's cap).
+    //    or history that scrolled past xterm's cap). Already matched, bounded
+    //    and newest-first on the Rust side.
     const tmuxById = await tmuxByIdPromise;
     if (cancel.aborted) return [];
-    const tmuxHit = tmuxById.get(term.session_id);
-    if (!tmuxHit) continue;
-
-    const walk = (text: string, kind: "tmux-history" | "tmux-live"): void => {
-      if (perSession >= MAX_MATCHES_PER_SESSION) return;
-      const lines = text.split("\n");
-      for (let i = 0; i < lines.length; i++) {
-        if (perSession >= MAX_MATCHES_PER_SESSION) break;
-        const line = lines[i];
-        if (!line) continue;
-        for (const hit of match(line)) {
-          const k = keyOf(hit.col, line);
-          if (seen.has(k)) continue;
-          seen.add(k);
-          if (
-            !push({
-              sessionId: term.session_id,
-              kind: term.kind,
-              projectSlug: term.project_slug,
-              tabLabel,
-              row: i,
-              col: hit.col,
-              length: hit.length,
-              line,
-              buffer: kind,
-            })
-          )
-            break;
-        }
-      }
-    };
-    walk(tmuxHit.normal, "tmux-history");
-    if (tmuxHit.alternate) walk(tmuxHit.alternate, "tmux-live");
+    for (const hit of tmuxById.get(term.session_id) ?? []) {
+      if (perSession >= MAX_MATCHES_PER_SESSION) break;
+      const k = keyOf(hit.col, hit.line);
+      if (seen.has(k)) continue;
+      seen.add(k);
+      if (
+        !push({
+          sessionId: term.session_id,
+          kind: term.kind,
+          projectSlug: term.project_slug,
+          tabLabel,
+          row: hit.row,
+          col: hit.col,
+          length: hit.length,
+          line: hit.line,
+          buffer: hit.buffer,
+        })
+      )
+        break;
+    }
   }
 
   return out;

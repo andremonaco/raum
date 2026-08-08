@@ -52,9 +52,18 @@ export const PaneFindOverlay: Component<PaneFindOverlayProps> = (props) => {
   // Re-run the search whenever the query or case toggle changes so the count
   // and active-match highlight track the box live (incremental, like a
   // browser's find-as-you-type). Empty query clears the addon's decorations.
+  // Debounced: with decorations on, every `findNext` walks the whole 100k-line
+  // buffer, so a per-keystroke run stalls typing on a full pane.
+  let searchTimer: ReturnType<typeof setTimeout> | null = null;
+  const cancelPendingSearch = (): void => {
+    if (searchTimer !== null) clearTimeout(searchTimer);
+    searchTimer = null;
+  };
   createEffect(() => {
     const q = query();
+    const opts = options();
     const addon = props.search;
+    cancelPendingSearch();
     if (!addon) return;
     if (q.length === 0) {
       try {
@@ -66,15 +75,23 @@ export const PaneFindOverlay: Component<PaneFindOverlayProps> = (props) => {
       setResultCount(0);
       return;
     }
-    try {
-      addon.findNext(q, { ...options(), incremental: true });
-    } catch {
-      /* addon may be mid-dispose */
-    }
+    searchTimer = setTimeout(() => {
+      searchTimer = null;
+      try {
+        addon.findNext(q, { ...opts, incremental: true });
+      } catch {
+        /* addon may be mid-dispose */
+      }
+    }, 150);
   });
+  onCleanup(cancelPendingSearch);
 
+  // Stepping explicitly must kill any armed debounce: the addon advances
+  // whenever its cached term equals the new term, so a trailing incremental
+  // run would jump a match past where the user just stepped.
   const findNext = (): void => {
     const q = query();
+    cancelPendingSearch();
     if (!props.search || q.length === 0) return;
     try {
       props.search.findNext(q, options());
@@ -84,6 +101,7 @@ export const PaneFindOverlay: Component<PaneFindOverlayProps> = (props) => {
   };
   const findPrevious = (): void => {
     const q = query();
+    cancelPendingSearch();
     if (!props.search || q.length === 0) return;
     try {
       props.search.findPrevious(q, options());
