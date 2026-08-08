@@ -35,12 +35,15 @@ import {
   __clearPendingPermissionForTests,
   __handleAgentStateChangedForTests,
   __handleNotificationEventForTests,
+  __handlePermissionExpiredForTests,
   __handleSessionRemovedForTests,
   __resetNotificationCenterForTests,
   __setWindowFocusedForTests,
   badgeMode,
+  clearPendingPermission,
   ensureNotificationPermission,
   pendingPermissionCount,
+  pendingPermissionForSession,
   startNotificationCenter,
   syncDockBadge,
 } from "./notificationCenter";
@@ -84,6 +87,7 @@ interface SendArgs {
   body: string;
   sessionId?: string | null;
   kind?: "done" | "needs_input";
+  requestId?: string | null;
 }
 
 interface ClearArgs {
@@ -156,21 +160,60 @@ describe("notification center", () => {
   });
 
   it("fires an OS notification for permission requests", async () => {
+    seedProject("raum", "raum", "◆");
+    seedSession("codex-1", "codex", "raum");
     await __handleNotificationEventForTests({
       harness: "codex",
       event: "PermissionRequest",
       session_id: "codex-1",
+      request_id: "req-codex-1",
       permission_key: "codex-1",
-      payload: { tool_name: "shell" },
+      payload: { tool_name: "Bash", tool_input: { command: "cargo test" } },
     });
     expect(pendingPermissionCount()).toBe(1);
     const calls = sendCalls();
     expect(calls).toHaveLength(1);
     expect(calls[0]).toMatchObject({
-      title: "Permission requested",
-      body: "Codex needs permission for shell.",
+      title: "◆ raum · Codex",
+      body: "cargo test",
       sessionId: "codex-1",
+      requestId: "req-codex-1",
     });
+  });
+
+  it("exposes the replyable pending request for the rail", async () => {
+    await __handleNotificationEventForTests({
+      harness: "claude-code",
+      event: "PermissionRequest",
+      session_id: "s-rail",
+      request_id: "req-rail",
+      permission_key: "req-rail",
+      payload: { tool_name: "Bash", tool_input: { command: "rm -rf /tmp/x" } },
+    });
+    const pending = pendingPermissionForSession("s-rail");
+    expect(pending).toMatchObject({
+      permissionKey: "req-rail",
+      sessionId: "s-rail",
+      requestId: "req-rail",
+      harness: "claude-code",
+    });
+    expect(pending?.receivedAt).toBeGreaterThan(0);
+
+    // Observation-only requests (no reply token) are not offered as rows.
+    await __handleNotificationEventForTests({
+      harness: "codex",
+      event: "PermissionRequest",
+      session_id: "s-observe",
+      permission_key: "obs-1",
+      payload: { tool_name: "Bash" },
+    });
+    expect(pendingPermissionForSession("s-observe")).toBeUndefined();
+
+    clearPendingPermission("req-rail");
+    expect(pendingPermissionForSession("s-rail")).toBeUndefined();
+    // Idempotent: a duplicate clear (double click) is a no-op.
+    clearPendingPermission("req-rail");
+    expect(pendingPermissionCount()).toBe(1);
   });
 
   it("fires OS notifications when an agent transitions to waiting", async () => {
@@ -354,7 +397,12 @@ describe("notification center", () => {
     expect(pendingPermissionCount()).toBe(0);
   });
 
-  it("clears pending permissions when the session leaves waiting", async () => {
+  it("keeps pending permissions when the session leaves waiting", async () => {
+    // A session leaving `waiting` is per-session; requests are per-request.
+    // Answering one of two parallel prompts demotes the session while the
+    // other is still parked and blocking the harness — dropping it here
+    // would hide a live prompt from the Critical badge. Individual entries
+    // are cleared by their own authority (a reply, or `permission-expired`).
     await __handleNotificationEventForTests({
       harness: "claude-code",
       event: "PermissionRequest",
@@ -371,7 +419,28 @@ describe("notification center", () => {
       from: "waiting",
       to: "working",
     });
+    expect(pendingPermissionCount()).toBe(1);
+
+    clearPendingPermission("req-1");
     expect(pendingPermissionCount()).toBe(0);
+  });
+
+  it("dismisses the OS banner when a request expires unanswered", async () => {
+    await __handleNotificationEventForTests({
+      harness: "claude-code",
+      event: "PermissionRequest",
+      session_id: "s-exp",
+      request_id: "req-exp",
+      permission_key: "req-exp",
+      payload: null,
+    });
+    expect(pendingPermissionCount()).toBe(1);
+
+    // The banner carries armed Allow/Deny actions — an expired request must
+    // take its banner with it, not leave a tappable trigger behind.
+    __handlePermissionExpiredForTests({ session_id: "s-exp", permission_key: "req-exp" });
+    expect(pendingPermissionCount()).toBe(0);
+    expect(clearCalls()).toEqual([{ sessionId: "s-exp", kinds: ["needs_input"] }]);
   });
 
   it("clears pending permissions when the session is removed", async () => {
