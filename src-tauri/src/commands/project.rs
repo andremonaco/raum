@@ -729,22 +729,26 @@ pub async fn project_list_gitignored(
 ///
 /// Returns `GitignoreNode` entries with empty `children` — further expansion
 /// triggers another call. OS noise files are filtered.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn project_list_dir(
     state: tauri::State<'_, AppHandleState>,
     slug: String,
     rel_path: String,
 ) -> Result<Vec<GitignoreNode>, String> {
-    let store = state
-        .config_store
-        .lock()
-        .map_err(|e| format!("config_store lock: {e}"))?;
-    let project = store
-        .read_project(&slug)
-        .map_err(|e| format!("read_project: {e}"))?
-        .ok_or_else(|| format!("project not found: {slug}"))?;
-
-    let root = project.root_path;
+    // Scope the guard: the read_dir + per-entry `is_dir` stat below is disk
+    // work, and holding the store lock across it blocks every other command
+    // that touches config.
+    let root = {
+        let store = state
+            .config_store
+            .lock()
+            .map_err(|e| format!("config_store lock: {e}"))?;
+        store
+            .read_project(&slug)
+            .map_err(|e| format!("read_project: {e}"))?
+            .ok_or_else(|| format!("project not found: {slug}"))?
+            .root_path
+    };
 
     // Prevent path traversal. Note: a naive `join(..).starts_with(root)`
     // check passes `../x` (component-wise comparison, no normalization) —

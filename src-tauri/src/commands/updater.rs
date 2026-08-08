@@ -9,7 +9,7 @@ use raum_core::config::Config;
 
 use crate::state::AppHandleState;
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn config_set_updater_check_on_launch(
     state: tauri::State<'_, AppHandleState>,
     enabled: bool,
@@ -48,7 +48,7 @@ pub fn config_set_updater_check_on_launch(
 /// than symlinks) the bundle into `/Applications`. Both prefixes are
 /// checked because Homebrew lives at `/opt/homebrew` on Apple Silicon and
 /// `/usr/local` on Intel.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn updater_install_flavor() -> &'static str {
     #[cfg(target_os = "macos")]
     {

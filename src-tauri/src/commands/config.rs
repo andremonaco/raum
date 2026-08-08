@@ -66,7 +66,7 @@ fn parse_os_release() -> (Option<String>, Vec<String>) {
     (id, id_like)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn config_get(state: tauri::State<'_, AppHandleState>) -> Result<Config, String> {
     // Recover a poisoned mutex instead of bubbling the lock error: a single
     // panic in any prior `config_store` user would otherwise permanently
@@ -84,7 +84,7 @@ pub fn config_get(state: tauri::State<'_, AppHandleState>) -> Result<Config, Str
 
 /// §2.4 — startup prerequisite check. Always returns a report; UI renders the
 /// blocking dependency modal when `report.all_ok()` is false.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn prereqs_check() -> PrereqReport {
     prereqs::check_prereqs()
 }
@@ -98,7 +98,7 @@ pub async fn harnesses_check() -> HarnessReport {
 }
 
 /// §13.2 — mark onboarding complete. Called on wizard finish *or* skip-from-any-step.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn config_mark_onboarded(state: tauri::State<'_, AppHandleState>) -> Result<Config, String> {
     let store = state.config_store.lock().map_err(|e| e.to_string())?;
     let mut cfg = store.read_config().map_err(|e| e.to_string())?;
@@ -122,7 +122,7 @@ pub struct ActiveLayoutGetResult {
     pub quarantined: bool,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn active_layout_get(
     state: tauri::State<'_, AppHandleState>,
 ) -> Result<ActiveLayoutGetResult, String> {
@@ -147,7 +147,7 @@ pub fn active_layout_get(
 /// Persist the current runtime grid state (geometry + session IDs) to
 /// `state/active-layout.toml`. Called by the frontend on a 500 ms debounce
 /// after any mutation to `runtimeLayoutStore`.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn active_layout_save(
     state: tauri::State<'_, AppHandleState>,
     layout: ActiveLayoutState,
@@ -163,7 +163,7 @@ pub fn active_layout_save(
 ///
 /// `harness` must be one of: `"shell"`, `"claude-code"`, `"codex"`, `"opencode"`.
 /// Pass `flags = None` (or an empty string) to clear the flags for that harness.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn config_set_harness_flags(
     state: tauri::State<'_, AppHandleState>,
     harness: String,
@@ -191,7 +191,7 @@ pub fn config_set_harness_flags(
 /// Existing panes continue running with whatever mode they were spawned
 /// under — the env var is consumed at boot. The toggle takes effect for
 /// the next pane spawn / replacement.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn config_set_claude_fullscreen(
     state: tauri::State<'_, AppHandleState>,
     enabled: bool,
@@ -211,7 +211,7 @@ pub fn config_set_claude_fullscreen(
 /// default so the picker shows the BYO entry instead of stale curated
 /// selection). Both being null clears any theme override and falls back to
 /// the default at next boot.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn config_set_appearance_theme(
     state: tauri::State<'_, AppHandleState>,
     theme_id: Option<String>,
@@ -233,7 +233,7 @@ pub fn config_set_appearance_theme(
 /// Persist the per-pane prompt-overlay toggle. The overlay fades the
 /// first and last user prompt over each agent pane as a glanceable
 /// banner; some users find it noisy and want it off.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn config_set_appearance_show_prompt_overlay(
     state: tauri::State<'_, AppHandleState>,
     enabled: bool,
@@ -252,7 +252,7 @@ pub fn config_set_appearance_show_prompt_overlay(
 /// the "Other projects" list. The staleness check itself is derived in the
 /// frontend (it has the per-session prompt timestamps); this only stores the
 /// preference. `days` is clamped to a minimum of 1.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn config_set_projects_auto_hide(
     state: tauri::State<'_, AppHandleState>,
     enabled: bool,
@@ -275,7 +275,7 @@ pub fn config_set_projects_auto_hide(
 /// staleness check itself is derived in the frontend (it holds the per-session
 /// activity timestamps); this only stores the preference. `days` is clamped to a
 /// minimum of 1.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn config_set_terminals_auto_dock(
     state: tauri::State<'_, AppHandleState>,
     enabled: bool,
@@ -300,7 +300,7 @@ pub fn config_set_terminals_auto_dock(
 /// the built-in `NESTED_PATH_PATTERN` (raum's default strategy). Validation uses
 /// the same rules as `worktree_preview_path` so an invalid pattern here surfaces
 /// the same error the user would see at worktree-create time.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn config_set_worktree_path_pattern(
     state: tauri::State<'_, AppHandleState>,
     pattern: String,

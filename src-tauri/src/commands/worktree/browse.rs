@@ -83,7 +83,7 @@ pub(super) fn list_dir_in(root: &Path, rel_path: &str) -> Result<Vec<WorktreeDir
 
 /// List the immediate children of `rel_path` inside the worktree at
 /// `worktree_path`. Root level is `rel_path: ""`.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn worktree_list_dir(
     worktree_path: String,
     rel_path: String,

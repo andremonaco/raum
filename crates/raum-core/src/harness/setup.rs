@@ -19,10 +19,11 @@
 //!   [`SetupAction`] with an outcome, which the Harness Health panel in
 //!   Settings renders as a checklist.
 
+use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -30,6 +31,34 @@ use thiserror::Error;
 use crate::agent::AgentKind;
 use crate::config_io::managed_json::{atomic_write, is_raum_managed};
 use crate::config_io::managed_toml;
+
+/// How long a cached `$PATH` probe / config scan stays valid. Both feed
+/// spawn-time preflight, which runs on every pane; the inputs (an installed
+/// harness binary, raum's own managed config files) do not change between
+/// two clicks.
+// ponytail: 30s TTL cache; event-invalidated cache if staleness ever bites
+pub const RUNTIME_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// `which(binary).is_ok()` behind [`RUNTIME_CACHE_TTL`]. A miss walks every
+/// `$PATH` entry with a `stat` per candidate, which is the bulk of the
+/// spawn-time preflight for a harness that *is* installed.
+#[must_use]
+pub fn which_cached(binary: &str) -> bool {
+    static CACHE: OnceLock<Mutex<HashMap<String, (Instant, bool)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Mutex::default);
+    let now = Instant::now();
+    if let Ok(g) = cache.lock()
+        && let Some((at, found)) = g.get(binary)
+        && now.duration_since(*at) < RUNTIME_CACHE_TTL
+    {
+        return *found;
+    }
+    let found = which::which(binary).is_ok();
+    if let Ok(mut g) = cache.lock() {
+        g.insert(binary.to_string(), (now, found));
+    }
+    found
+}
 
 /// Context handed to each [`crate::harness::traits::NotificationSetup`]
 /// planner. Carries paths the planner needs to decide what to do (hook
@@ -566,6 +595,16 @@ fn chmod(path: &Path, mode: u32) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn which_cached_returns_the_same_answer_on_the_second_call() {
+        // Both polarities: a hit stays a hit, a miss stays a miss (an
+        // inverted or wrongly keyed memo flips one of them).
+        assert!(which_cached("sh"));
+        assert!(which_cached("sh"));
+        assert!(!which_cached("raum-no-such-binary-xyz"));
+        assert!(!which_cached("raum-no-such-binary-xyz"));
+    }
 
     #[test]
     fn executor_writes_json_atomically() {

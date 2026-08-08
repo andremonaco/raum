@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use raum_core::agent::AgentKind;
-use raum_core::harness::setup::{SetupContext, SetupExecutor};
+use raum_core::harness::setup::{SetupContext, SetupExecutor, which_cached};
 use raum_core::paths;
 use raum_hydration::worktree_list as git_worktree_list;
 use serde::Serialize;
@@ -45,7 +45,11 @@ pub(super) async fn prepare_harness_launch<R: Runtime>(
             .ok_or_else(|| format!("no adapter registered for {:?}", harness))?
     };
 
-    if which::which(adapter.binary_path()).is_err() {
+    let binary = adapter.binary_path().to_string();
+    let binary_on_path = tokio::task::spawn_blocking(move || which_cached(&binary))
+        .await
+        .unwrap_or(false);
+    if !binary_on_path {
         info!(
             binary = adapter.binary_path(),
             harness = ?harness,
@@ -102,17 +106,21 @@ pub(super) async fn prepare_harness_launch<R: Runtime>(
     let worktree_paths: Vec<PathBuf> = if project_dir.as_os_str().is_empty() {
         Vec::new()
     } else {
-        match git_worktree_list(&project_dir) {
+        // `git worktree list` forks a subprocess — never on an async worker.
+        let dir = project_dir.clone();
+        tokio::task::spawn_blocking(move || match git_worktree_list(&dir) {
             Ok(entries) => entries.into_iter().map(|e| e.path).collect(),
             Err(e) => {
                 warn!(
-                    project_dir = %project_dir.display(),
+                    project_dir = %dir.display(),
                     error = %e,
                     "git worktree list failed; skipping worktree trust entries",
                 );
                 Vec::new()
             }
-        }
+        })
+        .await
+        .unwrap_or_default()
     };
     let ctx = SetupContext::new(
         hooks_dir.clone(),
@@ -126,7 +134,11 @@ pub(super) async fn prepare_harness_launch<R: Runtime>(
     if adapter.supports_native_events() {
         match state.harness_runtimes.plan(harness, &ctx).await {
             Ok(plan) => {
-                let report = SetupExecutor::new().apply(&plan);
+                // The executor writes + chmods files synchronously.
+                let report = tokio::task::spawn_blocking(move || SetupExecutor::new().apply(&plan))
+                    .await
+                    .map_err(|e| format!("setup apply task failed: {e}"))?;
+                state.harness_runtimes.invalidate_scan_cache();
                 if !report.ok {
                     hook_fallback = true;
                     warn!(

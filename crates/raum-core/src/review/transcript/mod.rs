@@ -75,21 +75,28 @@ pub async fn read_session_user_prompts(
     opencode_port: Option<u16>,
 ) -> Vec<String> {
     match kind {
-        AgentKind::ClaudeCode => {
-            let Some(path) = claude::discover_claude_code_transcript(cwd, home_dir) else {
-                return Vec::new();
-            };
-            let mut prompts = claude::parse_claude_user_prompts(&path);
-            cap_in_place(&mut prompts);
-            prompts
-        }
-        AgentKind::Codex => {
-            let Some(path) = codex::discover_codex_transcript(cwd, home_dir) else {
-                return Vec::new();
-            };
-            let mut prompts = codex::parse_codex_user_prompts(&path);
-            cap_in_place(&mut prompts);
-            prompts
+        AgentKind::ClaudeCode | AgentKind::Codex => {
+            let (cwd, home) = (cwd.to_path_buf(), home_dir.to_path_buf());
+            tokio::task::spawn_blocking(move || {
+                let is_codex = kind == AgentKind::Codex;
+                let path = if is_codex {
+                    codex::discover_codex_transcript(&cwd, &home)
+                } else {
+                    claude::discover_claude_code_transcript(&cwd, &home)
+                };
+                let Some(path) = path else {
+                    return Vec::new();
+                };
+                let mut prompts = if is_codex {
+                    codex::parse_codex_user_prompts(&path)
+                } else {
+                    claude::parse_claude_user_prompts(&path)
+                };
+                cap_in_place(&mut prompts);
+                prompts
+            })
+            .await
+            .unwrap_or_default()
         }
         AgentKind::OpenCode => {
             let Some(port) = opencode_port else {

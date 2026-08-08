@@ -344,8 +344,15 @@ pub async fn session_first_prompt<R: Runtime>(
             .map_err(|e| format!("config_store lock: {e}"))?;
         store.last_session_harness_id(&args.session_id)
     };
-    if let Some(id) = harness_session_id.as_deref() {
-        let prompts = read_session_user_prompts_for_id(kind, &cwd, &home_dir, id, opencode_port);
+    if let Some(id) = harness_session_id.clone() {
+        // Directory walk + jsonl parse — off the async worker (this command
+        // is fanned out over every pane on load).
+        let (dir, home, kind_owned) = (cwd.clone(), home_dir.clone(), kind);
+        let prompts = tokio::task::spawn_blocking(move || {
+            read_session_user_prompts_for_id(kind_owned, &dir, &home, &id, opencode_port)
+        })
+        .await
+        .map_err(|e| format!("transcript read task failed: {e}"))?;
         if let Some(first) = prompts.into_iter().next() {
             return Ok(Some(first));
         }
