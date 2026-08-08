@@ -6,8 +6,6 @@
 //! the default — raw pane bytes, no redraw-compression) or the legacy
 //! PTY-wrapped rendered client ([`pty_bridge`]).
 
-#![allow(clippy::cast_possible_truncation)]
-
 pub mod coalescer;
 pub mod control;
 mod disclaim;
