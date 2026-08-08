@@ -14,7 +14,7 @@
 //!
 //! The design splits cleanly into two halves:
 //!
-//! - `rehydrate_plan(tracked, live_ids)` — pure; classifies each tracked
+//! - `rehydrate_plan(tracked, live_ids, now_unix_ms)` — pure; classifies each tracked
 //!   session into `Register` (still alive in tmux) or `Forget` (tracked
 //!   row referring to a dead tmux id). Trivial to unit-test.
 //! - `apply_rehydrate_plan(app, state, plan)` — effectful; walks the
@@ -173,12 +173,20 @@ impl RehydrateReport {
 ///   so the harness's native `--resume` can rebuild the conversation.
 /// - `Forget` — everything else: shell sessions whose tmux is gone,
 ///   non-shell rows with neither resume id nor last prompt persisted
-///   (no recovery surface), or duplicate ids.
+///   (no recovery surface), rows without a `project_slug` (adopted
+///   orphans — harness spawns require a registered project, so recovery
+///   could never relaunch them; left alone they resurface in the orphan
+///   tray on every boot), `Completed` rows idle past
+///   [`COMPLETED_RECOVER_TTL_MS`], or duplicate ids.
 ///
 /// Duplicate tracked rows for the same session id are tolerated — we
 /// only emit a job for the first occurrence.
 #[must_use]
-pub fn rehydrate_plan(tracked: &[TrackedSession], live_ids: &HashSet<String>) -> Vec<RehydrateJob> {
+pub fn rehydrate_plan(
+    tracked: &[TrackedSession],
+    live_ids: &HashSet<String>,
+    now_unix_ms: u64,
+) -> Vec<RehydrateJob> {
     let mut out = Vec::with_capacity(tracked.len());
     let mut seen: HashSet<&str> = HashSet::new();
     for row in tracked {
@@ -197,6 +205,8 @@ pub fn rehydrate_plan(tracked: &[TrackedSession], live_ids: &HashSet<String>) ->
             });
         } else if !matches!(row.kind, AgentKind::Shell)
             && (row.harness_session_id.is_some() || row.last_prompt_text.is_some())
+            && row.project_slug.is_some()
+            && !is_expired_completed(row, now_unix_ms)
         {
             out.push(RehydrateJob::Recover {
                 session_id: row.session_id.clone(),
@@ -212,6 +222,21 @@ pub fn rehydrate_plan(tracked: &[TrackedSession], live_ids: &HashSet<String>) ->
         }
     }
     out
+}
+
+/// How long a `Completed` row with no live tmux session stays recoverable
+/// before the planner forgets it. A finished chat is still worth resuming the
+/// morning after a reboot; one untouched for a week is abandoned and would
+/// otherwise resurface in the orphan tray on every launch, forever.
+const COMPLETED_RECOVER_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+/// True when a dead row is a finished chat past its recovery window:
+/// `last_state == Completed` and the last transition (falling back to
+/// creation) is older than [`COMPLETED_RECOVER_TTL_MS`].
+fn is_expired_completed(row: &TrackedSession, now_unix_ms: u64) -> bool {
+    row.last_state == Some(AgentState::Completed)
+        && now_unix_ms.saturating_sub(row.last_state_at_unix_ms.unwrap_or(row.created_at_unix_ms))
+            > COMPLETED_RECOVER_TTL_MS
 }
 
 /// Run every job in `plan`. Best-effort: per-session errors are
@@ -573,6 +598,10 @@ mod tests {
         ids.iter().map(|s| (*s).to_string()).collect()
     }
 
+    /// Close to the rows' timestamps (`tracked` uses 1_000/2_000), so no
+    /// row is past `COMPLETED_RECOVER_TTL_MS` unless a test says so.
+    const NOW: u64 = 3_000;
+
     #[test]
     fn rehydrate_plan_classifies_live_tracked_sessions_for_registration() {
         let tracked_rows = vec![
@@ -592,7 +621,7 @@ mod tests {
             ),
         ];
         let live_ids = live(&["raum-a", "raum-b"]);
-        let plan = rehydrate_plan(&tracked_rows, &live_ids);
+        let plan = rehydrate_plan(&tracked_rows, &live_ids, NOW);
         assert_eq!(plan.len(), 2);
         assert!(matches!(
             &plan[0],
@@ -624,7 +653,7 @@ mod tests {
             tracked("raum-dead", AgentKind::Codex, Some("acme"), None, None),
         ];
         let live_ids = live(&["raum-alive"]);
-        let plan = rehydrate_plan(&tracked_rows, &live_ids);
+        let plan = rehydrate_plan(&tracked_rows, &live_ids, NOW);
         assert_eq!(plan.len(), 2);
         assert!(matches!(
             &plan[0],
@@ -640,7 +669,7 @@ mod tests {
     fn rehydrate_plan_marks_dead_non_shell_with_harness_id_for_recover() {
         let mut row = tracked("raum-dead", AgentKind::ClaudeCode, Some("acme"), None, None);
         row.harness_session_id = Some("11111111-2222-3333-4444-555555555555".into());
-        let plan = rehydrate_plan(&[row], &HashSet::new());
+        let plan = rehydrate_plan(&[row], &HashSet::new(), NOW);
         assert_eq!(plan.len(), 1);
         assert!(
             matches!(
@@ -663,7 +692,7 @@ mod tests {
         // discover the id from the prompt.
         let mut row = tracked("raum-dead", AgentKind::Codex, Some("acme"), None, None);
         row.last_prompt_text = Some("review this PR".into());
-        let plan = rehydrate_plan(&[row], &HashSet::new());
+        let plan = rehydrate_plan(&[row], &HashSet::new(), NOW);
         assert_eq!(plan.len(), 1);
         assert!(matches!(
             &plan[0],
@@ -678,7 +707,7 @@ mod tests {
         // (which can't happen in practice, but be defensive).
         let mut row = tracked("raum-dead-shell", AgentKind::Shell, None, None, None);
         row.last_prompt_text = Some("ignored".into());
-        let plan = rehydrate_plan(&[row], &HashSet::new());
+        let plan = rehydrate_plan(&[row], &HashSet::new(), NOW);
         assert_eq!(plan.len(), 1);
         assert!(matches!(&plan[0], RehydrateJob::Forget { .. }));
     }
@@ -699,7 +728,7 @@ mod tests {
             None,
         )];
         let live_ids = live(&["raum-shell-1"]);
-        let plan = rehydrate_plan(&tracked_rows, &live_ids);
+        let plan = rehydrate_plan(&tracked_rows, &live_ids, NOW);
         assert_eq!(plan.len(), 1);
         assert!(matches!(
             &plan[0],
@@ -708,6 +737,48 @@ mod tests {
                 harness: AgentKind::Shell,
                 ..
             } if session_id == "raum-shell-1"
+        ));
+    }
+
+    #[test]
+    fn rehydrate_plan_forgets_dead_rows_without_project_slug() {
+        // Adopted-orphan residue: reconcile adoption writes rows with no
+        // project metadata; a hook may later stamp harness_session_id.
+        // Once the tmux session dies there is nothing to recover into
+        // (harness spawns require a registered project) — Forget, or the
+        // row haunts the orphan tray on every boot.
+        let mut row = tracked("raum-adopted", AgentKind::ClaudeCode, None, None, None);
+        row.harness_session_id = Some("dddddddd-dddd-dddd-dddd-dddddddddddd".into());
+        let plan = rehydrate_plan(&[row], &HashSet::new(), NOW);
+        assert_eq!(plan.len(), 1);
+        assert!(matches!(
+            &plan[0],
+            RehydrateJob::Forget { session_id } if session_id == "raum-adopted"
+        ));
+    }
+
+    #[test]
+    fn rehydrate_plan_forgets_dead_completed_rows_past_ttl() {
+        let mut row = tracked(
+            "raum-done",
+            AgentKind::ClaudeCode,
+            Some("acme"),
+            None,
+            Some(AgentState::Completed),
+        );
+        row.harness_session_id = Some("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee".into());
+
+        // Fresh completed row (last_state_at = 2_000, NOW inside TTL):
+        // still a Recover — reboot the morning after must stay resumable.
+        let plan = rehydrate_plan(std::slice::from_ref(&row), &HashSet::new(), NOW);
+        assert!(matches!(&plan[0], RehydrateJob::Recover { .. }));
+
+        // Same row past the TTL: Forget.
+        let stale_now = 2_000 + COMPLETED_RECOVER_TTL_MS + 1;
+        let plan = rehydrate_plan(&[row], &HashSet::new(), stale_now);
+        assert!(matches!(
+            &plan[0],
+            RehydrateJob::Forget { session_id } if session_id == "raum-done"
         ));
     }
 
@@ -725,13 +796,13 @@ mod tests {
             ),
         ];
         let live_ids = live(&["raum-a"]);
-        let plan = rehydrate_plan(&tracked_rows, &live_ids);
+        let plan = rehydrate_plan(&tracked_rows, &live_ids, NOW);
         assert_eq!(plan.len(), 1, "duplicate rows collapse to one job");
     }
 
     #[test]
     fn rehydrate_plan_on_empty_tracked_returns_empty() {
-        let plan = rehydrate_plan(&[], &live(&["raum-orphan"]));
+        let plan = rehydrate_plan(&[], &live(&["raum-orphan"]), NOW);
         assert!(plan.is_empty());
     }
 
@@ -741,7 +812,7 @@ mod tests {
             tracked("raum-a", AgentKind::ClaudeCode, None, None, None),
             tracked("raum-b", AgentKind::Shell, None, None, None),
         ];
-        let plan = rehydrate_plan(&tracked_rows, &HashSet::new());
+        let plan = rehydrate_plan(&tracked_rows, &HashSet::new(), NOW);
         assert_eq!(plan.len(), 2);
         assert!(
             plan.iter()
@@ -776,7 +847,7 @@ mod tests {
         opencode_row.harness_session_id = Some("cccccccc-cccc-cccc-cccc-cccccccccccc".into());
         opencode_row.opencode_port = Some(5123);
 
-        let plan = rehydrate_plan(&[claude_row, codex_row, opencode_row], &HashSet::new());
+        let plan = rehydrate_plan(&[claude_row, codex_row, opencode_row], &HashSet::new(), NOW);
 
         assert_eq!(plan.len(), 3);
         let recover_kinds: Vec<AgentKind> = plan

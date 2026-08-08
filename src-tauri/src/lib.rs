@@ -836,7 +836,11 @@ fn bootstrap_rehydrate_sessions(app: &mut tauri::App) {
             }
         }
 
-        let plan = commands::agent_hydrate::rehydrate_plan(&tracked, &live_ids);
+        let plan = commands::agent_hydrate::rehydrate_plan(
+            &tracked,
+            &live_ids,
+            commands::terminal::now_unix_millis(),
+        );
 
         // 3. Apply. The applier spawns inside the same task; it runs
         // quickly because all per-session work is in-memory registry

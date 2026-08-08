@@ -51,6 +51,7 @@ pub(super) const SNAPSHOT_REPLAY_CHUNK_BYTES: usize = 32 * 1024;
 // `commands::terminal` so `lib.rs`, `agent_hydrate.rs`, `worktree.rs`,
 // `project.rs`, and `state.rs` keep resolving without edits.
 pub(crate) use entry::emit_terminal_session_upserted;
+pub(crate) use helpers::now_unix_millis;
 pub use io::{terminal_paste_paths, terminal_paste_text, terminal_send_keys};
 pub(crate) use kill::{
     kill_session_inner, protected_session_ids, sessions_for_project, sessions_for_worktree,
