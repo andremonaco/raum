@@ -1,11 +1,29 @@
 //! Read-only Tauri commands: `agent_list`, `agent_state`, `agent_snapshot`,
 //! plus the `agent_ack_state` write that records a seen completion.
 
+use std::sync::PoisonError;
+
 use serde::Serialize;
+use tauri::Manager;
 use tracing::warn;
 
 use super::registry::AgentListItem;
 use crate::state::AppHandleState;
+
+/// Every command in this module reads `state/sessions.toml` off disk, so none
+/// of them may run inline on the main thread (non-async `#[tauri::command]`
+/// handlers do). They all take an `AppHandle` — cheap to clone and `'static`,
+/// unlike `tauri::State<'_, _>` — and re-borrow the managed state inside the
+/// blocking closure.
+async fn on_blocking<T, F>(label: &'static str, f: F) -> Result<T, String>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|e| format!("{label} join: {e}"))
+}
 
 /// Join persisted per-session state metadata onto listed agent items.
 ///
@@ -58,16 +76,25 @@ fn join_persisted_state_meta(state: &AppHandleState, items: &mut [AgentListItem]
 }
 
 #[tauri::command]
-pub fn agent_list(state: tauri::State<'_, AppHandleState>) -> Vec<AgentListItem> {
-    // Take the registry snapshot and DROP the agents lock before touching the
-    // config store (see `join_persisted_state_meta` for the lock-ordering
-    // rationale).
-    let mut items = {
-        let registry = state.agents.lock().expect("agent registry poisoned");
-        registry.list()
-    };
-    join_persisted_state_meta(&state, &mut items);
-    items
+pub async fn agent_list(app: tauri::AppHandle) -> Vec<AgentListItem> {
+    on_blocking("agent_list", move || {
+        let state = app.state::<AppHandleState>();
+        // Take the registry snapshot and DROP the agents lock before touching
+        // the config store (see `join_persisted_state_meta` for the
+        // lock-ordering rationale). A poisoned registry is recovered rather
+        // than panicked on: one prior panic must not brick the agent list.
+        let mut items = {
+            let registry = state.agents.lock().unwrap_or_else(PoisonError::into_inner);
+            registry.list()
+        };
+        join_persisted_state_meta(&state, &mut items);
+        items
+    })
+    .await
+    .unwrap_or_else(|e| {
+        warn!(error = %e, "agent_list: blocking task failed; returning empty list");
+        Vec::new()
+    })
 }
 
 /// Atomic snapshot returned to the frontend on mount / after ⌘R. Combines
@@ -90,22 +117,26 @@ pub struct AgentSnapshot {
 }
 
 #[tauri::command]
-pub fn agent_snapshot(state: tauri::State<'_, AppHandleState>) -> Result<AgentSnapshot, String> {
-    // Read the agent + terminal registries, releasing both locks before the
-    // config-store join so we never hold `agents` while locking
-    // `config_store` (lock-ordering rule — see `join_persisted_state_meta`).
-    let mut agents = state
-        .agents
-        .lock()
-        .map_err(|e| format!("agent registry lock: {e}"))?
-        .list();
-    let terminals = state
-        .terminals
-        .lock()
-        .map_err(|e| format!("terminals lock: {e}"))?
-        .list();
-    join_persisted_state_meta(&state, &mut agents);
-    Ok(AgentSnapshot { agents, terminals })
+pub async fn agent_snapshot(app: tauri::AppHandle) -> Result<AgentSnapshot, String> {
+    on_blocking("agent_snapshot", move || {
+        let state = app.state::<AppHandleState>();
+        // Read the agent + terminal registries, releasing both locks before the
+        // config-store join so we never hold `agents` while locking
+        // `config_store` (lock-ordering rule — see `join_persisted_state_meta`).
+        let mut agents = state
+            .agents
+            .lock()
+            .map_err(|e| format!("agent registry lock: {e}"))?
+            .list();
+        let terminals = state
+            .terminals
+            .lock()
+            .map_err(|e| format!("terminals lock: {e}"))?
+            .list();
+        join_persisted_state_meta(&state, &mut agents);
+        Ok(AgentSnapshot { agents, terminals })
+    })
+    .await?
 }
 
 /// Shape returned by [`agent_state`]: the live machine state joined with the
@@ -124,30 +155,36 @@ pub struct AgentStateInfo {
 }
 
 #[tauri::command]
-pub fn agent_state(
-    state: tauri::State<'_, AppHandleState>,
-    session_id: String,
-) -> Option<AgentStateInfo> {
-    // Live state from the in-memory machine; the lock is released at the end
-    // of this statement, BEFORE the config-store read below (lock-ordering
-    // rule — see `join_persisted_state_meta`).
-    let live_state = state
-        .agents
-        .lock()
-        .expect("agent registry poisoned")
-        .state_for(&session_id)?;
+pub async fn agent_state(app: tauri::AppHandle, session_id: String) -> Option<AgentStateInfo> {
+    on_blocking("agent_state", move || {
+        let state = app.state::<AppHandleState>();
+        // Live state from the in-memory machine; the lock is released at the
+        // end of this statement, BEFORE the config-store read below
+        // (lock-ordering rule — see `join_persisted_state_meta`). A poisoned
+        // registry is recovered, not panicked on.
+        let live_state = state
+            .agents
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .state_for(&session_id)?;
 
-    let (entered_at_ms, acked) = state
-        .config_store
-        .lock()
-        .ok()
-        .and_then(|store| store.session_state_meta(&session_id))
-        .unwrap_or((None, false));
+        let (entered_at_ms, acked) = state
+            .config_store
+            .lock()
+            .ok()
+            .and_then(|store| store.session_state_meta(&session_id))
+            .unwrap_or((None, false));
 
-    Some(AgentStateInfo {
-        state: live_state,
-        entered_at_ms,
-        acked,
+        Some(AgentStateInfo {
+            state: live_state,
+            entered_at_ms,
+            acked,
+        })
+    })
+    .await
+    .unwrap_or_else(|e| {
+        warn!(error = %e, "agent_state: blocking task failed");
+        None
     })
 }
 
@@ -160,14 +197,15 @@ pub fn agent_state(
 /// frontend acks by session id and a shell session (or one torn down between
 /// the emit and the ack) simply has nothing to flag.
 #[tauri::command]
-pub fn agent_ack_state(
-    state: tauri::State<'_, AppHandleState>,
-    session_id: String,
-) -> Result<(), String> {
-    state
-        .config_store
-        .lock()
-        .map_err(|e| format!("config_store lock: {e}"))?
-        .ack_session_last_state(&session_id)
-        .map_err(|e| e.to_string())
+pub async fn agent_ack_state(app: tauri::AppHandle, session_id: String) -> Result<(), String> {
+    on_blocking("agent_ack_state", move || {
+        let state = app.state::<AppHandleState>();
+        state
+            .config_store
+            .lock()
+            .map_err(|e| format!("config_store lock: {e}"))?
+            .ack_session_last_state(&session_id)
+            .map_err(|e| e.to_string())
+    })
+    .await?
 }

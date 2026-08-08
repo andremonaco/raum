@@ -66,8 +66,9 @@ pub const MAX_USER_PROMPTS_RETURNED: usize = 200;
 ///   the local HTTP port raum pinned for the harness via `--port`. Other
 ///   kinds ignore it.
 ///
-/// Async because the OpenCode arm hits the local HTTP server. The other
-/// kinds do sync filesystem work and resolve immediately.
+/// Async because the OpenCode arm hits the local HTTP server. The file-backed
+/// kinds do a directory walk plus a jsonl parse, so they run on a blocking
+/// thread rather than the caller's async worker.
 pub async fn read_session_user_prompts(
     kind: AgentKind,
     cwd: &Path,
@@ -75,21 +76,28 @@ pub async fn read_session_user_prompts(
     opencode_port: Option<u16>,
 ) -> Vec<String> {
     match kind {
-        AgentKind::ClaudeCode => {
-            let Some(path) = claude::discover_claude_code_transcript(cwd, home_dir) else {
-                return Vec::new();
-            };
-            let mut prompts = claude::parse_claude_user_prompts(&path);
-            cap_in_place(&mut prompts);
-            prompts
-        }
-        AgentKind::Codex => {
-            let Some(path) = codex::discover_codex_transcript(cwd, home_dir) else {
-                return Vec::new();
-            };
-            let mut prompts = codex::parse_codex_user_prompts(&path);
-            cap_in_place(&mut prompts);
-            prompts
+        AgentKind::ClaudeCode | AgentKind::Codex => {
+            let (cwd, home) = (cwd.to_path_buf(), home_dir.to_path_buf());
+            tokio::task::spawn_blocking(move || {
+                let is_codex = kind == AgentKind::Codex;
+                let path = if is_codex {
+                    codex::discover_codex_transcript(&cwd, &home)
+                } else {
+                    claude::discover_claude_code_transcript(&cwd, &home)
+                };
+                let Some(path) = path else {
+                    return Vec::new();
+                };
+                let mut prompts = if is_codex {
+                    codex::parse_codex_user_prompts(&path)
+                } else {
+                    claude::parse_claude_user_prompts(&path)
+                };
+                cap_in_place(&mut prompts);
+                prompts
+            })
+            .await
+            .unwrap_or_default()
         }
         AgentKind::OpenCode => {
             let Some(port) = opencode_port else {
@@ -269,37 +277,23 @@ fn claude_transcript_path_for_id(cwd: &Path, home_dir: &Path, id: &str) -> Optio
 
 /// Walk Codex's `~/.codex/sessions/<YYYY>/<MM>/<DD>/` tree looking for
 /// a rollout whose filename ends with `-<id>.jsonl` (Codex's stable
-/// embed of the session id). Cheap because Codex scopes rollouts by
-/// date and we abort on the first match.
+/// embed of the session id).
+///
+/// Only filenames are inspected — no rollout is opened or parsed — and the
+/// date directories are visited newest-first, so the common case (the id
+/// belongs to a session from today or yesterday) returns after reading a
+/// couple of directories. A miss still costs a full traversal of the tree,
+/// which is unavoidable: the id carries no date.
 fn codex_transcript_path_for_id(_cwd: &Path, home_dir: &Path, id: &str) -> Option<PathBuf> {
     let sessions = home_dir.join(".codex").join("sessions");
     if !sessions.is_dir() {
         return None;
     }
     let suffix = format!("-{id}.jsonl");
-    let years = std::fs::read_dir(&sessions).ok()?;
-    for year in years.flatten() {
-        let yp = year.path();
-        if !yp.is_dir() {
-            continue;
-        }
-        let Ok(months) = std::fs::read_dir(&yp) else {
-            continue;
-        };
-        for month in months.flatten() {
-            let mp = month.path();
-            if !mp.is_dir() {
-                continue;
-            }
-            let Ok(days) = std::fs::read_dir(&mp) else {
-                continue;
-            };
-            for day in days.flatten() {
-                let dp = day.path();
-                if !dp.is_dir() {
-                    continue;
-                }
-                let Ok(files) = std::fs::read_dir(&dp) else {
+    for year in codex::subdirs_newest_first(&sessions) {
+        for month in codex::subdirs_newest_first(&year) {
+            for day in codex::subdirs_newest_first(&month) {
+                let Ok(files) = std::fs::read_dir(&day) else {
                     continue;
                 };
                 for entry in files.flatten() {
@@ -327,13 +321,31 @@ fn cap_in_place(prompts: &mut Vec<String>) {
     }
 }
 
-pub(super) fn transcript_contains_prompt(prompts: Vec<String>, target: &str) -> bool {
+/// Shortest prompt that may be matched by *containment* rather than
+/// equality. Substring matching in either direction is how a persisted
+/// prompt is reconciled with a transcript that wrapped or truncated it, but
+/// on a short prompt it degenerates: `"ok"` is a substring of nearly every
+/// transcript, so every session in the worktree would claim the pane. Below
+/// this length only an exact match counts.
+const MIN_CONTAINMENT_LEN: usize = 12;
+
+/// True when `prompts` contains `target` — exactly, or (for long enough
+/// needles) as a substring in either direction.
+///
+/// Takes a slice: callers build the prompt list only to ask this one
+/// question, and the previous by-value signature forced a move plus a drop
+/// of every string.
+pub(super) fn transcript_contains_prompt(prompts: &[String], target: &str) -> bool {
     let target = target.trim();
     if target.is_empty() {
         return false;
     }
-    prompts.into_iter().any(|prompt| {
+    prompts.iter().any(|prompt| {
         let prompt = prompt.trim();
-        prompt == target || prompt.contains(target) || target.contains(prompt)
+        if prompt == target {
+            return true;
+        }
+        (target.len() >= MIN_CONTAINMENT_LEN && prompt.contains(target))
+            || (prompt.len() >= MIN_CONTAINMENT_LEN && target.contains(prompt))
     })
 }

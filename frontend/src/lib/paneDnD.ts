@@ -41,9 +41,6 @@ export interface DragState {
    *  to compute its drag-follows-cursor transform `translate(dx, dy)`. */
   startPointerX: number;
   startPointerY: number;
-  /** Current pointer position in viewport coords. */
-  pointerX: number;
-  pointerY: number;
   /** Current hover target; either a pane id, the root sentinel, or null
    *  when the pointer is outside every drop-capable region. */
   targetId: string | RootTargetSentinel | null;
@@ -117,6 +114,24 @@ const MAX_EDGE_EXIT_PX = 64;
 
 const [dragState, setDragState] = createSignal<DragState | null>(null);
 export { dragState };
+
+/**
+ * Live pointer position, kept OUT of `dragState` on purpose: it changes every
+ * animation frame while every other field usually doesn't, and a new
+ * `dragState` identity fans out to every leaf frame / surface memo in the
+ * grid. Only the drag-transform effect reads these.
+ */
+const [dragPointerX, setDragPointerX] = createSignal(0);
+const [dragPointerY, setDragPointerY] = createSignal(0);
+export { dragPointerX, dragPointerY };
+
+/** Rect equality by value — `hitTest` hands back a fresh `DOMRect` each
+ *  frame, so identity comparison would defeat the no-op check below. */
+function sameRect(a: DOMRect | null, b: DOMRect | null): boolean {
+  if (a === b) return true;
+  if (a === null || b === null) return false;
+  return a.left === b.left && a.top === b.top && a.width === b.width && a.height === b.height;
+}
 
 /**
  * Test-only hook for driving `dragState` directly. Production code MUST go
@@ -261,14 +276,14 @@ export function beginDrag(opts: BeginDragOptions): void {
   const startPointerX = event.clientX;
   const startPointerY = event.clientY;
 
+  setDragPointerX(startPointerX);
+  setDragPointerY(startPointerY);
   setDragState({
     sourceId,
     sourceKind,
     sourceLabel,
     startPointerX,
     startPointerY,
-    pointerX: event.clientX,
-    pointerY: event.clientY,
     targetId: null,
     zone: null,
     targetRect: null,
@@ -449,14 +464,31 @@ export function beginDrag(opts: BeginDragOptions): void {
       clearArmTimer();
     }
 
+    setDragPointerX(e.clientX);
+    setDragPointerY(e.clientY);
+
+    // Nothing but the cursor moved this frame — leave `dragState` identical so
+    // the grid's drag memos don't recompute per frame.
+    if (
+      prev &&
+      prev.targetId === outTargetId &&
+      prev.zone === outZone &&
+      prev.snapped === snapped &&
+      prev.armed === armed &&
+      prev.armStartedAtMs === armStartedAtMs &&
+      prev.escapedTargetId === nextEscapedTargetId &&
+      sameRect(prev.targetRect, outRect) &&
+      sameRect(prev.snapHystRect, snapHystRect)
+    ) {
+      return;
+    }
+
     setDragState({
       sourceId,
       sourceKind,
       sourceLabel,
       startPointerX,
       startPointerY,
-      pointerX: e.clientX,
-      pointerY: e.clientY,
       targetId: outTargetId,
       zone: outZone,
       targetRect: outRect,

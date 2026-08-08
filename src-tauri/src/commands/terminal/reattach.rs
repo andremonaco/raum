@@ -12,7 +12,7 @@ use tauri::{AppHandle, Runtime};
 
 use crate::commands::agent::{
     RegisterOptions, cleanup_harness_session, infer_reattach_hook_fallback,
-    prepare_harness_launch_fast, register_harness_session_runtime_opts, resolve_project_dir,
+    prepare_harness_launch_fast_async, register_harness_session_runtime_opts, resolve_project_dir,
     spawn_harness_launch_refresh,
 };
 use crate::state::AppHandleState;
@@ -1023,13 +1023,13 @@ pub async fn terminal_provider_replace<R: Runtime>(
         ));
     }
 
-    let launch_report = prepare_harness_launch_fast(
+    let launch_report = prepare_harness_launch_fast_async(
         &app,
-        &state,
         args.kind,
-        effective_project_slug.as_deref(),
+        effective_project_slug.clone(),
         project_dir.clone(),
-    )?;
+    )
+    .await?;
     if launch_report.binary_missing {
         return Ok(ReconnectResult::unavailable(
             old_session_id,
@@ -1204,8 +1204,20 @@ pub async fn terminal_provider_replace<R: Runtime>(
     }
 
     let monitor = spawn_pane_death_monitor(app.clone(), tmux.clone(), new_session_id.clone());
-    if let Ok(mut reg) = state.terminals.lock() {
-        let _ = reg.set_monitor_task(&new_session_id, monitor);
+    match state.terminals.lock() {
+        Ok(mut reg) => {
+            let _ = reg.set_monitor_task(&new_session_id, monitor);
+        }
+        Err(e) => {
+            // Nobody owns the handle now — abort it rather than leaking a
+            // detached monitor task for a session we can't track.
+            monitor.abort();
+            tracing::warn!(
+                session_id = %new_session_id,
+                error = %e,
+                "terminal_respawn: failed to install pane-death monitor"
+            );
+        }
     }
 
     if let Ok(store) = state.config_store.lock() {

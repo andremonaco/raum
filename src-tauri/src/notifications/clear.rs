@@ -234,6 +234,18 @@ mod tests {
     }
 
     #[test]
+    fn filter_matching_accepts_permission_identifiers_with_request_id() {
+        // Permission prompts append a fourth `\x1f<request_id>` field so the
+        // delegate's Allow/Deny handler can reply. The dismiss path matches
+        // on the `<session>\x1f<kind>\x1f` prefix, so it must still catch them.
+        let ids = vec![format!(
+            "sess-1{IDENTIFIER_SEPARATOR}needs_input{IDENTIFIER_SEPARATOR}uuid-1{IDENTIFIER_SEPARATOR}req-1"
+        )];
+        let matched = filter_matching(&ids, "sess-1", &["needs_input".to_string()]);
+        assert_eq!(matched, ids);
+    }
+
+    #[test]
     fn filter_matching_with_empty_kinds_returns_nothing() {
         let ids = vec![format!(
             "sess-1{IDENTIFIER_SEPARATOR}done{IDENTIFIER_SEPARATOR}uuid"

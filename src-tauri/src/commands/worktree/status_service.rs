@@ -16,6 +16,8 @@
 //!   `git_checkout_branch` / `worktree_merge` nudge the path they touched.
 //! * **WatcherPulse** — the per-project `.git` watcher forwards HEAD *and*
 //!   index touches (commits/stages typed into a pane terminal land here).
+//!   Scoped to the paths belonging to the project that pulsed, so a background
+//!   project's commit doesn't recompute the active project's rows.
 //! * **Focus** — window regains focus.
 //! * **Fallback** — a slow 15 s tick that catches silent file edits by
 //!   agents/editors. Skipped while the window is unfocused, so a backgrounded
@@ -29,7 +31,7 @@
 //! push/pop is most likely to have happened.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -82,6 +84,12 @@ struct StatusChangedPayload {
 struct WatchEntry {
     trigger_tx: mpsc::UnboundedSender<RefreshCause>,
     task: tauri::async_runtime::JoinHandle<()>,
+    /// Main-repo root this worktree belongs to, resolved once at subscribe
+    /// time (see [`main_repo_root`]). Watcher pulses carry a project slug;
+    /// only the paths whose repo root matches that project's root recompute.
+    /// `None` when resolution failed — those fall open and recompute on every
+    /// pulse, exactly as everything did before.
+    repo_root: Option<PathBuf>,
     /// Working-tree file watcher for this path — pulses `trigger_tx` with
     /// `FsEdit` so raw edits (no git command) refresh promptly instead of
     /// waiting for the fallback poll. Attached asynchronously after the entry is
@@ -121,16 +129,16 @@ impl WorktreeStatusService {
             pulse_tx,
             focused: AtomicBool::new(true),
         });
-        // Drain watcher pulses → nudge every subscribed path. v1 fans out to
-        // all paths regardless of which project pulsed: the subscribed set
-        // is just the visible rows, recomputes are debounced + diffed, and
-        // mapping `.git/worktrees/<id>` back to a worktree path would need a
-        // `gitdir`-file read that isn't worth it yet.
+        // Drain watcher pulses → nudge the pulsing project's paths only.
+        // Only the active project has a `GitHeadWatcher` today, but a stale
+        // subscription from a just-deactivated project would otherwise still
+        // respawn `git diff`/`git status` for rows the pulse doesn't own.
         let drain_inner = inner.clone();
         tauri::async_runtime::spawn(async move {
             while let Some(slug) = pulse_rx.recv().await {
                 debug!(slug = %slug, "status_service: watcher pulse");
-                trigger_all_inner(&drain_inner, RefreshCause::WatcherPulse);
+                let root = project_root_for(&drain_inner.app, &slug);
+                trigger_scoped(&drain_inner, root.as_deref());
             }
         });
         Self { inner }
@@ -190,11 +198,13 @@ impl WorktreeStatusService {
                 }
                 let (trigger_tx, trigger_rx) = mpsc::unbounded_channel();
                 let task = spawn_watch_task(self.inner.clone(), path.clone(), trigger_rx);
+                let repo_root = main_repo_root(Path::new(&path));
                 entries.insert(
                     path.clone(),
                     WatchEntry {
                         trigger_tx: trigger_tx.clone(),
                         task,
+                        repo_root,
                         fs_watcher: None,
                     },
                 );
@@ -296,6 +306,68 @@ fn trigger_all_inner(inner: &Arc<ServiceInner>, cause: RefreshCause) {
     for entry in entries.values() {
         let _ = entry.trigger_tx.send(cause);
     }
+}
+
+/// `WatcherPulse` fan-out restricted to the paths belonging to `repo_root`.
+/// Entries whose own root is unknown (resolution failed, or the path is not a
+/// git worktree) always fire — a spurious debounced recompute is far cheaper
+/// than a status that never updates. `repo_root == None` (unknown project)
+/// degrades to the old fan-out.
+fn trigger_scoped(inner: &Arc<ServiceInner>, repo_root: Option<&Path>) {
+    let Ok(entries) = inner.entries.lock() else {
+        return;
+    };
+    for entry in entries.values() {
+        let mine = match (repo_root, entry.repo_root.as_deref()) {
+            (Some(want), Some(have)) => want == have,
+            _ => true,
+        };
+        if mine {
+            let _ = entry.trigger_tx.send(RefreshCause::WatcherPulse);
+        }
+    }
+}
+
+/// Main-repo root of the project registered under `slug`, or `None` when the
+/// config can't be read (then the pulse falls open, see [`trigger_scoped`]).
+/// Resolved through [`main_repo_root`] — the same resolver the entries use — so
+/// a project registered *at* a linked worktree still compares equal to its
+/// entries, which always resolve to the main repo. One small TOML read per pulse
+/// (pulses are already debounced 150 ms by the `.git` watcher) — cheap next to
+/// the git subprocesses a misrouted pulse would spawn.
+fn project_root_for(app: &tauri::AppHandle, slug: &str) -> Option<PathBuf> {
+    use tauri::Manager;
+    let state = app.try_state::<AppHandleState>()?;
+    let store = state.config_store.lock().ok()?;
+    let project = store.read_project(slug).ok().flatten()?;
+    main_repo_root(&project.root_path)
+}
+
+/// Canonical main-repo root for a worktree path: for the primary worktree that
+/// is the path itself; for a linked worktree the `.git` *file* points at
+/// `<main>/.git/worktrees/<id>`, so we climb back out. Returns `None` when the
+/// path has no `.git` at all (not a worktree — nothing a project pulse owns).
+fn main_repo_root(path: &Path) -> Option<PathBuf> {
+    let git = path.join(".git");
+    if git.is_dir() {
+        return Some(canonical(path));
+    }
+    let raw = std::fs::read_to_string(&git).ok()?;
+    let pointer = raw.strip_prefix("gitdir:")?.trim();
+    let gitdir = if Path::new(pointer).is_absolute() {
+        PathBuf::from(pointer)
+    } else {
+        path.join(pointer)
+    };
+    // `<main>/.git/worktrees/<id>` → `<main>`. `parent()` three times; anything
+    // shaped differently (submodule pointer) resolves to nothing rather than a
+    // wrong owner.
+    let main = gitdir.parent()?.parent()?.parent()?;
+    (gitdir.parent()?.file_name()? == "worktrees").then(|| canonical(main))
+}
+
+fn canonical(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
 /// Per-path watch loop. Seed compute on spawn (always emitted), then
@@ -441,4 +513,35 @@ pub fn worktree_status_refresh(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pulse scoping hinges entirely on this: a linked worktree must resolve
+    /// back to the main repo whose `.git` the project watcher pulses for.
+    #[test]
+    fn main_repo_root_resolves_primary_and_linked_worktrees() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("repo");
+        std::fs::create_dir_all(main.join(".git/worktrees/feat")).unwrap();
+        let linked = tmp.path().join("repo-worktrees/feat");
+        std::fs::create_dir_all(&linked).unwrap();
+        std::fs::write(
+            linked.join(".git"),
+            format!("gitdir: {}/.git/worktrees/feat\n", main.display()),
+        )
+        .unwrap();
+
+        assert_eq!(main_repo_root(&main), Some(canonical(&main)));
+        assert_eq!(main_repo_root(&linked), Some(canonical(&main)));
+        // A submodule-style pointer isn't a worktree — no owner, falls open.
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join(".git"), "gitdir: ../repo/.git/modules/sub\n").unwrap();
+        assert_eq!(main_repo_root(&sub), None);
+        // Not a git dir at all.
+        assert_eq!(main_repo_root(tmp.path()), None);
+    }
 }

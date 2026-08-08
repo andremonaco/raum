@@ -235,14 +235,17 @@ impl AgentRegistry {
     /// [`super::silence::spawn_silence_tick`] so the UI can recover
     /// activity / idle state when a harness-native event path is
     /// unavailable.
+    /// `last_output_at` is keyed by `Arc<str>` (not `String`) so the
+    /// silence-tick snapshot is a refcount bump per session instead of a full
+    /// key allocation four times a second.
     pub fn tick_silence_all(
         &mut self,
-        last_output_at: &HashMap<String, Instant>,
+        last_output_at: &HashMap<Arc<str>, Instant>,
         now: Instant,
     ) -> Vec<AgentStateChanged> {
         let mut out = Vec::new();
         for (sid, machine) in self.machines.iter_mut() {
-            let Some(last) = last_output_at.get(sid) else {
+            let Some(last) = last_output_at.get(sid.as_str()) else {
                 continue;
             };
             let age = now.saturating_duration_since(*last);

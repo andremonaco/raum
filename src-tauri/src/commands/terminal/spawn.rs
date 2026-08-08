@@ -13,7 +13,7 @@ use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{AppHandle, Runtime};
 
 use crate::commands::agent::{
-    RegisterOptions, cleanup_harness_session, prepare_harness_launch_fast,
+    RegisterOptions, cleanup_harness_session, prepare_harness_launch_fast_async,
     register_harness_session_runtime, register_harness_session_runtime_opts, resolve_project_dir,
     spawn_harness_launch_refresh,
 };
@@ -68,13 +68,13 @@ pub async fn terminal_spawn<R: Runtime>(
     let launch_report = if args.kind == AgentKind::Shell {
         None
     } else {
-        let report = prepare_harness_launch_fast(
+        let report = prepare_harness_launch_fast_async(
             &app,
-            &state,
             args.kind,
-            args.project_slug.as_deref(),
+            args.project_slug.clone(),
             project_dir.clone(),
-        )?;
+        )
+        .await?;
         if report.binary_missing {
             return Err(format!("binary `{}` not found on PATH", report.binary));
         }
@@ -309,8 +309,20 @@ pub async fn terminal_spawn<R: Runtime>(
             return Err(err);
         }
         let monitor = spawn_pane_death_monitor(app.clone(), tmux.clone(), session_id.clone());
-        if let Ok(mut reg) = state.terminals.lock() {
-            let _ = reg.set_monitor_task(&session_id, monitor);
+        match state.terminals.lock() {
+            Ok(mut reg) => {
+                let _ = reg.set_monitor_task(&session_id, monitor);
+            }
+            Err(e) => {
+                // Nobody owns the handle now — abort it rather than leaking a
+                // detached monitor task for a session we can't track.
+                monitor.abort();
+                tracing::warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "terminal_spawn: failed to install pane-death monitor"
+                );
+            }
         }
     }
 

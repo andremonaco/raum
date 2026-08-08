@@ -146,11 +146,24 @@ describe("projectStore visibility", () => {
 
   it("rolls back the optimistic patch when the persist fails", async () => {
     setProjects([project()]);
-    invokeMock.mockRejectedValueOnce(new Error("boom"));
+    // Fail only the persist — selection changes fire their own `invoke`
+    // (`project_set_active`), which must not swallow the rejection.
+    invokeMock.mockImplementation((cmd) =>
+      cmd === "project_update" ? Promise.reject(new Error("boom")) : Promise.resolve(undefined),
+    );
 
     await setProjectHidden("alpha", true);
 
     expect(projectStore.items.find((p) => p.slug === "alpha")?.hidden).toBe(false);
+  });
+
+  it("tells the backend which project is active so the git watcher follows", () => {
+    setProjects([project(), project({ slug: "beta", name: "Beta" })]);
+    invokeMock.mockClear();
+
+    setActiveProjectSlug("beta");
+
+    expect(invokeMock).toHaveBeenCalledWith("project_set_active", { slug: "beta" });
   });
 
   it("reopenProject selects the project and clears its hidden flag", async () => {

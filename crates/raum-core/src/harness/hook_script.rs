@@ -23,10 +23,28 @@ use crate::agent::AgentKind;
 
 const HEADER: &str = "# raum-managed — do not edit; regenerated on launch\n";
 
-/// Default timeout the `PermissionRequest` script waits before falling
-/// back to `"ask"`. 55 s gives Claude Code (60 s default hook timeout)
-/// 5 s of headroom for stdout capture + process teardown.
-pub const DEFAULT_PERMISSION_TIMEOUT_SECS: u32 = 55;
+/// Default timeout the `PermissionRequest` script waits before giving up
+/// and letting the harness show its own prompt.
+///
+/// Both harnesses budget 600 s for a `command` hook (Claude Code's
+/// per-hook `timeout` default, Codex's `normalize_command_hook` default),
+/// so there is ample headroom above this value.
+///
+/// Kept **below** raum-hooks' 90 s `PERMISSION_GC_AFTER` sweeper on
+/// purpose: the sweeper only runs inside raum's own Tokio runtime, so a
+/// hung raum (connect succeeds via the kernel accept backlog, nothing ever
+/// replies) is bounded by this client-side wait alone. It is the hard cap
+/// on how long a hung raum can block a turn.
+///
+/// The literal is duplicated inside the embedded Python fast paths
+/// (`format!` does not reach into a `const &str`); `timeout_default_is_in_sync`
+/// asserts the rendered scripts still agree with this constant.
+pub const DEFAULT_PERMISSION_TIMEOUT_SECS: u32 = 85;
+
+// raum-hooks' `PERMISSION_GC_AFTER` (90 s) is a literal here because
+// raum-hooks depends on raum-core, not the other way round. Compile error
+// if someone raises the client wait past the sweeper.
+const _: () = assert!(DEFAULT_PERMISSION_TIMEOUT_SECS < 90);
 
 /// Harnesses that use a raum-written hook dispatcher script. OpenCode
 /// is absent on purpose: notifications flow over SSE, not shell hooks
@@ -124,7 +142,7 @@ if not sock_path:
 event = sys.argv[1] if len(sys.argv) > 1 else "unknown"
 session_id = os.environ.get("RAUM_SESSION") or None
 payload = sys.stdin.read()
-timeout = float(os.environ.get("RAUM_HOOK_TIMEOUT_SECS", "55"))
+timeout = float(os.environ.get("RAUM_HOOK_TIMEOUT_SECS", "85"))
 
 def write_socket(envelope, wait_reply=False):
     line = json.dumps(envelope, separators=(",", ":")) + "\n"
@@ -164,8 +182,13 @@ if event == "PermissionRequest":
     elif decision == "deny":
         out = {"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": {"behavior": "deny", "message": "raum user denied"}}}
     else:
-        out = {"hookSpecificOutput": {"hookEventName": "PermissionRequest", "permissionDecision": "ask"}}
-    sys.stdout.write(json.dumps(out, separators=(",", ":")) + "\n")
+        out = None
+    # No decision (timeout, transport failure, unrecognised line): print
+    # nothing and exit 0 so Claude Code shows its own prompt. An "ask"-shaped
+    # document is a PreToolUse shape this event does not understand, so an
+    # empty stdout is both the honest and the safe answer.
+    if out is not None:
+        sys.stdout.write(json.dumps(out, separators=(",", ":")) + "\n")
 else:
     envelope = {
         "harness": "claude-code",
@@ -187,6 +210,9 @@ fi
 /// event name only. The legacy top-level `notify = [...]` script uses the
 /// argv shape — that one lives in `codex.rs::codex_notify_script_body`,
 /// not here.
+///
+/// `PermissionRequest` blocks on a decision line exactly like the Claude
+/// branch; every other event is fire-and-forget.
 const PYTHON_CODEX_FAST_PATH: &str = r#"PYTHON_BIN=""
 if [ -x /usr/bin/python3 ]; then
   PYTHON_BIN=/usr/bin/python3
@@ -201,6 +227,7 @@ import json
 import os
 import socket
 import sys
+import uuid
 
 sock_path = os.environ.get("RAUM_EVENT_SOCK") or ""
 if not sock_path:
@@ -213,25 +240,64 @@ try:
 except Exception:
     payload = {}
 session_id = os.environ.get("RAUM_SESSION") or None
-envelope = {
-    "harness": "codex",
-    "event": event,
-    "session_id": session_id,
-    "payload": payload,
-}
-line = json.dumps(envelope, separators=(",", ":")) + "\n"
-timeout = float(os.environ.get("RAUM_HOOK_SEND_TIMEOUT_SECS", "1"))
-try:
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-        sock.settimeout(timeout)
-        sock.connect(sock_path)
-        sock.sendall(line.encode("utf-8"))
-        try:
-            sock.shutdown(socket.SHUT_WR)
-        except Exception:
-            pass
-except Exception:
-    pass
+
+if event == "PermissionRequest":
+    envelope = {
+        "harness": "codex",
+        "event": event,
+        "session_id": session_id,
+        "request_id": uuid.uuid4().hex,
+        "payload": payload,
+    }
+    line = json.dumps(envelope, separators=(",", ":")) + "\n"
+    timeout = float(os.environ.get("RAUM_HOOK_TIMEOUT_SECS", "85"))
+    decision = ""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            sock.connect(sock_path)
+            sock.sendall(line.encode("utf-8"))
+            buf = b""
+            while not buf.endswith(b"\n"):
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+            decision = (buf.splitlines()[0] if buf else b"").decode("utf-8", "replace")
+    except Exception:
+        decision = ""
+
+    if decision == "allow":
+        out = {"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": {"behavior": "allow"}}}
+    elif decision == "deny":
+        out = {"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": {"behavior": "deny", "message": "raum user denied"}}}
+    else:
+        out = None
+    # Empty stdout = no decision: Codex falls through to its own approval
+    # prompt. Anything Codex cannot parse would mark the hook Failed, so
+    # we print nothing rather than an "ask"-shaped document.
+    if out is not None:
+        sys.stdout.write(json.dumps(out, separators=(",", ":")) + "\n")
+else:
+    envelope = {
+        "harness": "codex",
+        "event": event,
+        "session_id": session_id,
+        "payload": payload,
+    }
+    line = json.dumps(envelope, separators=(",", ":")) + "\n"
+    timeout = float(os.environ.get("RAUM_HOOK_SEND_TIMEOUT_SECS", "1"))
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            sock.connect(sock_path)
+            sock.sendall(line.encode("utf-8"))
+            try:
+                sock.shutdown(socket.SHUT_WR)
+            except Exception:
+                pass
+    except Exception:
+        pass
 ' "$@"
 fi
 
@@ -294,8 +360,10 @@ sock.close()
 
 # Blocking PermissionRequest: emit request + read one decision line back
 # + print the corresponding Claude-Code-compatible JSON to stdout. On
-# timeout or transport failure, fall through to permissionDecision:"ask"
-# so Claude Code shows its native TUI prompt (graceful degradation).
+# timeout, transport failure, or an unrecognised decision we print nothing
+# and exit 0 — Claude Code then shows its native TUI prompt (graceful
+# degradation). The "ask"-shaped PreToolUse document is NOT part of the
+# PermissionRequest contract, so it is never emitted here.
 handle_permission_request() {{
   REQ_ID=$(od -N8 -An -tx1 /dev/urandom 2>/dev/null | tr -d ' \n' || date +%s%N)
   JSON=$(printf '{{"harness":"claude-code","event":"%s","session_id":%s,"request_id":"%s","payload":%s}}' \
@@ -343,11 +411,9 @@ finally:
     deny)
       printf '{{"hookSpecificOutput":{{"hookEventName":"PermissionRequest","decision":{{"behavior":"deny","message":"raum user denied"}}}}}}\n'
       ;;
-    ask|"")
-      printf '{{"hookSpecificOutput":{{"hookEventName":"PermissionRequest","permissionDecision":"ask"}}}}\n'
-      ;;
     *)
-      printf '{{"hookSpecificOutput":{{"hookEventName":"PermissionRequest","permissionDecision":"ask"}}}}\n'
+      # No decision — stay silent so Claude Code prompts natively.
+      :
       ;;
   esac
   exit 0
@@ -366,16 +432,23 @@ esac
     )
 }
 
-/// Codex dispatcher: stdin payload, fire-and-forget only.
+/// Codex dispatcher: stdin payload + blocking `PermissionRequest`.
 ///
 /// Codex's `[hooks]` runtime invokes the script as `codex.sh <event>` and
 /// pipes the JSON payload on stdin (see
 /// https://developers.openai.com/codex/hooks). The payload is already
 /// valid JSON, so we embed it verbatim — re-escaping would corrupt
-/// nested strings. `PermissionRequest` is omitted because Codex doesn't
-/// have an equivalent hook event; the JSON shapes returned by
-/// `handle_permission_request` are Claude-Code-specific.
+/// nested strings.
+///
+/// `PermissionRequest` (openai/codex#17563, stable since Codex 0.122)
+/// blocks for one decision line and answers with
+/// `hookSpecificOutput.decision.behavior`. Codex's output schema is
+/// `deny_unknown_fields` and only knows `allow` / `deny` — there is no
+/// `"ask"` behaviour and no remember/scope field — so no-decision is
+/// expressed by printing **nothing** and exiting 0, which sends Codex
+/// down its normal approval path (graceful degradation).
 fn body_codex() -> String {
+    let timeout_secs = DEFAULT_PERMISSION_TIMEOUT_SECS;
     format!(
         r#"#!/usr/bin/env sh
 {HEADER}set -eu
@@ -384,6 +457,7 @@ if [ -z "$SOCK" ]; then exit 0; fi
 {PYTHON_CODEX_FAST_PATH}
 EVENT_NAME="${{1:-unknown}}"
 SESSION_ID="${{RAUM_SESSION:-}}"
+TIMEOUT_SECS="${{RAUM_HOOK_TIMEOUT_SECS:-{timeout_secs}}}"
 # Codex pipes the JSON payload on stdin. Empty stdin → fall back to
 # `{{}}` so the envelope still parses downstream.
 PAYLOAD="$(cat || true)"
@@ -401,23 +475,86 @@ fi
 # Embed PAYLOAD verbatim — Codex guarantees it's already valid JSON.
 # `$(...)` strips the trailing newline; the sending `printf '%s\n'`
 # re-adds one so the newline-framed reader on the other end unblocks.
-JSON=$(printf '{{"harness":"codex","event":"%s","session_id":%s,"payload":%s}}' \
-  "$EVENT_NAME" "$SESSION_JSON" "$PAYLOAD")
-
-if command -v socat >/dev/null 2>&1; then
-  printf '%s\n' "$JSON" | socat -u - UNIX-CONNECT:"$SOCK" || true
-elif command -v nc >/dev/null 2>&1; then
-  printf '%s\n' "$JSON" | nc -U "$SOCK" || true
-elif command -v python3 >/dev/null 2>&1; then
-  printf '%s\n' "$JSON" | python3 -c '
+send_fire_and_forget() {{
+  JSON=$(printf '{{"harness":"codex","event":"%s","session_id":%s,"payload":%s}}' \
+    "$EVENT_NAME" "$SESSION_JSON" "$PAYLOAD")
+  if command -v socat >/dev/null 2>&1; then
+    printf '%s\n' "$JSON" | socat -u - UNIX-CONNECT:"$SOCK" || true
+  elif command -v nc >/dev/null 2>&1; then
+    printf '%s\n' "$JSON" | nc -U "$SOCK" || true
+  elif command -v python3 >/dev/null 2>&1; then
+    printf '%s\n' "$JSON" | python3 -c '
 import os, sys, socket
 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 sock.connect(os.environ["RAUM_EVENT_SOCK"])
 sock.sendall(sys.stdin.buffer.read())
 sock.close()
 ' || true
-fi
-exit 0
+  fi
+}}
+
+# Blocking PermissionRequest: emit request + read one decision line back
+# + print Codex's approval-decision JSON to stdout. On timeout, transport
+# failure, or an unrecognised decision we print nothing and exit 0 —
+# Codex treats empty stdout as "no decision" and shows its own approval
+# prompt (graceful degradation).
+handle_permission_request() {{
+  REQ_ID=$(od -N8 -An -tx1 /dev/urandom 2>/dev/null | tr -d ' \n' || date +%s%N)
+  JSON=$(printf '{{"harness":"codex","event":"%s","session_id":%s,"request_id":"%s","payload":%s}}' \
+    "$EVENT_NAME" "$SESSION_JSON" "$REQ_ID" "$PAYLOAD")
+  DECISION=""
+  if command -v socat >/dev/null 2>&1; then
+    DECISION=$(printf '%s\n' "$JSON" | socat -T"$TIMEOUT_SECS" - UNIX-CONNECT:"$SOCK" 2>/dev/null | head -n1 || true)
+  elif command -v nc >/dev/null 2>&1; then
+    DECISION=$(printf '%s\n' "$JSON" | nc -U -w "$TIMEOUT_SECS" "$SOCK" 2>/dev/null | head -n1 || true)
+  elif command -v python3 >/dev/null 2>&1; then
+    DECISION=$(printf '%s\n' "$JSON" | python3 -c '
+import os, socket, sys
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.settimeout(float(os.environ.get("RAUM_HOOK_TIMEOUT_SECS", "{timeout_secs}")))
+sock.connect(os.environ["RAUM_EVENT_SOCK"])
+data = sys.stdin.buffer.read()
+sock.sendall(data)
+try:
+    buf = b""
+    while not buf.endswith(b"\n"):
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+    line = buf.splitlines()[0] if buf else b""
+    sys.stdout.write(line.decode("utf-8", errors="replace"))
+except Exception:
+    pass
+finally:
+    try: sock.close()
+    except Exception: pass
+' 2>/dev/null || true)
+  fi
+  case "$DECISION" in
+    allow)
+      printf '{{"hookSpecificOutput":{{"hookEventName":"PermissionRequest","decision":{{"behavior":"allow"}}}}}}\n'
+      ;;
+    deny)
+      printf '{{"hookSpecificOutput":{{"hookEventName":"PermissionRequest","decision":{{"behavior":"deny","message":"raum user denied"}}}}}}\n'
+      ;;
+    *)
+      # No decision — stay silent so Codex prompts natively.
+      :
+      ;;
+  esac
+  exit 0
+}}
+
+case "$EVENT_NAME" in
+  PermissionRequest)
+    handle_permission_request
+    ;;
+  *)
+    send_fire_and_forget
+    exit 0
+    ;;
+esac
 "#
     )
 }
@@ -474,11 +611,6 @@ mod tests {
             s.contains(r#"PAYLOAD="{}""#),
             "Codex dispatcher must fall back to an empty JSON object on empty stdin"
         );
-        // No PermissionRequest case — Codex has no equivalent event.
-        assert!(
-            !s.contains("handle_permission_request"),
-            "Codex dispatcher should not include PermissionRequest branch"
-        );
         assert!(
             s.contains(r#""harness":"codex""#),
             "Codex envelope must tag harness=codex"
@@ -493,6 +625,80 @@ mod tests {
             !s.contains(r#"$PAYLOAD" | json_escape_stdin"#),
             "Codex dispatcher must not re-escape an already-JSON payload"
         );
+    }
+
+    #[test]
+    fn codex_body_answers_permission_request() {
+        let s = body(HookDispatcher::Codex);
+        assert!(
+            s.contains("handle_permission_request"),
+            "Codex dispatcher must include the blocking PermissionRequest branch"
+        );
+        assert!(
+            s.contains(r#"if event == "PermissionRequest":"#),
+            "Codex Python fast path must branch on PermissionRequest"
+        );
+        // request_id is what makes the socket park the write half so the
+        // decision can be delivered back to this blocked script.
+        assert!(
+            s.contains(r#""request_id":"%s""#) && s.contains(r#""request_id": uuid.uuid4().hex"#),
+            "Codex PermissionRequest envelope must carry a request_id"
+        );
+        // Codex's output schema: hookSpecificOutput.decision.behavior,
+        // allow/deny only (deny_unknown_fields rejects everything else).
+        assert!(
+            s.contains(r#""hookEventName":"PermissionRequest","decision":{"behavior":"allow"}"#),
+            "Codex allow document must match Codex's decision schema"
+        );
+        assert!(
+            s.contains(r#""behavior":"deny","message":"raum user denied""#),
+            "Codex deny document must carry a message"
+        );
+        // No Claude-Code-only shapes: Codex rejects `permissionDecision`
+        // and `updatedPermissions` outright and discards the decision.
+        assert!(
+            !s.contains("permissionDecision"),
+            "Codex dispatcher must not emit Claude's permissionDecision field"
+        );
+        assert!(
+            !s.contains("updatedPermissions"),
+            "Codex dispatcher must not emit updatedPermissions (v1 is allow/deny only)"
+        );
+    }
+
+    #[test]
+    fn no_dispatcher_emits_an_ask_shaped_document() {
+        // `permissionDecision` belongs to PreToolUse, not PermissionRequest:
+        // a document carrying it is at best ignored, at worst a hook failure
+        // on every unanswered prompt. No-decision prints nothing instead.
+        for d in [HookDispatcher::ClaudeCode, HookDispatcher::Codex] {
+            let s = body(d);
+            assert!(
+                !s.contains("permissionDecision"),
+                "dispatcher {d:?} still emits an ask-shaped PermissionRequest document"
+            );
+        }
+    }
+
+    #[test]
+    fn timeout_default_is_in_sync() {
+        // The Python fast paths embed the timeout as a literal (a `const
+        // &str` is not reached by `format!`), so assert the rendered
+        // scripts still agree with the Rust constant.
+        let expected = DEFAULT_PERMISSION_TIMEOUT_SECS.to_string();
+        for d in [HookDispatcher::ClaudeCode, HookDispatcher::Codex] {
+            let s = body(d);
+            assert!(
+                s.contains(&format!(r#"RAUM_HOOK_TIMEOUT_SECS", "{expected}""#)),
+                "dispatcher {d:?} Python fast path drifted from DEFAULT_PERMISSION_TIMEOUT_SECS"
+            );
+            assert!(
+                s.contains(&format!(
+                    r#"TIMEOUT_SECS="${{RAUM_HOOK_TIMEOUT_SECS:-{expected}}}""#
+                )),
+                "dispatcher {d:?} shell fallback drifted from DEFAULT_PERMISSION_TIMEOUT_SECS"
+            );
+        }
     }
 
     #[test]

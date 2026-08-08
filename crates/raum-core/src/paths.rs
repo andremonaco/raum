@@ -30,12 +30,21 @@ fn instance_name_from(instance: Option<&str>) -> String {
 /// Root directory: `$XDG_CONFIG_HOME/<instance>` or `~/.config/<instance>`,
 /// where `<instance>` is [`instance_name`] (`raum` by default, `raum-dev` for
 /// the dev build).
+///
+/// Resolved once per process — every other path helper funnels through here,
+/// so this is hot enough that the env lookups and joins are worth skipping.
+/// `RAUM_INSTANCE` / `XDG_CONFIG_HOME` are launch-time inputs; a mid-process
+/// change to either is not observed.
 pub fn config_root() -> PathBuf {
-    let base = match env::var("XDG_CONFIG_HOME") {
-        Ok(xdg) if !xdg.is_empty() => PathBuf::from(xdg),
-        _ => home_dir().join(".config"),
-    };
-    base.join(instance_name())
+    static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        let base = match env::var("XDG_CONFIG_HOME") {
+            Ok(xdg) if !xdg.is_empty() => PathBuf::from(xdg),
+            _ => home_dir().join(".config"),
+        };
+        base.join(instance_name())
+    })
+    .clone()
 }
 
 pub fn projects_dir() -> PathBuf {

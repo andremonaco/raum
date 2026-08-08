@@ -33,6 +33,9 @@ describe("openProjectFromCli", () => {
     __resetProjectStoreForTests();
     clearPendingAddProject();
     invokeMock.mockReset();
+    // Default for the fire-and-forget calls the store makes on selection
+    // changes (`project_set_active`); `mockResolvedValueOnce` still wins.
+    invokeMock.mockResolvedValue(undefined);
   });
 
   it("focuses an existing project without prompting to add", async () => {

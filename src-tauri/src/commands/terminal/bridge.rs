@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use raum_core::AgentKind;
 use raum_core::harness::codex::{Osc9Parser, classify_osc9_payload};
@@ -185,7 +185,10 @@ pub(super) async fn open_bridge_and_monitor<R: Runtime>(
     let data_session_id_for_lost = session_id.clone();
     let exit_app = app.clone();
     let exit_id = session_id.clone();
-    let activity_for_data = session_activity.clone();
+    // Resolve the session's activity slot ONCE. The data callback below then
+    // stamps it with a single relaxed atomic store — no map lock, no String
+    // clone per output chunk.
+    let activity_for_data = session_activity.slot(&session_id);
     let activity_session_id = session_id.clone();
     let mut osc9_parser = (kind == AgentKind::Codex).then(Osc9Parser::new);
     let pane_context_dirty_for_data = pane_context_dirty_tx;
@@ -224,9 +227,7 @@ pub(super) async fn open_bridge_and_monitor<R: Runtime>(
             // (commands::agent::spawn_silence_tick) can flip a
             // `Working` machine to `Waiting` after the coalesced
             // stream goes quiet, even when hooks never fire.
-            if let Ok(mut map) = activity_for_data.lock() {
-                map.insert(activity_session_id.clone(), Instant::now());
-            }
+            activity_for_data.touch();
             if let Some(tx) = pane_context_dirty_for_data.as_ref() {
                 let _ = tx.try_send(());
             }
@@ -304,6 +305,17 @@ pub(super) fn control_transport_enabled() -> bool {
 /// can emit `terminal:process-exited` even when the attached client is still
 /// happily rendering an empty pane (remain-on-exit). Aborted by `terminal_kill`
 /// so an explicit close never fires a spurious overlay.
+///
+/// One of these runs per live pane, so the probe is
+/// [`TmuxManager::check_pane_dead_polled`] — a shared, briefly-cached
+/// `list-panes -a` — rather than a per-session `display-message` fork on every
+/// tick from every pane.
+///
+/// ponytail: still one task per pane on its own timer, just sharing a cached
+/// listing — so it is ~1–2 tmux forks per 300 ms regardless of pane count, not
+/// zero. The real fix is `%pane-died`/`%exit` off the control-mode connection
+/// the bridge already holds, which drops both the polling and the forks; that
+/// is a transport-layer change and deliberately out of scope here.
 pub(super) fn spawn_pane_death_monitor<R: Runtime>(
     app: AppHandle<R>,
     tmux: Arc<TmuxManager>,
@@ -314,7 +326,9 @@ pub(super) fn spawn_pane_death_monitor<R: Runtime>(
             tokio::time::sleep(Duration::from_millis(300)).await;
             let id = session_id.clone();
             let tmux_for_check = tmux.clone();
-            match tokio::task::spawn_blocking(move || tmux_for_check.check_pane_dead(&id)).await {
+            match tokio::task::spawn_blocking(move || tmux_for_check.check_pane_dead_polled(&id))
+                .await
+            {
                 Ok(Ok(Some(exit_code))) => {
                     let _ = app.emit(
                         "terminal:process-exited",

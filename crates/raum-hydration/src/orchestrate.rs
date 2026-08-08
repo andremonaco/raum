@@ -374,6 +374,61 @@ pub fn set_raum_base_branch(repo: &Path, branch: &str, base: &str) -> Result<(),
     Ok(())
 }
 
+/// Read every persisted `branch.<name>.raumBase` in one `git config` call,
+/// keyed by branch name.
+///
+/// The per-branch [`get_raum_base_branch`] costs one fork each, and the sidebar
+/// prewarm asks for every branch of every project at boot — dozens of
+/// serialized forks before the first paint. Empty map when git fails or nothing
+/// is set.
+#[must_use]
+pub fn raum_base_branch_map(repo: &str) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(res) = Command::new("git")
+        .args([
+            "-C",
+            repo,
+            "config",
+            "--local",
+            "--get-regexp",
+            r"^branch\..*\.raumBase$",
+        ])
+        .output()
+    else {
+        return out;
+    };
+    // Exit 1 just means "no matching keys".
+    if !res.status.success() {
+        return out;
+    }
+    for line in String::from_utf8_lossy(&res.stdout).lines() {
+        // `branch.<name>.raumBase <base>` — the branch name may itself contain
+        // dots, so strip the fixed prefix/suffix rather than splitting on '.'.
+        let Some((key, base)) = line.split_once(' ') else {
+            continue;
+        };
+        // git canonicalises section + variable to lowercase on output (only the
+        // subsection — the branch name — keeps its case), so the suffix match
+        // has to ignore case.
+        const SUFFIX: &str = ".raumbase";
+        let Some(name) = key.strip_prefix("branch.").and_then(|rest| {
+            let cut = rest.len().checked_sub(SUFFIX.len())?;
+            // `get` rather than indexing: a multi-byte branch name can put
+            // `cut` off a char boundary, which would panic on a slice.
+            rest.get(cut..)?
+                .eq_ignore_ascii_case(SUFFIX)
+                .then(|| &rest[..cut])
+        }) else {
+            continue;
+        };
+        let base = base.trim();
+        if !name.is_empty() && !base.is_empty() {
+            out.insert(name.to_string(), base.to_string());
+        }
+    }
+    out
+}
+
 /// Read a previously-persisted `branch.<name>.raumBase` value. `None` when
 /// unset, the repo is missing, or git is unavailable.
 #[must_use]
@@ -406,6 +461,11 @@ pub fn target_is_inside_raum_dir(root: &Path, target: &Path) -> bool {
 /// * Existing file that already ignores `.raum` (or `.raum/`) → no-op.
 /// * Existing file without the entry → append a `.raum/` line (preserving a
 ///   trailing newline if one was present, adding one otherwise).
+///
+/// The rewrite goes through [`raum_core::store::atomic_write`] (temp file →
+/// fsync → rename) rather than an in-place `fs::write`. This file belongs to
+/// the user and is usually tracked by git: an interrupted in-place write
+/// truncates it and silently un-ignores whatever else it listed.
 pub fn ensure_raum_gitignored(root: &Path) -> std::io::Result<()> {
     let gitignore = root.join(".gitignore");
     match std::fs::read_to_string(&gitignore) {
@@ -418,13 +478,23 @@ pub fn ensure_raum_gitignored(root: &Path) -> std::io::Result<()> {
                 updated.push('\n');
             }
             updated.push_str(".raum/\n");
-            std::fs::write(&gitignore, updated)
+            atomic_write_io(&gitignore, updated.as_bytes())
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::write(&gitignore, ".raum/\n")
+            atomic_write_io(&gitignore, b".raum/\n")
         }
         Err(e) => Err(e),
     }
+}
+
+/// [`raum_core::store::atomic_write`] with its error mapped back to
+/// `std::io::Error` — every failure it can produce here is an I/O failure,
+/// the other `StoreError` variants are unreachable for a raw byte write.
+fn atomic_write_io(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    raum_core::store::atomic_write(path, bytes).map_err(|e| match e {
+        raum_core::store::StoreError::Io(io) => io,
+        other => std::io::Error::other(other.to_string()),
+    })
 }
 
 #[must_use]
@@ -504,6 +574,25 @@ mod tests {
         ensure_raum_gitignored(dir.path()).unwrap();
         let body = std::fs::read_to_string(&gi).unwrap();
         assert_eq!(body, "node_modules\n.raum/\n");
+    }
+
+    #[test]
+    fn raum_base_branch_map_reads_back_what_git_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        assert!(
+            Command::new("git")
+                .args(["-C", &repo.to_string_lossy(), "init", "-q"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        // Dotted branch name: the subsection keeps its dots and its case, while
+        // git lowercases the `raumBase` variable in `--get-regexp` output.
+        set_raum_base_branch(repo, "feat/A.b", "main").unwrap();
+
+        let map = raum_base_branch_map(&repo.to_string_lossy());
+        assert_eq!(map.get("feat/A.b").map(String::as_str), Some("main"));
     }
 
     #[test]

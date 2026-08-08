@@ -22,7 +22,7 @@ pub fn keymap_get_defaults() -> DefaultKeymap {
 
 /// §12.2 — return the keymap with `~/.config/raum/keybindings.toml` merged
 /// over the defaults.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn keymap_get_effective(
     state: tauri::State<'_, AppHandleState>,
 ) -> Result<Vec<KeymapEntry>, String> {
@@ -33,7 +33,7 @@ pub fn keymap_get_effective(
 /// Upsert a single override in `keybindings.toml`. Rejects unknown actions and
 /// invalid accelerator strings. Returns the new effective keymap so the
 /// frontend can refresh without a second round-trip.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn keymap_set_override(
     state: tauri::State<'_, AppHandleState>,
     action: String,
@@ -54,7 +54,7 @@ pub fn keymap_set_override(
 
 /// Remove a single override from `keybindings.toml`, restoring the default for
 /// that action. Returns the new effective keymap.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn keymap_clear_override(
     state: tauri::State<'_, AppHandleState>,
     action: String,

@@ -37,9 +37,12 @@ pub async fn terminal_pane_context_batch(
 ) -> Result<HashMap<String, PaneContextPayload>, String> {
     let tmux = state.tmux.clone();
     let res = tokio::task::spawn_blocking(move || {
+        // One `list-panes -a` for the whole socket instead of a
+        // `display-message` fork per requested session.
+        let mut all = tmux.pane_context_all().unwrap_or_default();
         let mut out = HashMap::with_capacity(session_ids.len());
         for session_id in session_ids {
-            let ctx = tmux.pane_context(&session_id).unwrap_or_default();
+            let ctx = all.remove(&session_id).unwrap_or_default();
             out.insert(session_id, ctx.into());
         }
         out

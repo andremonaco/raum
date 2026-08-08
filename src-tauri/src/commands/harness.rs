@@ -124,7 +124,11 @@ pub async fn harness_install<R: Runtime>(
     let project_dir = resolve_project_dir(&state, project_slug.as_deref(), worktree_id.as_deref());
     let home_dir = resolve_home_dir()?;
     let slug = project_slug.clone().unwrap_or_default();
-    let worktree_paths = collect_worktree_paths(&project_dir);
+    // `git worktree list` forks a subprocess — never on an async worker.
+    let dir = project_dir.clone();
+    let worktree_paths = tokio::task::spawn_blocking(move || collect_worktree_paths(&dir))
+        .await
+        .map_err(|e| format!("worktree list task failed: {e}"))?;
     let ctx = SetupContext::new(paths::hooks_dir(), paths::event_socket_path(), slug)
         .with_project_dir(project_dir)
         .with_home_dir(home_dir)

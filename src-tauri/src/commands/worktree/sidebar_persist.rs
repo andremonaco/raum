@@ -7,7 +7,7 @@ use raum_core::config::QUICKFIRE_HISTORY_LIMIT;
 use crate::state::AppHandleState;
 
 /// §9.6 — list persisted quick-fire commands, most-recent first.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn quickfire_history_get(
     state: tauri::State<'_, AppHandleState>,
 ) -> Result<Vec<String>, String> {
@@ -22,7 +22,7 @@ pub fn quickfire_history_get(
 /// `QuickfireHistory::push` which dedupes and truncates to
 /// `QUICKFIRE_HISTORY_LIMIT`. Returns the updated list so the UI can avoid a
 /// follow-up `_get` round-trip.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn quickfire_history_push(
     state: tauri::State<'_, AppHandleState>,
     command: String,
@@ -50,7 +50,7 @@ pub fn quickfire_history_push(
 /// Width is clamped to `[160, 800]` to defend against accidental "drag to
 /// 0" states that would render the sidebar invisible and unrecoverable
 /// without editing config.toml by hand.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn config_set_sidebar_width(
     state: tauri::State<'_, AppHandleState>,
     width: u32,

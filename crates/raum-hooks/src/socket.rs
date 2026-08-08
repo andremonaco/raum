@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, unix::OwnedWriteHalf};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
@@ -29,6 +29,17 @@ pub const RAUM_PROJECT_SLUG_ENV: &str = "RAUM_PROJECT_SLUG";
 pub const RAUM_PROJECT_ROOT_ENV: &str = "RAUM_PROJECT_ROOT";
 pub const RAUM_WORKTREE_ID_ENV: &str = "RAUM_WORKTREE_ID";
 pub const PER_AGENT_BACKLOG: usize = 8_000;
+
+/// Ceiling on a single newline-delimited event. Real hook payloads are a few
+/// hundred bytes; the largest plausible one is a `PermissionRequest` carrying
+/// a tool input, still far under this. A peer that never sends a newline is
+/// cut off here instead of growing the line buffer without limit.
+const MAX_EVENT_LINE_BYTES: u64 = 64 * 1024;
+
+/// Pause after a failed `accept` before trying again, so an error that
+/// reproduces immediately (EMFILE, unlinked socket) cannot spin the accept
+/// loop at 100% CPU.
+const ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Synthetic event emitted by the socket server itself when a parked
 /// `PermissionRequest` was still unanswered [`PERMISSION_GC_AFTER`] after
@@ -49,12 +60,14 @@ pub const PERMISSION_EXPIRED_EVENT: &str = "PermissionExpired";
 /// server sees EOF milliseconds after the request while the client is still
 /// blocked reading its decision line. Reaping on EOF would drop the writer
 /// out from under that live client and dismiss a prompt the user never
-/// answered. The deadline sits above every client-side wait (default 55 s,
+/// answered. The deadline sits above every client-side wait (default 85 s,
 /// `DEFAULT_PERMISSION_TIMEOUT_SECS` in raum-core) so by the time it fires
 /// the script has provably given up. Tests pass an explicit deadline via
 /// [`spawn_event_socket_with_gc`] — a global test-mode shortening would
 /// race the park-then-assert tests, whose writers must stay parked across
-/// multi-hundred-ms poll windows.
+/// multi-hundred-ms poll windows. Changing either value must preserve that
+/// ordering: the script has to give up first, or the advertised answer
+/// window is really this deadline.
 const PERMISSION_GC_AFTER: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// A single hook event delivered over the UDS.
@@ -281,14 +294,32 @@ pub fn spawn_event_socket_with_gc(
         std::fs::create_dir_all(parent)?;
     }
     let listener = UnixListener::bind(path)?;
+    // The socket carries permission decisions and prompt text for every
+    // harness on the machine. `bind` applies the process umask, which on a
+    // default-022 system leaves it group/world readable and writable; pin it
+    // to owner-only so no other local account can inject events or read them.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
     let (tx, rx) = mpsc::channel::<HookEvent>(PER_AGENT_BACKLOG);
     let path_owned = path.to_path_buf();
     let pending = PendingRequests::new();
     let pending_for_task = pending.clone();
     let task = tokio::spawn(async move {
         loop {
-            let Ok((stream, _addr)) = listener.accept().await else {
-                continue;
+            let (stream, _addr) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    // A hard accept error (EMFILE, the socket file being
+                    // unlinked) repeats on the very next call, so a bare
+                    // `continue` here span the CPU at full tilt for as long
+                    // as the condition lasted. Back off so the loop stays
+                    // alive but idle-cheap, and say so in the log.
+                    warn!(error = %e, "event socket accept failed; backing off");
+                    tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                    continue;
+                }
             };
             let tx = tx.clone();
             let pending = pending_for_task.clone();
@@ -297,8 +328,21 @@ pub fn spawn_event_socket_with_gc(
                 let mut reader = BufReader::new(read_half);
                 let mut write_half_slot = Some(write_half);
                 let mut line = String::new();
-                while let Ok(n) = reader.read_line(&mut line).await {
+                // Bounded per line: a peer that never sends a newline would
+                // otherwise grow `line` until the process is OOM-killed.
+                while let Ok(n) = (&mut reader)
+                    .take(MAX_EVENT_LINE_BYTES)
+                    .read_line(&mut line)
+                    .await
+                {
                     if n == 0 {
+                        break;
+                    }
+                    if n as u64 == MAX_EVENT_LINE_BYTES && !line.ends_with('\n') {
+                        warn!(
+                            bytes = n,
+                            "hook event line exceeded the size limit; dropping connection"
+                        );
                         break;
                     }
                     match serde_json::from_str::<HookEvent>(line.trim()) {

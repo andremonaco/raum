@@ -274,6 +274,32 @@ function commandIcon(id: string): typeof PlayIcon {
 }
 
 // ---------------------------------------------------------------------------
+// Search round-trip cache
+// ---------------------------------------------------------------------------
+
+/** Every settled keystroke fans out to `worktree_list` + one
+ *  `search_files_in_path` per worktree — and typing forward/backspacing
+ *  replays the same (root, query) pairs seconds apart. Caching the promise
+ *  also collapses concurrent duplicates.
+ *  // ponytail: TTL cache; fs-watcher invalidation if staleness bites */
+const SEARCH_CACHE_TTL_MS = 30_000;
+const searchCache = new Map<string, { at: number; value: Promise<unknown> }>();
+
+function cached<T>(key: string, fetch: () => Promise<T>): Promise<T> {
+  const now = Date.now();
+  const hit = searchCache.get(key);
+  if (hit && now - hit.at < SEARCH_CACHE_TTL_MS) return hit.value as Promise<T>;
+  // One entry per (root, query); a long typing session would otherwise grow it
+  // without bound. Dropping the whole map is fine — it's a pure cache.
+  if (searchCache.size > 256) searchCache.clear();
+  const value = fetch();
+  searchCache.set(key, { at: now, value });
+  // Never serve a failed round-trip for 30 s.
+  void value.catch(() => searchCache.delete(key));
+  return value;
+}
+
+// ---------------------------------------------------------------------------
 // SpotlightDock
 // ---------------------------------------------------------------------------
 
@@ -405,18 +431,17 @@ export const SpotlightDock: Component = () => {
     }
     const token = ++fileToken;
     try {
-      const worktrees = await invoke<Worktree[]>("worktree_list", {
-        projectSlug: slug,
-      });
+      const worktrees = await cached(`wt:${slug}`, () =>
+        invoke<Worktree[]>("worktree_list", { projectSlug: slug }),
+      );
       if (token !== fileToken) return;
 
       const perWorktree = await Promise.all(
         worktrees.map(async (wt) => {
           try {
-            const hits = await invoke<FileHit[]>("search_files_in_path", {
-              path: wt.path,
-              query: q,
-            });
+            const hits = await cached(`files:${wt.path} ${q}`, () =>
+              invoke<FileHit[]>("search_files_in_path", { path: wt.path, query: q }),
+            );
             const branch =
               wt.branch?.replace(/^refs\/heads\//, "") ?? wt.path.split("/").at(-1) ?? "main";
             return hits.map(

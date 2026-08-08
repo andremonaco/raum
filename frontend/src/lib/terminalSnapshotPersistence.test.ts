@@ -79,7 +79,7 @@ describe("terminalSnapshotPersistence", () => {
 
   it("persists raw bytes with the session id in a header", async () => {
     invokeMock.mockResolvedValueOnce(true);
-    const source = makeSource({ 100_000: "hello" });
+    const source = makeSource({ 10_000: "hello" });
     await persistTerminalSnapshot("sess-1", source);
     expect(invokeMock).toHaveBeenCalledTimes(1);
     expect(invokeMock).toHaveBeenCalledWith(
@@ -99,9 +99,9 @@ describe("terminalSnapshotPersistence", () => {
     // path would actually shrink — the test asserts the retry loop calls
     // `invoke` until acceptance, never byte-truncates the blob.
     const source = makeSource({
-      100_000: "BIG".repeat(1000),
-      50_000: "MED".repeat(500),
-      25_000: "OK",
+      10_000: "BIG".repeat(1000),
+      5_000: "MED".repeat(500),
+      2_500: "OK",
     });
     await persistTerminalSnapshot("sess-overflow", source);
     expect(invokeMock).toHaveBeenCalledTimes(3);
@@ -113,9 +113,22 @@ describe("terminalSnapshotPersistence", () => {
     }
   });
 
+  it("serializes the routine checkpoint at a bounded row budget", async () => {
+    invokeMock.mockResolvedValueOnce(true);
+    const addon = new FakeSerializeAddon({ 10_000: "checkpoint" });
+    const source: SnapshotSource = {
+      term: makeTerm("normal"),
+      addon: addon as unknown as SnapshotSource["addon"],
+    };
+    await persistTerminalSnapshot("sess-budget", source);
+    // SerializeAddon's scan is synchronous main-thread work, so the debounced
+    // checkpoint never asks for the whole 100k-row buffer.
+    expect(addon.lastOptions?.scrollback).toBe(10_000);
+  });
+
   it("swallows persist errors so streaming is never blocked", async () => {
     invokeMock.mockRejectedValueOnce(new Error("disk full"));
-    const source = makeSource({ 100_000: "hi" });
+    const source = makeSource({ 10_000: "hi" });
     await expect(persistTerminalSnapshot("sess-err", source)).resolves.toBeUndefined();
   });
 
@@ -213,7 +226,7 @@ describe("terminalSnapshotPersistence", () => {
 
     it("flushes a pending debounced snapshot immediately on quit", async () => {
       invokeMock.mockResolvedValue(true);
-      const source = makeSource({ 100_000: "tail" });
+      const source = makeSource({ 5_000: "tail" });
       scheduleTerminalSnapshotPersist("sess-flush", source);
       // Timer hasn't fired yet — nothing persisted.
       expect(invokeMock).not.toHaveBeenCalled();
@@ -225,9 +238,24 @@ describe("terminalSnapshotPersistence", () => {
       );
     });
 
+    it("flushes at the same row budget as the checkpoint", async () => {
+      // The save overwrites `snapshots/<session>.bin` wholesale, so a smaller
+      // quit-time budget would replace a 10k-row snapshot with a shorter one —
+      // a clean shutdown must never destroy scrollback a crash would keep.
+      invokeMock.mockResolvedValue(true);
+      const addon = new FakeSerializeAddon({ 10_000: "tail" });
+      const source: SnapshotSource = {
+        term: makeTerm("normal"),
+        addon: addon as unknown as SnapshotSource["addon"],
+      };
+      scheduleTerminalSnapshotPersist("sess-quit-budget", source);
+      await flushAllTerminalSnapshotsNow();
+      expect(addon.lastOptions?.scrollback).toBe(10_000);
+    });
+
     it("cancel clears the pending timer so it never persists after unmount", async () => {
       invokeMock.mockResolvedValue(true);
-      const source = makeSource({ 100_000: "doomed" });
+      const source = makeSource({ 5_000: "doomed" });
       scheduleTerminalSnapshotPersist("sess-cancel", source);
       cancelTerminalSnapshotPersist("sess-cancel");
       vi.advanceTimersByTime(5000);
@@ -243,8 +271,8 @@ describe("terminalSnapshotPersistence", () => {
       // sources, but the pane cancels the OLD id on rotation (terminal-pane
       // setSessionId wrapper) so the quit flush only serializes the current id.
       invokeMock.mockResolvedValue(true);
-      const oldSource = makeSource({ 100_000: "old" });
-      const newSource = makeSource({ 100_000: "new" });
+      const oldSource = makeSource({ 5_000: "old" });
+      const newSource = makeSource({ 5_000: "new" });
       scheduleTerminalSnapshotPersist("sess-A", oldSource);
       scheduleTerminalSnapshotPersist("sess-B", newSource);
       // Rotation prunes the old id's tracked source + timer.
@@ -259,7 +287,7 @@ describe("terminalSnapshotPersistence", () => {
 
     it("a max-staleness overflow checkpoints a long burst before re-arming", async () => {
       invokeMock.mockResolvedValue(true);
-      const source = makeSource({ 100_000: "burst" });
+      const source = makeSource({ 10_000: "burst" });
       scheduleTerminalSnapshotPersist("sess-burst", source);
       // Advance past the max-staleness cap without the debounce firing, then
       // schedule again (simulating sustained output) — this must force a flush.

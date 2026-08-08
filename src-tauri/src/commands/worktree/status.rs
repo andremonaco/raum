@@ -16,18 +16,12 @@
 //! 2 s × N-rows poll storm) the full-scan cost is paid rarely.
 
 use std::collections::HashMap;
-use std::process::Command;
 
 use super::git_parse::{assemble_status, parse_numstat_z, parse_porcelain_v2_z};
 use super::types::WorktreeStatus;
-
-/// Build a `git -C <path> …` command with optional locks disabled (see
-/// module docs for why that flag is load-bearing).
-pub(super) fn git_cmd(path: &str) -> Command {
-    let mut cmd = Command::new("git");
-    cmd.env("GIT_OPTIONAL_LOCKS", "0").args(["-C", path]);
-    cmd
-}
+/// Every git subprocess in raum goes through [`crate::git::git_cmd`], which
+/// disables optional locks (see that module for why the flag is load-bearing).
+use crate::git::git_cmd;
 
 /// Run + parse the porcelain status. `Ok(None)` means git exited non-zero —
 /// usually "not a git repository" because the worktree dir was deleted out

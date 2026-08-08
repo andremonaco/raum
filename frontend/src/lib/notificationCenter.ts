@@ -35,6 +35,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { createEffect, createRoot, createSignal } from "solid-js";
 
 import { kindDisplayLabel } from "./agentKind";
+import { permissionSummary } from "./permissionSummary";
 import { agentStore, markAcknowledged, unreadAgentCount } from "../stores/agentStore";
 import type { AgentKind, AgentState, Reliability } from "../stores/agentStore";
 import { activeProjectSlug, projectBySlug } from "../stores/projectStore";
@@ -185,54 +186,63 @@ export type BadgeMode = "off" | "critical" | "all_unread";
 const [badgeMode, setBadgeMode] = createSignal<BadgeMode>("all_unread");
 export { badgeMode };
 
-/**
- * Set of open permission keys for requests the user has yet to
- * answer. The size drives the "Critical" badge mode. Kept outside Solid's
- * reactive graph (plain `Set`) so module consumers and tests can mutate it
- * synchronously; the derived `pendingPermissionCount` signal is the
- * reactive surface.
- */
-const pendingPermissionKeys = new Set<string>();
-const pendingPermissionSessions = new Map<string, string>();
-const [pendingPermissionCount, setPendingPermissionCount] = createSignal(0);
-export { pendingPermissionCount };
+/** An open permission request the user has yet to answer. */
+export interface PendingPermission {
+  /** Dedup key from the backend (`request_id ?? session_id ?? hash`). */
+  permissionKey: string;
+  sessionId: string | null;
+  /** Reply token. `null` ⇒ observation-only; the rail can't offer buttons. */
+  requestId: string | null;
+  harness: AgentKind;
+  receivedAt: number;
+  payload: Record<string, unknown> | null;
+}
 
-function addPendingPermission(
-  permissionKey: string,
-  sessionId: string | null | undefined,
-): boolean {
-  if (!permissionKey) return false;
-  if (pendingPermissionKeys.has(permissionKey)) return false;
-  pendingPermissionKeys.add(permissionKey);
-  if (sessionId) pendingPermissionSessions.set(permissionKey, sessionId);
-  setPendingPermissionCount(pendingPermissionKeys.size);
+/**
+ * Open permission requests, oldest first. Drives the "Critical" badge count
+ * and the inline Allow/Deny rows in the "Needs you" rail — one reactive
+ * surface rather than a second store mirroring this one.
+ */
+const [pendingPermissions, setPendingPermissions] = createSignal<PendingPermission[]>([]);
+export { pendingPermissions };
+
+/** Number of open permission requests. Drives the Critical badge mode. */
+export function pendingPermissionCount(): number {
+  return pendingPermissions().length;
+}
+
+/**
+ * The oldest replyable request owned by `sessionId`, if any. Reactive.
+ * Requests without a `requestId` are skipped: there is nothing to reply to.
+ */
+export function pendingPermissionForSession(sessionId: string): PendingPermission | undefined {
+  if (!sessionId) return undefined;
+  return pendingPermissions().find((p) => p.sessionId === sessionId && p.requestId);
+}
+
+function addPendingPermission(entry: PendingPermission): boolean {
+  if (!entry.permissionKey) return false;
+  if (pendingPermissions().some((p) => p.permissionKey === entry.permissionKey)) return false;
+  setPendingPermissions((prev) => [...prev, entry]);
   return true;
 }
 
-function clearPendingPermission(permissionKey: string): void {
-  if (!pendingPermissionKeys.delete(permissionKey)) return;
-  pendingPermissionSessions.delete(permissionKey);
-  setPendingPermissionCount(pendingPermissionKeys.size);
+/**
+ * Drop an open request — answered here, answered in the harness's own TUI,
+ * or expired by the socket sweeper. Idempotent.
+ */
+export function clearPendingPermission(permissionKey: string): void {
+  setPendingPermissions((prev) => prev.filter((p) => p.permissionKey !== permissionKey));
 }
 
+/**
+ * Drop every open request owned by a session that is *gone* (only
+ * `agent-session-removed` qualifies — a session merely leaving `waiting`
+ * can still own live requests, see `handleAgentStateChanged`). Dismisses
+ * the session's sticky "needs input" banners alongside.
+ */
 function clearPendingPermissionsForSession(sessionId: string): void {
-  let mutated = false;
-  for (const [permissionKey, sid] of pendingPermissionSessions) {
-    if (sid === sessionId) {
-      pendingPermissionSessions.delete(permissionKey);
-      pendingPermissionKeys.delete(permissionKey);
-      mutated = true;
-    }
-  }
-  if (mutated) setPendingPermissionCount(pendingPermissionKeys.size);
-
-  // Per the user's rule, "needs input" notifications are sticky until the
-  // harness is running again. The two callers of this helper both fit that
-  // moment exactly:
-  //   * `handleAgentStateChanged` — invoked on `waiting → !waiting`.
-  //   * `agent-session-removed` — the session is gone entirely.
-  // Drop the OS Notification Center entry alongside the in-memory cleanup
-  // above so the user doesn't see a stale "needs input" banner.
+  setPendingPermissions((prev) => prev.filter((p) => p.sessionId !== sessionId));
   void clearOsNotifications(sessionId, ["needs_input"]);
 }
 
@@ -347,6 +357,7 @@ async function emitOsNotification(
   body: string,
   sessionId: string | null | undefined,
   kind: NotificationKind,
+  requestId?: string | null,
 ): Promise<void> {
   try {
     await invoke("notifications_send", {
@@ -355,6 +366,8 @@ async function emitOsNotification(
         body,
         sessionId: sessionId ?? null,
         kind,
+        // Present ⇒ the native layer attaches Allow/Deny actions (macOS).
+        requestId: requestId ?? null,
       },
     });
   } catch (e) {
@@ -395,13 +408,15 @@ function composeNotification(
   harness: AgentKind,
   verb: "needs you" | "finished" | "errored",
 ): { title: string; body: string } {
+  const body = `${kindDisplayLabel(harness)} ${verb}.`;
+  return { title: projectLabel(sessionId), body };
+}
+
+/** `"<sigil> <projectName>"`, with either side dropped if unresolvable. */
+function projectLabel(sessionId: string): string {
   const slug = terminalStore.byId[sessionId]?.project_slug ?? null;
   const project = slug ? (projectBySlug().get(slug) ?? null) : null;
-  const sigil = project?.sigil ?? "";
-  const name = project?.name ?? "";
-  const title = [sigil, name].filter(Boolean).join(" ");
-  const body = `${kindDisplayLabel(harness)} ${verb}.`;
-  return { title, body };
+  return [project?.sigil ?? "", project?.name ?? ""].filter(Boolean).join(" ");
 }
 
 async function playSound(path: string): Promise<void> {
@@ -585,11 +600,18 @@ function handleAgentStateChanged(payload: AgentStateChangedPayload): void {
   // one anyway — returning here changes nothing for it.)
   if (payload.seeded) return;
 
-  // A session leaving `waiting` means any open permission requests it owned
-  // have been resolved (possibly outside raum, e.g. answered in the TUI).
-  // Drop them so the Critical badge count stays accurate.
+  // A session leaving `waiting` means the harness is running again, so the
+  // sticky "needs input" banner has served its purpose — dismiss it.
+  //
+  // Deliberately NOT dropping the in-memory entries: the session state is
+  // per-session, the requests are per-request. One reply (or a TUI answer)
+  // demotes the session while sibling requests can still be parked and
+  // blocking the harness; discarding them here would hide a live prompt
+  // from the Critical badge entirely. Each entry is cleared by its own
+  // authority instead — a successful reply, or the socket sweeper's
+  // `permission-expired`.
   if (payload.from === "waiting" && payload.to !== "waiting") {
-    clearPendingPermissionsForSession(sessionId);
+    void clearOsNotifications(sessionId, ["needs_input"]);
   }
 
   if (payload.to === "completed" || payload.to === "errored") {
@@ -604,6 +626,26 @@ function handleAgentStateChanged(payload: AgentStateChangedPayload): void {
   // PermissionRequest just ran `dispatchPermissionNotification` in the
   // same ~ms.
   void dispatchWaitingNotification(sessionId, payload.harness);
+}
+
+interface PermissionExpiredPayload {
+  session_id: string | null;
+  permission_key: string;
+}
+
+/**
+ * Socket-server GC signal: a parked permission request expired unanswered
+ * (the hook script gave up and let the harness prompt natively, or died).
+ * Drop the stale pending key so the Critical badge doesn't count a prompt
+ * that no longer exists, and dismiss the OS banner — it carries live
+ * Allow/Deny actions, so leaving it in Notification Center leaves an armed
+ * trigger for a request nothing is parked on any more. Session+kind is the
+ * only dismissal granularity the OS layer offers.
+ */
+function handlePermissionExpired(payload: PermissionExpiredPayload): void {
+  if (!payload.permission_key) return;
+  clearPendingPermission(payload.permission_key);
+  if (payload.session_id) void clearOsNotifications(payload.session_id, ["needs_input"]);
 }
 
 interface NotificationClickedPayload {
@@ -650,16 +692,12 @@ export async function startNotificationCenter(): Promise<UnlistenFn> {
     void dispatchPermissionNotification(ev.payload);
   });
 
-  // Socket-server GC signal: a parked permission request expired unanswered
-  // (the hook script timed out to "ask" or died). Drop the stale pending
-  // key so the Critical badge doesn't count a prompt that no longer exists.
-  const unlistenPermissionExpired = await listen<{
-    session_id: string | null;
-    permission_key: string;
-  }>("permission-expired", (ev) => {
-    if (!ev.payload.permission_key) return;
-    clearPendingPermission(ev.payload.permission_key);
-  });
+  const unlistenPermissionExpired = await listen<PermissionExpiredPayload>(
+    "permission-expired",
+    (ev) => {
+      handlePermissionExpired(ev.payload);
+    },
+  );
 
   // §11.6 — click-to-focus. The Rust `UNUserNotificationCenterDelegate`
   // emits `notifications:clicked` with `{ sessionId }` when the user taps
@@ -732,7 +770,14 @@ export async function startNotificationCenter(): Promise<UnlistenFn> {
  */
 async function dispatchPermissionNotification(payload: NotificationEventPayload): Promise<void> {
   if (!payload.permission_key) return;
-  const isNew = addPendingPermission(payload.permission_key, payload.session_id ?? null);
+  const isNew = addPendingPermission({
+    permissionKey: payload.permission_key,
+    sessionId: payload.session_id ?? null,
+    requestId: payload.request_id ?? null,
+    harness: payload.harness,
+    receivedAt: Date.now(),
+    payload: payload.payload ?? null,
+  });
   // Badge/pending counters are updated above regardless. The rest of
   // this function only runs when the permission key is new AND the
   // session hasn't already notified within `NOTIFY_DEDUP_MS` (prevents
@@ -742,8 +787,13 @@ async function dispatchPermissionNotification(payload: NotificationEventPayload)
   const sessionId = payload.session_id ?? "";
   if (sessionId && shouldDedupNotify(sessionId, Date.now())) return;
 
-  const title = "Permission requested";
-  const summary = permissionSummaryFor(payload);
+  // Title carries project identity + which harness is asking; body is the
+  // one-line subject ("rm -rf node_modules"), same string the rail shows.
+  const { tool, head } = permissionSummary(payload.harness, payload.payload);
+  const title = [projectLabel(sessionId), kindDisplayLabel(payload.harness)]
+    .filter(Boolean)
+    .join(" · ");
+  const summary = head || tool;
 
   void playWaitingSound();
 
@@ -758,17 +808,13 @@ async function dispatchPermissionNotification(payload: NotificationEventPayload)
   // keeps the badge accurate either way. See `windowFocused`.
   if (windowFocused()) return;
 
-  await emitOsNotification(title, summary, sessionId || null, "needs_input");
-}
-
-function permissionSummaryFor(payload: NotificationEventPayload): string {
-  const harnessName = kindDisplayLabel(payload.harness);
-  const p = payload.payload as Record<string, unknown> | null | undefined;
-  if (p && typeof p === "object") {
-    const tool = typeof p.tool_name === "string" ? p.tool_name : null;
-    if (tool) return `${harnessName} needs permission for ${tool}.`;
-  }
-  return `${harnessName} needs permission.`;
+  await emitOsNotification(
+    title,
+    summary,
+    sessionId || null,
+    "needs_input",
+    payload.request_id ?? null,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -804,9 +850,7 @@ export function __resetNotificationCenterForTests(): void {
   setNotificationDevMode(false);
   setNotificationStateNote(null);
   lastBadgeCount = -1;
-  pendingPermissionKeys.clear();
-  pendingPermissionSessions.clear();
-  setPendingPermissionCount(0);
+  setPendingPermissions([]);
   setBadgeMode("all_unread");
   setNotifyOnWaiting(true);
   setNotifyOnDone(true);
@@ -834,6 +878,11 @@ export async function __handleNotificationEventForTests(
 /** @internal — clear every pending permission owned by `sessionId`. */
 export function __handleSessionRemovedForTests(sessionId: string): void {
   clearPendingPermissionsForSession(sessionId);
+}
+
+/** @internal — drive the socket sweeper's expiry handler from tests. */
+export function __handlePermissionExpiredForTests(payload: PermissionExpiredPayload): void {
+  handlePermissionExpired(payload);
 }
 
 /** @internal — mark a pending permission as cleared for tests. */

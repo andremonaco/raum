@@ -5,12 +5,14 @@
 //! own TUI:
 //!
 //! * Claude Code → synchronous hook response (Phase 2).
-//! * OpenCode → HTTP `POST /session/:sid/permissions/:pid` (Phase 4).
-//! * Codex → no replier today; observation-only (Phase 3).
+//! * OpenCode → HTTP `POST /permission/:requestID/reply` (Phase 4).
+//! * Codex → synchronous hook response, same as Claude Code.
 //!
-//! Absence of a replier means "observation only" for that harness — the UI
-//! surfaces a notification without action buttons, and the user answers
-//! inside the harness's own TUI.
+//! Claude Code and Codex answer through the blocking hook script parked on
+//! the raum-hooks event socket rather than through a [`PermissionReplier`],
+//! so no replier is registered for them. Absence of *both* transports means
+//! "observation only" — the UI surfaces a notification without action
+//! buttons and the user answers inside the harness's own TUI.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

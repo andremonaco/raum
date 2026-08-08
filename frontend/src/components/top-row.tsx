@@ -581,14 +581,18 @@ export const TopRow: Component = () => {
     const t = setInterval(() => setNowSec(Math.floor(Date.now() / 1000)), 5000);
     onCleanup(() => clearInterval(t));
   });
-  const orphanedSessions = createMemo<TerminalRecord[]>(() => {
+  // Two memos on purpose: the scan + sort depends only on the session set and
+  // the placement index, while the grace cutoff moves every 5 s tick. Folding
+  // them together re-sorted every session on every tick for nothing.
+  const unplacedSessions = createMemo<TerminalRecord[]>(() => {
     const placed = placedSessionIds();
-    const cutoff = nowSec() - ORPHAN_GRACE_SECS;
     return Object.values(terminalStore.byId)
-      .filter(
-        (t) => !placed.has(t.session_id) && (t.created_unix === 0 || t.created_unix <= cutoff),
-      )
+      .filter((t) => !placed.has(t.session_id))
       .sort((a, b) => a.created_unix - b.created_unix);
+  });
+  const orphanedSessions = createMemo<TerminalRecord[]>(() => {
+    const cutoff = nowSec() - ORPHAN_GRACE_SECS;
+    return unplacedSessions().filter((t) => t.created_unix === 0 || t.created_unix <= cutoff);
   });
 
   async function closeOrphan(sessionId: string): Promise<void> {

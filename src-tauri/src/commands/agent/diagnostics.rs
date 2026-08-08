@@ -25,7 +25,7 @@ use crate::state::AppHandleState;
 /// triad lets the UI spot each common failure mode (no socat / missing
 /// script / env var never exported / harness started before config
 /// install).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 pub struct HooksDiagnostics {
     pub socket_bound: bool,
     pub socket_path: Option<String>,
@@ -103,8 +103,23 @@ fn script_status(harness: &str, hooks_dir: &std::path::Path) -> HookScriptStatus
     }
 }
 
+/// Stats several hook scripts and probes each transport (both filesystem +
+/// subprocess work), so it runs on the blocking pool rather than inline on the
+/// main thread.
 #[tauri::command]
-pub fn hooks_diagnostics(state: tauri::State<'_, AppHandleState>) -> HooksDiagnostics {
+pub async fn hooks_diagnostics(app: AppHandle) -> HooksDiagnostics {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppHandleState>();
+        hooks_diagnostics_inner(&state)
+    })
+    .await
+    .unwrap_or_else(|e| {
+        warn!(error = %e, "hooks_diagnostics: blocking task failed");
+        HooksDiagnostics::default()
+    })
+}
+
+fn hooks_diagnostics_inner(state: &AppHandleState) -> HooksDiagnostics {
     let (socket_bound, socket_path) = match state.event_socket.lock() {
         Ok(g) => match g.as_ref() {
             Some(h) => (true, Some(h.path.to_string_lossy().into_owned())),

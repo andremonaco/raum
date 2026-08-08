@@ -34,13 +34,15 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use raum_core::agent::AgentKind;
 use raum_core::harness::channel::NotificationChannel;
 use raum_core::harness::event::NotificationEvent;
 use raum_core::harness::reply::{Decision, PermissionReplier, ReplyError};
 use raum_core::harness::setup::{
-    ScanReport, SetupContext, SetupError, SetupExecutor, SetupPlan, SetupReport,
+    RUNTIME_CACHE_TTL, ScanReport, SetupContext, SetupError, SetupExecutor, SetupPlan, SetupReport,
+    which_cached,
 };
 use raum_core::harness::traits::{HarnessRuntime, NotificationSetup, SessionSpec};
 use raum_core::harness::{ClaudeCodeAdapter, CodexAdapter, OpenCodeAdapter};
@@ -59,6 +61,12 @@ pub struct HarnessRuntimeRegistry {
     codex: Arc<CodexAdapter>,
     /// Per-session state — channels' cancel tokens + repliers.
     sessions: Arc<Mutex<HashMap<String, SessionRuntime>>>,
+    /// `scan()` memo keyed by (kind, context paths), valid for
+    /// [`RUNTIME_CACHE_TTL`]. Every pane spawn scans, and a scan re-reads +
+    /// re-parses each harness's managed config; those files are raum-written
+    /// and any raum-side write invalidates via [`Self::invalidate_scan_cache`].
+    // ponytail: 30s TTL cache; event-invalidated cache if staleness ever bites
+    scans: Arc<Mutex<HashMap<String, (Instant, ScanReport)>>>,
 }
 
 impl std::fmt::Debug for HarnessRuntimeRegistry {
@@ -79,6 +87,7 @@ impl Default for HarnessRuntimeRegistry {
             opencode: Arc::new(OpenCodeAdapter::new()),
             codex: Arc::new(CodexAdapter::new()),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            scans: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -88,7 +97,8 @@ pub struct SessionRuntime {
     pub kind: AgentKind,
     /// Cancel tokens for every spawned channel (one per channel).
     pub cancel: CancellationToken,
-    /// Replier handle. `None` for observation-only harnesses (Codex).
+    /// Replier handle. `None` for the hook-script harnesses (Claude Code,
+    /// Codex), which answer over the raum-hooks event socket instead.
     pub replier: Option<Arc<dyn PermissionReplier>>,
     /// Keep join-handles out of the public surface; hold them so
     /// abort-on-drop semantics fire when the registry entry is removed.
@@ -127,8 +137,34 @@ impl HarnessRuntimeRegistry {
     /// config file for `kind` without spawning subprocesses or writing
     /// anything. Shell has no setup to scan so it returns a synthetic
     /// "ready" report.
+    ///
+    /// Memoized for [`RUNTIME_CACHE_TTL`] — see the `scans` field.
     #[must_use]
     pub fn scan(&self, kind: AgentKind, ctx: &SetupContext) -> ScanReport {
+        let key = scan_cache_key(kind, ctx);
+        let now = Instant::now();
+        if let Ok(g) = self.scans.lock()
+            && let Some((at, report)) = g.get(&key)
+            && now.duration_since(*at) < RUNTIME_CACHE_TTL
+        {
+            return report.clone();
+        }
+        let report = self.scan_uncached(kind, ctx);
+        if let Ok(mut g) = self.scans.lock() {
+            g.insert(key, (now, report.clone()));
+        }
+        report
+    }
+
+    /// Drop every memoized scan. Called after anything raum does that can
+    /// change a managed config file on disk, so the next scan reflects it.
+    pub fn invalidate_scan_cache(&self) {
+        if let Ok(mut g) = self.scans.lock() {
+            g.clear();
+        }
+    }
+
+    fn scan_uncached(&self, kind: AgentKind, ctx: &SetupContext) -> ScanReport {
         match kind {
             AgentKind::ClaudeCode => self.claude_code.scan(ctx),
             AgentKind::Codex => self.codex.scan(ctx),
@@ -136,7 +172,7 @@ impl HarnessRuntimeRegistry {
             AgentKind::Shell => ScanReport {
                 harness: AgentKind::Shell,
                 binary: "sh".into(),
-                binary_on_path: which::which("sh").is_ok(),
+                binary_on_path: which_cached("sh"),
                 raum_hooks_installed: true,
                 config_paths: Vec::new(),
                 reason_if_not_installed: None,
@@ -156,7 +192,11 @@ impl HarnessRuntimeRegistry {
         ctx: &SetupContext,
     ) -> Result<SetupReport, SetupError> {
         let plan = self.plan(kind, ctx).await?;
-        Ok(SetupExecutor::new().apply(&plan))
+        let report = tokio::task::spawn_blocking(move || SetupExecutor::new().apply(&plan))
+            .await
+            .map_err(|e| SetupError::Planner(format!("setup apply task failed: {e}")))?;
+        self.invalidate_scan_cache();
+        Ok(report)
     }
 
     /// Run the harness-specific selftest and return its report.
@@ -241,6 +281,19 @@ impl HarnessRuntimeRegistry {
             entry.cancel.cancel();
         }
     }
+}
+
+/// Memo key for [`HarnessRuntimeRegistry::scan`]: every context field a
+/// `scan` actually reads off disk. Missing one here means two different
+/// projects share a cached install-state.
+fn scan_cache_key(kind: AgentKind, ctx: &SetupContext) -> String {
+    format!(
+        "{kind:?}\u{1}{}\u{1}{}\u{1}{}\u{1}{}",
+        ctx.hooks_dir.display(),
+        ctx.event_socket_path.display(),
+        ctx.project_dir.display(),
+        ctx.home_dir.display(),
+    )
 }
 
 /// Run a single channel's task. Translates `NotificationEvent`s from
@@ -356,6 +409,27 @@ mod tests {
         assert_eq!(harness_wire_name(AgentKind::Codex), "codex");
         assert_eq!(harness_wire_name(AgentKind::OpenCode), "opencode");
         assert_eq!(harness_wire_name(AgentKind::Shell), "shell");
+    }
+
+    #[test]
+    fn scan_cache_key_separates_kind_and_project() {
+        use std::path::PathBuf;
+        let base = SetupContext::new(PathBuf::from("/h"), PathBuf::from("/s"), "slug")
+            .with_home_dir(PathBuf::from("/home/u"));
+        let a = base.clone().with_project_dir(PathBuf::from("/p/a"));
+        let b = base.clone().with_project_dir(PathBuf::from("/p/b"));
+        assert_ne!(
+            scan_cache_key(AgentKind::ClaudeCode, &a),
+            scan_cache_key(AgentKind::ClaudeCode, &b),
+        );
+        assert_ne!(
+            scan_cache_key(AgentKind::ClaudeCode, &a),
+            scan_cache_key(AgentKind::Codex, &a),
+        );
+        assert_eq!(
+            scan_cache_key(AgentKind::ClaudeCode, &a),
+            scan_cache_key(AgentKind::ClaudeCode, &a.clone()),
+        );
     }
 
     #[test]

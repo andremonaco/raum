@@ -2,11 +2,12 @@
 //!
 //! - `project_find_files` / `search_files_in_path` walk a directory honoring
 //!   `.gitignore` and return ranked filename matches.
-//! - `terminal_capture_text` hands the frontend the plain-text contents of
-//!   every live tmux pane so the scrollback walk can include content that
-//!   xterm.js has already lost — notably harness TUIs that live in
-//!   alternate-screen (which has no scrollback) while their history is kept
-//!   only in tmux's `history-limit`.
+//! - `terminal_capture_text` reaches into every live tmux pane so the
+//!   scrollback walk can include content that xterm.js has already lost —
+//!   notably harness TUIs that live in alternate-screen (which has no
+//!   scrollback) while their history is kept only in tmux's `history-limit`.
+//!   With a `query` it greps server-side and ships only matching lines; without
+//!   one it returns the raw capture (used by the pane backfill path).
 
 use std::path::{Path, PathBuf};
 
@@ -34,6 +35,12 @@ pub struct FileHit {
 /// Upper bound on results. Keeps render cheap and the IPC payload small.
 const MAX_HITS: usize = 200;
 
+/// Upper bound on directory entries visited per walk. [`MAX_HITS`] alone only
+/// bounds *matches*, so a query that matches nothing (or almost nothing) would
+/// still stat every file in a huge tree. This caps the work regardless of hit
+/// rate; a truncated walk just returns fewer results.
+const MAX_ENTRIES_VISITED: usize = 50_000;
+
 /// Pure search helper — walks `root` honoring `.gitignore` and returns ranked
 /// hits for `query`. Split from the command so tests don't need a populated
 /// `ConfigStore`.
@@ -53,8 +60,8 @@ pub fn find_files_in(root: &Path, query: &str) -> Vec<FileHit> {
         .follow_links(false)
         .build();
 
-    for dent in walker {
-        if hits.len() >= MAX_HITS {
+    for (visited, dent) in walker.enumerate() {
+        if hits.len() >= MAX_HITS || visited >= MAX_ENTRIES_VISITED {
             break;
         }
         let dent = match dent {
@@ -107,47 +114,124 @@ pub fn find_files_in(root: &Path, query: &str) -> Vec<FileHit> {
 /// basename exact > basename prefix > basename contains > full-path contains,
 /// then prefers shorter relative paths.
 #[tauri::command]
-pub fn project_find_files(project_slug: String, query: String) -> Result<Vec<FileHit>, String> {
-    let store = ConfigStore::default();
-    let project = store
-        .read_project(&project_slug)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("project '{project_slug}' not found"))?;
+pub async fn project_find_files(
+    project_slug: String,
+    query: String,
+) -> Result<Vec<FileHit>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = ConfigStore::default();
+        let project = store
+            .read_project(&project_slug)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("project '{project_slug}' not found"))?;
 
-    let root: PathBuf = project.root_path;
-    if !root.is_dir() {
-        return Err(format!(
-            "project root is not a directory: {}",
-            root.display()
-        ));
-    }
-    Ok(find_files_in(&root, &query))
+        let root: PathBuf = project.root_path;
+        if !root.is_dir() {
+            return Err(format!(
+                "project root is not a directory: {}",
+                root.display()
+            ));
+        }
+        Ok(find_files_in(&root, &query))
+    })
+    .await
+    .map_err(|e| format!("project_find_files join: {e}"))?
 }
 
 /// Search files under an arbitrary directory path. Used by the frontend to
 /// search each git worktree independently when the project has multiple
 /// worktrees checked out at different paths.
 #[tauri::command]
-pub fn search_files_in_path(path: String, query: String) -> Result<Vec<FileHit>, String> {
-    let root = PathBuf::from(&path);
-    if !root.is_dir() {
-        return Err(format!("not a directory: {}", root.display()));
-    }
-    Ok(find_files_in(&root, &query))
+pub async fn search_files_in_path(path: String, query: String) -> Result<Vec<FileHit>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = PathBuf::from(&path);
+        if !root.is_dir() {
+            return Err(format!("not a directory: {}", root.display()));
+        }
+        Ok(find_files_in(&root, &query))
+    })
+    .await
+    .map_err(|e| format!("search_files_in_path join: {e}"))?
 }
 
 /// Plain-text scrollback for one tmux session. Fields are already UTF-8 and
-/// free of ANSI escapes, so the frontend can split on `\n` and run its
-/// matcher directly.
+/// free of ANSI escapes, so the frontend can split on `\n` directly.
+///
+/// When the request carried a `query`, `normal`/`alternate` are left empty and
+/// only `matches` is populated — a 100k-line capture per pane per keystroke is
+/// far too much to serialise through IPC just to run `indexOf` in JS.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PaneTextHit {
     /// The tmux session id the capture came from.
     pub session_id: String,
-    /// Full normal-buffer history as plain text.
+    /// Full normal-buffer history as plain text. Empty when `query` was given.
     pub normal: String,
     /// Current alternate-screen frame as plain text, when one is active.
+    /// `None` when `query` was given.
     pub alternate: Option<String>,
+    /// Server-side grep results. Empty when no `query` was given.
+    pub matches: Vec<PaneLineMatch>,
+}
+
+/// One matching scrollback line. `col`/`length` are UTF-16 code-unit offsets so
+/// the frontend can slice `line` with them directly.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaneLineMatch {
+    /// Index of the line within its capture, counting from the top.
+    pub row: usize,
+    pub col: usize,
+    pub length: usize,
+    pub line: String,
+    /// `"tmux-history"` (normal buffer) or `"tmux-live"` (alt-screen frame).
+    pub buffer: &'static str,
+}
+
+/// Hard cap per pane, mirroring the frontend's own per-session cap: once eight
+/// lines match there is nothing to gain from scanning further back.
+const MAX_MATCHES_PER_SESSION: usize = 8;
+
+/// How far back from the newest line we grep. Recent output is what a ⌘F is
+/// nearly always after.
+// ponytail: `capture_pane_text` still asks tmux for the whole `-S -` history;
+// bounding it needs a line-count parameter on `TmuxManager::capture_pane_text`.
+const MAX_SCAN_LINES: usize = 10_000;
+
+/// Newest-first substring grep, appending into `out` until the per-session cap
+/// is hit. `needle_lc` must be ASCII-lowercased already.
+fn grep_capture(text: &str, needle_lc: &str, buffer: &'static str, out: &mut Vec<PaneLineMatch>) {
+    let lines: Vec<&str> = text.lines().collect();
+    let stop_at = lines.len().saturating_sub(MAX_SCAN_LINES);
+    let length = needle_lc.encode_utf16().count();
+    for row in (stop_at..lines.len()).rev() {
+        if out.len() >= MAX_MATCHES_PER_SESSION {
+            return;
+        }
+        let line = lines[row];
+        // ponytail: ASCII-only case folding, so byte offsets in the folded line
+        // still index the original. Full `to_lowercase` can change byte lengths
+        // and would need an index remap; needles here are ~always ASCII.
+        let hay = line.to_ascii_lowercase();
+        let mut from = 0usize;
+        while let Some(at) = hay[from..].find(needle_lc) {
+            let byte = from + at;
+            out.push(PaneLineMatch {
+                row,
+                col: line[..byte].encode_utf16().count(),
+                length,
+                line: line.to_string(),
+                buffer,
+            });
+            if out.len() >= MAX_MATCHES_PER_SESSION {
+                return;
+            }
+            from = byte + needle_lc.len();
+            if from >= hay.len() {
+                break;
+            }
+        }
+    }
 }
 
 /// Capture plain-text scrollback for a batch of tmux sessions. Each id is
@@ -155,25 +239,47 @@ pub struct PaneTextHit {
 /// doesn't serialise the whole batch; ids that error out (stale session,
 /// killed pane, socket gone) are dropped silently rather than failing the
 /// request — the frontend just won't see a result for them.
+///
+/// Pass `query` to grep in-process and get back only matching lines; omit it to
+/// get the raw capture text.
 #[tauri::command]
 pub async fn terminal_capture_text(
     session_ids: Vec<String>,
+    query: Option<String>,
     state: tauri::State<'_, AppHandleState>,
 ) -> Result<Vec<PaneTextHit>, String> {
     if session_ids.is_empty() {
         return Ok(Vec::new());
     }
+    let needle = query
+        .map(|q| q.to_ascii_lowercase())
+        .filter(|q| !q.is_empty());
     let tmux = state.tmux.clone();
     let mut set: JoinSet<Option<PaneTextHit>> = JoinSet::new();
     for id in session_ids {
         let tmux = tmux.clone();
-        set.spawn_blocking(move || match tmux.capture_pane_text(&id) {
-            Ok(snap) => Some(PaneTextHit {
+        let needle = needle.clone();
+        set.spawn_blocking(move || {
+            let snap = tmux.capture_pane_text(&id).ok()?;
+            let Some(needle) = needle else {
+                return Some(PaneTextHit {
+                    session_id: id,
+                    normal: snap.normal,
+                    alternate: snap.alternate,
+                    matches: Vec::new(),
+                });
+            };
+            let mut matches = Vec::new();
+            grep_capture(&snap.normal, &needle, "tmux-history", &mut matches);
+            if let Some(alt) = &snap.alternate {
+                grep_capture(alt, &needle, "tmux-live", &mut matches);
+            }
+            Some(PaneTextHit {
                 session_id: id,
-                normal: snap.normal,
-                alternate: snap.alternate,
-            }),
-            Err(_) => None,
+                normal: String::new(),
+                alternate: None,
+                matches,
+            })
         });
     }
     let mut out = Vec::new();
@@ -230,6 +336,32 @@ mod tests {
         let names: Vec<_> = hits.iter().map(|h| h.name.as_str()).collect();
         assert!(names.contains(&"visible.rs"));
         assert!(!names.contains(&"ignored.rs"));
+    }
+
+    #[test]
+    fn grep_is_newest_first_case_insensitive_and_capped() {
+        let text = (0..20)
+            .map(|i| format!("line {i} ERROR here"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut out = Vec::new();
+        grep_capture(&text, "error", "tmux-history", &mut out);
+        assert_eq!(out.len(), MAX_MATCHES_PER_SESSION);
+        assert_eq!(out[0].row, 19, "newest line first");
+        assert_eq!(out[0].col, 8);
+        assert_eq!(out[0].length, 5);
+        assert_eq!(out[0].buffer, "tmux-history");
+    }
+
+    #[test]
+    fn grep_reports_utf16_columns_and_all_hits_per_line() {
+        // "über " is 5 UTF-16 units but 6 bytes — col must be the former so the
+        // frontend's `line.slice(col, col + length)` lands on the match.
+        let mut out = Vec::new();
+        grep_capture("über ab ab", "ab", "tmux-live", &mut out);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].col, 5);
+        assert_eq!(out[1].col, 8);
     }
 
     #[test]

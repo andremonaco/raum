@@ -84,7 +84,14 @@ impl PtyBridgeHandle {
     /// Holds a brief mutex around the blocking write; pty writes are typically
     /// non-blocking because the slave is always being read.
     pub fn write_input(&self, bytes: &[u8]) -> std::io::Result<()> {
-        let mut w = self.inner.writer.lock().expect("pty writer poisoned");
+        // A poisoned writer mutex means another writer panicked mid-write.
+        // Surface it as a write error rather than panicking this thread too —
+        // `kill` and the `Drop` impl already degrade the same way.
+        let mut w = self
+            .inner
+            .writer
+            .lock()
+            .map_err(|_| std::io::Error::other("pty writer mutex poisoned"))?;
         w.write_all(bytes)?;
         w.flush()
     }
@@ -93,7 +100,11 @@ impl PtyBridgeHandle {
     /// SIGWINCH handler, propagates a server-side pane resize, and the inner
     /// harness process receives its own SIGWINCH.
     pub fn resize(&self, cols: u16, rows: u16) -> Result<(), PtyBridgeError> {
-        let m = self.inner.master.lock().expect("pty master poisoned");
+        let m = self
+            .inner
+            .master
+            .lock()
+            .map_err(|_| PtyBridgeError::Resize("pty master mutex poisoned".into()))?;
         m.resize(PtySize {
             cols,
             rows,
@@ -109,8 +120,11 @@ impl PtyBridgeHandle {
     /// you need to tear the client down without notifying the frontend (e.g.
     /// during reattach or explicit pane close).
     pub fn kill(&self) {
-        let mut k = self.inner.killer.lock().expect("pty killer poisoned");
-        let _ = k.kill();
+        // Best-effort, like `ControlBridgeHandle::kill` and the `Drop` impl: a
+        // poisoned killer mutex must not panic a teardown path.
+        if let Ok(mut k) = self.inner.killer.lock() {
+            let _ = k.kill();
+        }
     }
 
     /// Tear the bridge down without firing the exit sink AND without leaking
@@ -319,7 +333,8 @@ pub fn attach_via_pty(
                                     if waited >= BLOCKED_SEND_WARN_MS {
                                         tracing::warn!(
                                             session_id = %reader_session,
-                                            waited_ms = waited as u64,
+                                            waited_ms = u64::try_from(waited)
+                                                .unwrap_or(u64::MAX),
                                             "pty bridge: reader blocked on send \
                                              (IPC drain bottleneck — tmux may \
                                               throttle this client)",
@@ -373,6 +388,10 @@ pub fn attach_via_pty(
     std::thread::Builder::new()
         .name(format!("raum-pty-waiter-{session_id}"))
         .spawn(move || {
+            // portable-pty reports the code as `u32`; the frontend's contract
+            // is an `i32` with `-1` for "unavailable". Real exit codes are
+            // 0-255 (or 128+signal), so the cast is only nominally lossy.
+            #[allow(clippy::cast_possible_truncation)]
             let exit = match child.wait() {
                 Ok(status) => status.exit_code() as i32,
                 Err(_) => -1,

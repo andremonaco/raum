@@ -67,7 +67,10 @@ pub struct StreamCoalescer {
 impl StreamCoalescer {
     pub fn new() -> Self {
         Self {
-            buf: Vec::with_capacity(FLUSH_BYTES * 2),
+            // Grows into whatever the pane actually produces and is then
+            // reused for the lifetime of the bridge (see `flush`), so a
+            // pre-allocation would only cost idle panes memory.
+            buf: Vec::new(),
             first_pending: None,
             last_byte: Instant::now(),
         }
@@ -75,6 +78,20 @@ impl StreamCoalescer {
 
     pub fn pending(&self) -> usize {
         self.buf.len()
+    }
+
+    /// The instant a pending batch becomes flushable — the earlier of the
+    /// quiet gap and the max-hold cap — or `None` when nothing is buffered.
+    /// Lets the drain loop sleep exactly to the deadline instead of polling.
+    fn flush_deadline(&self) -> Option<Instant> {
+        if self.buf.is_empty() {
+            return None;
+        }
+        let quiet = self.last_byte + Duration::from_millis(QUIET_MS);
+        let cap = self
+            .first_pending
+            .map(|t| t + Duration::from_millis(MAX_HOLD_MS));
+        Some(cap.map_or(quiet, |cap| cap.min(quiet)))
     }
 
     /// Append `chunk`, then flush if the buffer is at or above
@@ -156,12 +173,12 @@ impl StreamCoalescer {
     where
         F: FnMut(Vec<u8>) -> bool,
     {
-        let payload = std::mem::take(&mut self.buf);
-        // Re-arm with a fresh buffer at the standard capacity. `mem::take`
-        // leaves us with an empty `Vec` whose backing allocation is now
-        // owned by `payload`, so a plain re-init is the cheapest way to
-        // restore the pre-allocated capacity for the next batch.
-        self.buf = Vec::with_capacity(FLUSH_BYTES * 2);
+        // Copy out an exactly-sized payload and keep the accumulator's
+        // allocation. `mem::take` would hand the backing buffer to the
+        // payload and force a fresh (up to `FLUSH_BYTES`-sized) allocation
+        // on every single flush — hundreds per second on a busy pane.
+        let payload = self.buf.clone();
+        self.buf.clear();
         self.first_pending = None;
         sink(payload)
     }
@@ -184,31 +201,48 @@ pub fn drain_coalesced(
 ) {
     use std::sync::mpsc::RecvTimeoutError;
 
-    let mut sink = move |bytes: Vec<u8>| -> bool { on_data(bytes) };
+    // Re-borrow the boxed sink instead of wrapping it in another closure —
+    // `&mut dyn FnMut` is itself `FnMut`, so the coalescer calls through one
+    // indirection instead of two.
+    let mut sink = &mut *on_data;
     let mut coalescer = StreamCoalescer::new();
-    // Poll at the quiet-gap granularity (not MAX_HOLD_MS) so a burst that
-    // goes quiet gets flushed promptly instead of waiting for the max-hold
-    // cap to expire.
-    let timeout = Duration::from_millis(QUIET_MS);
     loop {
-        match data_rx.recv_timeout(timeout) {
-            Ok(chunk) => {
-                if !coalescer.feed(&chunk, &mut sink) {
-                    break;
-                }
-                if !coalescer.flush_if_due(&mut sink) {
-                    break;
+        // With nothing buffered there is no deadline to service, so block
+        // instead of polling: an idle pane costs zero wakeups rather than
+        // 1000/QUIET_MS per second. A pending batch waits exactly to its own
+        // flush deadline — one wakeup per batch, and max-hold is honoured to
+        // the millisecond instead of overshooting by up to a poll interval.
+        let chunk = match coalescer.flush_deadline() {
+            None => match data_rx.recv() {
+                Ok(chunk) => chunk,
+                // Disconnected with an empty buffer — nothing to flush.
+                Err(_) => break,
+            },
+            Some(deadline) => {
+                let wait = deadline.saturating_duration_since(Instant::now());
+                match data_rx.recv_timeout(wait) {
+                    Ok(chunk) => chunk,
+                    Err(RecvTimeoutError::Timeout) => {
+                        if !coalescer.flush_if_due(&mut sink) {
+                            break;
+                        }
+                        continue;
+                    }
+                    Err(RecvTimeoutError::Disconnected) => {
+                        let _ = coalescer.force_flush(&mut sink);
+                        break;
+                    }
                 }
             }
-            Err(RecvTimeoutError::Timeout) => {
-                if !coalescer.flush_if_due(&mut sink) {
-                    break;
-                }
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                let _ = coalescer.force_flush(&mut sink);
-                break;
-            }
+        };
+        // One clock read per iteration, shared by the feed and the due check
+        // (they measure the same instant anyway).
+        let now = Instant::now();
+        if !coalescer.feed_at(&chunk, now, &mut sink) {
+            break;
+        }
+        if !coalescer.flush_if_due_at(now, &mut sink) {
+            break;
         }
     }
 }
@@ -260,6 +294,24 @@ mod tests {
     /// directions (and pass without exercising the branch they named).
     fn at(t0: Instant, ms: u64) -> Instant {
         t0 + Duration::from_millis(ms)
+    }
+
+    #[test]
+    fn flush_deadline_tracks_the_earlier_of_quiet_gap_and_max_hold() {
+        let out = RefCell::new(Vec::new());
+        let mut sink = collect_sink(&out);
+        let mut c = StreamCoalescer::new();
+        assert_eq!(c.flush_deadline(), None, "idle: nothing to wait for");
+        let t0 = Instant::now();
+        c.feed_at(b"a", t0, &mut sink);
+        // Fresh batch: the quiet gap is the nearer deadline.
+        assert_eq!(c.flush_deadline(), Some(at(t0, QUIET_MS)));
+        // Kept fed past MAX_HOLD - QUIET: the cap becomes the nearer one, so
+        // the drain loop can't sleep past it.
+        c.feed_at(b"b", at(t0, MAX_HOLD_MS - 1), &mut sink);
+        assert_eq!(c.flush_deadline(), Some(at(t0, MAX_HOLD_MS)));
+        c.force_flush(&mut sink);
+        assert_eq!(c.flush_deadline(), None, "drained: back to blocking recv");
     }
 
     #[test]

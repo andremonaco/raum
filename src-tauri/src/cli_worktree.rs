@@ -11,7 +11,6 @@
 //! Runs as a short-lived process and exits; it never boots the GUI.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use raum_core::config::{
     NESTED_PATH_PATTERN, PathStrategy, ProjectConfig, SIBLING_GROUP_PATH_PATTERN, WorktreeConfig,
@@ -234,7 +233,7 @@ fn resolve_project(
 /// The main repo's working-tree root (resolves correctly from inside a worktree
 /// via `--git-common-dir`).
 fn current_repo_root() -> Option<PathBuf> {
-    let out = Command::new("git")
+    let out = crate::git::git_bare()
         .args(["rev-parse", "--git-common-dir"])
         .output()
         .ok()?;

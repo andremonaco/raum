@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { activeProjectSlug } from "../stores/projectStore";
 import {
   setTerminalPaneContexts,
   terminalStore,
@@ -7,9 +8,18 @@ import {
 
 const SHELL_CONTEXT_POLL_MS = 2_000;
 
+/** Shells of the ACTIVE project only — the labels of a backgrounded project's
+ *  shells are off screen, and each id costs a tmux round-trip per tick
+ *  (live-watch is active-project-scoped app-wide). Project-less shells stay
+ *  included: nothing else would ever refresh them. */
 function shellSessionIds(): string[] {
+  const slug = activeProjectSlug();
   return Object.values(terminalStore.byId)
-    .filter((terminal) => terminal.kind === "shell")
+    .filter(
+      (terminal) =>
+        terminal.kind === "shell" &&
+        (terminal.project_slug === null || terminal.project_slug === slug),
+    )
     .map((terminal) => terminal.session_id);
 }
 
@@ -38,6 +48,9 @@ export function startShellContextPoller(): () => void {
 
   const tick = async (): Promise<void> => {
     if (stopped || inFlight) return;
+    // Nothing reads shell labels while the window is hidden, and the tick is a
+    // per-shell tmux round-trip — skip it and pick up on the next visible tick.
+    if (typeof document !== "undefined" && document.hidden) return;
     const sessionIds = shellSessionIds();
     if (sessionIds.length === 0) return;
 
@@ -66,8 +79,20 @@ export function startShellContextPoller(): () => void {
     void tick();
   }, SHELL_CONTEXT_POLL_MS);
 
+  // Refresh immediately on re-show so the labels aren't up to one poll window
+  // stale after the ticks that were skipped while hidden.
+  const onVisibilityChange = (): void => {
+    if (!document.hidden) void tick();
+  };
+  if (typeof document !== "undefined") {
+    document.addEventListener("visibilitychange", onVisibilityChange);
+  }
+
   return () => {
     stopped = true;
     window.clearInterval(timer);
+    if (typeof document !== "undefined") {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    }
   };
 }

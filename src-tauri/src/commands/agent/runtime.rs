@@ -11,7 +11,7 @@ use raum_core::agent_state::{
     AgentStateChanged, AgentStateMachine, HookEvent as CoreHookEvent, PromptEntry, PromptUpdated,
     extract_harness_session_id, extract_user_prompt,
 };
-use raum_core::harness::setup::SetupContext;
+use raum_core::harness::setup::{SetupContext, which_cached};
 use raum_core::harness::traits::SessionSpec;
 use raum_core::harness::{Reliability, decode_payload};
 use raum_core::paths;
@@ -348,7 +348,7 @@ pub fn ensure_bridge_running<R: Runtime>(app: &AppHandle<R>, bus: &AgentEventBus
                 Ok(change) => {
                     // Persist first so `agent_snapshot` / `agent_list`
                     // callers that race with the emit see the new state.
-                    persist_last_state(&app, &change);
+                    persist_last_state(&app, &change).await;
                     if let Err(e) = app.emit("agent-state-changed", &change) {
                         warn!(error=%e, "agent-state-changed emit failed");
                     }
@@ -364,7 +364,7 @@ pub fn ensure_bridge_running<R: Runtime>(app: &AppHandle<R>, bus: &AgentEventBus
         loop {
             match prompt_rx.recv().await {
                 Ok(update) => {
-                    persist_last_prompt(&prompt_app, &update);
+                    persist_last_prompt(&prompt_app, &update).await;
                     if let Err(e) = prompt_app.emit("pane:prompt-updated", &update) {
                         warn!(error=%e, "pane:prompt-updated emit failed");
                     }
@@ -387,6 +387,25 @@ pub fn ensure_bridge_running<R: Runtime>(app: &AppHandle<R>, bus: &AgentEventBus
 /// verify the binary exists and do a cheap on-disk scan so sessions with hooks
 /// missing can start in silence-fallback mode until the background refresh
 /// catches up.
+/// `spawn_blocking` wrapper around [`prepare_harness_launch_fast`] for the
+/// async spawn/reattach commands. The preflight resolves `$PATH` and reads
+/// each harness's managed config, so it must not run on a tokio worker —
+/// every pane spawn goes through here.
+pub async fn prepare_harness_launch_fast_async<R: Runtime>(
+    app: &AppHandle<R>,
+    harness: AgentKind,
+    project_slug: Option<String>,
+    project_dir: PathBuf,
+) -> Result<super::spawn::AgentSpawnReport, String> {
+    let app = app.clone();
+    tokio::task::spawn_blocking(move || {
+        let state: tauri::State<'_, AppHandleState> = app.state();
+        prepare_harness_launch_fast(&app, &state, harness, project_slug.as_deref(), project_dir)
+    })
+    .await
+    .map_err(|e| format!("harness preflight task failed: {e}"))?
+}
+
 pub fn prepare_harness_launch_fast<R: Runtime>(
     app: &AppHandle<R>,
     state: &AppHandleState,
@@ -406,7 +425,7 @@ pub fn prepare_harness_launch_fast<R: Runtime>(
             .ok_or_else(|| format!("no adapter registered for {:?}", harness))?
     };
 
-    if which::which(adapter.binary_path()).is_err() {
+    if !which_cached(adapter.binary_path()) {
         info!(
             binary = adapter.binary_path(),
             harness = ?harness,

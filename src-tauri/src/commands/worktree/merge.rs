@@ -2,7 +2,6 @@
 //! and the actual merge → optional cleanup state machine.
 
 use std::path::Path;
-use std::process::Command;
 
 use raum_hydration::{
     get_raum_base_branch, worktree_list as git_worktree_list,
@@ -20,6 +19,7 @@ use crate::commands::terminal::kill_session_inner;
 use crate::commands::worktree_progress::{
     ProgressEvent, StepStatus, emit_counter, emit_done, emit_failed, emit_step, emit_step_detail,
 };
+use crate::git::git_cmd;
 use crate::state::AppHandleState;
 
 /// Resolve the "sprouted-from" base branch for `source_branch` checked out at
@@ -37,10 +37,8 @@ fn resolve_target_branch(
         }
     }
     // Upstream of source — read via `git -C <source_path> rev-parse`.
-    let upstream = Command::new("git")
+    let upstream = git_cmd(source_path)
         .args([
-            "-C",
-            source_path,
             "rev-parse",
             "--abbrev-ref",
             "--symbolic-full-name",
@@ -79,10 +77,8 @@ fn worktree_path_for_branch(repo_root: &Path, branch: &str) -> Option<String> {
 /// We split on newlines and discard the first line (always a 40-char hex OID
 /// when output is non-empty).
 fn detect_conflicts(repo: &str, target: &str, source: &str) -> Result<Vec<String>, String> {
-    let out = Command::new("git")
+    let out = git_cmd(repo)
         .args([
-            "-C",
-            repo,
             "merge-tree",
             "--write-tree",
             "--name-only",
@@ -115,15 +111,8 @@ fn detect_conflicts(repo: &str, target: &str, source: &str) -> Result<Vec<String
 /// other direction is possible. Used to phrase the merge as "fast-forward" vs
 /// "merge commit".
 fn is_ancestor(repo: &str, ancestor: &str, descendant: &str) -> bool {
-    Command::new("git")
-        .args([
-            "-C",
-            repo,
-            "merge-base",
-            "--is-ancestor",
-            ancestor,
-            descendant,
-        ])
+    git_cmd(repo)
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
         .status()
         .is_ok_and(|s| s.success())
 }
@@ -428,17 +417,15 @@ pub async fn worktree_merge<R: tauri::Runtime>(
         let tb = target_branch.clone();
         let res = blocking("git merge", move || {
             let msg = format!("Merge branch '{sb}' into {tb}");
-            let out = Command::new("git")
-                .args(["-C", &tp, "merge", "--no-edit", "-m", &msg, &sb])
+            let out = git_cmd(&tp)
+                .args(["merge", "--no-edit", "-m", &msg, &sb])
                 .output()
                 .map_err(|e| format!("spawn git merge: {e}"))?;
             if out.status.success() {
                 return Ok::<(), String>(());
             }
             // Best-effort abort so we don't leave the target in a half-merged state.
-            let _ = Command::new("git")
-                .args(["-C", &tp, "merge", "--abort"])
-                .output();
+            let _ = git_cmd(&tp).args(["merge", "--abort"]).output();
             let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
             Err(if stderr.is_empty() {
                 "git merge failed".into()

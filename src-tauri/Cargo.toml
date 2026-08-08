@@ -58,6 +58,7 @@ objc2-foundation = { version = "0.3", features = [
     "NSArray",
     "NSDictionary",
     "NSError",
+    "NSSet",
     "NSString",
     "NSThread",
 ] }
@@ -65,6 +66,8 @@ objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSDockTile", "N
 objc2-user-notifications = { version = "0.3", features = [
     "block2",
     "UNNotification",
+    "UNNotificationAction",
+    "UNNotificationCategory",
     "UNNotificationContent",
     "UNNotificationRequest",
     "UNNotificationResponse",

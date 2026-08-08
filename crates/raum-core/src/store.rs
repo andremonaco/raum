@@ -4,8 +4,14 @@
 //! Every TOML in raum flows through this module: it guarantees atomic writes
 //! (temp-file + rename), 0700 tree perms on Unix, and a single schema version.
 
+use std::collections::HashMap;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime};
 
+use parking_lot::Mutex;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use thiserror::Error;
@@ -30,23 +36,68 @@ pub enum StoreError {
     InvalidSlug(String),
 }
 
+/// Stat fingerprint used to decide whether a cached parse is still valid.
+/// `mtime` alone can miss same-millisecond rewrites on coarse-granularity
+/// filesystems, so the length rides along as a cheap second signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    mtime: SystemTime,
+    len: u64,
+}
+
+impl FileStamp {
+    /// `None` when the file is absent or unstattable — the caller then
+    /// treats the cache as cold rather than guessing.
+    fn of(path: &Path) -> Option<Self> {
+        let meta = std::fs::metadata(path).ok()?;
+        Some(Self {
+            mtime: meta.modified().ok()?,
+            len: meta.len(),
+        })
+    }
+}
+
 #[derive(Debug)]
 pub struct ConfigStore {
     pub root: PathBuf,
+    /// Parsed `state/sessions.toml` keyed by the file's stat fingerprint.
+    ///
+    /// Every hook event fans out into several session accessors and each of
+    /// them used to re-read and re-parse the whole file. The cache collapses
+    /// that to one stat per call while staying honest about external edits:
+    /// the file-watcher, a hand-edit, or a second raum process all bump the
+    /// fingerprint, which forces a reparse. Lifecycle writes (anything that
+    /// changes the row *set*) stay synchronous and atomic — `sessions.toml`
+    /// is the recovery authority; the cache is refreshed *after* the rename
+    /// lands. Display-only field updates go through
+    /// [`ConfigStore::write_sessions_debounced`].
+    sessions_cache: Arc<Mutex<Option<(FileStamp, SessionState)>>>,
+    /// Display-only `sessions.toml` update awaiting its coalesced disk write.
+    sessions_pending: Arc<Mutex<PendingSessions>>,
+    /// Same stat-fingerprint deal for `config.toml` — read three times during
+    /// bootstrap and from ~10 frontend command handlers.
+    config_cache: Mutex<Option<(FileStamp, Config)>>,
+    /// …and for `projects/<slug>/project.toml`, keyed by slug (a project list
+    /// walks every slug, so a single-entry cache would just thrash).
+    project_cache: Mutex<HashMap<String, (FileStamp, ProjectConfig)>>,
 }
 
 impl Default for ConfigStore {
     fn default() -> Self {
-        Self {
-            root: paths::config_root(),
-        }
+        Self::new(paths::config_root())
     }
 }
 
 impl ConfigStore {
     #[must_use]
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            sessions_cache: Arc::new(Mutex::new(None)),
+            sessions_pending: Arc::new(Mutex::new(PendingSessions::default())),
+            config_cache: Mutex::new(None),
+            project_cache: Mutex::new(HashMap::new()),
+        }
     }
 
     // ---- directory bootstrap ------------------------------------------------
@@ -77,13 +128,21 @@ impl ConfigStore {
     // ---- config.toml --------------------------------------------------------
 
     pub fn read_config(&self) -> Result<Config, StoreError> {
-        let cfg: Config = read_toml_or_default(&self.config_path())?;
-        log_unknown_keys("config.toml", &cfg.unknown);
+        let path = self.config_path();
+        let (cfg, parsed) = read_cached_slot::<Config>(&path, &mut self.config_cache.lock())?;
+        if parsed {
+            log_unknown_keys("config.toml", &cfg.unknown);
+        }
         Ok(cfg)
     }
 
     pub fn write_config(&self, cfg: &Config) -> Result<(), StoreError> {
-        write_toml(&self.config_path(), cfg)
+        let path = self.config_path();
+        let mut cache = self.config_cache.lock();
+        *cache = None;
+        write_toml(&path, cfg)?;
+        *cache = FileStamp::of(&path).map(|stamp| (stamp, cfg.clone()));
+        Ok(())
     }
 
     fn config_path(&self) -> PathBuf {
@@ -95,12 +154,24 @@ impl ConfigStore {
     pub fn read_project(&self, slug: &str) -> Result<Option<ProjectConfig>, StoreError> {
         validate_slug(slug)?;
         let path = self.project_path(slug);
-        if !path.exists() {
+        let Some(stamp) = FileStamp::of(&path) else {
+            self.project_cache.lock().remove(slug);
             return Ok(None);
+        };
+        let mut cache = self.project_cache.lock();
+        if let Some((cached_stamp, cached)) = cache.get(slug)
+            && *cached_stamp == stamp
+        {
+            return Ok(Some(cached.clone()));
         }
         let raw = std::fs::read_to_string(&path)?;
         let project: ProjectConfig = toml::from_str(&raw)?;
         log_unknown_keys(&format!("projects/{slug}/project.toml"), &project.unknown);
+        // Only cache when the file didn't move under us mid-parse (see
+        // `read_cached_slot`).
+        if FileStamp::of(&path) == Some(stamp) {
+            cache.insert(slug.to_string(), (stamp, project.clone()));
+        }
         Ok(Some(project))
     }
 
@@ -108,7 +179,14 @@ impl ConfigStore {
         validate_slug(&project.slug)?;
         let dir = self.root.join("projects").join(&project.slug);
         ensure_dir_0700(&dir)?;
-        write_toml(&dir.join("project.toml"), project)
+        let path = dir.join("project.toml");
+        let mut cache = self.project_cache.lock();
+        cache.remove(&project.slug);
+        write_toml(&path, project)?;
+        if let Some(stamp) = FileStamp::of(&path) {
+            cache.insert(project.slug.clone(), (stamp, project.clone()));
+        }
+        Ok(())
     }
 
     pub fn list_project_slugs(&self) -> Result<Vec<String>, StoreError> {
@@ -132,6 +210,7 @@ impl ConfigStore {
     pub fn delete_project(&self, slug: &str) -> Result<(), StoreError> {
         validate_slug(slug)?;
         let dir = self.root.join("projects").join(slug);
+        self.project_cache.lock().remove(slug);
         if dir.exists() {
             std::fs::remove_dir_all(&dir)?;
         }
@@ -154,13 +233,90 @@ impl ConfigStore {
 
     // ---- state/sessions.toml ------------------------------------------------
 
-    pub fn read_sessions(&self) -> Result<SessionState, StoreError> {
-        read_toml_or_default(&self.root.join("state").join("sessions.toml"))
+    fn sessions_path(&self) -> PathBuf {
+        self.root.join("state").join("sessions.toml")
     }
 
+    /// Read `state/sessions.toml`, reusing the in-memory parse when the file
+    /// is byte-identical (same mtime + size) to the one we last saw. A
+    /// changed file — file-watcher reload, external edit, another raum
+    /// process — reparses.
+    pub fn read_sessions(&self) -> Result<SessionState, StoreError> {
+        read_cached_slot(&self.sessions_path(), &mut self.sessions_cache.lock())
+            .map(|(state, _parsed)| state)
+    }
+
+    /// Immediate, crash-consistent write. Use for every mutation that changes
+    /// the *set* of tracked rows (insert / remove / adopt) — that set is the
+    /// recovery authority and must never lag memory on disk.
+    ///
+    /// Discards any pending debounced write: `state` is always derived from
+    /// [`read_sessions`], which serves the cache, and the cache already
+    /// carries the pending edits. Writing the older pending value first would
+    /// only invert the on-disk ordering.
     pub fn write_sessions(&self, state: &SessionState) -> Result<(), StoreError> {
-        ensure_dir_0700(&self.root.join("state"))?;
-        write_toml(&self.root.join("state").join("sessions.toml"), state)
+        let mut pending = self.sessions_pending.lock();
+        pending.state = None;
+        pending.deadline = None;
+        write_sessions_to(&self.sessions_path(), &self.sessions_cache, state)
+    }
+
+    /// Cache-immediate, disk-deferred sibling of [`write_sessions`] for
+    /// display-only field updates on rows that already exist (`last_state`).
+    ///
+    /// The in-memory cache — which every reader goes through — is updated
+    /// now, so nothing ever observes a stale value. Only the atomic disk
+    /// write is coalesced into one per [`SESSIONS_DEBOUNCE`] quiet window,
+    /// which collapses a screenful of panes toggling Working/Waiting on every
+    /// tool call into a single serialize + fsync.
+    ///
+    /// Recovery *does* read `last_state` (`rehydrate_plan` seeds the state
+    /// machine from it), so the tail this can lose is not free — but it is
+    /// self-correcting as long as `last_state_acked` on disk never gets
+    /// *ahead* of it. `ack_session_last_state` writes the flag through
+    /// immediately, so `update_session_last_state` must too whenever it
+    /// clears an ack; only ack-neutral touches land here.
+    fn write_sessions_debounced(&self, state: &SessionState) -> Result<(), StoreError> {
+        let path = self.sessions_path();
+        // Lock order everywhere: `sessions_pending` before `sessions_cache`.
+        let mut pending = self.sessions_pending.lock();
+        let Some(stamp) = FileStamp::of(&path) else {
+            // No file on disk yet: there is no stamp to cache against, so a
+            // deferred write would leave readers seeing the absent-file
+            // default. Write it through.
+            return write_sessions_to(&path, &self.sessions_cache, state);
+        };
+        // Cached against the *current* (pre-flush) stamp, so an external edit
+        // still invalidates the entry exactly as it would without debouncing.
+        *self.sessions_cache.lock() = Some((stamp, state.clone()));
+        pending.state = Some(state.clone());
+        pending.deadline = Some(Instant::now() + SESSIONS_DEBOUNCE);
+        if pending.armed {
+            return Ok(());
+        }
+        pending.armed = true;
+        drop(pending);
+        spawn_sessions_flusher(
+            path,
+            Arc::clone(&self.sessions_cache),
+            Arc::clone(&self.sessions_pending),
+        );
+        Ok(())
+    }
+
+    /// Write any pending debounced `sessions.toml` update to disk right now.
+    /// Wired into the quit-flush path (Contract 1) so the final state
+    /// transitions before exit are never lost. Idempotent — a call with
+    /// nothing outstanding does no IO.
+    pub fn flush_sessions(&self) {
+        let mut pending = self.sessions_pending.lock();
+        pending.deadline = None;
+        let Some(state) = pending.state.take() else {
+            return;
+        };
+        if let Err(e) = write_sessions_to(&self.sessions_path(), &self.sessions_cache, &state) {
+            warn!(error = %e, "sessions.toml quit flush failed");
+        }
     }
 
     /// Upsert the last-known `AgentState` for `session_id`. If a tracked row
@@ -183,23 +339,36 @@ impl ConfigStore {
             // state yet, so clear any prior acknowledgment. Otherwise a
             // completion that later flips to working-then-done would inherit
             // the old "seen" flag and never re-surface in the rail.
-            row.last_state_acked = false;
-        } else {
-            st.sessions.push(TrackedSession {
-                session_id: session_id.to_string(),
-                project_slug: None,
-                worktree_id: None,
-                opencode_port: None,
-                kind: harness,
-                created_at_unix_ms: at_unix_ms,
-                last_state: Some(state),
-                last_state_at_unix_ms: Some(at_unix_ms),
-                last_state_acked: false,
-                last_prompt_text: None,
-                last_prompt_at_unix_ms: None,
-                harness_session_id: None,
-            });
+            let cleared_ack = std::mem::replace(&mut row.last_state_acked, false);
+            return if cleared_ack {
+                // The ack was written through immediately; deferring its
+                // clear would let a crash resurrect it on disk *without* the
+                // transition that invalidated it, permanently hiding the next
+                // completion from the attention rail. Ack flips are
+                // user-paced, so there is nothing worth coalescing here.
+                self.write_sessions(&st)
+            } else {
+                // Ack-neutral field touch on an existing row: display
+                // metadata, so the disk write is coalesced (see
+                // `write_sessions_debounced`).
+                self.write_sessions_debounced(&st)
+            };
         }
+        st.sessions.push(TrackedSession {
+            session_id: session_id.to_string(),
+            project_slug: None,
+            worktree_id: None,
+            opencode_port: None,
+            kind: harness,
+            created_at_unix_ms: at_unix_ms,
+            last_state: Some(state),
+            last_state_at_unix_ms: Some(at_unix_ms),
+            last_state_acked: false,
+            last_prompt_text: None,
+            last_prompt_at_unix_ms: None,
+            harness_session_id: None,
+        });
+        // Inserting a row changes the tracked *set* — write it through.
         self.write_sessions(&st)
     }
 
@@ -242,6 +411,12 @@ impl ConfigStore {
         };
         row.last_prompt_text = Some(text.to_string());
         row.last_prompt_at_unix_ms = Some(at_unix_ms);
+        // NOT debounced despite being a field-only update: `rehydrate_plan`
+        // reads `last_prompt_text` to decide Recover vs Forget after the tmux
+        // server dies, so losing the tail of this stream in a crash could
+        // downgrade a recoverable session to a forgotten one. It is also
+        // human-paced (one write per submitted prompt), so there is nothing
+        // to coalesce.
         self.write_sessions(&st)
     }
 
@@ -288,6 +463,9 @@ impl ConfigStore {
                 harness_session_id: Some(harness_session_id.to_string()),
             });
         }
+        // NOT debounced, same reason as `update_session_last_prompt`:
+        // `harness_session_id` is the primary Recover key in `rehydrate_plan`.
+        // Sticky once set, so this writes roughly once per session anyway.
         self.write_sessions(&st)
     }
 
@@ -360,39 +538,29 @@ impl ConfigStore {
         opencode_port: Option<u16>,
         created_at_unix_ms: u64,
     ) -> Result<(), StoreError> {
+        self.upsert_tracked_sessions(&[TrackedSessionUpsert {
+            session_id,
+            harness,
+            project_slug,
+            worktree_id,
+            opencode_port,
+            created_at_unix_ms,
+        }])
+    }
+
+    /// Batch [`upsert_tracked_session`]: identical write-once semantics per
+    /// row, but a single atomic write for the whole slice. Startup paths that
+    /// register N sessions used to rewrite the entire file N times.
+    pub fn upsert_tracked_sessions(
+        &self,
+        rows: &[TrackedSessionUpsert<'_>],
+    ) -> Result<(), StoreError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
         let mut st = self.read_sessions().unwrap_or_default();
-        if let Some(row) = st.sessions.iter_mut().find(|s| s.session_id == session_id) {
-            // Metadata is write-once. A later caller that only has `None`
-            // must never clobber an existing `Some`; a later caller with
-            // `Some` only wins if the current value is `None`.
-            if row.project_slug.is_none()
-                && let Some(slug) = project_slug
-            {
-                row.project_slug = Some(slug.to_string());
-            }
-            if row.worktree_id.is_none()
-                && let Some(wt) = worktree_id
-            {
-                row.worktree_id = Some(wt.to_string());
-            }
-            if row.opencode_port.is_none() {
-                row.opencode_port = opencode_port;
-            }
-        } else {
-            st.sessions.push(TrackedSession {
-                session_id: session_id.to_string(),
-                project_slug: project_slug.map(str::to_string),
-                worktree_id: worktree_id.map(str::to_string),
-                opencode_port,
-                kind: harness,
-                created_at_unix_ms,
-                last_state: None,
-                last_state_at_unix_ms: None,
-                last_state_acked: false,
-                last_prompt_text: None,
-                last_prompt_at_unix_ms: None,
-                harness_session_id: None,
-            });
+        for row in rows {
+            upsert_row(&mut st, row);
         }
         self.write_sessions(&st)
     }
@@ -401,9 +569,21 @@ impl ConfigStore {
     /// torn down so the next launch doesn't try to re-hydrate a state for a
     /// tmux window that no longer exists.
     pub fn forget_session(&self, session_id: &str) -> Result<(), StoreError> {
+        self.forget_sessions(std::slice::from_ref(&session_id))
+    }
+
+    /// Batch [`forget_session`] — one atomic write for the whole set instead
+    /// of one per id (boot rehydrate forgets every stale row at once).
+    pub fn forget_sessions(&self, session_ids: &[&str]) -> Result<(), StoreError> {
+        if session_ids.is_empty() {
+            return Ok(());
+        }
         let mut st = self.read_sessions().unwrap_or_default();
         let before = st.sessions.len();
-        st.sessions.retain(|s| s.session_id != session_id);
+        // ponytail: linear membership per row; both sides are tens of entries.
+        // Swap in a HashSet if sessions.toml ever grows past a few hundred.
+        st.sessions
+            .retain(|s| !session_ids.contains(&s.session_id.as_str()));
         if st.sessions.len() == before {
             return Ok(());
         }
@@ -484,6 +664,58 @@ impl ConfigStore {
     }
 }
 
+/// One row for [`ConfigStore::upsert_tracked_sessions`] — the borrowed form of
+/// [`ConfigStore::upsert_tracked_session`]'s argument list.
+#[derive(Debug, Clone, Copy)]
+pub struct TrackedSessionUpsert<'a> {
+    pub session_id: &'a str,
+    pub harness: AgentKind,
+    pub project_slug: Option<&'a str>,
+    pub worktree_id: Option<&'a str>,
+    pub opencode_port: Option<u16>,
+    pub created_at_unix_ms: u64,
+}
+
+/// Apply one upsert to an in-memory `SessionState`. Metadata is write-once: a
+/// later caller holding `None` must never clobber an existing `Some`, and one
+/// holding `Some` only wins where the current value is `None`.
+fn upsert_row(st: &mut SessionState, row: &TrackedSessionUpsert<'_>) {
+    if let Some(existing) = st
+        .sessions
+        .iter_mut()
+        .find(|s| s.session_id == row.session_id)
+    {
+        if existing.project_slug.is_none()
+            && let Some(slug) = row.project_slug
+        {
+            existing.project_slug = Some(slug.to_string());
+        }
+        if existing.worktree_id.is_none()
+            && let Some(wt) = row.worktree_id
+        {
+            existing.worktree_id = Some(wt.to_string());
+        }
+        if existing.opencode_port.is_none() {
+            existing.opencode_port = row.opencode_port;
+        }
+        return;
+    }
+    st.sessions.push(TrackedSession {
+        session_id: row.session_id.to_string(),
+        project_slug: row.project_slug.map(str::to_string),
+        worktree_id: row.worktree_id.map(str::to_string),
+        opencode_port: row.opencode_port,
+        kind: row.harness,
+        created_at_unix_ms: row.created_at_unix_ms,
+        last_state: None,
+        last_state_at_unix_ms: None,
+        last_state_acked: false,
+        last_prompt_text: None,
+        last_prompt_at_unix_ms: None,
+        harness_session_id: None,
+    });
+}
+
 /// Deep-merge a `ProjectConfig` with an optional `.raum.toml`. When a field in
 /// `.raum.toml` is `Some`, it replaces the project value; otherwise the project
 /// value is kept.
@@ -535,6 +767,33 @@ fn validate_slug(slug: &str) -> Result<(), StoreError> {
         return Err(StoreError::InvalidSlug(slug.into()));
     }
     Ok(())
+}
+
+/// Stat-fingerprinted read: hand back the cached parse when `path` is
+/// unchanged since `slot` was filled, otherwise reparse and refresh it. The
+/// returned flag is `true` when this call actually parsed (used to keep the
+/// unknown-keys log one-shot rather than once per cache hit).
+fn read_cached_slot<T: DeserializeOwned + Default + Clone>(
+    path: &Path,
+    slot: &mut Option<(FileStamp, T)>,
+) -> Result<(T, bool), StoreError> {
+    let Some(stamp) = FileStamp::of(path) else {
+        // Absent (or unstattable): nothing worth caching, and any cached
+        // parse now describes a file that no longer exists.
+        *slot = None;
+        return read_toml_or_default(path).map(|v| (v, true));
+    };
+    if let Some((cached_stamp, cached)) = slot.as_ref()
+        && *cached_stamp == stamp
+    {
+        return Ok((cached.clone(), false));
+    }
+    let value: T = read_toml_or_default(path)?;
+    // Re-stat after the parse: if the file moved underneath us (including the
+    // corrupt-file quarantine rename inside `read_toml_or_default`) the
+    // fingerprint would be a lie, so leave the cache cold instead.
+    *slot = (FileStamp::of(path) == Some(stamp)).then(|| (stamp, value.clone()));
+    Ok((value, true))
 }
 
 fn read_toml_or_default<T: DeserializeOwned + Default>(path: &Path) -> Result<T, StoreError> {
@@ -616,9 +875,22 @@ fn log_unknown_keys(origin: &str, unknown: &std::collections::BTreeMap<String, t
     info!(origin, unknown_keys = ?keys, "TOML contains unknown keys; preserved as-is");
 }
 
-/// Atomic write: write to `<path>.<pid>.tmp` and `rename` onto `<path>`.
-/// On POSIX `rename(2)` is atomic on the same filesystem, which
-/// `~/.config/raum/` is by definition.
+/// Monotonic suffix for temp files. The pid alone is not enough: two
+/// concurrent writers inside one process targeting the same path would pick
+/// the same temp name and clobber each other's half-written bytes before
+/// either rename landed.
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Atomic, durable write: write to `<path>.<pid>.<seq>.tmp`, `fsync` it, then
+/// `rename` onto `<path>`. On POSIX `rename(2)` is atomic on the same
+/// filesystem, which `~/.config/raum/` is by definition.
+///
+/// The `sync_all` before the rename is what makes the atomicity meaningful
+/// across a power loss / hard reboot: without it the rename can be durable
+/// while the data blocks it points at are not, leaving a zero-length or
+/// torn file where the recovery authority used to be. The parent-directory
+/// fsync afterwards makes the rename itself durable; it is best-effort
+/// because some filesystems refuse to sync a directory handle.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -628,9 +900,19 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
         .and_then(|s| s.to_str())
         .unwrap_or("raum.tmp");
     let pid = std::process::id();
-    let tmp = path.with_file_name(format!(".{file_name}.{pid}.tmp"));
-    std::fs::write(&tmp, bytes)?;
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_file_name(format!(".{file_name}.{pid}.{seq}.tmp"));
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
     std::fs::rename(&tmp, path)?;
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
     debug!(path = %path.display(), bytes = bytes.len(), "atomic toml write");
     Ok(())
 }
@@ -651,119 +933,86 @@ fn ensure_dir_0700(path: &Path) -> Result<(), StoreError> {
 }
 
 // ============================================================================
-// DebouncedWriter (§2.3)
+// sessions.toml write debouncing (§2.3)
 // ============================================================================
 
-/// Debounced, atomic writer that coalesces rapid updates of a `T: Serialize`
-/// into at most one TOML write per `debounce` quiet window.
-///
-/// Writers call [`DebouncedWriter::submit`] with a value; the writer waits
-/// `debounce` of silence before flushing the most recent value through
-/// [`atomic_write`]. Five `submit` calls inside the window collapse into
-/// exactly one disk write carrying the last value.
-///
-/// Backed by a `tokio::sync::mpsc` channel + a single background task. The
-/// `T` type parameter is carried for API clarity; serialization to TOML
-/// happens inline so `T` never needs to be `Send`.
-pub struct DebouncedWriter<T: Serialize> {
-    tx: tokio::sync::mpsc::UnboundedSender<Message>,
-    _marker: std::marker::PhantomData<fn(T)>,
+/// Quiet window for coalescing display-only `sessions.toml` updates. Matches
+/// the documented 500 ms config-write debounce.
+const SESSIONS_DEBOUNCE: Duration = Duration::from_millis(500);
+
+/// A `sessions.toml` write deferred by
+/// [`ConfigStore::write_sessions_debounced`].
+#[derive(Debug, Default)]
+struct PendingSessions {
+    /// Value still owed to disk; `None` means nothing is outstanding.
+    state: Option<SessionState>,
+    /// Pushed out by every submit inside the window, so the flusher re-sleeps
+    /// and a whole burst collapses into one write.
+    deadline: Option<Instant>,
+    /// A flusher thread is alive and owns draining `state`.
+    armed: bool,
 }
 
-impl<T: Serialize> std::fmt::Debug for DebouncedWriter<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DebouncedWriter")
-            .field("type", &std::any::type_name::<T>())
-            .finish()
+/// Atomic `sessions.toml` write + cache refresh. Shared by the immediate and
+/// the debounced paths so both keep the same "drop the cache before writing"
+/// discipline. Callers hold `sessions_pending`; this takes `sessions_cache`.
+fn write_sessions_to(
+    path: &Path,
+    cache: &Mutex<Option<(FileStamp, SessionState)>>,
+    state: &SessionState,
+) -> Result<(), StoreError> {
+    if let Some(parent) = path.parent() {
+        ensure_dir_0700(parent)?;
     }
+    let mut cache = cache.lock();
+    // Drop first so a failed write can never leave a stale hit behind.
+    *cache = None;
+    write_toml(path, state)?;
+    *cache = FileStamp::of(path).map(|stamp| (stamp, state.clone()));
+    Ok(())
 }
 
-impl<T: Serialize> Clone for DebouncedWriter<T> {
-    fn clone(&self) -> Self {
-        Self {
-            tx: self.tx.clone(),
-            _marker: std::marker::PhantomData,
-        }
-    }
-}
-
-#[derive(Debug)]
-enum Message {
-    Submit(String),
-    Flush(tokio::sync::oneshot::Sender<()>),
-}
-
-impl<T: Serialize> DebouncedWriter<T> {
-    /// Create a new writer that serializes `T` to TOML and writes atomically
-    /// to `path` with a `debounce` quiet window.
-    #[must_use]
-    pub fn new(path: PathBuf, debounce: std::time::Duration) -> Self {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
-
-        tokio::spawn(async move {
-            let mut pending: Option<String> = None;
-            loop {
-                tokio::select! {
-                    biased;
-                    msg = rx.recv() => {
-                        match msg {
-                            Some(Message::Submit(raw)) => {
-                                pending = Some(raw);
-                            }
-                            Some(Message::Flush(ack)) => {
-                                if let Some(raw) = pending.take() {
-                                    if let Err(e) = atomic_write(&path, raw.as_bytes()) {
-                                        warn!(path = %path.display(), error = %e, "debounced flush failed");
-                                    }
-                                }
-                                let _ = ack.send(());
-                            }
-                            None => {
-                                if let Some(raw) = pending.take() {
-                                    if let Err(e) = atomic_write(&path, raw.as_bytes()) {
-                                        warn!(path = %path.display(), error = %e, "debounced final flush failed");
-                                    }
-                                }
-                                break;
-                            }
-                        }
-                    }
-                    () = tokio::time::sleep(debounce), if pending.is_some() => {
-                        if let Some(raw) = pending.take() {
-                            if let Err(e) = atomic_write(&path, raw.as_bytes()) {
-                                warn!(path = %path.display(), error = %e, "debounced write failed");
-                            }
-                        }
-                    }
-                }
+/// Background half of [`ConfigStore::write_sessions_debounced`]: sleep until
+/// the (possibly extended) deadline, then perform the single coalesced write
+/// and disarm.
+///
+/// One short-lived thread per burst rather than a parked worker — no shutdown
+/// protocol to get wrong, and an idle raum spawns none at all.
+///
+/// The pending lock is held across the write so a concurrent submit can
+/// neither arm a second flusher nor land its value out of order.
+fn spawn_sessions_flusher(
+    path: PathBuf,
+    cache: Arc<Mutex<Option<(FileStamp, SessionState)>>>,
+    pending: Arc<Mutex<PendingSessions>>,
+) {
+    std::thread::spawn(move || {
+        loop {
+            let wait = {
+                let p = pending.lock();
+                p.deadline.map_or(Duration::ZERO, |d| {
+                    d.saturating_duration_since(Instant::now())
+                })
+            };
+            if !wait.is_zero() {
+                std::thread::sleep(wait);
+                continue;
             }
-        });
-
-        Self {
-            tx,
-            _marker: std::marker::PhantomData,
-        }
-    }
-
-    /// Submit a new value. If more `submit` calls arrive within the debounce
-    /// window, only the last value is written.
-    pub fn submit(&self, value: &T) -> Result<(), StoreError> {
-        let raw = toml::to_string_pretty(value)?;
-        // If the receiver has been dropped, the writer task has exited and
-        // further submits are no-ops.
-        let _ = self.tx.send(Message::Submit(raw));
-        Ok(())
-    }
-
-    /// Block until any pending value has been flushed. Primarily for tests
-    /// and shutdown.
-    pub async fn flush(&self) {
-        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        if self.tx.send(Message::Flush(ack_tx)).is_err() {
+            let mut p = pending.lock();
+            if p.deadline.is_some_and(|d| d > Instant::now()) {
+                // Extended while we were re-acquiring the lock.
+                continue;
+            }
+            p.deadline = None;
+            if let Some(state) = p.state.take()
+                && let Err(e) = write_sessions_to(&path, &cache, &state)
+            {
+                warn!(path = %path.display(), error = %e, "debounced sessions.toml write failed");
+            }
+            p.armed = false;
             return;
         }
-        let _ = ack_rx.await;
-    }
+    });
 }
 
 #[cfg(test)]
@@ -942,6 +1191,29 @@ mod tests {
         store.write_sessions(&st).unwrap();
         let back = store.read_sessions().unwrap();
         assert_eq!(back.sessions.len(), 1);
+    }
+
+    #[test]
+    fn sessions_cache_reparses_after_external_edit() {
+        // The in-memory cache must never hide a write that came from outside
+        // this ConfigStore (file-watcher reload, hand-edit, second process).
+        let dir = tempdir().unwrap();
+        let store = ConfigStore::new(dir.path());
+        store.ensure_layout().unwrap();
+        store
+            .update_session_last_state("raum-a", AgentKind::Codex, AgentState::Working, 1)
+            .unwrap();
+        assert_eq!(store.read_sessions().unwrap().sessions.len(), 1);
+
+        std::fs::write(
+            dir.path().join("state").join("sessions.toml"),
+            "[[session]]\nsession_id = \"raum-external\"\nkind = \"shell\"\ncreated_at_unix_ms = 7\n",
+        )
+        .unwrap();
+
+        let back = store.read_sessions().unwrap();
+        assert_eq!(back.sessions.len(), 1);
+        assert_eq!(back.sessions[0].session_id, "raum-external");
     }
 
     #[test]
@@ -1255,6 +1527,112 @@ created_at_unix_ms = 1
     }
 
     #[test]
+    fn config_and_project_caches_reparse_after_external_edit() {
+        // Same contract as the sessions cache: an edit that didn't go through
+        // this ConfigStore must still be observed on the next read.
+        let dir = tempdir().unwrap();
+        let store = ConfigStore::new(dir.path());
+        store.ensure_layout().unwrap();
+        assert!(!store.read_config().unwrap().onboarded);
+
+        let mut cfg = store.read_config().unwrap();
+        cfg.onboarded = true;
+        std::fs::write(
+            dir.path().join("config.toml"),
+            toml::to_string_pretty(&cfg).unwrap(),
+        )
+        .unwrap();
+        assert!(store.read_config().unwrap().onboarded);
+
+        let p = ProjectConfig {
+            slug: "acme".into(),
+            name: "Acme".into(),
+            root_path: dir.path().to_path_buf(),
+            ..ProjectConfig::default()
+        };
+        store.write_project(&p).unwrap();
+        assert_eq!(store.read_project("acme").unwrap().unwrap().name, "Acme");
+
+        let renamed = ProjectConfig {
+            name: "Acme Renamed".into(),
+            ..p
+        };
+        std::fs::write(
+            dir.path()
+                .join("projects")
+                .join("acme")
+                .join("project.toml"),
+            toml::to_string_pretty(&renamed).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            store.read_project("acme").unwrap().unwrap().name,
+            "Acme Renamed"
+        );
+
+        // A deleted project must not keep resolving out of the cache.
+        store.delete_project("acme").unwrap();
+        assert!(store.read_project("acme").unwrap().is_none());
+    }
+
+    #[test]
+    fn batch_upsert_and_forget_match_the_single_row_variants() {
+        let dir = tempdir().unwrap();
+        let store = ConfigStore::new(dir.path());
+        store.ensure_layout().unwrap();
+
+        store
+            .upsert_tracked_sessions(&[
+                TrackedSessionUpsert {
+                    session_id: "raum-a",
+                    harness: AgentKind::ClaudeCode,
+                    project_slug: Some("acme"),
+                    worktree_id: None,
+                    opencode_port: None,
+                    created_at_unix_ms: 1,
+                },
+                TrackedSessionUpsert {
+                    session_id: "raum-b",
+                    harness: AgentKind::Shell,
+                    project_slug: None,
+                    worktree_id: None,
+                    opencode_port: None,
+                    created_at_unix_ms: 2,
+                },
+                // Second row for `raum-a`: write-once metadata still holds
+                // inside a single batch.
+                TrackedSessionUpsert {
+                    session_id: "raum-a",
+                    harness: AgentKind::ClaudeCode,
+                    project_slug: Some("other"),
+                    worktree_id: Some("wt-late"),
+                    opencode_port: None,
+                    created_at_unix_ms: 9,
+                },
+            ])
+            .unwrap();
+
+        let back = store.read_sessions().unwrap();
+        assert_eq!(back.sessions.len(), 2);
+        let a = back
+            .sessions
+            .iter()
+            .find(|s| s.session_id == "raum-a")
+            .unwrap();
+        assert_eq!(a.project_slug.as_deref(), Some("acme"));
+        assert_eq!(a.worktree_id.as_deref(), Some("wt-late"));
+        assert_eq!(a.created_at_unix_ms, 1);
+
+        store.forget_sessions(&["raum-a", "raum-missing"]).unwrap();
+        let back = store.read_sessions().unwrap();
+        assert_eq!(back.sessions.len(), 1);
+        assert_eq!(back.sessions[0].session_id, "raum-b");
+        // All-miss batch is a silent no-op.
+        store.forget_sessions(&["nope"]).unwrap();
+        assert_eq!(store.read_sessions().unwrap().sessions.len(), 1);
+    }
+
+    #[test]
     fn quickfire_history_round_trip() {
         let dir = tempdir().unwrap();
         let store = ConfigStore::new(dir.path());
@@ -1427,54 +1805,180 @@ created_at_unix_ms = 1
         assert_eq!(eff.worktree.path_pattern, "project-pattern/{branch-slug}");
     }
 
-    // ---- DebouncedWriter ----
+    // ---- sessions.toml debounce ----
 
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn debounced_writer_coalesces_five_rapid_writes() {
+    /// Count the atomic writes that actually reached disk by watching the
+    /// file's stat fingerprint change. `atomic_write` renames a fresh inode
+    /// over the path every time, so a coalesced burst leaves exactly one bump.
+    fn sessions_stamp(dir: &Path) -> Option<(SystemTime, u64)> {
+        let meta = std::fs::metadata(dir.join("state").join("sessions.toml")).ok()?;
+        Some((meta.modified().ok()?, meta.len()))
+    }
+
+    #[test]
+    fn last_state_burst_coalesces_into_one_disk_write() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("out.toml");
-        let writer: DebouncedWriter<QuickfireHistory> =
-            DebouncedWriter::new(path.clone(), std::time::Duration::from_millis(500));
+        let store = ConfigStore::new(dir.path());
+        store.ensure_layout().unwrap();
+        // Row insert is a lifecycle write — synchronous, and it establishes
+        // the file so subsequent field touches can be deferred.
+        store
+            .update_session_last_state("raum-a", AgentKind::Codex, AgentState::Working, 1)
+            .unwrap();
+        let before = sessions_stamp(dir.path()).expect("insert must be written through");
 
-        // Five submits inside one 500ms quiet window.
-        for i in 0..5 {
-            let hist = QuickfireHistory {
-                entries: vec![format!("cmd-{i}")],
+        for i in 0..20u64 {
+            let state = if i % 2 == 0 {
+                AgentState::Waiting
+            } else {
+                AgentState::Working
             };
-            writer.submit(&hist).unwrap();
+            store
+                .update_session_last_state("raum-a", AgentKind::Codex, state, 100 + i)
+                .unwrap();
         }
-
-        // Advance past the quiet window so the background task flushes once.
-        tokio::time::advance(std::time::Duration::from_millis(600)).await;
-        writer.flush().await;
-
-        let raw = std::fs::read_to_string(&path).unwrap();
-        // Only the last submitted value survives.
-        assert!(raw.contains("cmd-4"));
-        assert!(!raw.contains("cmd-3"));
-
-        // Count temp files; there should be no leftover `.out.toml.*.tmp`.
-        let entries: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(Result::ok)
-            .collect();
+        // Nothing on disk yet — the burst is still inside the quiet window.
         assert_eq!(
-            entries.len(),
-            1,
-            "expected exactly one file, found {entries:?}"
+            sessions_stamp(dir.path()),
+            Some(before),
+            "a burst of last_state updates must not touch disk while it is hot"
+        );
+        // …but the cache already reports the newest value.
+        assert_eq!(
+            store.last_session_state("raum-a"),
+            Some(AgentState::Working)
+        );
+
+        // Generous margin over SESSIONS_DEBOUNCE for a loaded CI box.
+        std::thread::sleep(SESSIONS_DEBOUNCE + Duration::from_millis(750));
+        assert_ne!(
+            sessions_stamp(dir.path()),
+            Some(before),
+            "the burst must land on disk once the window goes quiet"
+        );
+        // Re-read from a cold store: exactly the last value survived.
+        let fresh = ConfigStore::new(dir.path());
+        let row = &fresh.read_sessions().unwrap().sessions[0];
+        assert_eq!(row.last_state, Some(AgentState::Working));
+        assert_eq!(row.last_state_at_unix_ms, Some(119));
+    }
+
+    #[test]
+    fn critical_write_flushes_pending_last_state_first() {
+        // Ordering contract: a lifecycle mutation must never land on disk
+        // carrying an older `last_state` than memory has already served.
+        let dir = tempdir().unwrap();
+        let store = ConfigStore::new(dir.path());
+        store.ensure_layout().unwrap();
+        store
+            .update_session_last_state("raum-a", AgentKind::Codex, AgentState::Working, 1)
+            .unwrap();
+        store
+            .update_session_last_state("raum-a", AgentKind::Codex, AgentState::Completed, 2)
+            .unwrap();
+
+        // Critical write while the debounced value is still pending.
+        store
+            .upsert_tracked_session("raum-b", AgentKind::Shell, Some("acme"), None, None, 3)
+            .unwrap();
+
+        let fresh = ConfigStore::new(dir.path());
+        let back = fresh.read_sessions().unwrap();
+        assert_eq!(back.sessions.len(), 2, "new row must be on disk");
+        let a = back
+            .sessions
+            .iter()
+            .find(|s| s.session_id == "raum-a")
+            .unwrap();
+        assert_eq!(
+            a.last_state,
+            Some(AgentState::Completed),
+            "the pending field update must not be lost or reverted by the lifecycle write"
         );
     }
 
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn debounced_writer_flushes_on_drop_via_flush_method() {
+    #[test]
+    fn flush_sessions_writes_pending_immediately() {
+        // What the quit-flush path relies on (Contract 1).
         let dir = tempdir().unwrap();
-        let path = dir.path().join("out.toml");
-        let writer: DebouncedWriter<QuickfireHistory> =
-            DebouncedWriter::new(path.clone(), std::time::Duration::from_millis(500));
-        let hist = QuickfireHistory::default();
-        writer.submit(&hist).unwrap();
-        tokio::time::advance(std::time::Duration::from_millis(600)).await;
-        writer.flush().await;
-        assert!(path.exists());
+        let store = ConfigStore::new(dir.path());
+        store.ensure_layout().unwrap();
+        store
+            .update_session_last_state("raum-a", AgentKind::Codex, AgentState::Working, 1)
+            .unwrap();
+        store
+            .update_session_last_state("raum-a", AgentKind::Codex, AgentState::Completed, 2)
+            .unwrap();
+
+        store.flush_sessions();
+
+        let fresh = ConfigStore::new(dir.path());
+        assert_eq!(
+            fresh.read_sessions().unwrap().sessions[0].last_state,
+            Some(AgentState::Completed),
+        );
+        // Idempotent: nothing outstanding, no second write.
+        let stamp = sessions_stamp(dir.path());
+        store.flush_sessions();
+        assert_eq!(sessions_stamp(dir.path()), stamp);
+    }
+
+    #[test]
+    fn ack_after_debounced_update_is_durable() {
+        // `ack_session_last_state` is critical (it silences the attention
+        // rail); both the ack and the state it acks must be on disk.
+        let dir = tempdir().unwrap();
+        let store = ConfigStore::new(dir.path());
+        store.ensure_layout().unwrap();
+        store
+            .update_session_last_state("raum-a", AgentKind::Codex, AgentState::Working, 1)
+            .unwrap();
+        store
+            .update_session_last_state("raum-a", AgentKind::Codex, AgentState::Completed, 2)
+            .unwrap();
+        store.ack_session_last_state("raum-a").unwrap();
+
+        let fresh = ConfigStore::new(dir.path());
+        let row = &fresh.read_sessions().unwrap().sessions[0];
+        assert_eq!(row.last_state, Some(AgentState::Completed));
+        assert!(row.last_state_acked);
+    }
+
+    #[test]
+    fn clearing_an_ack_is_durable_without_waiting_for_the_window() {
+        // Inversion guard: the ack is written through immediately, so its
+        // clear must be too. Otherwise a crash inside the quiet window leaves
+        // disk at acked=true and the next completion never re-surfaces in the
+        // attention rail. No sleep here — the cold read *is* the crash.
+        let dir = tempdir().unwrap();
+        let store = ConfigStore::new(dir.path());
+        store.ensure_layout().unwrap();
+        store
+            .update_session_last_state("raum-a", AgentKind::Codex, AgentState::Completed, 1)
+            .unwrap();
+        store.ack_session_last_state("raum-a").unwrap();
+
+        // Agent picks the work back up: fresh transition, ack invalidated.
+        store
+            .update_session_last_state("raum-a", AgentKind::Codex, AgentState::Working, 2)
+            .unwrap();
+
+        let fresh = ConfigStore::new(dir.path());
+        let row = &fresh.read_sessions().unwrap().sessions[0];
+        assert!(
+            !row.last_state_acked,
+            "a cleared ack must reach disk immediately, not on the debounce deadline"
+        );
+
+        // …while ack-neutral touches still coalesce.
+        let before = sessions_stamp(dir.path()).unwrap();
+        store
+            .update_session_last_state("raum-a", AgentKind::Codex, AgentState::Completed, 3)
+            .unwrap();
+        assert_eq!(
+            sessions_stamp(dir.path()),
+            Some(before),
+            "an update that changes no ack must stay debounced"
+        );
     }
 }

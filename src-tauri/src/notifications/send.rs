@@ -11,7 +11,16 @@
 //! identifier — we encode it as `"<sessionId>\x1f<uuid>"` (ASCII unit
 //! separator) so the click delegate can pull the originating session
 //! back out without needing an `NSDictionary<NSString, NSObject>`
-//! `userInfo` payload.
+//! `userInfo` payload. A permission request appends its `requestId` as a
+//! fourth field so the Allow/Deny action handler can reply without any
+//! extra bookkeeping.
+//!
+//! Linux stays click-to-focus only: `notify-rust` can render freedesktop
+//! actions, but reading the chosen one means keeping the
+//! `NotificationHandle` parked on a blocking thread for the whole
+//! lifetime of the banner and probing the daemon for the `actions`
+//! capability first. The in-app Attention rail already covers Linux, so
+//! v1 skips it.
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Runtime};
@@ -22,6 +31,22 @@ use tracing::{info, warn};
 /// not a character that should ever appear in a raum session id.
 #[cfg(any(target_os = "macos", test))]
 pub const IDENTIFIER_SEPARATOR: char = '\x1f';
+
+/// The `kind` tag that marks a notification as a permission prompt. Only
+/// these get Allow/Deny action buttons.
+#[cfg(any(target_os = "macos", test))]
+pub const NEEDS_INPUT_KIND: &str = "needs_input";
+
+/// `UNNotificationCategory` identifier carrying the Allow/Deny actions.
+/// Registered once in [`crate::notifications::delegate::install`].
+#[cfg(target_os = "macos")]
+pub const PERMISSION_CATEGORY: &str = "raum.permission";
+
+/// Action identifiers inside [`PERMISSION_CATEGORY`].
+#[cfg(target_os = "macos")]
+pub const ALLOW_ACTION: &str = "raum.allow";
+#[cfg(target_os = "macos")]
+pub const DENY_ACTION: &str = "raum.deny";
 
 /// Arguments for [`notifications_send`]. Kept small on purpose; sound
 /// playback continues to flow through `notifications_play_sound` so we
@@ -49,6 +74,15 @@ pub struct SendNotificationArgs {
     /// `cfg(test)` doesn't need to bring the field back on Linux.
     #[cfg(target_os = "macos")]
     pub kind: Option<String>,
+    /// Optional parked permission-request id. When present *and* `kind`
+    /// is `"needs_input"` the banner is delivered under
+    /// [`PERMISSION_CATEGORY`], i.e. with Allow/Deny buttons, and the id
+    /// is appended to the request identifier so the delegate can reply.
+    ///
+    /// Same cfg-gate rationale as `kind`: the Linux path has no action
+    /// support, so the field would trip `dead_code` there.
+    #[cfg(target_os = "macos")]
+    pub request_id: Option<String>,
 }
 
 /// Result of [`notifications_send`].
@@ -61,22 +95,34 @@ pub struct SendNotificationResult {
     pub error: Option<String>,
 }
 
-/// Build the request identifier that round-trips `session_id` and
-/// `kind` through the OS. Pure for testing.
+/// Build the request identifier that round-trips `session_id`, `kind`
+/// and (for permission prompts) `request_id` through the OS. Pure for
+/// testing.
 ///
-/// Format: `<session_id>\x1f<kind>\x1f<uuid>`. Either field may be
-/// absent — when `kind` is `None`/empty we fall back to the legacy
-/// two-part shape `<session_id>\x1f<uuid>` so the click delegate (which
-/// only inspects the prefix) keeps working unchanged.
+/// Format: `<session_id>\x1f<kind>\x1f<uuid>\x1f<request_id>`. Every
+/// field but the uuid may be absent — when `kind` is `None`/empty we
+/// fall back to the legacy two-part shape `<session_id>\x1f<uuid>` so
+/// the click delegate (which only inspects the prefix) keeps working
+/// unchanged. `request_id` is strictly appended, so
+/// [`crate::notifications::clear`]'s `<session_id>\x1f<kind>\x1f` prefix
+/// match is unaffected.
 #[cfg(any(target_os = "macos", test))]
-pub fn build_request_identifier(session_id: Option<&str>, kind: Option<&str>) -> String {
+pub fn build_request_identifier(
+    session_id: Option<&str>,
+    kind: Option<&str>,
+    request_id: Option<&str>,
+) -> String {
     let suffix = uuid::Uuid::new_v4().to_string();
     let sid = session_id.unwrap_or("");
-    match kind {
-        Some(k) if !k.is_empty() => {
-            format!("{sid}{IDENTIFIER_SEPARATOR}{k}{IDENTIFIER_SEPARATOR}{suffix}")
-        }
-        _ => format!("{sid}{IDENTIFIER_SEPARATOR}{suffix}"),
+    let Some(kind) = kind.filter(|k| !k.is_empty()) else {
+        // No kind ⇒ no request id either; a permission prompt always
+        // carries `needs_input`.
+        return format!("{sid}{IDENTIFIER_SEPARATOR}{suffix}");
+    };
+    let base = format!("{sid}{IDENTIFIER_SEPARATOR}{kind}{IDENTIFIER_SEPARATOR}{suffix}");
+    match request_id.filter(|r| !r.is_empty()) {
+        Some(rid) => format!("{base}{IDENTIFIER_SEPARATOR}{rid}"),
+        None => base,
     }
 }
 
@@ -116,6 +162,19 @@ pub fn kind_from_identifier(identifier: &str) -> Option<String> {
     }
 }
 
+/// Recover the parked `request_id` from a request identifier produced by
+/// [`build_request_identifier`]. `None` for every identifier that isn't a
+/// permission prompt (legacy two-part, plain three-part, or a stale
+/// identifier minted before this field existed).
+#[cfg(any(target_os = "macos", test))]
+pub fn request_id_from_identifier(identifier: &str) -> Option<String> {
+    identifier
+        .split(IDENTIFIER_SEPARATOR)
+        .nth(3)
+        .filter(|r| !r.is_empty())
+        .map(str::to_string)
+}
+
 /// §11 — send an OS notification via the modern, supported API on each
 /// platform. Errors are returned as `Ok(SendNotificationResult)` with
 /// `delivered: false` so the frontend dispatcher does not need to
@@ -143,8 +202,16 @@ pub async fn notifications_send<R: Runtime>(
                 error: Some("unbundled process (dev mode)".to_string()),
             });
         }
-        let identifier = build_request_identifier(args.session_id.as_deref(), args.kind.as_deref());
-        return Ok(send_macos(&args, &identifier).await);
+        // Action buttons only make sense on a live permission prompt —
+        // a `done` banner has nothing to allow or deny.
+        let request_id = args
+            .request_id
+            .as_deref()
+            .filter(|r| !r.is_empty())
+            .filter(|_| args.kind.as_deref() == Some(NEEDS_INPUT_KIND));
+        let identifier =
+            build_request_identifier(args.session_id.as_deref(), args.kind.as_deref(), request_id);
+        return Ok(send_macos(&args, &identifier, request_id.is_some()).await);
     }
 
     #[cfg(target_os = "linux")]
@@ -163,7 +230,11 @@ pub async fn notifications_send<R: Runtime>(
 }
 
 #[cfg(target_os = "macos")]
-async fn send_macos(args: &SendNotificationArgs, identifier: &str) -> SendNotificationResult {
+async fn send_macos(
+    args: &SendNotificationArgs,
+    identifier: &str,
+    with_actions: bool,
+) -> SendNotificationResult {
     use std::time::Duration;
 
     use block2::RcBlock;
@@ -194,6 +265,13 @@ async fn send_macos(args: &SendNotificationArgs, identifier: &str) -> SendNotifi
         let content = UNMutableNotificationContent::new();
         content.setTitle(&title_ns);
         content.setBody(&body_ns);
+        if with_actions {
+            // The category (and its Allow/Deny actions) is registered once
+            // by `delegate::install`; here we only tag the notification
+            // with it. macOS surfaces the buttons on hover/expand, or
+            // immediately when the user has raum set to "Alerts".
+            content.setCategoryIdentifier(&NSString::from_str(PERMISSION_CATEGORY));
+        }
 
         let request = UNNotificationRequest::requestWithIdentifier_content_trigger(
             &identifier_ns,
@@ -299,7 +377,7 @@ mod tests {
 
     #[test]
     fn round_trips_session_id_through_identifier() {
-        let id = build_request_identifier(Some("sess-abc"), None);
+        let id = build_request_identifier(Some("sess-abc"), None, None);
         assert!(id.starts_with("sess-abc"));
         assert!(id.contains(IDENTIFIER_SEPARATOR));
         assert_eq!(session_id_from_identifier(&id).as_deref(), Some("sess-abc"));
@@ -307,14 +385,14 @@ mod tests {
 
     #[test]
     fn handles_missing_session_id() {
-        let id = build_request_identifier(None, None);
+        let id = build_request_identifier(None, None, None);
         assert!(id.starts_with(IDENTIFIER_SEPARATOR));
         assert!(session_id_from_identifier(&id).is_none());
     }
 
     #[test]
     fn rejects_empty_session_id_prefix() {
-        let id = build_request_identifier(Some(""), None);
+        let id = build_request_identifier(Some(""), None, None);
         assert!(session_id_from_identifier(&id).is_none());
     }
 
@@ -325,16 +403,16 @@ mod tests {
 
     #[test]
     fn round_trips_kind_through_identifier() {
-        let id = build_request_identifier(Some("sess-abc"), Some("done"));
+        let id = build_request_identifier(Some("sess-abc"), Some("done"), None);
         assert_eq!(session_id_from_identifier(&id).as_deref(), Some("sess-abc"));
         assert_eq!(kind_from_identifier(&id).as_deref(), Some("done"));
     }
 
     #[test]
     fn round_trips_kind_without_session() {
-        let id = build_request_identifier(None, Some("needs_input"));
+        let id = build_request_identifier(None, Some(NEEDS_INPUT_KIND), None);
         assert!(session_id_from_identifier(&id).is_none());
-        assert_eq!(kind_from_identifier(&id).as_deref(), Some("needs_input"));
+        assert_eq!(kind_from_identifier(&id).as_deref(), Some(NEEDS_INPUT_KIND));
     }
 
     #[test]
@@ -342,7 +420,7 @@ mod tests {
         // Identifiers minted before this change carry only the session id —
         // a single \x1f separator. The parser must not panic and must report
         // `kind = None`.
-        let legacy = build_request_identifier(Some("sess-legacy"), None);
+        let legacy = build_request_identifier(Some("sess-legacy"), None, None);
         assert_eq!(
             session_id_from_identifier(&legacy).as_deref(),
             Some("sess-legacy")
@@ -353,5 +431,39 @@ mod tests {
     #[test]
     fn unrecognised_identifier_yields_no_kind() {
         assert!(kind_from_identifier("plain-uuid-no-separator").is_none());
+    }
+
+    #[test]
+    fn round_trips_request_id_through_identifier() {
+        let id = build_request_identifier(Some("sess-abc"), Some(NEEDS_INPUT_KIND), Some("req-9"));
+        assert_eq!(session_id_from_identifier(&id).as_deref(), Some("sess-abc"));
+        assert_eq!(kind_from_identifier(&id).as_deref(), Some(NEEDS_INPUT_KIND));
+        assert_eq!(request_id_from_identifier(&id).as_deref(), Some("req-9"));
+    }
+
+    #[test]
+    fn identifiers_without_request_id_yield_none() {
+        for id in [
+            build_request_identifier(Some("s"), Some("done"), None),
+            build_request_identifier(Some("s"), None, None),
+            build_request_identifier(Some("s"), Some(NEEDS_INPUT_KIND), Some("")),
+            "plain-uuid-no-separator".to_string(),
+        ] {
+            assert!(request_id_from_identifier(&id).is_none(), "{id:?}");
+        }
+    }
+
+    #[test]
+    fn request_id_is_appended_after_the_clear_prefix() {
+        // `notifications::clear` dismisses by the `<session>\x1f<kind>\x1f`
+        // prefix. Appending the request id must not disturb that, otherwise
+        // answered permission banners would linger in Notification Center.
+        let prefix =
+            format!("sess-1{IDENTIFIER_SEPARATOR}{NEEDS_INPUT_KIND}{IDENTIFIER_SEPARATOR}");
+        let with_req =
+            build_request_identifier(Some("sess-1"), Some(NEEDS_INPUT_KIND), Some("req-1"));
+        let without = build_request_identifier(Some("sess-1"), Some(NEEDS_INPUT_KIND), None);
+        assert!(with_req.starts_with(&prefix));
+        assert!(without.starts_with(&prefix));
     }
 }

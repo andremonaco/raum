@@ -4,9 +4,8 @@
 //! the sidebar updates via the `worktree-status-changed` push instead of a
 //! follow-up frontend fetch.
 
-use std::process::Command;
-
 use super::status_service::trigger_status_refresh;
+use crate::git::git_cmd;
 use crate::state::AppHandleState;
 
 /// Stage one or more files in the worktree at `worktree_path`.
@@ -19,8 +18,8 @@ pub async fn git_stage(
 ) -> Result<(), String> {
     let path = worktree_path.clone();
     tokio::task::spawn_blocking(move || {
-        let mut cmd = Command::new("git");
-        cmd.args(["-C", &worktree_path, "add", "--"]);
+        let mut cmd = git_cmd(&worktree_path);
+        cmd.args(["add", "--"]);
         for f in &files {
             cmd.arg(f);
         }
@@ -46,8 +45,8 @@ pub async fn git_unstage(
 ) -> Result<(), String> {
     let path = worktree_path.clone();
     tokio::task::spawn_blocking(move || {
-        let mut cmd = Command::new("git");
-        cmd.args(["-C", &worktree_path, "reset", "HEAD", "--"]);
+        let mut cmd = git_cmd(&worktree_path);
+        cmd.args(["reset", "HEAD", "--"]);
         for f in &files {
             cmd.arg(f);
         }
@@ -81,10 +80,8 @@ pub async fn git_discard(
     let path = worktree_path.clone();
     tokio::task::spawn_blocking(move || {
         for file in &files {
-            let status_out = Command::new("git")
+            let status_out = git_cmd(&worktree_path)
                 .args([
-                    "-C",
-                    &worktree_path,
                     "status",
                     "--porcelain=v2",
                     "--untracked-files=all",
@@ -110,16 +107,16 @@ pub async fn git_discard(
                 .is_some_and(|c| c != '.');
 
             if is_untracked {
-                let out = Command::new("git")
-                    .args(["-C", &worktree_path, "clean", "-f", "--", file])
+                let out = git_cmd(&worktree_path)
+                    .args(["clean", "-f", "--", file])
                     .output()
                     .map_err(|e| format!("git clean: {e}"))?;
                 if !out.status.success() {
                     return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
                 }
             } else if has_worktree_change {
-                let out = Command::new("git")
-                    .args(["-C", &worktree_path, "checkout", "--", file])
+                let out = git_cmd(&worktree_path)
+                    .args(["checkout", "--", file])
                     .output()
                     .map_err(|e| format!("git checkout: {e}"))?;
                 if !out.status.success() {
@@ -148,15 +145,15 @@ pub async fn git_discard_all(
 ) -> Result<(), String> {
     let path = worktree_path.clone();
     tokio::task::spawn_blocking(move || {
-        let out = Command::new("git")
-            .args(["-C", &worktree_path, "checkout", "--", "."])
+        let out = git_cmd(&worktree_path)
+            .args(["checkout", "--", "."])
             .output()
             .map_err(|e| format!("git checkout: {e}"))?;
         if !out.status.success() {
             return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
         }
-        let out = Command::new("git")
-            .args(["-C", &worktree_path, "clean", "-fd"])
+        let out = git_cmd(&worktree_path)
+            .args(["clean", "-fd"])
             .output()
             .map_err(|e| format!("git clean: {e}"))?;
         if !out.status.success() {
@@ -180,8 +177,8 @@ pub async fn git_discard_all(
 #[tauri::command]
 pub async fn git_diff(worktree_path: String, file: String, staged: bool) -> Result<String, String> {
     tokio::task::spawn_blocking(move || {
-        let mut cmd = Command::new("git");
-        cmd.args(["-C", &worktree_path, "diff", "--no-color"]);
+        let mut cmd = git_cmd(&worktree_path);
+        cmd.args(["diff", "--no-color"]);
         if staged {
             cmd.arg("--cached");
         }
@@ -195,17 +192,8 @@ pub async fn git_diff(worktree_path: String, file: String, staged: bool) -> Resu
             // Untracked file: synthesise a diff against /dev/null so the viewer
             // shows the whole file as added. `git diff --no-index` always exits
             // 1 when there are differences, so we don't treat that as an error.
-            let untracked = Command::new("git")
-                .args([
-                    "-C",
-                    &worktree_path,
-                    "diff",
-                    "--no-color",
-                    "--no-index",
-                    "--",
-                    "/dev/null",
-                    &file,
-                ])
+            let untracked = git_cmd(&worktree_path)
+                .args(["diff", "--no-color", "--no-index", "--", "/dev/null", &file])
                 .output()
                 .map_err(|e| format!("git diff --no-index: {e}"))?;
             return Ok(String::from_utf8_lossy(&untracked.stdout).to_string());

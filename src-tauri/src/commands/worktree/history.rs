@@ -6,8 +6,8 @@
 use std::collections::HashSet;
 
 use super::git_parse::{parse_log_z, parse_name_status_z, parse_numstat_z};
-use super::status::git_cmd;
 use super::types::{CommitFileChange, CommitInfo};
+use crate::git::git_cmd;
 
 /// Upper bound per `git_log` page. The frontend pages in chunks of 50; the
 /// clamp keeps a buggy caller from serializing an entire monorepo history

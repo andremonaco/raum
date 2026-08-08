@@ -7,6 +7,8 @@
 //!   `raum_core::project::project_with_defaults` (pseudo-random palette
 //!   color, built-in path pattern, branch prefix mode `none`). Detects a
 //!   `.raum.toml` at `root_path` and sets `in_repo_settings` accordingly.
+//! * `project_set_active(slug)` — the selected project tab changed; scopes
+//!   the live `.git` watcher to that project (see `git_watcher`).
 //! * `project_list()` — enumerate registered projects (reads every
 //!   `projects/<slug>/project.toml`).
 //! * `project_update(project)` — overwrite the user-level `project.toml`
@@ -31,9 +33,9 @@ use raum_core::project::project_with_defaults;
 use raum_core::sigil::{is_valid_sigil, resolve_sigil};
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
-use tauri::{AppHandle, Emitter, Runtime};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 
-use crate::commands::git_watcher::GitHeadWatcher;
+use crate::commands::git_watcher;
 use crate::commands::terminal::{kill_session_inner, sessions_for_project};
 use crate::commands::worktree_progress::{
     ProgressEvent, StepStatus, emit_counter, emit_done, emit_failed, emit_step, emit_step_detail,
@@ -175,9 +177,12 @@ impl From<EffectiveProjectConfig> for EffectiveProjectDto {
 /// `projects/<slug>/project.toml` with defaults from
 /// `project_with_defaults` and flips `in_repo_settings` on when the project
 /// root already carries a `.raum.toml`.
+///
+/// No `.git` watcher is started here — watchers are scoped to the active
+/// project (see `project_set_active`), which the frontend calls right after
+/// registration if the new project becomes the selected tab.
 #[tauri::command]
-pub fn project_register<R: Runtime>(
-    app: AppHandle<R>,
+pub fn project_register(
     state: tauri::State<'_, AppHandleState>,
     root_path: String,
     name: String,
@@ -214,23 +219,31 @@ pub fn project_register<R: Runtime>(
 
     drop(store);
 
-    let status_pulse = state
-        .status_service
-        .lock()
-        .ok()
-        .and_then(|guard| guard.as_ref().map(|svc| svc.pulse_sender()));
-    match GitHeadWatcher::start(project.slug.clone(), &project.root_path, app, status_pulse) {
-        Ok(watcher) => {
-            if let Ok(mut watchers) = state.git_watchers.lock() {
-                watchers.insert(project.slug.clone(), watcher);
-            }
-        }
-        Err(e) => {
-            tracing::warn!(slug = %project.slug, error = %e, "git_watcher: start failed");
-        }
-    }
-
     Ok(ProjectListItem::from_project(&project, has_raum_toml))
+}
+
+/// Tell the backend which project tab is selected. Scopes the live `.git`
+/// watcher to it: the previous project's watcher is stopped and the new one's
+/// started (`None` — no project selected — stops all). Called by the frontend
+/// on every project switch, including the one right after launch.
+///
+/// Runs on the blocking pool, never inline on the main thread: the swap is a
+/// `project.toml` read plus an FSEvents teardown — `notify`'s `stop()` spin-
+/// waits on the CFRunLoop and then joins its thread — plus a fresh `.git`
+/// scan (`read_dir` of `.git/worktrees`, one stat per linked worktree). On a
+/// busy or network-mounted repo that is hundreds of ms of UI-thread freeze
+/// per project tab click.
+#[tauri::command]
+pub async fn project_set_active<R: Runtime>(
+    app: AppHandle<R>,
+    slug: Option<String>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppHandleState>();
+        git_watcher::set_active_project(&app, &state, slug.as_deref());
+    })
+    .await
+    .map_err(|e| format!("project_set_active join: {e}"))
 }
 
 /// §5.4 — list every registered project.
@@ -669,20 +682,23 @@ fn build_tree_from_git_lines(lines: impl Iterator<Item = String>) -> Vec<Gitigno
 /// matches git's own resolution (global gitignore, `.git/info/exclude`, nested
 /// `.gitignore` files). Used by the hydration picker.
 #[tauri::command]
-pub fn project_list_gitignored(
+pub async fn project_list_gitignored(
     state: tauri::State<'_, AppHandleState>,
     slug: String,
 ) -> Result<Vec<GitignoreNode>, String> {
-    let store = state
-        .config_store
-        .lock()
-        .map_err(|e| format!("config_store lock: {e}"))?;
-    let project = store
-        .read_project(&slug)
-        .map_err(|e| format!("read_project: {e}"))?
-        .ok_or_else(|| format!("project not found: {slug}"))?;
-
-    let root = project.root_path;
+    // Scope the guard: `git ls-files` on a big monorepo takes hundreds of ms
+    // and every other command that touches the config store would block on it.
+    let root = {
+        let store = state
+            .config_store
+            .lock()
+            .map_err(|e| format!("config_store lock: {e}"))?;
+        let project = store
+            .read_project(&slug)
+            .map_err(|e| format!("read_project: {e}"))?
+            .ok_or_else(|| format!("project not found: {slug}"))?;
+        project.root_path
+    };
     if !root.is_dir() {
         return Err(format!(
             "project root is not a directory: {}",
@@ -690,29 +706,34 @@ pub fn project_list_gitignored(
         ));
     }
 
-    // `--directory` collapses entirely-ignored subtrees (e.g. `node_modules/`)
-    // into a single entry so we never enumerate thousands of files inside them.
-    let output = std::process::Command::new("git")
-        .args([
-            "ls-files",
-            "--others",
-            "--ignored",
-            "--exclude-standard",
-            "--directory",
-            "--no-empty-directory",
-        ])
-        .current_dir(&root)
-        .output()
-        .map_err(|e| format!("git ls-files: {e}"))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        // `--directory` collapses entirely-ignored subtrees (e.g. `node_modules/`)
+        // into a single entry so we never enumerate thousands of files inside them.
+        let output = crate::git::git_bare()
+            .args([
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "--directory",
+                "--no-empty-directory",
+            ])
+            .current_dir(&root)
+            .output()
+            .map_err(|e| format!("git ls-files: {e}"))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("git ls-files failed: {stderr}"));
-    }
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("git ls-files failed: {stderr}"));
+        }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let nodes = build_tree_from_git_lines(stdout.lines().map(|l| l.to_string()));
-    Ok(nodes)
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(build_tree_from_git_lines(
+            stdout.lines().map(|l| l.to_string()),
+        ))
+    })
+    .await
+    .map_err(|e| format!("project_list_gitignored join: {e}"))?
 }
 
 /// List the immediate children of a directory inside a project root. Used by
@@ -721,22 +742,26 @@ pub fn project_list_gitignored(
 ///
 /// Returns `GitignoreNode` entries with empty `children` — further expansion
 /// triggers another call. OS noise files are filtered.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn project_list_dir(
     state: tauri::State<'_, AppHandleState>,
     slug: String,
     rel_path: String,
 ) -> Result<Vec<GitignoreNode>, String> {
-    let store = state
-        .config_store
-        .lock()
-        .map_err(|e| format!("config_store lock: {e}"))?;
-    let project = store
-        .read_project(&slug)
-        .map_err(|e| format!("read_project: {e}"))?
-        .ok_or_else(|| format!("project not found: {slug}"))?;
-
-    let root = project.root_path;
+    // Scope the guard: the read_dir + per-entry `is_dir` stat below is disk
+    // work, and holding the store lock across it blocks every other command
+    // that touches config.
+    let root = {
+        let store = state
+            .config_store
+            .lock()
+            .map_err(|e| format!("config_store lock: {e}"))?;
+        store
+            .read_project(&slug)
+            .map_err(|e| format!("read_project: {e}"))?
+            .ok_or_else(|| format!("project not found: {slug}"))?
+            .root_path
+    };
 
     // Prevent path traversal. Note: a naive `join(..).starts_with(root)`
     // check passes `../x` (component-wise comparison, no normalization) —

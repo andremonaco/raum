@@ -45,7 +45,7 @@ pub use persistence::infer_reattach_hook_fallback;
 pub use query::{agent_ack_state, agent_list, agent_snapshot, agent_state};
 pub use registry::{AgentEventBus, AgentRegistry};
 pub use runtime::{
-    RegisterOptions, drive_event_socket, ensure_bridge_running, prepare_harness_launch_fast,
+    RegisterOptions, drive_event_socket, ensure_bridge_running, prepare_harness_launch_fast_async,
     register_harness_session_runtime, register_harness_session_runtime_opts,
 };
 pub use silence::spawn_silence_tick;

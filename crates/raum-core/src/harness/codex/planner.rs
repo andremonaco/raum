@@ -180,13 +180,20 @@ pub(super) fn merge_codex_hooks_json(
     serde_json::to_string_pretty(&root).map_err(|e| SetupError::Serialize(e.to_string()))
 }
 
+/// Matcher raum writes on every managed hook entry. Shared with
+/// [`codex_hook_trusted_hash`] so the written entry and the pre-seeded
+/// hash can never drift apart for the events that keep their matcher.
+const CODEX_HOOK_MATCHER: &str = ".*";
+
 pub(super) fn codex_hook_entry(event: &str, hook_script: &Path) -> Value {
     // Codex timeout default is 600 s per upstream docs; leave
-    // unspecified so we track that default automatically.
+    // unspecified so we track that default automatically. The
+    // dispatcher self-limits the blocking `PermissionRequest` wait via
+    // `RAUM_HOOK_TIMEOUT_SECS`, so it never rides the 600 s ceiling.
     json!({
         MARKER_KEY: MARKER_BEGIN,
         "_raum_event": event,
-        "matcher": ".*",
+        "matcher": CODEX_HOOK_MATCHER,
         "hooks": [
             {
                 "type": "command",
@@ -198,9 +205,9 @@ pub(super) fn codex_hook_entry(event: &str, hook_script: &Path) -> Value {
 }
 
 /// Snake-case label for an event, mirroring upstream
-/// `codex-rs/hooks/src/lib.rs::hook_event_key_label`. raum subscribes
-/// to two events today; if `RAUM_CODEX_HOOK_EVENTS` ever grows, extend
-/// this map at the same time. Unknown events fall through to the input
+/// `codex-rs/hooks/src/lib.rs::hook_event_key_label`. If
+/// `RAUM_CODEX_HOOK_EVENTS` ever grows, extend this map at the same
+/// time. Unknown events fall through to the input
 /// string so a missing arm shows up as a hash/key mismatch in tests
 /// rather than a silent panic at startup.
 fn codex_hook_event_label(event: &str) -> &str {
@@ -215,6 +222,19 @@ fn codex_hook_event_label(event: &str) -> &str {
         "Stop" => "stop",
         other => other,
     }
+}
+
+/// Whether Codex keeps the entry's `matcher` when it normalises a hook
+/// for hashing. Mirrors upstream `HOOK_EVENT_NAMES_WITH_MATCHERS` /
+/// `matcher_pattern_for_event`: every event carries a matcher except
+/// `UserPromptSubmit` and `Stop`, which are forced to `None`. Listing
+/// the positives explicitly keeps a future addition to
+/// [`RAUM_CODEX_HOOK_EVENTS`] from silently inheriting the wrong side.
+fn codex_event_has_matcher(event: &str) -> bool {
+    matches!(
+        event,
+        "PermissionRequest" | "PreToolUse" | "PostToolUse" | "PreCompact" | "PostCompact"
+    )
 }
 
 /// Build the `[hooks.state."<key>"]` table key Codex uses to look up
@@ -244,18 +264,17 @@ pub(super) fn codex_hook_state_key(
 /// writes after Codex's discovery normalisation step (timeout `None` →
 /// 600, `async` defaulted to `false`).
 ///
-/// No `matcher` key: `matcher_pattern_for_event` in
+/// The `matcher` key is **per-event**: `matcher_pattern_for_event` in
 /// `codex-rs/hooks/src/events/common.rs` normalises the matcher to
 /// `None` for `UserPromptSubmit` and `Stop` (matchers are meaningless
-/// for those events), and `toml::Value` serialisation drops `None`
-/// fields — so the matcher never enters the hash for the events raum
-/// subscribes to. Including `"matcher": ".*"` here made every hash
-/// mismatch, stranding raum's hooks in Codex's "new or changed" review
-/// prompt on every launch. If `RAUM_CODEX_HOOK_EVENTS` ever grows an
-/// event listed in upstream `HOOK_EVENT_NAMES_WITH_MATCHERS`, the
-/// matcher must be re-added for that event only.
+/// for those events) and `toml::Value` serialisation drops `None`
+/// fields, so including `"matcher": ".*"` for those made every hash
+/// mismatch and stranded raum's hooks in Codex's "new or changed"
+/// review prompt on every launch. `PermissionRequest` *does* keep its
+/// matcher, so it must be hashed with one — see
+/// [`codex_event_has_matcher`].
 pub(super) fn codex_hook_trusted_hash(event: &str, hook_script: &Path) -> String {
-    let identity = json!({
+    let mut identity = json!({
         "event_name": codex_hook_event_label(event),
         "hooks": [
             {
@@ -267,6 +286,9 @@ pub(super) fn codex_hook_trusted_hash(event: &str, hook_script: &Path) -> String
             }
         ],
     });
+    if codex_event_has_matcher(event) {
+        identity["matcher"] = json!(CODEX_HOOK_MATCHER);
+    }
     let canonical = canonicalize_json(identity);
     let bytes = serde_json::to_vec(&canonical).unwrap_or_default();
     let digest = Sha256::digest(&bytes);

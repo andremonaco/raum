@@ -34,7 +34,7 @@ pub(super) fn discover_claude_session_id_by_prompt(
         if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
             continue;
         }
-        if !transcript_contains_prompt(parse_claude_user_prompts(&path), prompt) {
+        if !transcript_contains_prompt(&parse_claude_user_prompts(&path), prompt) {
             continue;
         }
         let Some(id) = path
@@ -200,44 +200,70 @@ fn extract_user_prompt_text(content: &Value) -> Option<String> {
 /// after the wrappers (which is the typical case for the
 /// `<local-command-caveat>` injection — caveat block followed by the
 /// actual prompt) survives intact.
+///
+/// Implementation: one left-to-right pass with a cursor. Each step finds
+/// the *earliest* open tag at or after the cursor and removes it together
+/// with its matching close (or truncates when the close never comes). The
+/// predecessor re-scanned all nine tags over the whole string once per
+/// outer pass and rebuilt both tag literals with `format!` every time,
+/// which is quadratic-to-cubic in the number of wrappers on a line.
 pub(crate) fn clean_claude_user_text(text: &str) -> Option<String> {
-    const WRAPPER_TAGS: &[&str] = &[
-        "command-name",
-        "command-message",
-        "command-args",
-        "command-stdout",
-        "command-stderr",
-        "local-command-caveat",
-        "local-command-stdout",
-        "local-command-stderr",
-        "local-command-name",
-    ];
     let mut out = text.to_string();
-    let mut changed = true;
-    // Outer loop handles nested or interleaved tags by re-scanning until
-    // no more replacements happen.
-    while changed {
-        changed = false;
-        for tag in WRAPPER_TAGS {
-            let open = format!("<{tag}>");
-            let close = format!("</{tag}>");
-            while let Some(start) = out.find(&open) {
-                if let Some(end_rel) = out[start + open.len()..].find(&close) {
-                    let end = start + open.len() + end_rel + close.len();
-                    out.replace_range(start..end, "");
-                    changed = true;
-                } else {
-                    // Unclosed wrapper — drop everything from the open
-                    // tag forward. Anything after a never-closed tag in
-                    // a transcript line is by definition still inside
-                    // the wrapper.
-                    out.truncate(start);
-                    changed = true;
-                    break;
-                }
-            }
+    let mut cursor = 0usize;
+    while cursor < out.len() {
+        // Earliest wrapper open at or after the cursor. Open tags all start
+        // with `<` and no tag name is a suffix of another's, so a match is
+        // never ambiguous.
+        let Some((start, open, close)) = WRAPPER_TAGS
+            .iter()
+            .filter_map(|&(open, close)| {
+                out[cursor..]
+                    .find(open)
+                    .map(|at| (cursor + at, open, close))
+            })
+            .min_by_key(|&(at, _, _)| at)
+        else {
+            break;
+        };
+
+        let Some(end_rel) = out[start + open.len()..].find(close) else {
+            // Unclosed wrapper — drop everything from the open tag forward.
+            // Anything after a never-closed tag in a transcript line is by
+            // definition still inside the wrapper.
+            out.truncate(start);
+            break;
+        };
+        let end = start + open.len() + end_rel + close.len();
+        out.replace_range(start..end, "");
+
+        // Resume slightly *before* the splice so a tag literal formed by the
+        // concatenation of the two surviving halves is still caught — that
+        // is the only thing the old re-scan-from-the-top loop bought us.
+        cursor = start.saturating_sub(LONGEST_WRAPPER_TAG);
+        while cursor > 0 && !out.is_char_boundary(cursor) {
+            cursor -= 1;
         }
     }
     let trimmed = out.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
+
+/// `(open, close)` literals for every wrapper we strip. Consts rather than
+/// per-iteration `format!` calls — the old code rebuilt all eighteen strings
+/// on every pass of its rescan loop.
+const WRAPPER_TAGS: &[(&str, &str)] = &[
+    ("<command-name>", "</command-name>"),
+    ("<command-message>", "</command-message>"),
+    ("<command-args>", "</command-args>"),
+    ("<command-stdout>", "</command-stdout>"),
+    ("<command-stderr>", "</command-stderr>"),
+    ("<local-command-caveat>", "</local-command-caveat>"),
+    ("<local-command-stdout>", "</local-command-stdout>"),
+    ("<local-command-stderr>", "</local-command-stderr>"),
+    ("<local-command-name>", "</local-command-name>"),
+];
+
+/// Longest close literal (`</local-command-caveat>`). A tag literal created
+/// by splicing two halves together must straddle the join, so rewinding this
+/// far is enough to catch it.
+const LONGEST_WRAPPER_TAG: usize = "</local-command-caveat>".len();

@@ -58,8 +58,8 @@ import {
   type LayoutNode,
   type Rect,
 } from "../../lib/layoutTree";
-import { ROOT_TARGET, dragState } from "../../lib/paneDnD";
-import { installWindowResizeClass } from "../../lib/gridResizeClass";
+import { ROOT_TARGET, dragPointerX, dragPointerY, dragState } from "../../lib/paneDnD";
+import { WINDOW_RESIZE_ACTIVE_CLASS, installWindowResizeClass } from "../../lib/gridResizeClass";
 import { timeMemoSettle } from "../../lib/perf";
 import {
   prewarmProjectionCache,
@@ -147,7 +147,33 @@ export const TerminalGrid: Component = () => {
     () => activeWorktreeStore.byProject[activeProjectSlug() ?? ""] ?? ALL_WORKTREES_SCOPE,
   );
 
-  createEffect(() => {
+  // PREWARM (deferred + gesture-gated).
+  //
+  // `prewarmProjectionCache` re-projects EVERY known project's tree, and
+  // `layoutRev` bumps once per rAF frame while a divider is being dragged —
+  // so running it inline meant paying the full cross-project projection cost
+  // dozens of times a second for geometry the user is still changing. Instead
+  // the effect only arms a short trailing timer; a burst of revs coalesces to
+  // a single prewarm, and while a pane drag or a divider/window resize is in
+  // flight the timer simply re-arms until the gesture settles.
+  const PREWARM_IDLE_MS = 150;
+  let prewarmTimer: ReturnType<typeof setTimeout> | null = null;
+  const gridGestureActive = (): boolean => {
+    if (dragState() !== null) return true;
+    const root = rootEl();
+    if (!root) return false;
+    return (
+      root.classList.contains("is-resizing") || root.classList.contains(WINDOW_RESIZE_ACTIVE_CLASS)
+    );
+  };
+  const runPrewarm = (): void => {
+    prewarmTimer = null;
+    // Still mid-gesture — check back rather than projecting geometry that is
+    // about to change again on the next frame.
+    if (gridGestureActive()) {
+      schedulePrewarm();
+      return;
+    }
     const projects = projectStore.items;
     if (projects.length === 0) return;
     setProjectionCacheMaxSize(Math.max(16, projects.length * 2));
@@ -158,6 +184,29 @@ export const TerminalGrid: Component = () => {
       projects,
       scopesByProject: activeWorktreeStore.byProject,
     });
+  };
+  function schedulePrewarm(): void {
+    if (prewarmTimer !== null) clearTimeout(prewarmTimer);
+    prewarmTimer = setTimeout(runPrewarm, PREWARM_IDLE_MS);
+  }
+  createEffect(() => {
+    // Subscriptions only — the actual read happens at fire time so the
+    // prewarm always warms the *latest* revision, not the one that armed it.
+    // Touch exactly what the prewarm consumes (layout revision, project
+    // identity/paths, each project's active scope) so nothing stops re-arming.
+    void layoutRev();
+    for (const project of projectStore.items) {
+      void project.slug;
+      void project.rootPath;
+      void activeWorktreeStore.byProject[project.slug];
+    }
+    schedulePrewarm();
+  });
+  onCleanup(() => {
+    if (prewarmTimer !== null) {
+      clearTimeout(prewarmTimer);
+      prewarmTimer = null;
+    }
   });
 
   // Pruned tree + rect projection for the active project tab. Both drop
@@ -623,8 +672,8 @@ export const TerminalGrid: Component = () => {
       root.style.removeProperty("--snap-dy");
       return;
     }
-    root.style.setProperty("--drag-dx", `${s.pointerX - s.startPointerX}px`);
-    root.style.setProperty("--drag-dy", `${s.pointerY - s.startPointerY}px`);
+    root.style.setProperty("--drag-dx", `${dragPointerX() - s.startPointerX}px`);
+    root.style.setProperty("--drag-dy", `${dragPointerY() - s.startPointerY}px`);
 
     // Compute --snap-dx/dy only while snapped on a real pane (root-edge
     // magnets keep cursor tracking). Both the source's resting pixel

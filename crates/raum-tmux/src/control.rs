@@ -22,7 +22,10 @@
 //!    (content + SGR reset + restored modes + cursor position) is emitted
 //!    as the first frame, then live `%output` is forwarded verbatim.
 //! 3. Input goes back as `send-keys -H <hex…>` commands on the same stdin,
-//!    so keystroke bytes reach the pane unmodified.
+//!    so keystroke bytes reach the pane unmodified. Operational commands
+//!    ([`ControlBridgeHandle::run_command`]) ride the same stdin and their
+//!    reply block is correlated back to the caller — that is what lets
+//!    `resize-window` stop forking a `tmux` process per pointer-move event.
 //! 4. A waiter thread polls the child for exit and signals `on_exit` unless
 //!    the bridge was torn down deliberately (`shutdown_silent`).
 //!
@@ -31,11 +34,13 @@
 //! never participates in size negotiation and `resize` on this handle is a
 //! no-op.
 
+use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{RecvTimeoutError, SyncSender};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use thiserror::Error;
@@ -52,14 +57,123 @@ pub enum ControlBridgeError {
 }
 
 /// Max raw input bytes encoded into a single `send-keys -H` command line.
-/// Keystrokes are a handful of bytes; only large pastes ever chunk. Kept
-/// comfortably under tmux's command-line limits.
-const INPUT_CHUNK_BYTES: usize = 256;
+/// Keystrokes are a handful of bytes; only large pastes ever chunk — and a
+/// 256-byte chunk turned a modest paste into dozens of command lines, each
+/// its own round trip through the server's command parser. At 4 KB the
+/// encoded line is ~12 KB, still far under what tmux's control-mode reader
+/// (an unbounded evbuffer line) and command parser handle.
+const INPUT_CHUNK_BYTES: usize = 4096;
+
+/// Lowercase hex digit pairs for every byte value. `send-keys -H` sits on the
+/// keystroke path, so encoding is a table index per byte instead of a
+/// `write!("{b:02x}")` formatting machine invocation per byte.
+const HEX_PAIRS: [[u8; 2]; 256] = {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut table = [[0u8; 2]; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        table[i] = [DIGITS[i >> 4], DIGITS[i & 0x0f]];
+        i += 1;
+    }
+    table
+};
+
+/// Reader-thread batch target: parsed `%output` accumulates until the batch
+/// reaches this size (or the read buffer runs dry) before crossing the
+/// channel. tmux emits one `%output` per pane write, so a busy pane produces
+/// thousands of sub-100-byte lines a second — one channel slot each turned a
+/// 512-slot channel into a ~50 KB pipe and woke the coalescer per line.
+const BATCH_BYTES: usize = 16 * 1024;
+
+/// ≥50 ms blocked on a full channel means the IPC pipeline (coalescer →
+/// WebView) was the bottleneck for that interval. Warned once per reader —
+/// see [`forward_chunk`].
+const BLOCKED_SEND_WARN_MS: u128 = 50;
 
 /// Poll interval for the child-exit waiter thread. The control child has no
 /// PTY we can block on, and `Child::wait` would hold the kill mutex forever,
 /// so the waiter polls `try_wait` instead.
 const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(150);
+
+/// How long [`ControlBridgeHandle::run_command`] waits for its reply before
+/// declaring the control path unusable. A wedged client must never brick a
+/// caller — it falls back to a `tmux` subprocess — and the first timeout
+/// latches the path off (`degraded`) so later callers don't each pay the
+/// stall. Note this is a *reply* deadline, not a command one: a busy pane can
+/// hold the reader off for far longer than tmux takes to apply the command,
+/// which is why the resize path doesn't wait at all.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// A command reply: the block's content lines, or the server's `%error` text.
+type ReplyResult = Result<Vec<Vec<u8>>, String>;
+
+/// Reply correlation for commands written to this client's stdin.
+///
+/// tmux answers one control client's commands **in order**, one
+/// `%begin`…`%end`/`%error` block each, so a sequence number is all the
+/// correlation needed: every command written bumps `written` (input
+/// `send-keys` included — those consume a reply block too), the reader bumps
+/// `answered` per finished block, and a waiter fires when the two meet.
+/// Both counters start after the attach-time sync commands, whose blocks the
+/// parser consumes in its pre-`Live` phases.
+#[derive(Default)]
+struct Pending {
+    written: u64,
+    answered: u64,
+    /// `(sequence number, reply channel)` in issue order. Holds only the
+    /// commands somebody is actually waiting on — normally zero or one.
+    waiters: VecDeque<(u64, SyncSender<ReplyResult>)>,
+}
+
+impl Pending {
+    /// Writer side: account for one command about to hit stdin. Callers hold
+    /// the stdin lock, so the numbering matches the order tmux receives them.
+    fn issued(&mut self) -> u64 {
+        self.written += 1;
+        self.written
+    }
+
+    /// Reader side: one reply block finished. Wakes its waiter, if any.
+    fn complete(&mut self, lines: Vec<Vec<u8>>, errored: bool) {
+        self.answered += 1;
+        let reply = if errored {
+            Err(block_error_text(&lines))
+        } else {
+            Ok(lines)
+        };
+        let mut reply = Some(reply);
+        while let Some(&(seq, _)) = self.waiters.front() {
+            if seq > self.answered {
+                break;
+            }
+            // `seq < answered` can only mean the counters desynced (a write
+            // that never produced a block). Popping drops the sender, which
+            // fails that waiter immediately instead of hanging it.
+            let (_, tx) = self.waiters.pop_front().unwrap_or_else(|| unreachable!());
+            if seq == self.answered {
+                if let Some(reply) = reply.take() {
+                    let _ = tx.try_send(reply);
+                }
+                break;
+            }
+        }
+    }
+}
+
+/// `%error` block content → one error string. Dropping the senders instead
+/// would look like a torn-down client, so an empty body still gets text.
+fn block_error_text(lines: &[Vec<u8>]) -> String {
+    let text = lines
+        .iter()
+        .map(|l| String::from_utf8_lossy(l))
+        .collect::<Vec<_>>()
+        .join("; ");
+    if text.trim().is_empty() {
+        "tmux reported an error".to_string()
+    } else {
+        text
+    }
+}
 
 /// Owning handle returned by [`attach_via_control`]. Cheap to clone via the
 /// internal `Arc`; dropping the last clone kills the child and tears down the
@@ -80,6 +194,12 @@ struct ControlInner {
     /// frontend doesn't see a spurious bridge-lost event for a session that
     /// is still very much alive.
     suppress_exit: Arc<AtomicBool>,
+    /// Command-reply correlation, shared with the reader thread.
+    pending: Arc<Mutex<Pending>>,
+    /// Latched when the command path proved unusable (reply timeout, failed
+    /// write). Streaming and input are unaffected — only [`ControlBridgeHandle::run_command`]
+    /// gives up, so its callers stay on their subprocess fallback.
+    degraded: AtomicBool,
 }
 
 impl std::fmt::Debug for ControlBridgeHandle {
@@ -102,25 +222,142 @@ impl ControlBridgeHandle {
         if bytes.is_empty() {
             return Ok(());
         }
-        let mut guard = self.inner.stdin.lock().expect("control stdin poisoned");
+        // A poisoned stdin mutex means some other writer panicked mid-command;
+        // report it like any other write failure instead of taking this thread
+        // down too (`kill` / `Drop` already degrade gracefully the same way).
+        let mut guard = self
+            .inner
+            .stdin
+            .lock()
+            .map_err(|_| std::io::Error::other("control client stdin mutex poisoned"))?;
         let Some(stdin) = guard.as_mut() else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "control client stdin closed",
             ));
         };
+        let prefix_len = self.inner.session_id.len() + 17;
+        let mut cmd: Vec<u8> = Vec::with_capacity(prefix_len + INPUT_CHUNK_BYTES * 3);
         for chunk in bytes.chunks(INPUT_CHUNK_BYTES) {
-            let mut cmd = String::with_capacity(20 + self.inner.session_id.len() + chunk.len() * 3);
-            cmd.push_str("send-keys -t ");
-            cmd.push_str(&self.inner.session_id);
-            cmd.push_str(" -H");
-            for b in chunk {
-                let _ = write!(cmd, " {b:02x}");
+            cmd.clear();
+            cmd.extend_from_slice(b"send-keys -t ");
+            cmd.extend_from_slice(self.inner.session_id.as_bytes());
+            cmd.extend_from_slice(b" -H");
+            for &b in chunk {
+                cmd.push(b' ');
+                cmd.extend_from_slice(&HEX_PAIRS[usize::from(b)]);
             }
-            cmd.push('\n');
-            stdin.write_all(cmd.as_bytes())?;
+            cmd.push(b'\n');
+            // Count the command *before* it is written: its reply block can
+            // land the instant the write returns, and the reader must not
+            // credit that block to a later command's waiter. A failed write
+            // leaves the counter one ahead, so it also latches the command
+            // path off (input itself is already failing at that point).
+            self.inner.lock_pending().issued();
+            if let Err(e) = stdin.write_all(&cmd) {
+                self.inner.degraded.store(true, Ordering::Relaxed);
+                return Err(e);
+            }
         }
         stdin.flush()
+    }
+
+    /// Issue a tmux command on this control client and wait for its reply.
+    ///
+    /// Returns the reply block's content lines, or the server's message when
+    /// tmux answered `%error`. Every failure mode (no live client, wedged
+    /// reader, tmux refusal) is an `Err` the caller is expected to answer with
+    /// its subprocess fallback.
+    ///
+    /// **Waiting couples the caller to the pane's output backlog.** The reply
+    /// is parsed by the same reader thread that parses `%output`, and that
+    /// thread blocks in [`forward_chunk`] whenever the data channel to the
+    /// coalescer saturates — so on a pane spewing output the `%end` sits
+    /// behind megabytes of queued `%output`. Only use this where a reply is
+    /// actually needed and a [`REPLY_TIMEOUT`] stall is acceptable; anything
+    /// on a latency path wants a fire-and-forget `issue(cmd, None)` the way
+    /// [`ControlBridgeHandle::resize_window`] does.
+    ///
+    /// ponytail: the pane-context and pane-death polls could ride this too,
+    /// but round 1 already batched them to one fork per 200 ms tick for *all*
+    /// panes — routing them would trade that for one control round trip per
+    /// pane. Not worth it; revisit only if the batched tick shows up in a
+    /// profile.
+    pub fn run_command(&self, cmd: &str) -> ReplyResult {
+        if self.inner.degraded.load(Ordering::Relaxed) {
+            return Err("control command path degraded".to_string());
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        self.issue(cmd, Some(tx))?;
+        match rx.recv_timeout(REPLY_TIMEOUT) {
+            Ok(reply) => reply,
+            Err(RecvTimeoutError::Timeout) => {
+                self.inner.degraded.store(true, Ordering::Relaxed);
+                Err(format!("control command timed out after {REPLY_TIMEOUT:?}"))
+            }
+            // Sender dropped: the reader hit EOF or the bridge was torn down.
+            Err(RecvTimeoutError::Disconnected) => Err("control client gone".to_string()),
+        }
+    }
+
+    /// Write one command line and, when the caller wants the reply, register
+    /// its waiter. The stdin lock is held across both so a command line can
+    /// never interleave with `send-keys` input bytes mid-line, and so the
+    /// sequence number matches the order the server will answer in.
+    ///
+    /// `waiter: None` is fire-and-forget: the command still consumes a reply
+    /// block and the reader still counts it, nobody is woken.
+    fn issue(&self, cmd: &str, waiter: Option<SyncSender<ReplyResult>>) -> Result<(), String> {
+        let mut guard = self
+            .inner
+            .stdin
+            .lock()
+            .map_err(|_| "control client stdin mutex poisoned".to_string())?;
+        let Some(stdin) = guard.as_mut() else {
+            return Err("control client stdin closed".to_string());
+        };
+        {
+            let mut pending = self.inner.lock_pending();
+            let seq = pending.issued();
+            if let Some(tx) = waiter {
+                pending.waiters.push_back((seq, tx));
+            }
+        }
+        if let Err(e) = stdin
+            .write_all(cmd.as_bytes())
+            .and_then(|()| stdin.write_all(b"\n"))
+            .and_then(|()| stdin.flush())
+        {
+            // The counter (and the queued waiter) are now one ahead of what
+            // tmux will ever answer. Latch the path off rather than unwind:
+            // a client whose stdin fails is not coming back.
+            self.inner.degraded.store(true, Ordering::Relaxed);
+            return Err(format!("control client write: {e}"));
+        }
+        Ok(())
+    }
+
+    /// Server-side `resize-window` over this client instead of a `tmux
+    /// resize-window` subprocess.
+    ///
+    /// Fire-and-forget on purpose: a divider drag fires this at pointer-move
+    /// rate, and waiting for the reply would put resize latency behind the
+    /// pane's `%output` backlog (see [`ControlBridgeHandle::run_command`]) —
+    /// dragging next to a pane running `yes` stalled the full
+    /// [`REPLY_TIMEOUT`]. Command order on this client's stdin is the only
+    /// guarantee the caller's grow/shrink sequencing rests on, and that
+    /// survives.
+    ///
+    /// ponytail: this gives up the `%error` → subprocess-fallback path, so a
+    /// resize tmux *refuses* (dead session) now reads as success; a failed
+    /// write still falls back. Route the reply to a background waiter if a
+    /// refusal ever needs to be acted on.
+    pub fn resize_window(&self, cols: u32, rows: u32) -> Result<(), String> {
+        let cmd = format!(
+            "resize-window -t {} -x {cols} -y {rows}",
+            self.inner.session_id
+        );
+        self.issue(&cmd, None)
     }
 
     /// No-op: the control client has no viewport. Pane geometry is owned by
@@ -149,7 +386,22 @@ impl ControlBridgeHandle {
         if let Ok(mut stdin) = self.inner.stdin.lock() {
             let _ = stdin.take();
         }
+        self.inner.fail_pending();
         self.kill();
+    }
+}
+
+impl ControlInner {
+    /// A panicking writer must not wedge every later command — the counters
+    /// are plain integers, so the recovered state is still coherent.
+    fn lock_pending(&self) -> std::sync::MutexGuard<'_, Pending> {
+        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Drop every waiter's sender so pending callers fail *now* rather than
+    /// sitting out [`REPLY_TIMEOUT`] on a client that is going away.
+    fn fail_pending(&self) {
+        self.lock_pending().waiters.clear();
     }
 }
 
@@ -163,6 +415,7 @@ impl Drop for ControlInner {
         if let Ok(mut stdin) = self.stdin.lock() {
             let _ = stdin.take();
         }
+        self.fail_pending();
         if let Ok(mut child) = self.child.lock() {
             let _ = child.kill();
         }
@@ -244,15 +497,22 @@ enum SyncPhase {
 /// One parsed wire event the bridge has to act on.
 #[derive(Debug, PartialEq, Eq)]
 enum ControlEvent {
-    /// Bytes for xterm: either the assembled initial replay or live,
-    /// unescaped `%output` data.
-    Data(Vec<u8>),
+    /// Bytes for xterm — either the assembled initial replay or live,
+    /// unescaped `%output` data — were appended to the caller's buffer.
+    /// The parser never owns a payload: the reader thread passes the batch
+    /// buffer straight in, so a `%output` line costs no allocation at all
+    /// until the batch actually crosses the channel.
+    Data,
     /// The control client announced it is exiting (`%exit`).
     Exit,
     /// A `%layout-change` reported more than one pane in the window: some
     /// outside tool split our one-pane session. Surfaced once so the bridge
     /// can log it; foreign panes' output is dropped either way.
     ForeignSplit,
+    /// A command's reply block closed while live — its content lines, and
+    /// whether tmux terminated it with `%error`. Block content, never pane
+    /// output: it goes to the command's waiter, not to xterm.
+    Reply { lines: Vec<Vec<u8>>, errored: bool },
     /// Nothing actionable (notification we ignore, block bookkeeping, …).
     None,
 }
@@ -283,13 +543,25 @@ impl ControlParser {
         }
     }
 
-    /// Feed one wire line (trailing `\n`/`\r` already stripped).
-    fn feed_line(&mut self, line: &[u8]) -> ControlEvent {
+    /// Feed one wire line (trailing `\n`/`\r` already stripped). Bytes for
+    /// xterm are appended to `out`; [`ControlEvent::Data`] says it grew.
+    fn feed_line(&mut self, line: &[u8], out: &mut Vec<u8>) -> ControlEvent {
+        // Hot path: once live, essentially every line is `%output`. Test it
+        // before the block/`%begin` bookkeeping so the common line costs one
+        // prefix compare. The `block.is_none()` guard is load-bearing —
+        // capture/command-reply content lines may themselves start with
+        // `%output ` and must stay block content.
+        if self.phase == SyncPhase::Live && self.block.is_none() {
+            if let Some(rest) = line.strip_prefix(b"%output ") {
+                return self.live_output(rest, out);
+            }
+        }
+
         if self.block.is_some() {
             if is_block_terminator(line, b"%end ") || is_block_terminator(line, b"%error ") {
                 let lines = self.block.take().unwrap_or_default();
                 let errored = line.starts_with(b"%error ");
-                return self.finish_block(lines, errored);
+                return self.finish_block(lines, errored, out);
             }
             if let Some(block) = self.block.as_mut() {
                 block.push(line.to_vec());
@@ -301,23 +573,11 @@ impl ControlParser {
             self.block = Some(Vec::new());
             return ControlEvent::None;
         }
-        if let Some(rest) = line.strip_prefix(b"%output ") {
-            // `%output %<pane-id> <escaped-data>`.
-            let (pane, data) = match rest.iter().position(|&b| b == b' ') {
-                Some(idx) => (&rest[..idx], &rest[idx + 1..]),
-                None => return ControlEvent::None,
-            };
-            if self.phase == SyncPhase::Live {
-                // Foreign panes (see `lead_pane`) never reach xterm. Unknown
-                // lead (meta reply errored) degrades to forwarding everything.
-                if self.lead_pane.as_deref().is_some_and(|lead| lead != pane) {
-                    return ControlEvent::None;
-                }
-                return ControlEvent::Data(unescape_output(data));
-            }
-            // Pre-sync output is already contained in the capture the server
-            // will answer next (single ordered stream), so dropping it here
-            // is what makes the initial paint exact instead of duplicated.
+        if line.starts_with(b"%output ") {
+            // Live output was handled above, so this is pre-sync output —
+            // already contained in the capture the server will answer next
+            // (single ordered stream). Dropping it here is what makes the
+            // initial paint exact instead of duplicated.
             return ControlEvent::None;
         }
         if line == b"%exit" || line.starts_with(b"%exit ") {
@@ -338,7 +598,28 @@ impl ControlParser {
         ControlEvent::None
     }
 
-    fn finish_block(&mut self, lines: Vec<Vec<u8>>, errored: bool) -> ControlEvent {
+    /// Live `%output %<pane-id> <escaped-data>` — unescape straight into the
+    /// caller's buffer.
+    fn live_output(&mut self, rest: &[u8], out: &mut Vec<u8>) -> ControlEvent {
+        let Some(idx) = rest.iter().position(|&b| b == b' ') else {
+            return ControlEvent::None;
+        };
+        let (pane, data) = (&rest[..idx], &rest[idx + 1..]);
+        // Foreign panes (see `lead_pane`) never reach xterm. Unknown lead
+        // (meta reply errored) degrades to forwarding everything.
+        if self.lead_pane.as_deref().is_some_and(|lead| lead != pane) {
+            return ControlEvent::None;
+        }
+        unescape_into(out, data);
+        ControlEvent::Data
+    }
+
+    fn finish_block(
+        &mut self,
+        lines: Vec<Vec<u8>>,
+        errored: bool,
+        out: &mut Vec<u8>,
+    ) -> ControlEvent {
         match self.phase {
             SyncPhase::AwaitGreeting => {
                 self.phase = SyncPhase::AwaitMeta;
@@ -367,10 +648,14 @@ impl ControlParser {
                 if replay.is_empty() {
                     ControlEvent::None
                 } else {
-                    ControlEvent::Data(replay)
+                    out.extend_from_slice(&replay);
+                    ControlEvent::Data
                 }
             }
-            SyncPhase::Live => ControlEvent::None,
+            // Live-phase blocks are command replies: the attach-time sync is
+            // long done, so the only `%begin` blocks left are answers to
+            // commands raum wrote on stdin (`send-keys`, `resize-window`, …).
+            SyncPhase::Live => ControlEvent::Reply { lines, errored },
         }
     }
 }
@@ -389,15 +674,21 @@ fn is_block_terminator(line: &[u8], prefix: &[u8]) -> bool {
 /// (including `\\` for backslash). C-style single-character escapes are
 /// handled defensively for portability across tmux builds; valid UTF-8 passes
 /// through untouched.
-fn unescape_output(data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len());
+fn unescape_into(out: &mut Vec<u8>, data: &[u8]) {
+    out.reserve(data.len());
     let mut i = 0;
     while i < data.len() {
-        let b = data[i];
-        if b != b'\\' {
-            out.push(b);
-            i += 1;
-            continue;
+        // Printable runs are the overwhelming majority of a `%output` line,
+        // so copy each run to the next backslash in bulk and let only the
+        // escapes themselves go byte-wise.
+        let run = data[i..]
+            .iter()
+            .position(|&b| b == b'\\')
+            .unwrap_or(data.len() - i);
+        out.extend_from_slice(&data[i..i + run]);
+        i += run;
+        if i == data.len() {
+            break;
         }
         i += 1;
         let Some(&c) = data.get(i) else {
@@ -462,7 +753,6 @@ fn unescape_output(data: &[u8]) -> Vec<u8> {
             }
         }
     }
-    out
 }
 
 /// Build the first frame for xterm from the sync replies: viewport content
@@ -617,6 +907,11 @@ pub fn attach_via_control(
     // transport's reader/coalescer split so a busy WebView never stalls the
     // pipe tmux writes into.
     let (data_tx, data_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(512);
+    // Both counters start at zero *after* the two sync commands above: their
+    // reply blocks are consumed by the parser's pre-`Live` phases, so the
+    // first block the reader counts is the first command a caller issued.
+    let pending = Arc::new(Mutex::new(Pending::default()));
+    let reader_pending = pending.clone();
     let reader_session = session_id.to_string();
     std::thread::Builder::new()
         .name(format!("raum-ctl-reader-{session_id}"))
@@ -624,6 +919,8 @@ pub fn attach_via_control(
             let mut parser = ControlParser::new();
             let mut reader = BufReader::with_capacity(128 * 1024, stdout);
             let mut line: Vec<u8> = Vec::with_capacity(4096);
+            let mut batch: Vec<u8> = Vec::new();
+            let mut blocked_send_warned = false;
             loop {
                 line.clear();
                 match reader.read_until(b'\n', &mut line) {
@@ -632,12 +929,10 @@ pub fn attach_via_control(
                         while line.last().is_some_and(|&b| b == b'\n' || b == b'\r') {
                             line.pop();
                         }
-                        match parser.feed_line(&line) {
-                            ControlEvent::Data(bytes) => {
-                                if !forward_chunk(&data_tx, bytes, &reader_session) {
-                                    break;
-                                }
-                            }
+                        match parser.feed_line(&line, &mut batch) {
+                            // Bytes landed in `batch`; the send decision is
+                            // made below, once per read.
+                            ControlEvent::Data => {}
                             ControlEvent::Exit => {
                                 tracing::debug!(
                                     session_id = %reader_session,
@@ -652,7 +947,34 @@ pub fn attach_via_control(
                                      output — the lead pane will render at reduced width",
                                 );
                             }
+                            ControlEvent::Reply { lines, errored } => {
+                                reader_pending
+                                    .lock()
+                                    .unwrap_or_else(PoisonError::into_inner)
+                                    .complete(lines, errored);
+                            }
                             ControlEvent::None => {}
+                        }
+                        // Ship the batch once it is worth a frame, or as soon
+                        // as the read buffer runs dry — i.e. we are about to
+                        // block on the pipe anyway, so holding bytes back
+                        // would only add latency.
+                        // ponytail: "input exhausted" is buffer-empty, not
+                        // "no complete line buffered"; a batch can sit for the
+                        // time tmux takes to finish a line split across reads.
+                        // Scanning the (128 KB) buffer for a newline per line
+                        // costs more than that wait — revisit with memchr if a
+                        // stall ever shows up.
+                        if !batch.is_empty()
+                            && (batch.len() >= BATCH_BYTES || reader.buffer().is_empty())
+                            && !forward_chunk(
+                                &data_tx,
+                                std::mem::take(&mut batch),
+                                &reader_session,
+                                &mut blocked_send_warned,
+                            )
+                        {
+                            break;
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
@@ -667,6 +989,16 @@ pub fn attach_via_control(
                     }
                 }
             }
+            if !batch.is_empty() {
+                let _ = forward_chunk(&data_tx, batch, &reader_session, &mut blocked_send_warned);
+            }
+            // No further replies can arrive: fail anyone still waiting rather
+            // than leave them to time out.
+            reader_pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .waiters
+                .clear();
             // Drop `data_tx` so the coalescer thread observes channel close.
         })
         .map_err(|e| ControlBridgeError::Spawn(e.to_string()))?;
@@ -688,6 +1020,8 @@ pub fn attach_via_control(
         stdin: Mutex::new(Some(stdin)),
         child: Mutex::new(child),
         suppress_exit: suppress_exit.clone(),
+        pending,
+        degraded: AtomicBool::new(false),
     });
 
     // Waiter thread: polls `try_wait` (the kill path needs the child mutex,
@@ -728,10 +1062,15 @@ pub fn attach_via_control(
 
 /// `try_send` first, blocking `send` on a full channel — same no-drop
 /// discipline as the PTY reader. Returns `false` when the coalescer is gone.
+///
+/// `warned` is the reader thread's one-shot latch: a saturated channel stays
+/// saturated for the whole burst, so warning per blocked send would emit
+/// thousands of identical lines. Mirrors `pty_bridge`'s `blocked_send_warned`.
 fn forward_chunk(
     tx: &std::sync::mpsc::SyncSender<Vec<u8>>,
     bytes: Vec<u8>,
     session_id: &str,
+    warned: &mut bool,
 ) -> bool {
     match tx.try_send(bytes) {
         Ok(()) => true,
@@ -740,13 +1079,16 @@ fn forward_chunk(
             if tx.send(bytes).is_err() {
                 return false;
             }
-            let waited = waited_at.elapsed().as_millis();
-            if waited >= 50 {
-                tracing::warn!(
-                    session_id = %session_id,
-                    waited_ms = waited as u64,
-                    "control bridge: reader blocked on send (IPC drain bottleneck)",
-                );
+            if !*warned {
+                let waited = waited_at.elapsed().as_millis();
+                if waited >= BLOCKED_SEND_WARN_MS {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        waited_ms = u64::try_from(waited).unwrap_or(u64::MAX),
+                        "control bridge: reader blocked on send (IPC drain bottleneck)",
+                    );
+                    *warned = true;
+                }
             }
             true
         }
@@ -756,30 +1098,43 @@ fn forward_chunk(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc::Receiver;
+
     use super::*;
 
-    fn line(parser: &mut ControlParser, s: &str) -> ControlEvent {
-        parser.feed_line(s.as_bytes())
+    fn unescape_output(data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        unescape_into(&mut out, data);
+        out
     }
 
-    fn drive_to_live(
-        parser: &mut ControlParser,
-        meta: &str,
-        capture: &[&str],
-    ) -> Vec<ControlEvent> {
-        let mut events = vec![
-            line(parser, "%begin 100 0 0"),
-            line(parser, "%end 100 0 0"),
-            line(parser, "%begin 100 1 1"),
-            line(parser, meta),
-            line(parser, "%end 100 1 1"),
-            line(parser, "%begin 100 2 1"),
-        ];
+    fn line(parser: &mut ControlParser, s: &str) -> ControlEvent {
+        parser.feed_line(s.as_bytes(), &mut Vec::new())
+    }
+
+    /// Feed a line and return both the event and whatever it appended.
+    fn feed(parser: &mut ControlParser, s: &str) -> (ControlEvent, Vec<u8>) {
+        let mut out = Vec::new();
+        let ev = parser.feed_line(s.as_bytes(), &mut out);
+        (ev, out)
+    }
+
+    /// Drive the greeting → meta → capture handshake; returns the assembled
+    /// replay frame (the only data the handshake emits).
+    fn drive_to_live(parser: &mut ControlParser, meta: &str, capture: &[&str]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut feed = |s: &str| parser.feed_line(s.as_bytes(), &mut out);
+        feed("%begin 100 0 0");
+        feed("%end 100 0 0");
+        feed("%begin 100 1 1");
+        feed(meta);
+        feed("%end 100 1 1");
+        feed("%begin 100 2 1");
         for l in capture {
-            events.push(line(parser, l));
+            feed(l);
         }
-        events.push(line(parser, "%end 100 2 1"));
-        events
+        feed("%end 100 2 1");
+        out
     }
 
     const META_SHELL: &str = "%0,0,7,2,1,0,0,1,0,0,0,0,0,0,0";
@@ -817,33 +1172,23 @@ mod tests {
         assert_eq!(line(&mut p, META_SHELL), ControlEvent::None);
         assert_eq!(line(&mut p, "%end 1 1 1"), ControlEvent::None);
         assert_eq!(line(&mut p, "%begin 1 2 1"), ControlEvent::None);
-        let replay = line(&mut p, "%end 1 2 1");
         // Empty capture still assembles modes + cursor for a fresh pane.
-        let ControlEvent::Data(replay) = replay else {
-            panic!("expected replay frame, got {replay:?}");
-        };
+        let (ev, replay) = feed(&mut p, "%end 1 2 1");
+        assert_eq!(ev, ControlEvent::Data);
         assert!(replay.ends_with(b"\x1b[3;8H"), "cursor restore missing");
-        match line(&mut p, "%output %0 live\\033[0m") {
-            ControlEvent::Data(bytes) => assert_eq!(bytes, b"live\x1b[0m"),
-            other => panic!("expected live output, got {other:?}"),
-        }
+        let (ev, bytes) = feed(&mut p, "%output %0 live\\033[0m");
+        assert_eq!(ev, ControlEvent::Data);
+        assert_eq!(bytes, b"live\x1b[0m");
     }
 
     #[test]
     fn capture_content_lines_are_not_misread_as_notifications() {
         let mut p = ControlParser::new();
-        let events = drive_to_live(
+        let replay = drive_to_live(
             &mut p,
             META_SHELL,
             &["%output %0 fake", "$ echo done", "done"],
         );
-        let replay = events
-            .into_iter()
-            .find_map(|e| match e {
-                ControlEvent::Data(bytes) => Some(bytes),
-                _ => None,
-            })
-            .expect("replay frame");
         let text = String::from_utf8_lossy(&replay).into_owned();
         assert!(
             text.contains("%output %0 fake"),
@@ -860,14 +1205,7 @@ mod tests {
         let mut p = ControlParser::new();
         // alt on, cursor 4,1; cursor hidden; mouse any+sgr on.
         let meta = "%0,1,4,1,0,0,0,1,0,0,0,0,1,1,0";
-        let events = drive_to_live(&mut p, meta, &["┌ TUI ┐", "└─────┘"]);
-        let replay = events
-            .into_iter()
-            .find_map(|e| match e {
-                ControlEvent::Data(bytes) => Some(bytes),
-                _ => None,
-            })
-            .expect("replay frame");
+        let replay = drive_to_live(&mut p, meta, &["┌ TUI ┐", "└─────┘"]);
         let text = String::from_utf8_lossy(&replay).into_owned();
         assert!(
             text.starts_with("\x1b[?1049h\x1b[H\x1b[2J"),
@@ -882,14 +1220,7 @@ mod tests {
     #[test]
     fn trailing_blank_capture_rows_are_trimmed() {
         let mut p = ControlParser::new();
-        let events = drive_to_live(&mut p, META_SHELL, &["$ ls", "", "", ""]);
-        let replay = events
-            .into_iter()
-            .find_map(|e| match e {
-                ControlEvent::Data(bytes) => Some(bytes),
-                _ => None,
-            })
-            .expect("replay frame");
+        let replay = drive_to_live(&mut p, META_SHELL, &["$ ls", "", "", ""]);
         let text = String::from_utf8_lossy(&replay).into_owned();
         assert!(
             text.starts_with("$ ls\x1b[0m"),
@@ -907,10 +1238,8 @@ mod tests {
         assert_eq!(line(&mut p, "%end 1 1 1"), ControlEvent::None);
         assert_eq!(line(&mut p, "%begin 1 2 1"), ControlEvent::None);
         assert_eq!(line(&mut p, "no current target"), ControlEvent::None);
-        let ev = line(&mut p, "%error 1 2 1");
-        let ControlEvent::Data(replay) = ev else {
-            panic!("expected modes-only replay, got {ev:?}");
-        };
+        let (ev, replay) = feed(&mut p, "%error 1 2 1");
+        assert_eq!(ev, ControlEvent::Data, "expected modes-only replay");
         let text = String::from_utf8_lossy(&replay).into_owned();
         assert!(
             !text.contains("no current target"),
@@ -935,17 +1264,20 @@ mod tests {
         let mut p = ControlParser::new();
         drive_to_live(&mut p, META_SHELL, &["x"]);
         // Lead pane (%0 per META_SHELL) passes.
-        match line(&mut p, "%output %0 lead") {
-            ControlEvent::Data(bytes) => assert_eq!(bytes, b"lead"),
-            other => panic!("expected lead output, got {other:?}"),
-        }
+        assert_eq!(
+            feed(&mut p, "%output %0 lead"),
+            (ControlEvent::Data, b"lead".to_vec())
+        );
         // A teammate pane from a foreign split-window must not reach xterm.
-        assert_eq!(line(&mut p, "%output %7 intruder"), ControlEvent::None);
+        assert_eq!(
+            feed(&mut p, "%output %7 intruder"),
+            (ControlEvent::None, Vec::new())
+        );
         // Lead output still flows afterwards.
-        match line(&mut p, "%output %0 more") {
-            ControlEvent::Data(bytes) => assert_eq!(bytes, b"more"),
-            other => panic!("expected lead output, got {other:?}"),
-        }
+        assert_eq!(
+            feed(&mut p, "%output %0 more"),
+            (ControlEvent::Data, b"more".to_vec())
+        );
     }
 
     #[test]
@@ -958,10 +1290,10 @@ mod tests {
         assert_eq!(line(&mut p, "%error 1 1 1"), ControlEvent::None);
         assert_eq!(line(&mut p, "%begin 1 2 1"), ControlEvent::None);
         let _replay = line(&mut p, "%end 1 2 1");
-        match line(&mut p, "%output %3 data") {
-            ControlEvent::Data(bytes) => assert_eq!(bytes, b"data"),
-            other => panic!("expected forwarded output, got {other:?}"),
-        }
+        assert_eq!(
+            feed(&mut p, "%output %3 data"),
+            (ControlEvent::Data, b"data".to_vec())
+        );
     }
 
     #[test]
@@ -994,15 +1326,283 @@ mod tests {
     }
 
     #[test]
-    fn late_blocks_are_swallowed_in_live_phase() {
+    fn live_blocks_become_command_replies_and_never_pane_output() {
         let mut p = ControlParser::new();
         drive_to_live(&mut p, META_SHELL, &["x"]);
-        // Reply to a send-keys command: bookkeeping only.
-        assert_eq!(line(&mut p, "%begin 2 3 1"), ControlEvent::None);
-        assert_eq!(line(&mut p, "%end 2 3 1"), ControlEvent::None);
-        match line(&mut p, "%output %0 after") {
-            ControlEvent::Data(bytes) => assert_eq!(bytes, b"after"),
-            other => panic!("expected forwarded output, got {other:?}"),
+        let (ev, out) = feed(&mut p, "%begin 2 3 1");
+        assert_eq!(ev, ControlEvent::None);
+        // A `%output`-looking content line inside a live command reply stays
+        // block content — the hot path must not steal it.
+        assert_eq!(line(&mut p, "%output %0 not-live"), ControlEvent::None);
+        let (ev, out_end) = feed(&mut p, "%end 2 3 1");
+        assert_eq!(
+            ev,
+            ControlEvent::Reply {
+                lines: vec![b"%output %0 not-live".to_vec()],
+                errored: false,
+            }
+        );
+        // Reply content is the waiter's, never xterm's.
+        assert!(
+            out.is_empty() && out_end.is_empty(),
+            "reply leaked to xterm"
+        );
+        assert_eq!(
+            feed(&mut p, "%output %0 after"),
+            (ControlEvent::Data, b"after".to_vec())
+        );
+        // `%error` terminates a reply block just the same.
+        assert_eq!(line(&mut p, "%begin 2 4 1"), ControlEvent::None);
+        assert_eq!(line(&mut p, "can't find window: nope"), ControlEvent::None);
+        assert_eq!(
+            line(&mut p, "%error 2 4 1"),
+            ControlEvent::Reply {
+                lines: vec![b"can't find window: nope".to_vec()],
+                errored: true,
+            }
+        );
+    }
+
+    /// Register a waiter the way [`ControlBridgeHandle::issue`] does.
+    fn wait_for(p: &mut Pending) -> Receiver<ReplyResult> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let seq = p.issued();
+        p.waiters.push_back((seq, tx));
+        rx
+    }
+
+    /// tmux answers a control client's commands in order, so the Nth reply
+    /// block belongs to the Nth command written — *including* the `send-keys`
+    /// lines the keystroke path writes, which nobody waits on. Miscounting
+    /// those hands a keystroke's empty reply to a resize waiter.
+    #[test]
+    fn replies_wake_the_command_that_asked_in_issue_order() {
+        let mut p = Pending::default();
+        assert_eq!(
+            p.issued(),
+            1,
+            "a keystroke send-keys still consumes a reply"
+        );
+        let rx = wait_for(&mut p);
+        let later = wait_for(&mut p);
+
+        p.complete(Vec::new(), false); // the send-keys reply
+        assert!(matches!(
+            rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        p.complete(vec![b"80x24".to_vec()], false);
+        assert_eq!(rx.try_recv().expect("reply"), Ok(vec![b"80x24".to_vec()]));
+        assert!(matches!(
+            later.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        p.complete(Vec::new(), false);
+        assert_eq!(later.try_recv().expect("reply"), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn error_replies_carry_the_server_message() {
+        let mut p = Pending::default();
+        let rx = wait_for(&mut p);
+        p.complete(vec![b"can't find window: nope".to_vec()], true);
+        assert_eq!(
+            rx.try_recv().expect("reply"),
+            Err("can't find window: nope".to_string())
+        );
+        // An empty `%error` body must still read as a failure, never as Ok.
+        let rx = wait_for(&mut p);
+        p.complete(Vec::new(), true);
+        assert!(rx.try_recv().expect("reply").is_err());
+    }
+
+    /// Teardown (reader EOF, `shutdown_silent`, drop) drops the senders, so a
+    /// caller blocked in `recv_timeout` fails at once instead of hanging out
+    /// the full `REPLY_TIMEOUT` while the app is quitting.
+    #[test]
+    fn teardown_fails_pending_waiters_immediately() {
+        let mut p = Pending::default();
+        let rx = wait_for(&mut p);
+        p.waiters.clear();
+        assert!(matches!(
+            rx.recv_timeout(Duration::ZERO),
+            Err(RecvTimeoutError::Disconnected)
+        ));
+    }
+
+    /// `tmux` missing → the end-to-end tests below have nothing to talk to.
+    fn no_tmux() -> bool {
+        std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .is_err()
+    }
+
+    /// A socket name no other test run can collide with.
+    fn test_socket(tag: &str) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        format!("raum-{tag}-{}-{nanos}", std::process::id())
+    }
+
+    /// `resize_window` doesn't wait for tmux's reply, so the new geometry
+    /// lands a beat after the call returns — poll for it.
+    fn wait_for_size(mgr: &TmuxManager, session: &str, want: (u32, u32)) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let size = mgr
+                .list_sessions()
+                .ok()
+                .and_then(|s| s.into_iter().find(|s| s.id == session))
+                .map(|s| (s.width, s.height));
+            if size == Some(want) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(25));
         }
+    }
+
+    /// The regression this guards: waiting for the `resize-window` reply puts
+    /// resize latency behind the pane's *output* pipeline. The reply is parsed
+    /// by the same reader thread that pushes `%output` downstream, so a
+    /// consumer that stops draining wedges that thread in `forward_chunk`'s
+    /// blocking send and *no* reply can be parsed until it moves — the resize
+    /// then sat out the full [`REPLY_TIMEOUT`] with the caller's per-session
+    /// lock held, and a divider drag next to a pane running `yes` visibly
+    /// stopped following the pointer.
+    ///
+    /// The test stalls the sink for longer than [`REPLY_TIMEOUT`] while the
+    /// pane floods, so the split is unambiguous: fire-and-forget returns in
+    /// microseconds, waiting cannot return in under two seconds. Skipped
+    /// without `tmux`.
+    #[test]
+    fn resize_does_not_wait_behind_a_stalled_output_consumer() {
+        if no_tmux() {
+            return;
+        }
+        let mgr = TmuxManager::with_socket(test_socket("ctlflood"));
+        let session = "ctlflood-1";
+        mgr.new_session(session, std::path::Path::new("/tmp"), None, Some((80, 24)))
+            .expect("new_session");
+
+        let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stall = Arc::new(AtomicBool::new(false));
+        let (seen, stalling) = (received.clone(), stall.clone());
+        let bridge = attach_via_control(
+            &mgr,
+            session,
+            24,
+            Box::new(move |b: Vec<u8>| {
+                seen.fetch_add(b.len(), Ordering::Relaxed);
+                // Chronically slow, then fully stalled on demand.
+                let nap = if stalling.load(Ordering::Relaxed) {
+                    REPLY_TIMEOUT * 2
+                } else {
+                    Duration::from_millis(50)
+                };
+                std::thread::sleep(nap);
+                true
+            }),
+            Box::new(|_| {}),
+        )
+        .expect("attach_via_control");
+
+        // Flood the pane, then wait for real throughput: bytes through a sink
+        // this slow mean the reader is already blocking on the data channel.
+        bridge
+            .write_input(b"yes raum-flood\n")
+            .expect("write_input");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while received.load(Ordering::Relaxed) < 1 << 20 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pane never produced enough output to back the reader up"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        // Stop the drain entirely and let `yes` refill the 512-slot channel,
+        // which pins the reader in `forward_chunk` for the next few seconds.
+        stall.store(true, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(500));
+
+        let started = std::time::Instant::now();
+        bridge.resize_window(100, 30).expect("resize over control");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "resize blocked {elapsed:?} behind the output backlog"
+        );
+        // tmux reads a client's stdin regardless of whether it reads its
+        // stdout, so the command still lands with the reader wedged.
+        assert!(
+            wait_for_size(&mgr, session, (100, 30)),
+            "fire-and-forget resize never applied"
+        );
+
+        drop(bridge);
+        let _ = mgr.kill_server();
+    }
+
+    /// End-to-end against a real server: a `resize-window` issued over the
+    /// live control connection must complete (no subprocess, no timeout),
+    /// actually resize the window, and leave the pane streaming afterwards —
+    /// the command path shares stdin with `send-keys` and the reply block
+    /// shares the reader with `%output`. Skipped without `tmux`.
+    #[test]
+    fn resize_window_over_the_control_client_completes_and_keeps_streaming() {
+        if no_tmux() {
+            return;
+        }
+        let mgr = TmuxManager::with_socket(test_socket("ctlcmd"));
+        let session = "ctlcmd-1";
+        mgr.new_session(session, std::path::Path::new("/tmp"), None, Some((80, 24)))
+            .expect("new_session");
+
+        let received = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let sink = received.clone();
+        let bridge = attach_via_control(
+            &mgr,
+            session,
+            24,
+            Box::new(move |bytes| {
+                sink.lock().unwrap().extend_from_slice(&bytes);
+                true
+            }),
+            Box::new(|_| {}),
+        )
+        .expect("attach_via_control");
+
+        bridge.resize_window(100, 30).expect("resize over control");
+        assert!(
+            wait_for_size(&mgr, session, (100, 30)),
+            "resize-window did not apply"
+        );
+
+        // The reply block must not have disturbed the output path.
+        bridge
+            .write_input(b"printf 'RAUM_CTLCMD_OK\\n'\n")
+            .expect("write_input");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut seen = false;
+        while std::time::Instant::now() < deadline && !seen {
+            std::thread::sleep(Duration::from_millis(25));
+            seen = String::from_utf8_lossy(&received.lock().unwrap()).contains("RAUM_CTLCMD_OK");
+        }
+        assert!(seen, "pane stopped streaming after a control command");
+
+        // A command tmux refuses maps to Err with its message, and the client
+        // stays usable afterwards.
+        let err = bridge
+            .run_command("resize-window -t raum-no-such-session -x 10 -y 10")
+            .expect_err("tmux should refuse an unknown target");
+        assert!(err.contains("session") || err.contains("find"), "{err}");
+        bridge.resize_window(90, 26).expect("client still usable");
+
+        drop(bridge);
+        let _ = mgr.kill_server();
     }
 }

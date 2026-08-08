@@ -46,6 +46,7 @@ import { isTabAlive, isTabPendingReset } from "../stores/runtimeLayoutStore";
 import {
   registerPane,
   requestWebgl,
+  requestWebglIfSlotFree,
   setPaneVisibility,
   unregisterPane,
 } from "../lib/rendererScheduler";
@@ -55,7 +56,8 @@ import {
   type TerminalBufferKind,
 } from "../lib/terminalRegistry";
 import { dropTargetPaneId } from "../lib/fileDrop";
-import { SCROLLBACK_DEFAULT } from "../lib/scrollbackConfig";
+import { observeGridRootClass } from "../lib/gridResizeClass";
+import { scrollbackForKind } from "../lib/scrollbackConfig";
 import {
   cancelTerminalSnapshotPersist,
   loadTerminalSnapshotBytes,
@@ -420,7 +422,7 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
   // itself the latest-wins resize pump below still sends throttled updates,
   // keeping tmux, the PTY, and xterm's fitted geometry close enough that TUI
   // redraws remain live and correctly wrapped.
-  let gridMutationObserver: MutationObserver | null = null;
+  let stopGridClassObserver: (() => void) | null = null;
   // Whether an interactive drag saw at least one ResizeObserver tick. The
   // MutationObserver uses this as a cheap "final flush owed" flag because the
   // last pointerup style mutation and the last ResizeObserver callback do not
@@ -488,6 +490,9 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
   let backfillInFlight = false;
   let backfillEverFired = false;
   let backfillSessionId: string | null = null;
+  /** Wall-clock ms of the last parsed frame, used by the single self-
+   *  rescheduling quiet timer below instead of a per-frame timer reset. */
+  let backfillLastOutputAt = 0;
   const cancelBackfill = (): void => {
     if (backfillTimer !== null) {
       clearTimeout(backfillTimer);
@@ -552,6 +557,31 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       backfillInFlight = false;
     }
   };
+  /**
+   * Quiet-window timer body. One timer lives at a time and re-arms itself for
+   * the remaining quiet time when output arrived after it was armed — so a
+   * streaming pane pays a single `setTimeout` per quiet window instead of a
+   * clearTimeout+setTimeout pair on every parsed frame.
+   */
+  const onBackfillQuietTimer = (): void => {
+    backfillTimer = null;
+    const quietFor = Date.now() - backfillLastOutputAt;
+    if (quietFor < BACKFILL_QUIET_MS) {
+      backfillTimer = setTimeout(onBackfillQuietTimer, BACKFILL_QUIET_MS - quietFor);
+      return;
+    }
+    if (backfillInFlight) return;
+    const currentId = sessionId();
+    if (!currentId || currentId !== backfillSessionId) return;
+    // Skip the very first quiet window after the pane attaches: tmux's
+    // history is the source of truth and would otherwise replay every
+    // pre-existing line into xterm on top of what reattach already drew.
+    if (!backfillEverFired) {
+      backfillEverFired = true;
+      return;
+    }
+    void runBackfillRecovery(currentId);
+  };
   const scheduleBackfill = (): void => {
     // Harness panes manage their own scrollback (alt-screen + snapshot
     // store); never inject raw bytes into them.
@@ -566,22 +596,11 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
     if (backfillSessionId !== id) {
       backfillSessionId = id;
       backfillEverFired = false;
+      cancelBackfill();
     }
-    cancelBackfill();
-    backfillTimer = setTimeout(() => {
-      backfillTimer = null;
-      if (backfillInFlight) return;
-      const currentId = sessionId();
-      if (!currentId || currentId !== backfillSessionId) return;
-      // Skip the very first quiet window after the pane attaches: tmux's
-      // history is the source of truth and would otherwise replay every
-      // pre-existing line into xterm on top of what reattach already drew.
-      if (!backfillEverFired) {
-        backfillEverFired = true;
-        return;
-      }
-      void runBackfillRecovery(currentId);
-    }, BACKFILL_QUIET_MS);
+    backfillLastOutputAt = Date.now();
+    if (backfillTimer !== null) return;
+    backfillTimer = setTimeout(onBackfillQuietTimer, BACKFILL_QUIET_MS);
   };
 
   const normalBuffer = () => term?.buffer.normal ?? null;
@@ -661,6 +680,7 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
     if (!visible) return;
     requestVisibleResize?.(true);
     if (props.active) void requestWebgl(paneId);
+    else requestWebglIfSlotFree(paneId);
   });
 
   onMount(() => {
@@ -675,7 +695,7 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
           // dedicated effect below pushes later changes into `term.options`.
           fontSize: terminalFontSize(),
           fontFamily: '"JetBrains Mono", Menlo, "DejaVu Sans Mono", monospace',
-          scrollback: SCROLLBACK_DEFAULT,
+          scrollback: scrollbackForKind(props.kind),
           theme: getCurrentXtermTheme() ?? FALLBACK_XTERM_THEME,
         }),
       );
@@ -830,8 +850,12 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       const forbid = await shouldForbidWebgl();
       if (!term) return;
       registerPane(paneId, term, { forbidWebgl: forbid, visible: props.visible !== false });
-      // Focusing the pane promotes it to WebGL (§4.2).
-      if (!forbid && props.visible !== false && props.active) requestWebgl(paneId);
+      // Focusing the pane promotes it to WebGL (§4.2); a visible-but-unfocused
+      // pane still streams output, so it takes any slot left over.
+      if (!forbid && props.visible !== false) {
+        if (props.active) void requestWebgl(paneId);
+        else requestWebglIfSlotFree(paneId);
+      }
     })();
 
     // Subscribe to process-exit events from the backend monitor task. When the
@@ -1788,8 +1812,11 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       resizeObserver.observe(host);
     }
 
-    if (gridRoot && typeof MutationObserver !== "undefined") {
-      gridMutationObserver = new MutationObserver(() => {
+    if (gridRoot) {
+      // One shared MutationObserver per grid root, fanned out to every pane —
+      // a dozen panes watching the same node for the same class flip is a
+      // dozen callbacks per mutation for identical work.
+      stopGridClassObserver = observeGridRootClass(gridRoot, () => {
         // Class-attribute flips only; ignore if the drag is still active.
         if (gridRoot.classList.contains("is-resizing")) return;
         if (!resizePendingFromDrag) return;
@@ -1798,10 +1825,6 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         // with pointerup. Force the pump to measure now so tmux lands on the
         // committed geometry without waiting for the next throttle window.
         scheduleResize(true);
-      });
-      gridMutationObserver.observe(gridRoot, {
-        attributes: true,
-        attributeFilter: ["class"],
       });
     }
 
@@ -2203,10 +2226,11 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       /* best-effort */
     }
     try {
-      gridMutationObserver?.disconnect();
+      stopGridClassObserver?.();
     } catch {
       /* best-effort */
     }
+    stopGridClassObserver = null;
     try {
       fit?.dispose();
     } catch {

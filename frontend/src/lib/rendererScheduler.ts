@@ -3,7 +3,9 @@
  *
  * At most 8 panes may simultaneously hold a WebGL renderer; everything else
  * runs on the canvas addon. Focusing a canvas pane promotes it to WebGL,
- * evicting the LRU pane to canvas if the cap is hit. If a pane's WebGL
+ * evicting the LRU pane to canvas if the cap is hit; a merely-visible pane
+ * takes a slot only while one is free (`requestWebglIfSlotFree`), so focus
+ * always wins a contested slot. If a pane's WebGL
  * context is lost (`webglcontextlost`) we demote it permanently for the rest
  * of the session and surface a console WARN + a `render-warning` window
  * event so the UI can show a banner.
@@ -120,11 +122,6 @@ async function installWebgl(entry: PaneEntry): Promise<boolean> {
       "color:#0a7",
     );
   }
-  try {
-    entry.addon?.dispose();
-  } catch {
-    /* best-effort */
-  }
   let WebglAddon: typeof import("@xterm/addon-webgl").WebglAddon;
   try {
     ({ WebglAddon } = await loadWebglAddon());
@@ -133,6 +130,20 @@ async function installWebgl(entry: PaneEntry): Promise<boolean> {
     entry.forbidWebgl = true;
     installCanvas(entry);
     return false;
+  }
+  // The import above spans real time (tens of ms for the first pane to need
+  // it). The pane may have been hidden or the page backgrounded meanwhile —
+  // taking a slot now would strand a context no demotion path can reclaim,
+  // since both of those check `renderer === "webgl"`. The pane keeps its
+  // canvas addon until here for the same reason.
+  if (entry.forbidWebgl || !entry.visible || backgrounded) {
+    if (backgrounded && entry.visible) entry.pendingRepromote = true;
+    return false;
+  }
+  try {
+    entry.addon?.dispose();
+  } catch {
+    /* best-effort */
   }
   const webgl = new WebglAddon();
   try {
@@ -151,6 +162,27 @@ async function installWebgl(entry: PaneEntry): Promise<boolean> {
     installCanvas(entry);
     return false;
   }
+}
+
+let promotionsInFlight = 0;
+
+/**
+ * A visible pane streams output whether or not it holds focus, so an idle
+ * WebGL slot is wasted on it. Fills free slots opportunistically; unlike
+ * `requestWebgl` this never evicts (and doesn't bump `mru`), so focus stays
+ * the tiebreaker whenever the cap is contested.
+ */
+function promoteIfSlotFree(entry: PaneEntry): void {
+  if (backgrounded || entry.forbidWebgl || !entry.visible) return;
+  if (entry.renderer === "webgl") return;
+  // `installWebgl` only flips `renderer` after its dynamic import resolves, so
+  // a grid full of panes promoting at once would blow past the cap without
+  // counting the promotions still in flight.
+  if (currentWebglCount() + promotionsInFlight >= MAX_WEBGL_PANES) return;
+  promotionsInFlight += 1;
+  void installWebgl(entry).finally(() => {
+    promotionsInFlight -= 1;
+  });
 }
 
 /** Register a pane; the scheduler installs an initial canvas addon. */
@@ -201,6 +233,16 @@ export function setPaneVisibility(paneId: string, visible: boolean): void {
 }
 
 /**
+ * Opportunistic promotion for a pane that is on screen but not focused.
+ * Callers use this instead of [`requestWebgl`] when the pane has no claim
+ * on a contested slot — see [`promoteIfSlotFree`].
+ */
+export function requestWebglIfSlotFree(paneId: string): void {
+  const entry = panes.get(paneId);
+  if (entry) promoteIfSlotFree(entry);
+}
+
+/**
  * Promote `paneId` to WebGL, evicting the LRU WebGL pane to canvas if the
  * cap would otherwise be exceeded. No-op if the pane is already WebGL, or if
  * it has been demoted permanently due to context loss.
@@ -214,11 +256,19 @@ export async function requestWebgl(paneId: string): Promise<void> {
   if (entry.forbidWebgl) return;
   if (!entry.visible) return;
 
-  if (currentWebglCount() >= MAX_WEBGL_PANES) {
+  // Counts in-flight promotions for the same reason `promoteIfSlotFree` does:
+  // otherwise a focus promotion and an opportunistic one in the same tick both
+  // see a free slot and land one context over the cap.
+  if (currentWebglCount() + promotionsInFlight >= MAX_WEBGL_PANES) {
     const lru = findLruWebgl(paneId);
     if (lru) installCanvas(lru);
   }
-  await installWebgl(entry);
+  promotionsInFlight += 1;
+  try {
+    await installWebgl(entry);
+  } finally {
+    promotionsInFlight -= 1;
+  }
 }
 
 /**
@@ -406,6 +456,7 @@ export function __resetSchedulerForTests(): void {
   }
   panes.clear();
   mruCounter = 0;
+  promotionsInFlight = 0;
   backgrounded = false;
   setWarnings([]);
 }

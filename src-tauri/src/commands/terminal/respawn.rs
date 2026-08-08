@@ -16,7 +16,7 @@ use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{AppHandle, Runtime};
 
 use crate::commands::agent::{
-    prepare_harness_launch_fast, resolve_project_dir, spawn_harness_launch_refresh,
+    prepare_harness_launch_fast_async, resolve_project_dir, spawn_harness_launch_refresh,
 };
 use crate::state::AppHandleState;
 
@@ -505,13 +505,13 @@ pub async fn terminal_self_heal<R: Runtime>(
         return Err("harness self-heal requires a registered project".to_string());
     }
 
-    let launch_report = prepare_harness_launch_fast(
+    let launch_report = prepare_harness_launch_fast_async(
         &app,
-        &state,
         args.kind,
-        effective_project_slug.as_deref(),
+        effective_project_slug.clone(),
         project_dir.clone(),
-    )?;
+    )
+    .await?;
     if launch_report.binary_missing {
         return Err(format!(
             "binary `{}` not found on PATH",

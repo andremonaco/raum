@@ -3,9 +3,10 @@
 //! Codex exposes three complementary observation surfaces:
 //!
 //! 1. **Hooks** (`~/.codex/hooks.json`, gated on `[features] codex_hooks =
-//!    true`). Event-driven; raum uses only the coarse lifecycle hooks
-//!    `UserPromptSubmit` and `Stop`. `SessionStart` is deliberately
-//!    *not* subscribed — see `RAUM_CODEX_HOOK_EVENTS` for why.
+//!    true`). Event-driven; raum uses the coarse lifecycle hooks
+//!    `UserPromptSubmit` and `Stop` plus the blocking `PermissionRequest`
+//!    approval hook. `SessionStart` is deliberately *not* subscribed —
+//!    see `RAUM_CODEX_HOOK_EVENTS` for why.
 //! 2. **`notify` script** (top-level `notify = […]` in `config.toml`).
 //!    Legacy pathway; currently only emits `agent-turn-complete`. Payload
 //!    is handed to the script as the **last argv argument** — Codex does
@@ -16,11 +17,12 @@
 //!    tails the coalesced tmux byte stream to pick these up. Phase 3
 //!    defines the channel; the tmux-side byte tap is Phase 5 work.
 //!
-//! Codex has no replier today (`HarnessRuntime::replier` returns `None`):
-//! even though the hook runtime accepts a `permissionDecision` field,
-//! upstream has not wired enforcement yet. Observation only; click on
-//! the notification focuses the pane and the user answers in Codex's
-//! native TUI.
+//! Replies ride the blocking `PermissionRequest` hook: the dispatcher
+//! parks on the event socket until raum writes back `allow` or `deny`.
+//! `HarnessRuntime::replier` still returns `None` for the same reason
+//! Claude Code's does — the decision goes out over the parked socket
+//! writer, which lives in `src-tauri`, not through a per-session
+//! replier object.
 //!
 //! # Version gate
 //!
@@ -63,6 +65,12 @@ mod tests;
 /// `PostToolUse` are Bash-scoped in upstream Codex and are not relevant
 /// for raum's visible "working / idle / needs attention" model.
 ///
+/// `PermissionRequest` (openai/codex#17563, stable since 0.122) is the
+/// one blocking event: the dispatcher waits for a decision line and
+/// answers with `hookSpecificOutput.decision.behavior`. It is also the
+/// only event here that keeps a matcher through Codex's normalisation —
+/// see [`planner::codex_hook_trusted_hash`].
+///
 /// **Not** `SessionStart`: it would call
 /// [`crate::agent_state::AgentStateMachine::arm_activity`] at boot, which
 /// then lets the silence-heuristic tick promote `Idle → Working` off
@@ -71,7 +79,7 @@ mod tests;
 /// (see `RAUM_HOOK_EVENTS` in `claude_code.rs`). Activity is still armed
 /// in time for real turns by `UserPromptSubmit` (via the classifier) and
 /// by `terminal_send_keys` on user Enter.
-pub const RAUM_CODEX_HOOK_EVENTS: &[&str] = &["UserPromptSubmit", "Stop"];
+pub const RAUM_CODEX_HOOK_EVENTS: &[&str] = &["PermissionRequest", "UserPromptSubmit", "Stop"];
 
 /// Minimum Codex version this adapter targets for hooks. Codex 0.130
 /// introduced two coupled changes that raum's hook plumbing depends on:
