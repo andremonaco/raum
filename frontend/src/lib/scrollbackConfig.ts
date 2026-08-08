@@ -8,6 +8,16 @@
 export const SCROLLBACK_MIN = 100;
 export const SCROLLBACK_MAX = 100_000;
 export const SCROLLBACK_DEFAULT = 100_000;
+/** Shells are interactive, not transcript stores — 100k retained lines per
+ *  shell pane is pure resident memory nobody scrolls back through. */
+export const SCROLLBACK_SHELL_DEFAULT = 10_000;
+
+/** Scrollback a freshly-created pane of `kind` should hold.
+ *  // ponytail: per-kind constants; route a user setting through
+ *  `normalizeScrollbackLines` here once config exposes one. */
+export function scrollbackForKind(kind: string): number {
+  return normalizeScrollbackLines(kind === "shell" ? SCROLLBACK_SHELL_DEFAULT : SCROLLBACK_DEFAULT);
+}
 
 /**
  * Coerce an arbitrary value into a valid scrollback line count.

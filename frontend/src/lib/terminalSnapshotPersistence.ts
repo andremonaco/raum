@@ -60,10 +60,34 @@ const SNAPSHOT_DEBOUNCE_MS = 2000;
  */
 const SNAPSHOT_MAX_STALENESS_MS = 10_000;
 const SCROLLBACK_MAX = 100_000;
+/**
+ * Rows serialized by every persist — routine checkpoint AND quit flush. It is
+ * one budget on purpose: the on-disk snapshot is keyed by session id and each
+ * save overwrites it wholesale, so a quit flush with a *smaller* budget would
+ * replace an existing 10k-row snapshot with a 5k-row one and make a clean
+ * shutdown destroy scrollback that a crash would have preserved.
+ *
+ * SerializeAddon walks the buffer synchronously on the main thread (~200 ms for
+ * 5k rows), so asking for the full 100k-row buffer every couple of seconds per
+ * pane is a visible hitch. 10k rows keeps a generous recovery tail while
+ * bounding the scan; the overflow ladder below still halves DOWN from here if
+ * the backend rejects.
+ *
+ * ponytail: fixed 10k row cap — restores keep the freshest 10k rows, not the
+ * full 100k xterm buffer, and a many-pane quit pays ~400 ms of serialize per
+ * pane against the backend's bounded quit-flush wait. Upgrade path if either
+ * bites: append-only snapshot segments so a persist never has to re-serialize
+ * (or shrink) history it already wrote.
+ */
+const SCROLLBACK_CHECKPOINT = 10_000;
 /// Binary-search tries when re-serializing on backend overflow. The xterm
 /// buffer is bounded, so 8 halvings always reach `SCROLLBACK_MIN` or below.
 const OVERFLOW_RETRIES = 8;
 const SCROLLBACK_MIN = 200;
+
+/** Hoisted: a fresh TextEncoder per serialize is pure allocation churn on a
+ *  path that runs every couple of seconds per pane. */
+const textEncoder = new TextEncoder();
 
 const timers = new Map<string, ReturnType<typeof setTimeout>>();
 const inflight = new Map<string, Promise<void>>();
@@ -96,7 +120,7 @@ function serializeAt(
 ): Uint8Array | null {
   const text = addon.serialize({ scrollback, excludeAltBuffer });
   if (!text) return null;
-  return new TextEncoder().encode(text);
+  return textEncoder.encode(text);
 }
 
 /**
@@ -122,9 +146,14 @@ export function serializeTerminalSnapshot(source: SnapshotSource): Uint8Array | 
 }
 
 /**
- * Persist the current buffer for `sessionId`. If the backend reports the
- * snapshot is over its size cap, re-serialize with progressively smaller
- * scrollback budgets until it fits or `SCROLLBACK_MIN` is reached.
+ * Persist the current buffer for `sessionId`. Serialization starts at
+ * `SCROLLBACK_CHECKPOINT` rows (a bounded budget) rather than the whole xterm
+ * buffer, because SerializeAddon's scan is synchronous main-thread work. If the
+ * backend reports the snapshot is over its size cap, re-serialize with
+ * progressively smaller budgets (halving DOWN from the starting bound) until it
+ * fits or `SCROLLBACK_MIN` is reached. The budget is deliberately not a
+ * parameter — see `SCROLLBACK_CHECKPOINT`: a caller-supplied smaller budget
+ * shrinks the snapshot already on disk.
  *
  * All errors are swallowed — snapshot persistence is a best-effort recovery
  * cache. A failed write must not break terminal streaming.
@@ -135,7 +164,7 @@ export async function persistTerminalSnapshot(
 ): Promise<void> {
   if (!sessionId) return;
   const excludeAltBuffer = shouldExcludeAltBuffer(source.term);
-  let scrollback = SCROLLBACK_MAX;
+  let scrollback = SCROLLBACK_CHECKPOINT;
   for (let attempt = 0; attempt < OVERFLOW_RETRIES; attempt += 1) {
     const bytes = serializeAt(source.addon, scrollback, excludeAltBuffer);
     if (!bytes || bytes.byteLength === 0) return;
@@ -248,7 +277,9 @@ export async function flushAllTerminalSnapshotsNow(): Promise<void> {
     // checkpointed exactly once and a second flush call is a no-op.
     sources.delete(sessionId);
     // Persist directly (do not go through the inflight short-circuit dedupe —
-    // we want the freshest serialize, even if a write is mid-flight).
+    // we want the freshest serialize, even if a write is mid-flight). Same row
+    // budget as the routine checkpoint: the save overwrites the whole file, so
+    // a cheaper quit-time serialize would shrink an already-larger snapshot.
     pending.push(persistTerminalSnapshot(sessionId, source));
   }
   // Also await anything already inflight so the caller's ack truly follows all
