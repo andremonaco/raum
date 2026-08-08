@@ -20,7 +20,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
 tracing = "0.1"
-tokio = { version = "1", features = ["full"] }
+# Narrow feature set — this crate only binds a UDS, reads lines off it,
+# fans events into an mpsc, and spawns a timed sweeper task.
+tokio = { version = "1", features = ["net", "io-util", "sync", "rt", "time"] }
 
 [dev-dependencies]
 tempfile = "3"
