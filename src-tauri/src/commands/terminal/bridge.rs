@@ -304,6 +304,17 @@ pub(super) fn control_transport_enabled() -> bool {
 /// can emit `terminal:process-exited` even when the attached client is still
 /// happily rendering an empty pane (remain-on-exit). Aborted by `terminal_kill`
 /// so an explicit close never fires a spurious overlay.
+///
+/// One of these runs per live pane, so the probe is
+/// [`TmuxManager::check_pane_dead_polled`] — a shared, briefly-cached
+/// `list-panes -a` — rather than a per-session `display-message` fork on every
+/// tick from every pane.
+///
+/// ponytail: still one task per pane on its own timer, just sharing a cached
+/// listing — so it is ~1–2 tmux forks per 300 ms regardless of pane count, not
+/// zero. The real fix is `%pane-died`/`%exit` off the control-mode connection
+/// the bridge already holds, which drops both the polling and the forks; that
+/// is a transport-layer change and deliberately out of scope here.
 pub(super) fn spawn_pane_death_monitor<R: Runtime>(
     app: AppHandle<R>,
     tmux: Arc<TmuxManager>,
@@ -314,7 +325,9 @@ pub(super) fn spawn_pane_death_monitor<R: Runtime>(
             tokio::time::sleep(Duration::from_millis(300)).await;
             let id = session_id.clone();
             let tmux_for_check = tmux.clone();
-            match tokio::task::spawn_blocking(move || tmux_for_check.check_pane_dead(&id)).await {
+            match tokio::task::spawn_blocking(move || tmux_for_check.check_pane_dead_polled(&id))
+                .await
+            {
                 Ok(Ok(Some(exit_code))) => {
                     let _ = app.emit(
                         "terminal:process-exited",

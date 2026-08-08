@@ -18,7 +18,6 @@ raum-core = { path = "../raum-core" }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tracing = "0.1"
-tokio = { version = "1", features = ["full"] }
 portable-pty = "0.9"
 
 [target.'cfg(unix)'.dependencies]

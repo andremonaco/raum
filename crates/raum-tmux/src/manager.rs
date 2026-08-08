@@ -5,15 +5,15 @@
 //! - launch-time recovery with eager concurrent attach
 //! - stale-session reaper
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use raum_core::config::{SessionState, XTERM_SCROLLBACK_LINES};
+use raum_core::config::XTERM_SCROLLBACK_LINES;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::warn;
@@ -138,14 +138,19 @@ pub struct PaneContext {
     pub window_name: String,
 }
 
-/// Launch-time recovery summary (§3.6).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct RecoveryReport {
-    /// Sessions that are on the socket AND tracked in `state/sessions.toml`.
-    pub reattached: Vec<String>,
-    /// Sessions that are on the socket but NOT in `state/sessions.toml`.
-    pub orphaned: Vec<String>,
-}
+/// How long a batched pane-death listing stays usable for
+/// [`TmuxManager::check_pane_dead_polled`]. Deliberately shorter than the
+/// 300 ms monitor tick, so a single pane still gets a fresh answer every tick
+/// while N panes on independent timers collapse to ~1–2 tmux forks per tick
+/// instead of N.
+const DEAD_POLL_CACHE_TTL: Duration = Duration::from_millis(200);
+
+/// `list-panes -a` format backing [`TmuxManager::check_pane_dead_polled`].
+const DEAD_POLL_FORMAT: &str = "#{session_name}\u{1f}#{pane_dead}\u{1f}#{pane_dead_status}";
+
+/// A batched pane-death listing plus the instant it was taken. `None` inside
+/// the map means the pane is still running.
+type DeadCache = Mutex<Option<(Instant, HashMap<String, Option<i32>>)>>;
 
 #[derive(Debug, Clone)]
 pub struct TmuxManager {
@@ -156,6 +161,9 @@ pub struct TmuxManager {
     /// the startup sync reaches every holder of the manager; only consulted at
     /// the moment the server is born.
     disclaim_tcc: Arc<AtomicBool>,
+    /// Last batched pane-death listing + when it was taken. Shared across
+    /// clones so every pane-death monitor draws from one refresh.
+    dead_cache: Arc<DeadCache>,
 }
 
 impl Default for TmuxManager {
@@ -164,6 +172,7 @@ impl Default for TmuxManager {
             socket: default_socket_name(),
             binary: PathBuf::from("tmux"),
             disclaim_tcc: Arc::new(AtomicBool::new(false)),
+            dead_cache: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -176,6 +185,7 @@ impl TmuxManager {
             socket: socket.into(),
             binary: PathBuf::from("tmux"),
             disclaim_tcc: Arc::new(AtomicBool::new(false)),
+            dead_cache: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -326,40 +336,64 @@ impl TmuxManager {
     /// Idempotent: tmux's `set` clobbers prior values, so calling this on
     /// every launch is safe even when the server is already running.
     pub fn apply_server_options(&self) -> Result<(), TmuxError> {
-        // `set-option -g prefix None` is sufficient on its own: with no prefix
-        // key, no key-table binding can fire from a user keystroke. We
-        // deliberately do NOT follow up with `unbind-key -a` — that deletes
-        // the `prefix` and `root` key-tables entirely, after which any later
-        // tmux op (including ones inside `attach-session`'s key-dispatch
-        // path) that touches a missing table emits `table prefix doesn't
-        // exist` on the parent's stderr.
-        self.run_quiet(&["set-option", "-g", "prefix", "None"]);
-        // Zero ESC delay. Ink/Codex/vim depend on fast Esc detection.
-        self.run_quiet(&["set-option", "-s", "escape-time", "0"]);
-        // Hide the status bar — we don't need it stealing a row of viewport.
-        self.run_quiet(&["set-option", "-g", "status", "off"]);
-        // Strip smcup/rmcup from the attached client's terminfo. Without this,
-        // `tmux attach-session` emits the alt-screen enter sequence into
-        // xterm.js on connect, which parks the webview in its alternate
-        // buffer — where xterm.js keeps no scrollback. Wheel scroll then sees
-        // an empty history and does nothing. Stripping these at the outer
-        // (attached-client) layer keeps the inner pane's alt-screen handling
-        // untouched, so TUIs running inside tmux still get their alt-screen
-        // on the pane.
+        // One chained invocation: six separate `tmux set-option` spawns cost
+        // six process launches and six socket handshakes on every launch.
         self.run_quiet(&[
+            // `set-option -g prefix None` is sufficient on its own: with no
+            // prefix key, no key-table binding can fire from a user
+            // keystroke. We deliberately do NOT follow up with `unbind-key
+            // -a` — that deletes the `prefix` and `root` key-tables
+            // entirely, after which any later tmux op (including ones inside
+            // `attach-session`'s key-dispatch path) that touches a missing
+            // table emits `table prefix doesn't exist` on the parent's
+            // stderr.
+            "set-option",
+            "-g",
+            "prefix",
+            "None",
+            ";",
+            // Zero ESC delay. Ink/Codex/vim depend on fast Esc detection.
+            "set-option",
+            "-s",
+            "escape-time",
+            "0",
+            ";",
+            // Hide the status bar — we don't need it stealing a row of
+            // viewport.
+            "set-option",
+            "-g",
+            "status",
+            "off",
+            ";",
+            // Strip smcup/rmcup from the attached client's terminfo. Without
+            // this, `tmux attach-session` emits the alt-screen enter sequence
+            // into xterm.js on connect, which parks the webview in its
+            // alternate buffer — where xterm.js keeps no scrollback. Wheel
+            // scroll then sees an empty history and does nothing. Stripping
+            // these at the outer (attached-client) layer keeps the inner
+            // pane's alt-screen handling untouched, so TUIs running inside
+            // tmux still get their alt-screen on the pane.
             "set-option",
             "-s",
             "terminal-overrides",
             ",xterm-256color:smcup@:rmcup@",
+            ";",
+            // Forward `\e[I` / `\e[O` from the attached client through to the
+            // inner process when it has requested DECSET 1004. With this off,
+            // tmux silently drops those bytes and harnesses (Claude Code,
+            // Codex, vim's `:set autoread`, etc.) never see focus
+            // transitions — and `claude doctor` flags the misconfiguration.
+            "set-option",
+            "-g",
+            "focus-events",
+            "on",
+            ";",
+            // Don't emit DECSLRM / xterm title escapes from tmux.
+            "set-option",
+            "-g",
+            "set-titles",
+            "off",
         ]);
-        // Forward `\e[I` / `\e[O` from the attached client through to the
-        // inner process when it has requested DECSET 1004. With this off,
-        // tmux silently drops those bytes and harnesses (Claude Code, Codex,
-        // vim's `:set autoread`, etc.) never see focus transitions — and
-        // `claude doctor` flags the misconfiguration.
-        self.run_quiet(&["set-option", "-g", "focus-events", "on"]);
-        // Don't emit DECSLRM / xterm title escapes from tmux.
-        self.run_quiet(&["set-option", "-g", "set-titles", "off"]);
         Ok(())
     }
 
@@ -560,29 +594,55 @@ impl TmuxManager {
                 stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             });
         }
-        self.set_history_limit(id, XTERM_SCROLLBACK_LINES);
-        self.run_quiet(&["set-option", "-t", id, "remain-on-exit", "on"]);
-        // Pin the window size to whatever raum drives via `resize-window`,
-        // regardless of attached-client geometry. tmux's auto modes
-        // (`latest`/`largest`/etc.) don't fire reliably on every tmux build
-        // when a single PTY-attached client connects, which left the window
-        // pegged at 80×24 while the xterm viewport grew — tmux then filled
-        // the difference with its hatched "viewport > pane" pattern. Manual
-        // mode plus explicit `tmux resize-window` from the resize command
-        // makes our intent the source of truth.
-        self.run_quiet(&["set-option", "-t", id, "window-size", "manual"]);
-        // Hide the status bar on this specific session. `apply_server_options`
-        // sets `-g status off`, but that only sticks if the tmux server is
-        // alive when it runs — on a clean launch the server may start just to
-        // answer the `-g` set and then exit (no sessions yet), discarding the
-        // global value. Setting it session-local here is race-free.
-        self.run_quiet(&["set-option", "-t", id, "status", "off"]);
-        // Re-apply the server-wide smcup/rmcup strip now that we know the
-        // server is alive (the session we just created is keeping it up).
-        // `terminal-overrides` is a server option, so it can't be mirrored
-        // per-session the way `status off` is — but setting it with the
-        // server guaranteed-alive here avoids the same cold-start race.
+        // Post-creation options, chained into one invocation instead of four
+        // separate spawns. The per-window history-limit that used to run here
+        // is gone: the `set-option -g history-limit` above executes in the
+        // same chain *before* `new-session`, so the fresh window inherits it.
+        //
+        // ponytail: kept as a second tmux call rather than folded into the
+        // creation chain above. tmux aborts a command list at the first
+        // failure, so an option this build doesn't know (e.g. `window-size`
+        // on tmux < 2.9) would both skip the rest and turn a successful
+        // session creation into an `Err` — leaving an untracked live session.
+        // `run_quiet` keeps these best-effort, which is the existing contract.
         self.run_quiet(&[
+            "set-option",
+            "-t",
+            id,
+            "remain-on-exit",
+            "on",
+            ";",
+            // Pin the window size to whatever raum drives via `resize-window`,
+            // regardless of attached-client geometry. tmux's auto modes
+            // (`latest`/`largest`/etc.) don't fire reliably on every tmux build
+            // when a single PTY-attached client connects, which left the window
+            // pegged at 80×24 while the xterm viewport grew — tmux then filled
+            // the difference with its hatched "viewport > pane" pattern. Manual
+            // mode plus explicit `tmux resize-window` from the resize command
+            // makes our intent the source of truth.
+            "set-option",
+            "-t",
+            id,
+            "window-size",
+            "manual",
+            ";",
+            // Hide the status bar on this specific session.
+            // `apply_server_options` sets `-g status off`, but that only
+            // sticks if the tmux server is alive when it runs — on a clean
+            // launch the server may start just to answer the `-g` set and then
+            // exit (no sessions yet), discarding the global value. Setting it
+            // session-local here is race-free.
+            "set-option",
+            "-t",
+            id,
+            "status",
+            "off",
+            ";",
+            // Re-apply the server-wide smcup/rmcup strip now that we know the
+            // server is alive (the session we just created is keeping it up).
+            // `terminal-overrides` is a server option, so it can't be mirrored
+            // per-session the way `status off` is — but setting it with the
+            // server guaranteed-alive here avoids the same cold-start race.
             "set-option",
             "-s",
             "terminal-overrides",
@@ -702,6 +762,85 @@ impl TmuxManager {
         }
     }
 
+    /// [`Self::check_pane_dead`] for the 300 ms pane-death poll: answers from a
+    /// single `list-panes -a` covering every pane on the socket, cached for
+    /// [`DEAD_POLL_CACHE_TTL`]. The per-session `display-message` cost one tmux
+    /// fork per live pane per tick; this is one fork per tick for all of them.
+    ///
+    /// Semantics match `check_pane_dead` exactly — `Ok(Some(code))` dead,
+    /// `Ok(None)` alive, `Err` when the session is not on the server (killed
+    /// externally, or the server itself is gone). Only for the polling monitor:
+    /// callers that act on the answer immediately (respawn, rehydrate probes)
+    /// must keep using `check_pane_dead` so they never read a stale tick.
+    pub fn check_pane_dead_polled(&self, id: &str) -> Result<Option<i32>, TmuxError> {
+        let mut guard = self
+            .dead_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let fresh = guard
+            .as_ref()
+            .is_some_and(|(at, _)| at.elapsed() < DEAD_POLL_CACHE_TTL);
+        if !fresh {
+            // A dead server lists no panes (Ok, empty) and every id below reads
+            // as gone — same as the per-session probe. A *failed* listing is a
+            // different thing and must never be cached: the map is shared by
+            // every monitor, so one transient fork failure would report every
+            // pane gone at once and each monitor would exit for good. Fall back
+            // to the per-session probe for this tick and leave the cache alone.
+            match self.list_panes_all(DEAD_POLL_FORMAT) {
+                Ok(listing) => *guard = Some((Instant::now(), parse_panes_dead(&listing))),
+                Err(_) => {
+                    drop(guard);
+                    return self.check_pane_dead(id);
+                }
+            }
+        }
+        guard
+            .as_ref()
+            .and_then(|(_, panes)| panes.get(id).copied())
+            .ok_or_else(|| TmuxError::NonZero {
+                status: 1,
+                stderr: format!("can't find pane: {id}"),
+            })
+    }
+
+    /// `tmux list-panes -a -F <format>` — one line per session on the whole
+    /// server. A cold socket yields an empty listing rather than an error,
+    /// matching [`Self::list_sessions`].
+    ///
+    /// The filter narrows each session to the pane `display-message -t
+    /// <session>` would report: the active pane of the active window. Callers
+    /// key the rows by `#{session_name}`, and raum's own sessions hold one
+    /// pane — but a harness that runs `tmux split-window` inside raum's window
+    /// (see `ControlEvent::ForeignSplit`) adds panes we must not confuse with
+    /// the lead one. Without the filter a foreign pane's row would overwrite
+    /// the lead pane's, and a helper that exits would read as the session
+    /// itself dying.
+    fn list_panes_all(&self, format: &str) -> Result<String, TmuxError> {
+        let out = self
+            .cmd()
+            .args([
+                "list-panes",
+                "-a",
+                "-f",
+                "#{&&:#{pane_active},#{window_active}}",
+                "-F",
+                format,
+            ])
+            .output()?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if is_no_server_stderr(&stderr) {
+                return Ok(String::new());
+            }
+            return Err(TmuxError::NonZero {
+                status: out.status.code().unwrap_or(-1),
+                stderr: stderr.into_owned(),
+            });
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
     /// Capture the pane state needed to restore a fresh xterm.js instance
     /// before the live tmux client reattaches.
     ///
@@ -713,18 +852,16 @@ impl TmuxManager {
     ///   history while the pane is in alternate-screen; once alternate-screen
     ///   is inactive tmux reports `no alternate screen`.
     pub fn capture_pane_snapshot(&self, id: &str) -> Result<PaneSnapshot, TmuxError> {
-        let alternate_on = self.is_alternate_on(id)?;
+        let (alternate_on, visible) = self.alternate_and_capture(id, "-", true)?;
         if alternate_on {
-            let alternate = self.capture_pane(id, false)?;
-            let normal = self.capture_pane(id, true)?;
             return Ok(PaneSnapshot {
-                normal,
-                alternate: Some(alternate),
+                normal: self.capture_pane_alt(id)?,
+                alternate: Some(rewrite_lf_to_crlf(visible)),
             });
         }
 
         Ok(PaneSnapshot {
-            normal: self.capture_pane(id, false)?,
+            normal: rewrite_lf_to_crlf(visible),
             alternate: None,
         })
     }
@@ -743,18 +880,20 @@ impl TmuxManager {
         id: &str,
         line_count: u16,
     ) -> Result<PaneSnapshot, TmuxError> {
-        let line_count = line_count.max(1);
-        let alternate_on = self.is_alternate_on(id)?;
+        let start = format!("-{}", line_count.max(1).saturating_sub(1));
+        // Both branches want the same visible capture — only which field it
+        // lands in differs — so this path is a single tmux invocation.
+        let (alternate_on, visible) = self.alternate_and_capture(id, &start, true)?;
+        let visible = rewrite_lf_to_crlf(visible);
         if alternate_on {
-            let alternate = self.capture_pane_recent(id, false, line_count)?;
             return Ok(PaneSnapshot {
                 normal: Vec::new(),
-                alternate: Some(alternate),
+                alternate: Some(visible),
             });
         }
 
         Ok(PaneSnapshot {
-            normal: self.capture_pane_recent(id, false, line_count)?,
+            normal: visible,
             alternate: None,
         })
     }
@@ -764,18 +903,16 @@ impl TmuxManager {
     /// frame, if active) as decoded UTF-8 with no ANSI escapes — ready to
     /// split on `\n` and match against.
     pub fn capture_pane_text(&self, id: &str) -> Result<PaneTextSnapshot, TmuxError> {
-        let alternate_on = self.is_alternate_on(id)?;
+        let (alternate_on, visible) = self.alternate_and_capture(id, "-", false)?;
         if alternate_on {
-            let alternate = self.capture_pane_plain(id, false)?;
-            let normal = self.capture_pane_plain(id, true)?;
             return Ok(PaneTextSnapshot {
-                normal,
-                alternate: Some(alternate),
+                normal: self.capture_pane_alt_plain(id)?,
+                alternate: Some(decode_lossy(visible)),
             });
         }
 
         Ok(PaneTextSnapshot {
-            normal: self.capture_pane_plain(id, false)?,
+            normal: decode_lossy(visible),
             alternate: None,
         })
     }
@@ -809,6 +946,33 @@ impl TmuxManager {
         Ok(parse_pane_context(&line))
     }
 
+    /// [`Self::pane_context`] for every pane on the socket in ONE invocation,
+    /// keyed by session name. The tab strip refreshes context for all panes at
+    /// once, which as per-session `display-message` calls cost one tmux fork
+    /// per pane per refresh.
+    ///
+    /// [`Self::list_panes_all`] narrows each session to the same pane
+    /// `display-message -t <session>` reports, so the session name is a unique
+    /// key even when a harness split the window.
+    pub fn pane_context_all(&self) -> Result<HashMap<String, PaneContext>, TmuxError> {
+        let listing = self.list_panes_all(
+            "#{session_name}\u{1f}#{pane_current_command}\u{1f}#{pane_current_path}\u{1f}#{pane_title}\u{1f}#{window_name}",
+        )?;
+        let mut out = HashMap::new();
+        for raw in listing.lines() {
+            let line = raw.trim_end_matches('\r');
+            let Some((name, rest)) = line.split_once('\u{1f}') else {
+                continue;
+            };
+            let name = name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            out.insert(name.to_string(), parse_pane_context(rest));
+        }
+        Ok(out)
+    }
+
     /// Whether the pane currently has the alternate screen buffer active
     /// (TUIs like `vim`, `htop`, Codex). Callers need this to choose between
     /// full-history capture (alt-screen apps cleanly separate the alt frame
@@ -828,18 +992,75 @@ impl TmuxManager {
         Ok(String::from_utf8_lossy(&out.stdout).trim() == "1")
     }
 
-    fn capture_pane(&self, id: &str, alternate_mode: bool) -> Result<Vec<u8>, TmuxError> {
+    /// Answer `#{alternate_on}` AND capture the visible surface from `start` to
+    /// the end of the pane, in ONE tmux invocation. Every snapshot path needs
+    /// both, and two spawns cost two process launches plus two socket
+    /// handshakes per pane — on quit-flush that runs for every open pane.
+    ///
+    /// `escapes` selects `capture-pane -e -J` (a replayable capture, see
+    /// [`Self::capture_pane_alt`]) over the plain-text form used by search.
+    /// Returns the capture bytes verbatim; CRLF rewriting is the caller's.
+    fn alternate_and_capture(
+        &self,
+        id: &str,
+        start: &str,
+        escapes: bool,
+    ) -> Result<(bool, Vec<u8>), TmuxError> {
         let mut cmd = self.cmd();
+        cmd.args([
+            "display-message",
+            "-p",
+            "-t",
+            id,
+            "#{alternate_on}",
+            ";",
+            "capture-pane",
+            "-p",
+        ]);
+        if escapes {
+            cmd.args(["-e", "-J"]);
+        }
+        cmd.args(["-S", start, "-E", "-", "-t", id]);
+        let out = cmd.output()?;
+        if !out.status.success() {
+            return Err(TmuxError::NonZero {
+                status: out.status.code().unwrap_or(-1),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            });
+        }
+        // `display-message -p` emits exactly one line, so the first newline
+        // separates the flag from the capture that follows it.
+        let split = out.stdout.iter().position(|&b| b == b'\n');
+        let alternate_on = out.stdout[..split.unwrap_or(out.stdout.len())].trim_ascii() == b"1";
+        let mut capture = out.stdout;
+        capture.drain(..split.map_or(capture.len(), |i| i + 1));
+        Ok((alternate_on, capture))
+    }
+
+    /// `capture-pane -a`: the normal-buffer history preserved underneath a live
+    /// alternate screen. Only meaningful while `#{alternate_on}` is 1 — tmux
+    /// answers `no alternate screen` otherwise.
+    fn capture_pane_alt(&self, id: &str) -> Result<Vec<u8>, TmuxError> {
         // `-J` joins lines tmux marked as hard-wrapped when they were stored
         // in scrollback. Without it, replaying this capture into xterm.js
         // paints old rows at the pane's previous (narrower) width — tmux
         // never reflows stored history on resize.
-        cmd.args(["capture-pane", "-p", "-e", "-J"]);
-        if alternate_mode {
-            cmd.arg("-a");
-        }
-        cmd.args(["-S", "-", "-E", "-", "-t", id]);
-        let out = cmd.output()?;
+        let out = self
+            .cmd()
+            .args([
+                "capture-pane",
+                "-p",
+                "-e",
+                "-J",
+                "-a",
+                "-S",
+                "-",
+                "-E",
+                "-",
+                "-t",
+                id,
+            ])
+            .output()?;
         if !out.status.success() {
             return Err(TmuxError::NonZero {
                 status: out.status.code().unwrap_or(-1),
@@ -849,45 +1070,19 @@ impl TmuxManager {
         Ok(rewrite_lf_to_crlf(out.stdout))
     }
 
-    fn capture_pane_recent(
-        &self,
-        id: &str,
-        alternate_mode: bool,
-        line_count: u16,
-    ) -> Result<Vec<u8>, TmuxError> {
-        let mut cmd = self.cmd();
-        // See `capture_pane` for why `-J` is required here.
-        cmd.args(["capture-pane", "-p", "-e", "-J"]);
-        if alternate_mode {
-            cmd.arg("-a");
-        }
-        let start = format!("-{}", line_count.saturating_sub(1));
-        cmd.args(["-S", &start, "-E", "-", "-t", id]);
-        let out = cmd.output()?;
+    /// Plain-text [`Self::capture_pane_alt`] for the search index.
+    fn capture_pane_alt_plain(&self, id: &str) -> Result<String, TmuxError> {
+        let out = self
+            .cmd()
+            .args(["capture-pane", "-p", "-a", "-S", "-", "-E", "-", "-t", id])
+            .output()?;
         if !out.status.success() {
             return Err(TmuxError::NonZero {
                 status: out.status.code().unwrap_or(-1),
                 stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             });
         }
-        Ok(rewrite_lf_to_crlf(out.stdout))
-    }
-
-    fn capture_pane_plain(&self, id: &str, alternate_mode: bool) -> Result<String, TmuxError> {
-        let mut cmd = self.cmd();
-        cmd.args(["capture-pane", "-p"]);
-        if alternate_mode {
-            cmd.arg("-a");
-        }
-        cmd.args(["-S", "-", "-E", "-", "-t", id]);
-        let out = cmd.output()?;
-        if !out.status.success() {
-            return Err(TmuxError::NonZero {
-                status: out.status.code().unwrap_or(-1),
-                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-            });
-        }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        Ok(decode_lossy(out.stdout))
     }
 
     /// Type `command` into the session's shell and hit Enter. Used to launch
@@ -973,56 +1168,6 @@ impl TmuxManager {
         Ok(())
     }
 
-    /// §3.6 — launch-time recovery: enumerate sessions on the socket, reconcile
-    /// with `state/sessions.toml`, and fire an eager concurrent attach ping per
-    /// session so the backend warms its per-pane mpsc/pipe-pane topology.
-    ///
-    /// The "attach ping" is a cheap `tmux has-session -t <id>` spawned on a tokio
-    /// task. It lets the operating system schedule the socket handshake work in
-    /// parallel; once all tasks resolve, the returned `RecoveryReport` is final.
-    pub async fn recover_sessions(&self, state: &SessionState) -> RecoveryReport {
-        let live = match self.list_sessions() {
-            Ok(v) => v,
-            Err(_) => return RecoveryReport::default(),
-        };
-
-        let tracked: HashSet<String> = state
-            .sessions
-            .iter()
-            .map(|s| s.session_id.clone())
-            .collect();
-
-        let this = Arc::new(self.clone());
-        let mut handles = Vec::with_capacity(live.len());
-        for s in &live {
-            let m = this.clone();
-            let id = s.id.clone();
-            handles.push(tokio::spawn(async move {
-                let _ = tokio::task::spawn_blocking(move || {
-                    let _ = m.cmd().args(["has-session", "-t", &id]).status();
-                })
-                .await;
-            }));
-        }
-        for h in handles {
-            let _ = h.await;
-        }
-
-        let mut reattached = Vec::new();
-        let mut orphaned = Vec::new();
-        for s in live {
-            if tracked.contains(&s.id) {
-                reattached.push(s.id);
-            } else {
-                orphaned.push(s.id);
-            }
-        }
-        RecoveryReport {
-            reattached,
-            orphaned,
-        }
-    }
-
     /// §3.7 — stale-session reaper. Kills any session whose `session_created`
     /// timestamp is older than `threshold_days` and returns the ids that were
     /// killed. Sessions in `keep` are never reaped regardless of age — callers
@@ -1058,17 +1203,57 @@ impl TmuxManager {
     }
 }
 
+/// Turn every `\n` into `\r\n` so a capture replays into xterm.js with the
+/// carriage returns a real terminal would have seen. Copies the runs between
+/// newlines wholesale instead of pushing byte by byte, and sizes the output
+/// exactly — a full-scrollback capture is megabytes.
 fn rewrite_lf_to_crlf(bytes: Vec<u8>) -> Vec<u8> {
-    let mut crlf = Vec::with_capacity(bytes.len() + 32);
-    for b in bytes {
-        if b == b'\n' {
-            crlf.push(b'\r');
-            crlf.push(b'\n');
-        } else {
-            crlf.push(b);
-        }
+    // ponytail: clippy's fix for this scan is the `bytecount` crate — a whole
+    // dependency for a pass that costs less than the copy right below it.
+    #[allow(clippy::naive_bytecount)]
+    let newlines = bytes.iter().filter(|&&b| b == b'\n').count();
+    if newlines == 0 {
+        return bytes;
     }
+    let mut crlf = Vec::with_capacity(bytes.len() + newlines);
+    let mut rest = bytes.as_slice();
+    while let Some(i) = rest.iter().position(|&b| b == b'\n') {
+        crlf.extend_from_slice(&rest[..i]);
+        crlf.extend_from_slice(b"\r\n");
+        rest = &rest[i + 1..];
+    }
+    crlf.extend_from_slice(rest);
     crlf
+}
+
+/// Captures are almost always valid UTF-8; take ownership of the buffer
+/// instead of copying it, and only pay for the lossy rewrite when the pane
+/// really did emit invalid bytes.
+fn decode_lossy(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+}
+
+/// Parse [`DEAD_POLL_FORMAT`] rows into `session name -> exit code`, where
+/// `None` means the pane is still running. Mirrors the per-session
+/// [`TmuxManager::check_pane_dead`] parse: only `pane_dead == 1` counts as
+/// dead, and an unparsable `pane_dead_status` degrades to `-1`.
+fn parse_panes_dead(stdout: &str) -> HashMap<String, Option<i32>> {
+    let mut out = HashMap::new();
+    for raw in stdout.lines() {
+        let mut parts = raw.trim_end_matches('\r').split('\u{1f}');
+        let Some(name) = parts.next().map(str::trim).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let dead = parts.next().is_some_and(|s| s.trim() == "1");
+        let code = dead.then(|| {
+            parts
+                .next()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(-1)
+        });
+        out.insert(name.to_string(), code);
+    }
+    out
 }
 
 fn parse_pane_context(stdout: &str) -> PaneContext {
@@ -1106,6 +1291,67 @@ mod tests {
         assert!(clone.disclaim_tcc.load(Ordering::Relaxed));
         clone.set_disclaim_tcc(false);
         assert!(!mgr.disclaim_tcc.load(Ordering::Relaxed));
+    }
+
+    /// The batched `list-panes -a` calls replace per-session `display-message`
+    /// forks, so their format strings are the whole contract — a typo'd
+    /// `#{...}` yields empty tab labels and a permanently-alive dead poll
+    /// without failing anything. Only a live server can prove them, so this
+    /// stages two real sessions and reads them back. Skipped without `tmux`.
+    #[test]
+    fn batched_pane_queries_read_back_from_a_live_server() {
+        if Command::new("tmux").arg("-V").output().is_err() {
+            return;
+        }
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let mgr = TmuxManager::with_socket(format!("raum-batch-{}-{nanos}", std::process::id()));
+        for id in ["batch-a", "batch-b"] {
+            mgr.new_session(id, std::path::Path::new("/tmp"), None, Some((80, 24)))
+                .expect("new_session");
+        }
+
+        let ctx = mgr.pane_context_all().expect("pane_context_all");
+        assert_eq!(ctx.len(), 2, "one row per live session, got {ctx:?}");
+        for id in ["batch-a", "batch-b"] {
+            let pane = ctx.get(id).expect("session present in the batch");
+            // tmux resolves the login shell here; the field must not be the
+            // empty string a wrongly keyed format would produce.
+            assert!(!pane.current_command.is_empty(), "{id}: {pane:?}");
+            // macOS resolves `/tmp` to `/private/tmp`, hence the suffix match.
+            assert!(pane.current_path.ends_with("/tmp"), "{id}: {pane:?}");
+        }
+        // Same values the per-session call reports.
+        assert_eq!(
+            mgr.pane_context("batch-a")
+                .expect("pane_context")
+                .pane_title,
+            ctx["batch-a"].pane_title
+        );
+
+        let alive = mgr.check_pane_dead_polled("batch-a");
+        assert!(matches!(alive, Ok(None)), "live pane, got {alive:?}");
+        // A session that was never created is "gone", not "alive".
+        assert!(mgr.check_pane_dead_polled("batch-nope").is_err());
+
+        // A harness teammate pane that exits must not read as the session
+        // dying — the monitor would kill the user's live pane and delete its
+        // snapshot. `remain-on-exit` is already on from `new_session`.
+        mgr.cmd()
+            .args(["split-window", "-t", "batch-a", "-d", "sh", "-c", "exit 3"])
+            .output()
+            .expect("split-window");
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(mgr.check_pane_dead("batch-a").expect("probe"), None);
+        let mgr2 = TmuxManager::with_socket(mgr.socket.clone());
+        let polled = mgr2.check_pane_dead_polled("batch-a");
+        assert!(
+            matches!(polled, Ok(None)),
+            "dead teammate pane leaked into the session's verdict: {polled:?}"
+        );
+
+        let _ = mgr.kill_server();
     }
 
     /// The legacy detector drives a prompt that destroys the user's live
@@ -1200,6 +1446,33 @@ sess-windows-crlf\t1700000002\t100\t30\r
         assert_eq!(parsed.current_path, "/tmp/raum");
         assert_eq!(parsed.pane_title, "⠋ raum");
         assert_eq!(parsed.window_name, "node");
+    }
+
+    /// The batched dead-poll replaces a per-session `display-message`, so it
+    /// has to classify the same rows the same way — a false "dead" tears the
+    /// user's pane down and deletes its snapshot.
+    #[test]
+    fn parse_panes_dead_matches_per_session_semantics() {
+        let stdout = "\
+alive\u{1f}0\u{1f}
+clean\u{1f}1\u{1f}0
+failed\u{1f}1\u{1f}130
+nostatus\u{1f}1\u{1f}
+garbage\u{1f}1\u{1f}nope
+crlf\u{1f}0\u{1f}\r
+\u{1f}1\u{1f}0
+";
+        let parsed = parse_panes_dead(stdout);
+        assert_eq!(parsed.get("alive"), Some(&None));
+        assert_eq!(parsed.get("clean"), Some(&Some(0)));
+        assert_eq!(parsed.get("failed"), Some(&Some(130)));
+        // Missing / unparsable status still means dead, code unknown.
+        assert_eq!(parsed.get("nostatus"), Some(&Some(-1)));
+        assert_eq!(parsed.get("garbage"), Some(&Some(-1)));
+        assert_eq!(parsed.get("crlf"), Some(&None));
+        // A nameless row is unusable as a key, and an absent key reads as
+        // "session gone" — so it must be dropped, not inserted under "".
+        assert_eq!(parsed.len(), 6);
     }
 
     #[test]

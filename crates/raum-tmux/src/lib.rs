@@ -18,8 +18,8 @@ pub mod transport;
 pub use coalescer::{FLUSH_BYTES, MAX_HOLD_MS, QUIET_MS, StreamCoalescer};
 pub use control::{ControlBridgeError, ControlBridgeHandle, attach_via_control};
 pub use manager::{
-    PaneContext, PaneSnapshot, PaneTextSnapshot, RAUM_TMUX_SOCKET, RecoveryReport, TmuxError,
-    TmuxManager, TmuxSession,
+    PaneContext, PaneSnapshot, PaneTextSnapshot, RAUM_TMUX_SOCKET, TmuxError, TmuxManager,
+    TmuxSession,
 };
 pub use pty_bridge::{DataSink, ExitSink, PtyBridgeError, PtyBridgeHandle, attach_via_pty};
 pub use transport::TerminalBridge;
