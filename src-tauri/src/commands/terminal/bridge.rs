@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use raum_core::AgentKind;
 use raum_core::harness::codex::{Osc9Parser, classify_osc9_payload};
@@ -185,7 +185,10 @@ pub(super) async fn open_bridge_and_monitor<R: Runtime>(
     let data_session_id_for_lost = session_id.clone();
     let exit_app = app.clone();
     let exit_id = session_id.clone();
-    let activity_for_data = session_activity.clone();
+    // Resolve the session's activity slot ONCE. The data callback below then
+    // stamps it with a single relaxed atomic store — no map lock, no String
+    // clone per output chunk.
+    let activity_for_data = session_activity.slot(&session_id);
     let activity_session_id = session_id.clone();
     let mut osc9_parser = (kind == AgentKind::Codex).then(Osc9Parser::new);
     let pane_context_dirty_for_data = pane_context_dirty_tx;
@@ -224,9 +227,7 @@ pub(super) async fn open_bridge_and_monitor<R: Runtime>(
             // (commands::agent::spawn_silence_tick) can flip a
             // `Working` machine to `Waiting` after the coalesced
             // stream goes quiet, even when hooks never fire.
-            if let Ok(mut map) = activity_for_data.lock() {
-                map.insert(activity_session_id.clone(), Instant::now());
-            }
+            activity_for_data.touch();
             if let Some(tx) = pane_context_dirty_for_data.as_ref() {
                 let _ = tx.try_send(());
             }

@@ -2,8 +2,9 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use raum_core::store::ConfigStore;
 use raum_hooks::EventSocketHandle;
@@ -76,7 +77,7 @@ pub struct AppHandleState {
     /// Populated inside the PTY bytes callback in
     /// `commands::terminal::open_bridge_and_monitor`; cleared when a
     /// session is killed or reattached away from.
-    pub session_activity: Arc<Mutex<HashMap<String, Instant>>>,
+    pub session_activity: Arc<SessionActivity>,
     /// Per-session resize/attach geometry gate. `terminal_resize` and
     /// `terminal_reattach` both mutate the same tmux window + PTY viewport;
     /// serialize those operations per session so a live user drag cannot
@@ -134,6 +135,121 @@ pub struct AppHandleState {
     >,
 }
 
+/// Per-session "last PTY output" clock.
+///
+/// The bridge's data callback runs once per coalesced output chunk — many
+/// times a second per live pane — so the hot path must not take a global lock
+/// or allocate. Each session gets an [`ActivitySlot`] (an `Arc<AtomicU64>`
+/// holding millis since [`SessionActivity::origin`]) handed out once at bridge
+/// setup; writing a stamp is then a single relaxed atomic store. The map is
+/// locked only when a session is added or removed, plus a cheap Arc-clone
+/// snapshot on each silence tick.
+#[derive(Debug)]
+pub struct SessionActivity {
+    /// Process-start reference point. Stamps are millis relative to this so a
+    /// plain `u64` atomic can stand in for a non-atomic `Instant`.
+    origin: Instant,
+    slots: Mutex<HashMap<Arc<str>, Arc<AtomicU64>>>,
+}
+
+/// One session's activity stamp. Cheap to clone and lock-free to write.
+#[derive(Clone, Debug)]
+pub struct ActivitySlot {
+    origin: Instant,
+    cell: Arc<AtomicU64>,
+}
+
+impl ActivitySlot {
+    /// Record "output just arrived". No lock, no allocation.
+    pub fn touch(&self) {
+        // 0 is reserved for "never stamped", so clamp elapsed millis up to 1.
+        let ms = u64::try_from(self.origin.elapsed().as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        self.cell.store(ms, Ordering::Relaxed);
+    }
+}
+
+impl SessionActivity {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+            slots: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Get (or create) the slot for `session_id`. Callers hold onto the result
+    /// so the map lock is taken once per session, not once per output chunk.
+    /// A poisoned map degrades to a detached slot rather than dropping output
+    /// tracking entirely.
+    #[must_use]
+    pub fn slot(&self, session_id: &str) -> ActivitySlot {
+        let cell = match self.slots.lock() {
+            Ok(mut slots) => slots
+                .entry(Arc::from(session_id))
+                .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+                .clone(),
+            Err(_) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    "session_activity: slots lock poisoned; using detached slot"
+                );
+                Arc::new(AtomicU64::new(0))
+            }
+        };
+        ActivitySlot {
+            origin: self.origin,
+            cell,
+        }
+    }
+
+    /// Stamp `session_id` right now, creating its slot if needed. For the
+    /// one-shot seeding paths; the hot path uses a cached [`ActivitySlot`].
+    pub fn touch(&self, session_id: &str) {
+        self.slot(session_id).touch();
+    }
+
+    pub fn remove(&self, session_id: &str) {
+        if let Ok(mut slots) = self.slots.lock() {
+            slots.remove(session_id);
+        }
+    }
+
+    /// Last-output instant for every session that has produced output.
+    /// The lock is held only for Arc clones + relaxed atomic loads.
+    #[must_use]
+    pub fn snapshot(&self) -> HashMap<Arc<str>, Instant> {
+        let Ok(slots) = self.slots.lock() else {
+            return HashMap::new();
+        };
+        slots
+            .iter()
+            .filter_map(|(id, cell)| {
+                let ms = cell.load(Ordering::Relaxed);
+                (ms != 0).then(|| (id.clone(), self.origin + Duration::from_millis(ms)))
+            })
+            .collect()
+    }
+
+    /// Test helper: has this session ever been stamped?
+    #[cfg(test)]
+    #[must_use]
+    pub fn has(&self, session_id: &str) -> bool {
+        self.slots.lock().is_ok_and(|slots| {
+            slots
+                .get(session_id)
+                .is_some_and(|cell| cell.load(Ordering::Relaxed) != 0)
+        })
+    }
+}
+
+impl Default for SessionActivity {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Snapshot of the most recent hook event, surfaced via
 /// `hooks_diagnostics` so the Harness Health UI can answer "are hooks
 /// actually firing?" without the user digging through logs.
@@ -158,7 +274,7 @@ impl Default for AppHandleState {
             event_socket: Mutex::new(None),
             harness_runtimes: HarnessRuntimeRegistry::new(),
             channel_event_tx: Mutex::new(None),
-            session_activity: Arc::new(Mutex::new(HashMap::new())),
+            session_activity: Arc::new(SessionActivity::new()),
             terminal_resize_locks: Mutex::new(HashMap::new()),
             last_hook_at: Arc::new(Mutex::new(None)),
             review_links: Mutex::new(HashMap::new()),

@@ -1,8 +1,5 @@
 #![allow(deprecated)]
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-
 use raum_core::agent::{AgentAdapter, AgentKind, SessionId};
 use raum_core::agent_state::{AgentStateMachine, HookEvent as CoreHookEvent};
 use raum_hooks::HookEvent;
@@ -397,20 +394,19 @@ fn permission_notification_event_falls_back_to_session_id_key() {
 
 #[test]
 fn persisted_working_state_seeds_session_activity() {
-    let session_activity = Arc::new(Mutex::new(HashMap::new()));
+    let session_activity = crate::state::SessionActivity::new();
     seed_session_activity_for_persisted_state(
         &session_activity,
         "raum-working",
         Some(raum_core::agent::AgentState::Working),
     );
 
-    let activity = session_activity.lock().unwrap();
-    assert!(activity.contains_key("raum-working"));
+    assert!(session_activity.has("raum-working"));
 }
 
 #[test]
 fn non_working_persisted_state_does_not_seed_session_activity() {
-    let session_activity = Arc::new(Mutex::new(HashMap::new()));
+    let session_activity = crate::state::SessionActivity::new();
     seed_session_activity_for_persisted_state(
         &session_activity,
         "raum-idle",
@@ -418,7 +414,6 @@ fn non_working_persisted_state_does_not_seed_session_activity() {
     );
     seed_session_activity_for_persisted_state(&session_activity, "raum-none", None);
 
-    let activity = session_activity.lock().unwrap();
-    assert!(!activity.contains_key("raum-idle"));
-    assert!(!activity.contains_key("raum-none"));
+    assert!(!session_activity.has("raum-idle"));
+    assert!(!session_activity.has("raum-none"));
 }

@@ -3,7 +3,7 @@
 //! activity / idle state when a harness-native event path is unavailable.
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use raum_core::agent_state::AgentStateChanged;
@@ -43,15 +43,9 @@ pub fn spawn_silence_tick<R: Runtime>(app: &AppHandle<R>) {
         loop {
             interval.tick().await;
             let state: tauri::State<'_, crate::state::AppHandleState> = app.state();
-            let activity_snapshot: HashMap<String, Instant> = {
-                match state.session_activity.lock() {
-                    Ok(g) => g.clone(),
-                    Err(_) => {
-                        warn!("silence-tick: session_activity lock poisoned; skipping tick");
-                        continue;
-                    }
-                }
-            };
+            // Cheap: the activity map is locked only long enough to clone
+            // `Arc<str>` keys and load one atomic per session.
+            let activity_snapshot: HashMap<Arc<str>, Instant> = state.session_activity.snapshot();
             let now = Instant::now();
             let changes: Vec<AgentStateChanged> = {
                 let Ok(mut registry) = state.agents.lock() else {

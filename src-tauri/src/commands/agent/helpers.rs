@@ -10,9 +10,7 @@ use crate::state::AppHandleState;
 
 pub fn cleanup_harness_session(state: &AppHandleState, session_id: &str) {
     state.harness_runtimes.end_session(session_id);
-    if let Ok(mut map) = state.session_activity.lock() {
-        map.remove(session_id);
-    }
+    state.session_activity.remove(session_id);
     if let Ok(store) = state.config_store.lock()
         && let Err(e) = store.forget_session(session_id)
     {

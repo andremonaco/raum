@@ -2,10 +2,9 @@
 //! kill code paths. Pure functions and lock primitives only — no
 //! command handlers, no Tauri emits.
 
-use std::collections::HashMap;
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use raum_core::AgentKind;
 
@@ -273,6 +272,6 @@ pub(super) fn harness_session_env_pairs(
 }
 
 /// Type alias used by [`super::bridge::open_bridge_and_monitor`] to pass
-/// the shared session-activity map without leaking a concrete `Mutex`
-/// type across module boundaries.
-pub(super) type SessionActivityMap = Arc<Mutex<HashMap<String, std::time::Instant>>>;
+/// the shared per-session activity clock without naming the concrete type
+/// across module boundaries.
+pub(super) type SessionActivityMap = Arc<crate::state::SessionActivity>;

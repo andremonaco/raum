@@ -348,7 +348,7 @@ pub fn ensure_bridge_running<R: Runtime>(app: &AppHandle<R>, bus: &AgentEventBus
                 Ok(change) => {
                     // Persist first so `agent_snapshot` / `agent_list`
                     // callers that race with the emit see the new state.
-                    persist_last_state(&app, &change);
+                    persist_last_state(&app, &change).await;
                     if let Err(e) = app.emit("agent-state-changed", &change) {
                         warn!(error=%e, "agent-state-changed emit failed");
                     }
@@ -364,7 +364,7 @@ pub fn ensure_bridge_running<R: Runtime>(app: &AppHandle<R>, bus: &AgentEventBus
         loop {
             match prompt_rx.recv().await {
                 Ok(update) => {
-                    persist_last_prompt(&prompt_app, &update);
+                    persist_last_prompt(&prompt_app, &update).await;
                     if let Err(e) = prompt_app.emit("pane:prompt-updated", &update) {
                         warn!(error=%e, "pane:prompt-updated emit failed");
                     }
