@@ -273,6 +273,7 @@ pub fn run() {
             commands::permission::reply_permission,
             // §5.4 — project command surface (Wave 3B).
             commands::project::project_register,
+            commands::project::project_set_active,
             commands::project::project_find_by_path,
             commands::project::project_list,
             commands::project::project_update,
@@ -426,12 +427,12 @@ pub fn run() {
             // runs first.
             bootstrap_tmux_tcc_policy(app);
 
-            // Must come before `bootstrap_git_watchers` — the watchers take
-            // the service's pulse sender so terminal-driven commits/stages
-            // refresh the sidebar status.
+            // Must come before the first `project_set_active` — the `.git`
+            // watcher takes the service's pulse sender so terminal-driven
+            // commits/stages refresh the sidebar status. No watcher is started
+            // here: the frontend activates a project tab within a beat of
+            // launch and only that project gets one.
             bootstrap_status_service(app);
-
-            bootstrap_git_watchers(app);
 
             // §7.6 — bring up the hook-event UDS socket and bridge it into
             // the agent state machines. Failures here downgrade to the
@@ -1214,59 +1215,6 @@ fn bootstrap_status_service(app: &mut tauri::App) {
         });
     } else {
         warn!("bootstrap_status_service: main window not found");
-    }
-}
-
-/// Start a `GitHeadWatcher` for every already-registered project so branch
-/// badges refresh automatically after startup. Failures per project are
-/// logged and skipped — a bad repo never blocks launch.
-fn bootstrap_git_watchers(app: &mut tauri::App) {
-    let state: tauri::State<'_, state::AppHandleState> = app.state();
-    let handle = app.handle().clone();
-    let status_pulse = state
-        .status_service
-        .lock()
-        .ok()
-        .and_then(|guard| guard.as_ref().map(|svc| svc.pulse_sender()));
-
-    let slugs_and_roots: Vec<(String, std::path::PathBuf)> = {
-        let Ok(store) = state.config_store.lock() else {
-            warn!("bootstrap_git_watchers: config_store lock poisoned");
-            return;
-        };
-        let slugs = match store.list_project_slugs() {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(error = %e, "bootstrap_git_watchers: list_project_slugs failed");
-                return;
-            }
-        };
-        slugs
-            .into_iter()
-            .filter_map(|slug| match store.read_project(&slug) {
-                Ok(Some(p)) => Some((p.slug, p.root_path)),
-                _ => None,
-            })
-            .collect()
-    };
-
-    let Ok(mut watchers) = state.git_watchers.lock() else {
-        warn!("bootstrap_git_watchers: git_watchers lock poisoned");
-        return;
-    };
-    for (slug, root) in slugs_and_roots {
-        match commands::git_watcher::GitHeadWatcher::start(
-            slug.clone(),
-            &root,
-            handle.clone(),
-            status_pulse.clone(),
-        ) {
-            Ok(w) => {
-                info!(id = %slug, "git_watcher: started");
-                watchers.insert(slug, w);
-            }
-            Err(e) => warn!(id = %slug, error = %e, "git_watcher: start failed"),
-        }
     }
 }
 

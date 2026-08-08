@@ -59,11 +59,18 @@ const [activeProjectSlug, setActiveProjectSlugInternal] = createSignal<string | 
 
 /** Set the currently-active project tab. Persists into the active-layout
  *  snapshot so the same project is reselected on next launch — without this
- *  the rehydrated grid renders empty until the user clicks a project tab. */
+ *  the rehydrated grid renders empty until the user clicks a project tab.
+ *
+ *  Also tells the backend, which scopes its live `.git` watcher to the active
+ *  project (one FSEvents stream, not one per registered project). */
 function setActiveProjectSlug(slug: string | undefined): void {
   if (activeProjectSlug() === slug) return;
   setActiveProjectSlugInternal(slug);
   scheduleActiveSave();
+  void invoke("project_set_active", { slug: slug ?? null }).catch(() => {
+    /* Tauri context unavailable (tests) — branch badges then degrade to the
+       status service's fallback poll. */
+  });
 }
 
 export { activeProjectSlug, setActiveProjectSlug };

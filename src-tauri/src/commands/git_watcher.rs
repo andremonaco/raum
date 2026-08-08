@@ -14,6 +14,14 @@
 //! stay stable across the rename. FS events are coalesced inside a debounce
 //! window before a single event is emitted to the webview.
 //!
+//! Exactly one watcher runs at a time: the one for the *active* project (see
+//! [`set_active_project`]). An FSEvents/inotify stream plus a supervisor task
+//! per registered project is real, permanent cost for repos nobody is looking
+//! at; a backgrounded project simply has no live watch until it is activated
+//! again, at which point the sidebar's fresh status subscriptions seed its
+//! diffstats and [`set_active_project`]'s catch-up event re-fetches its
+//! worktree/branch list.
+//!
 //! The watcher self-heals under fd pressure. When the FSEvents stream starts
 //! returning errors (typically `EMFILE` once the rest of the app exhausts
 //! descriptors) two things happen so we don't degrade silently or spam the
@@ -26,8 +34,9 @@
 //! emitted ~80 identical WARNs/min and never recovered without an app
 //! restart.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -38,6 +47,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::notify_watch::{ErrorRateMap, HealthState, SUPERVISOR_TICK, emit_rate_limited_error};
+use crate::state::AppHandleState;
 
 /// Git checkout writes multiple files (HEAD, index, packed-refs) in quick
 /// succession. Coalesce the burst so we emit one frontend event per switch.
@@ -73,10 +83,16 @@ pub struct GitHeadWatcher {
     /// once the abort lands those clones are released too.
     _pulse_tx: mpsc::UnboundedSender<PulseKind>,
     inner: Arc<Mutex<Inner>>,
+    /// Set in `Drop`, checked by the supervisor every tick. `abort()` alone
+    /// only takes effect at the task's next await point, so a supervisor that
+    /// is mid-tick could still rebuild — and resurrect — a watcher this
+    /// project just stopped.
+    stopped: Arc<AtomicBool>,
 }
 
 impl Drop for GitHeadWatcher {
     fn drop(&mut self) {
+        self.stopped.store(true, Ordering::Relaxed);
         self.supervisor.abort();
     }
 }
@@ -152,18 +168,21 @@ impl GitHeadWatcher {
         // Supervisor: notice when the watcher has been erroring for ≥30 s
         // with no successful event, drop it, and re-create. Backs off if
         // the rebuild itself fails (typically also EMFILE).
+        let stopped = Arc::new(AtomicBool::new(false));
         let supervisor = tauri::async_runtime::spawn(supervise_watcher(
             slug,
             inner.clone(),
             pulse_tx.clone(),
             error_state,
             health,
+            stopped.clone(),
         ));
 
         Ok(Self {
             supervisor,
             _pulse_tx: pulse_tx,
             inner,
+            stopped,
         })
     }
 
@@ -210,6 +229,67 @@ impl GitHeadWatcher {
             inner.watched.remove(&path);
         }
     }
+}
+
+/// Scope the live `.git` watcher to `slug` — the project the user currently
+/// has selected — stopping every other project's watcher. `None` (no project
+/// selected) stops all of them.
+///
+/// Diffstats need no catch-up pulse from here: switching mounts that project's
+/// sidebar rows, and each new status subscription seeds an immediate recompute
+/// in the status service (see `set_subscriptions`). *Branch names* do: while
+/// the project was backgrounded it had no watcher, so a checkout/merge inside
+/// it emitted nothing, and the frontend's worktree-list cache is only
+/// invalidated by `worktree-branches-changed`. So we emit one for the
+/// newly-activated slug.
+pub fn set_active_project<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &AppHandleState,
+    slug: Option<&str>,
+) {
+    // Resolve the root before touching the watcher map — the config store has
+    // its own lock and holding both at once invites a deadlock.
+    let target = slug.and_then(|slug| {
+        let store = state.config_store.lock().ok()?;
+        let project = store.read_project(slug).ok().flatten()?;
+        Some((project.slug, project.root_path))
+    });
+    let status_pulse = state
+        .status_service
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|svc| svc.pulse_sender()));
+
+    let Ok(mut watchers) = state.git_watchers.lock() else {
+        warn!("git_watcher: set_active_project: git_watchers lock poisoned");
+        return;
+    };
+    // Dropping the removed entries stops their streams and supervisors.
+    if !retain_only(&mut watchers, target.as_ref().map(|(s, _)| s.as_str())) {
+        return;
+    }
+    let Some((slug, root)) = target else { return };
+    match GitHeadWatcher::start(slug.clone(), &root, app.clone(), status_pulse) {
+        Ok(w) => {
+            info!(id = %slug, "git_watcher: started");
+            watchers.insert(slug.clone(), w);
+        }
+        Err(e) => warn!(id = %slug, error = %e, "git_watcher: start failed"),
+    }
+    // Catch-up after the watcher is live, so a checkout landing right now is
+    // either included in the refetch or caught by the watcher — never both
+    // missed. Emitted on failed starts too: the list is stale either way.
+    if let Err(e) = app.emit("worktree-branches-changed", json!({ "slug": slug })) {
+        warn!(slug = %slug, error = %e, "worktree-branches-changed emit failed");
+    }
+}
+
+/// Drop every entry except `keep`, returning whether `keep` still needs a
+/// watcher started. Generic over the value so the switch policy is testable
+/// without an FSEvents stream.
+fn retain_only<V>(watchers: &mut HashMap<String, V>, keep: Option<&str>) -> bool {
+    watchers.retain(|slug, _| Some(slug.as_str()) == keep);
+    keep.is_some_and(|k| !watchers.contains_key(k))
 }
 
 /// Build a `RecommendedWatcher` and watch every dir from
@@ -279,6 +359,7 @@ async fn supervise_watcher(
     pulse_tx: mpsc::UnboundedSender<PulseKind>,
     error_state: Arc<Mutex<ErrorRateMap>>,
     health: Arc<Mutex<HealthState>>,
+    stopped: Arc<AtomicBool>,
 ) {
     let mut tick = tokio::time::interval(SUPERVISOR_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -286,6 +367,11 @@ async fn supervise_watcher(
     tick.tick().await;
     loop {
         tick.tick().await;
+        // The watcher was stopped (project deactivated / removed): never
+        // rebuild it, and release our `inner` clone so the OS stream goes away.
+        if stopped.load(Ordering::Relaxed) {
+            return;
+        }
 
         let now = Instant::now();
         let dropped_errors = {
@@ -477,6 +563,110 @@ mod tests {
             .add_path(PathBuf::from("/repo/.git/index.lock"));
         assert!(!event_touches_index(&ev));
         assert!(!event_touches_head(&ev));
+    }
+
+    /// Project switch: the old project's watcher is *dropped* (its stream
+    /// stops), the new one is reported as needing a start, and re-activating
+    /// the same project doesn't churn a restart.
+    #[test]
+    fn retain_only_swaps_the_active_project() {
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut map = HashMap::new();
+        map.insert("alpha".to_string(), DropFlag(dropped.clone()));
+
+        assert!(retain_only(&mut map, Some("beta")));
+        assert!(dropped.load(Ordering::Relaxed), "alpha's watcher must stop");
+        assert!(map.is_empty());
+
+        let mut live: HashMap<String, u8> = HashMap::from([("beta".to_string(), 1)]);
+        assert!(!retain_only(&mut live, Some("beta")));
+        assert_eq!(live.len(), 1);
+
+        assert!(!retain_only(&mut live, None));
+        assert!(live.is_empty());
+    }
+
+    /// Health state that has been erroring long enough to justify a rebuild.
+    /// `None` on a machine booted seconds ago (monotonic clock can't go back
+    /// that far) — the supervisor tests then skip rather than hang.
+    fn erroring_health() -> Option<Arc<Mutex<HealthState>>> {
+        let long_ago = Instant::now().checked_sub(Duration::from_secs(120))?;
+        let mut h = HealthState::default();
+        for _ in 0..5 {
+            h.record_err(long_ago);
+        }
+        Some(Arc::new(Mutex::new(h)))
+    }
+
+    fn empty_inner(root: &Path) -> Arc<Mutex<Inner>> {
+        let watcher = notify::recommended_watcher(|_res| {}).unwrap();
+        Arc::new(Mutex::new(Inner {
+            watcher,
+            watched: HashSet::new(),
+            root: root.to_path_buf(),
+        }))
+    }
+
+    fn repo_with_head() -> tempfile::TempDir {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        dir
+    }
+
+    /// Control for the test below: a *live* watcher does get rebuilt, so an
+    /// empty watch set there really is the stop flag's doing.
+    #[tokio::test(start_paused = true)]
+    async fn supervisor_rebuilds_a_live_watcher() {
+        let Some(health) = erroring_health() else {
+            return;
+        };
+        let dir = repo_with_head();
+        let inner = empty_inner(dir.path());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let stopped = Arc::new(AtomicBool::new(false));
+        tokio::spawn(supervise_watcher(
+            "alpha".into(),
+            inner.clone(),
+            tx,
+            Arc::new(Mutex::new(ErrorRateMap::default())),
+            health,
+            stopped,
+        ));
+        tokio::time::sleep(SUPERVISOR_TICK * 3).await;
+        assert!(!inner.lock().unwrap().watched.is_empty());
+    }
+
+    /// A stopped watcher's supervisor exits instead of resurrecting it.
+    #[tokio::test(start_paused = true)]
+    async fn supervisor_does_not_rebuild_after_stop() {
+        let Some(health) = erroring_health() else {
+            return;
+        };
+        let dir = repo_with_head();
+        let inner = empty_inner(dir.path());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let stopped = Arc::new(AtomicBool::new(true));
+        let task = tokio::spawn(supervise_watcher(
+            "alpha".into(),
+            inner.clone(),
+            tx,
+            Arc::new(Mutex::new(ErrorRateMap::default())),
+            health,
+            stopped,
+        ));
+        tokio::time::timeout(SUPERVISOR_TICK * 3, task)
+            .await
+            .expect("supervisor should exit once stopped")
+            .unwrap();
+        assert!(inner.lock().unwrap().watched.is_empty());
     }
 
     #[test]

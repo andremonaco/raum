@@ -95,6 +95,11 @@ const PER_DIR_WATCHES: bool = !cfg!(target_os = "macos");
 pub(super) struct WorktreeFsWatcher {
     supervisor: tauri::async_runtime::JoinHandle<()>,
     debounce: tauri::async_runtime::JoinHandle<()>,
+    /// The per-dir add drain (inotify backends only; `None` on macOS, where the
+    /// recursive stream covers new dirs). It holds a clone of `_inner`, so
+    /// leaving it detached would keep the `Arc` — and with it the live notify
+    /// watcher — alive forever after this struct drops.
+    dir_drain: Option<tauri::async_runtime::JoinHandle<()>>,
     /// Owns the live notify watcher (the supervisor holds a clone for rebuilds).
     /// Held only to keep the watcher alive for this struct's lifetime — never
     /// read directly, so it carries the conventional leading underscore.
@@ -111,6 +116,9 @@ impl Drop for WorktreeFsWatcher {
     fn drop(&mut self) {
         self.supervisor.abort();
         self.debounce.abort();
+        if let Some(drain) = self.dir_drain.take() {
+            drain.abort();
+        }
     }
 }
 
@@ -127,7 +135,7 @@ impl WorktreeFsWatcher {
         // Canonicalize once up front. notify's FSEvents backend reports
         // canonical event paths, so a non-canonical root (e.g. a worktree under
         // a symlinked dir like macOS `/tmp` -> `/private/tmp`) would make every
-        // `strip_prefix(root)` in `under_dot_git` / the gitignore matcher fail
+        // `strip_prefix(root)` in `under_skipped_top_level` / the gitignore matcher fail
         // and the filters fail *open* — re-admitting the `.git/` and `target/`
         // churn this watcher exists to drop. Fall back to the raw path if the
         // dir can't be resolved (it always should — it's a live worktree).
@@ -177,10 +185,10 @@ impl WorktreeFsWatcher {
         // recompute. On macOS the recursive stream covers new dirs, so the
         // callback never sends and this drain is never spawned (`dir_rx` is just
         // dropped).
-        if PER_DIR_WATCHES {
+        let dir_drain = if PER_DIR_WATCHES {
             let drain_inner = inner.clone();
             let drain_pulse = deps.raw_tx.clone();
-            tauri::async_runtime::spawn(async move {
+            Some(tauri::async_runtime::spawn(async move {
                 while let Some(new_dir) = dir_rx.recv().await {
                     let dirs = watchable_dirs(&new_dir);
                     if let Ok(mut guard) = drain_inner.lock() {
@@ -190,14 +198,17 @@ impl WorktreeFsWatcher {
                     }
                     let _ = drain_pulse.send(());
                 }
-            });
-        }
+            }))
+        } else {
+            None
+        };
 
         let supervisor = tauri::async_runtime::spawn(supervise_watcher(inner.clone(), deps));
 
         Ok(Self {
             supervisor,
             debounce,
+            dir_drain,
             _inner: inner,
         })
     }
@@ -310,6 +321,11 @@ fn watchable_dirs(root: &Path) -> Vec<PathBuf> {
 /// Build a gitignore matcher from the worktree's root `.gitignore` and
 /// `.git/info/exclude`. Missing files are skipped; on a build error we fall
 /// back to an empty matcher (no filtering) rather than failing the watcher.
+// ponytail: root .gitignore only on macOS; nested-ignored trees still pulse
+// (harmless — the recompute just finds nothing). Feeding every nested
+// `.gitignore` in would cost a full `WalkBuilder` pass at watcher start, which
+// macOS currently avoids entirely; add it if a nested-ignored tree ever churns
+// hard enough to matter.
 fn build_gitignore(root: &Path) -> Gitignore {
     let mut builder = GitignoreBuilder::new(root);
     // `add` returns `Some(err)` on failure; a missing file is a benign skip.
@@ -321,11 +337,25 @@ fn build_gitignore(root: &Path) -> Gitignore {
     })
 }
 
-/// True when an event path should trigger a status recompute: not inside the
-/// worktree's `.git/`, and not matched by gitignore (so `target/`,
-/// `node_modules/`, and other build churn are dropped before any `git diff`).
+/// Top-level directory names under the worktree root whose whole subtree is
+/// dropped on a single `OsStr` compare, before the gitignore matcher runs.
+///
+/// `.git` is git's own state (a linked worktree's `.git` is a pointer file —
+/// same first component). The rest are the churners a `cargo build` /
+/// `bun install` fires thousands of events per second for, straight onto
+/// notify's callback thread; `matched_path_or_any_parents` re-walks every
+/// ancestor of every one of them, and would reject them anyway.
+///
+// ponytail: a repo that *tracks* a top-level `target`/`dist`/`node_modules`
+// loses prompt status on edits there — the 15 s fallback poll still catches
+// them. Make it gitignore-derived if that ever bites.
+const SKIP_TOP_LEVEL: [&str; 4] = [".git", "target", "node_modules", "dist"];
+
+/// True when an event path should trigger a status recompute: not under a
+/// [`SKIP_TOP_LEVEL`] directory, and not matched by gitignore (so the rest of
+/// the build churn is dropped before any `git diff`).
 fn is_relevant(path: &Path, root: &Path, gitignore: &Gitignore) -> bool {
-    if under_dot_git(path, root) {
+    if under_skipped_top_level(path, root) {
         return false;
     }
     !gitignore
@@ -333,14 +363,14 @@ fn is_relevant(path: &Path, root: &Path, gitignore: &Gitignore) -> bool {
         .is_ignore()
 }
 
-/// True when `path`'s first component under `root` is `.git` (the main
-/// worktree's git dir, or a linked worktree's `.git` pointer file). The real
-/// linked gitdir lives outside the worktree root, so it is never seen here.
-fn under_dot_git(path: &Path, root: &Path) -> bool {
+/// True when `path`'s first component under `root` is one of
+/// [`SKIP_TOP_LEVEL`]. The real linked gitdir lives outside the worktree root,
+/// so it is never seen here.
+fn under_skipped_top_level(path: &Path, root: &Path) -> bool {
     path.strip_prefix(root)
         .ok()
         .and_then(|rel| rel.components().next())
-        .is_some_and(|c| c.as_os_str() == ".git")
+        .is_some_and(|c| SKIP_TOP_LEVEL.iter().any(|skip| c.as_os_str() == *skip))
 }
 
 /// Rebuild the watcher once notify has been erroring long enough (see
@@ -410,23 +440,53 @@ mod tests {
     }
 
     #[test]
-    fn under_dot_git_matches_main_dir_and_linked_file() {
+    fn under_skipped_top_level_matches_git_and_churners() {
         let root = Path::new("/repo");
         // Main worktree: `.git` is a directory; everything under it is git's.
-        assert!(under_dot_git(Path::new("/repo/.git"), root));
-        assert!(under_dot_git(Path::new("/repo/.git/index"), root));
-        assert!(under_dot_git(Path::new("/repo/.git/objects/ab/cd"), root));
+        assert!(under_skipped_top_level(Path::new("/repo/.git"), root));
+        assert!(under_skipped_top_level(Path::new("/repo/.git/index"), root));
+        assert!(under_skipped_top_level(
+            Path::new("/repo/.git/objects/ab/cd"),
+            root
+        ));
         // Linked worktree: `.git` is a pointer *file* — same first component.
-        assert!(under_dot_git(Path::new("/repo/.git"), root));
-        // Lookalikes are NOT the git dir.
-        assert!(!under_dot_git(
+        assert!(under_skipped_top_level(Path::new("/repo/.git"), root));
+        // The gitignore-matcher bypass: build churn rejected on one compare.
+        assert!(under_skipped_top_level(
+            Path::new("/repo/target/debug/deps/x.o"),
+            root
+        ));
+        assert!(under_skipped_top_level(
+            Path::new("/repo/node_modules/a/b.js"),
+            root
+        ));
+        assert!(under_skipped_top_level(
+            Path::new("/repo/dist/app.js"),
+            root
+        ));
+        // Lookalikes are NOT skipped.
+        assert!(!under_skipped_top_level(
             Path::new("/repo/.github/workflows/ci.yml"),
             root
         ));
-        assert!(!under_dot_git(Path::new("/repo/src/.gitkeep"), root));
-        assert!(!under_dot_git(Path::new("/repo/src/main.rs"), root));
+        assert!(!under_skipped_top_level(
+            Path::new("/repo/src/.gitkeep"),
+            root
+        ));
+        assert!(!under_skipped_top_level(
+            Path::new("/repo/src/main.rs"),
+            root
+        ));
+        // Nested, not top-level — the gitignore matcher still owns these.
+        assert!(!under_skipped_top_level(
+            Path::new("/repo/crates/core/target/x"),
+            root
+        ));
         // A path outside the root has no first component under it.
-        assert!(!under_dot_git(Path::new("/other/.git/index"), root));
+        assert!(!under_skipped_top_level(
+            Path::new("/other/.git/index"),
+            root
+        ));
     }
 
     #[test]
