@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.18](https://github.com/andremonaco/raum/releases/tag/v0.1.18) - 2026-08-08
+
+### Added
+
+- feat(notifications): Allow/Deny actions on macOS permission banners
+
+### Fixed
+
+- fix(tmux): separate batched pane fields with a tab, not \x1f
+- fix(tmux): narrow the batched pane listing in Rust, not via list-panes -f
+- perf(search): grep tmux scrollback in Rust instead of shipping it over IPC
+- fix(worktree): validate the project slug before writing a config fragment
+- fix(notifications): option-safe sound paths, reap detached children
+- perf(hydration): APFS clones, EOF-driven hook waits, bounded output tails
+- fix(hooks): harden the event socket
+- perf(review): cheaper transcript discovery, shared HTTP clients
+- fix(rehydrate): forget dead rows with no project and expired completed ones
+- perf(watchers): scope the live .git watcher to the active project
+- perf(ipc): move blocking command handlers off the main thread
+- perf(agent): lock-free per-session output clock, async state persistence
+- perf(tmux): run commands over the control client, stop forking for resize
+- perf(tmux): batch pane queries behind one list-panes call
+- fix(config-io): keep the user's JSON key order when installing managed hooks
+- perf(store): fingerprint-cache TOML reads, debounce display-only session writes
+- fix(opencode): make permission replies idempotent, keep the current route
+
+### Other
+
+- chore(tmux): drop the crate-wide truncation allow, tolerate poisoned mutexes
+- refactor(git): centralize git subprocesses, batch sidebar branch lookups
+
+
 ## [0.1.17](https://github.com/andremonaco/raum/releases/tag/v0.1.17) - 2026-08-07
 
 ### Added
