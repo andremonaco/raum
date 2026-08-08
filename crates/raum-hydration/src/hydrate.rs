@@ -57,6 +57,12 @@ where
 {
     let mut report = HydrationReport::default();
 
+    // Canonicalize the two roots once. `safe_join` needs the canonical root
+    // to detect symlink escapes, and it used to recompute it — one realpath
+    // syscall chain per root per rule — on every single manifest entry.
+    let canon_source = canonicalize_or_self(source);
+    let canon_target = canonicalize_or_self(target);
+
     // Symlinks win over duplicate copies — collect symlink set first.
     let symlink_set: std::collections::HashSet<&String> = manifest.symlink.iter().collect();
 
@@ -70,8 +76,8 @@ where
     let mut done: u64 = 0;
 
     for rel in &copy_effective {
-        let src = safe_join(source, rel)?;
-        let dst = safe_join(target, rel)?;
+        let src = safe_join(source, &canon_source, rel)?;
+        let dst = safe_join(target, &canon_target, rel)?;
         if !src.exists() {
             report.skipped.push(src);
             done += 1;
@@ -94,8 +100,8 @@ where
     }
 
     for rel in &manifest.symlink {
-        let src = safe_join(source, rel)?;
-        let dst = safe_join(target, rel)?;
+        let src = safe_join(source, &canon_source, rel)?;
+        let dst = safe_join(target, &canon_target, rel)?;
         if !src.exists() {
             report.skipped.push(src);
             done += 1;
@@ -161,6 +167,58 @@ where
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    if clone_tree(src, dst) {
+        return Ok(());
+    }
+    copy_dir_walk(src, dst)
+}
+
+/// macOS fast path: `cp -Rc` clones the whole subtree with APFS copy-on-write
+/// (`clonefile(2)`) in a single subprocess — near-instant and near-zero disk
+/// for a `node_modules`-sized tree, versus a byte-for-byte per-file walk.
+/// `clonefile` carries mode bits and symlinks across verbatim, so the walk's
+/// semantics are preserved (verified by the existing mode/symlink tests).
+///
+/// Only taken when `dst` doesn't exist yet, so a half-finished clone can be
+/// removed wholesale before the portable walk retries. Returns `false` on any
+/// failure — non-APFS volume, cross-volume copy, missing `/bin/cp` — and the
+/// caller falls back. `libc::clonefile` would skip the subprocess, but `unsafe`
+/// is denied workspace-wide.
+#[cfg(target_os = "macos")]
+fn clone_tree(src: &Path, dst: &Path) -> bool {
+    if dst.exists() {
+        return false;
+    }
+    // BSD `cp -R` does not dereference a symlink *operand*: `cp -Rc link dst`
+    // recreates `dst` as a symlink, turning a manifest `copy` into a `symlink`
+    // whose relative target then resolves against the new worktree. The
+    // portable walk reads through the link and materialises a real tree.
+    if src
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink())
+    {
+        return false;
+    }
+    let status = std::process::Command::new("/bin/cp")
+        .arg("-Rc")
+        .arg(src)
+        .arg(dst)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    match status {
+        Ok(s) if s.success() => true,
+        other => {
+            debug!(?src, ?dst, ?other, "clonefile copy unavailable; walking");
+            let _ = std::fs::remove_dir_all(dst);
+            false
+        }
+    }
+}
+
+fn copy_dir_walk(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
@@ -168,7 +226,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
         let from = entry.path();
         let to = dst.join(entry.file_name());
         if file_type.is_dir() {
-            copy_dir_recursive(&from, &to)?;
+            copy_dir_walk(&from, &to)?;
         } else if file_type.is_symlink() {
             let target = std::fs::read_link(&from)?;
             symlink(&target, &to)?;
@@ -179,7 +237,12 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, HydrationError> {
+/// Join `rel` under `root`, rejecting anything that escapes it.
+///
+/// `canon_root` is the caller-hoisted canonical form of `root` (see
+/// [`canonicalize_or_self`]) — passed in rather than recomputed so a
+/// hundred-rule manifest does not issue a hundred redundant realpath walks.
+fn safe_join(root: &Path, canon_root: &Path, rel: &str) -> Result<PathBuf, HydrationError> {
     let cleaned = PathBuf::from(rel);
     if cleaned.is_absolute() {
         return Err(HydrationError::EscapingPath(rel.to_string()));
@@ -195,9 +258,8 @@ fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, HydrationError> {
     let joined = root.join(cleaned);
     // Belt-and-suspenders: canonicalize both sides to defeat symlink escapes. Walk the
     // joined path up until we find an existing ancestor we can canonicalize.
-    let canon_root = canonicalize_or_self(root);
-    let canon_anchor = closest_canonical_ancestor(&joined, &canon_root);
-    if !canon_anchor.starts_with(&canon_root) {
+    let canon_anchor = closest_canonical_ancestor(&joined, canon_root);
+    if !canon_anchor.starts_with(canon_root) {
         warn!(?joined, "rejected path outside root");
         return Err(HydrationError::EscapingPath(rel.to_string()));
     }
@@ -331,6 +393,67 @@ mod tests {
         let copied_meta = std::fs::metadata(dst.path().join("run.sh")).unwrap();
         let mode = copied_meta.permissions().mode() & 0o777;
         assert_eq!(mode, 0o755, "copy preserved unix mode bits");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dir_copy_preserves_modes_and_inner_symlinks() {
+        // Guards the macOS `cp -Rc` clone fast path against the portable walk:
+        // whichever runs, exec bits and symlinks inside the tree survive.
+        use std::os::unix::fs::PermissionsExt;
+        let src = tempdir().unwrap();
+        let dst = tempdir().unwrap();
+        write(&src.path().join("tree/nested/run.sh"), "#!/bin/sh\n");
+        std::fs::set_permissions(
+            src.path().join("tree/nested/run.sh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        symlink(Path::new("nested/run.sh"), &src.path().join("tree/link")).unwrap();
+        let manifest = HydrationManifest {
+            copy: vec!["tree".into()],
+            symlink: vec![],
+        };
+        apply_hydration(src.path(), dst.path(), &manifest).unwrap();
+        let mode = std::fs::metadata(dst.path().join("tree/nested/run.sh"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755);
+        assert!(
+            dst.path()
+                .join("tree/link")
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copying_a_symlinked_dir_materialises_a_real_tree() {
+        // A `copy` rule whose source is a symlink to a directory must produce an
+        // independent directory, not a symlink (macOS `cp -Rc` would do the latter).
+        let src = tempdir().unwrap();
+        let dst = tempdir().unwrap();
+        write(&src.path().join("real/inner.txt"), "payload");
+        symlink(Path::new("real"), &src.path().join("linked")).unwrap();
+        let manifest = HydrationManifest {
+            copy: vec!["linked".into()],
+            symlink: vec![],
+        };
+        apply_hydration(src.path(), dst.path(), &manifest).unwrap();
+        let meta = dst.path().join("linked").symlink_metadata().unwrap();
+        assert!(
+            meta.file_type().is_dir(),
+            "copy operand must not stay a symlink"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join("linked/inner.txt")).unwrap(),
+            "payload"
+        );
     }
 
     #[test]
