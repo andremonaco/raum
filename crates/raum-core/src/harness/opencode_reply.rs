@@ -3,9 +3,21 @@
 //! Answers an OpenCode permission request by POSTing to
 //! `/permission/:requestID/reply` on the local OpenCode server. The
 //! actual path and body shape were confirmed against
-//! `packages/opencode/src/server/routes/instance/permission.ts`
+//! `packages/opencode/src/server/routes/instance/httpapi/groups/permission.ts`
 //! (body is `{ reply: "once" | "always" | "reject", message?: string }`,
 //! NOT `{ response, remember? }` as the plan sketch assumed).
+//!
+//! Route audit (opencode dev @ fe82a1b, v1.18.15): this request-scoped
+//! route is the **current, non-deprecated** one; the session-scoped
+//! `POST /session/:sessionID/permissions/:permissionID` carries
+//! `deprecated: true` in both source and the generated OpenAPI, and its
+//! body has no `remember` field either (the docs table on
+//! opencode.ai/docs/server is stale). No fallback to the session-scoped
+//! route: a 404 here is ambiguous (route-missing on opencode < 1.14.30
+//! vs. request-already-answered, which is the *common* case because one
+//! reject cascades to every sibling request in the session), so a
+//! fallback POST would mostly fire spurious replies at a deprecated
+//! endpoint.
 //!
 //! The replier shares a [`PendingRequestMap`] with
 //! [`super::opencode_sse::OpenCodeSseChannel`] so consumers can resolve a
@@ -67,16 +79,14 @@ impl HttpReplyReplier {
 
 /// Map raum's [`Decision`] variants onto OpenCode's `reply` string.
 /// [`Decision::Ask`] has no OpenCode equivalent — it is the "bounce back
-/// to the native TUI" escape hatch, so it maps to a transport-level
-/// rejection rather than to a reply body.
-fn decision_to_reply(d: Decision) -> Result<&'static str, ReplyError> {
+/// to the native TUI" escape hatch, so it maps to `None`: we send
+/// nothing and leave the request pending for OpenCode's own prompt.
+fn decision_to_reply(d: Decision) -> Option<&'static str> {
     match d {
-        Decision::Allow => Ok("once"),
-        Decision::AllowAndRemember => Ok("always"),
-        Decision::Deny => Ok("reject"),
-        Decision::Ask => Err(ReplyError::Rejected(
-            "OpenCode has no `ask` reply; the native TUI handles fallback".into(),
-        )),
+        Decision::Allow => Some("once"),
+        Decision::AllowAndRemember => Some("always"),
+        Decision::Deny => Some("reject"),
+        Decision::Ask => None,
     }
 }
 
@@ -87,7 +97,16 @@ impl PermissionReplier for HttpReplyReplier {
         request_id: &PermissionRequestId,
         decision: Decision,
     ) -> Result<(), ReplyError> {
-        let reply = decision_to_reply(decision)?;
+        let Some(reply) = decision_to_reply(decision) else {
+            // `Ask` = graceful degradation: don't answer, let OpenCode's
+            // own TUI prompt the user.
+            debug!(
+                target: "opencode_reply",
+                request=%request_id.as_str(),
+                "ask: not replying, native TUI handles it"
+            );
+            return Ok(());
+        };
         let body = ReplyBody {
             reply,
             message: None,
@@ -132,12 +151,18 @@ impl PermissionReplier for HttpReplyReplier {
 
         let status = resp.status();
         if status.as_u16() == 404 {
-            // Clear the stale map entry; OpenCode has already forgotten
-            // about this request (typically because it was answered in
-            // the TUI between the notification firing and the user
-            // clicking).
+            // Idempotency: OpenCode has already forgotten this request —
+            // the user double-clicked, answered in the TUI, or a sibling
+            // `reject`/`always` in the same session cascaded and resolved
+            // it. Nothing left to deliver and nothing the user needs to
+            // see, so clear the stale map entry and report success.
+            debug!(
+                target: "opencode_reply",
+                request=%request_id.as_str(),
+                "404: already answered, treating as delivered"
+            );
             self.pending.lock().remove(request_id);
-            return Err(ReplyError::UnknownRequest(request_id.as_str().to_string()));
+            return Ok(());
         }
         if !status.is_success() {
             warn!(
@@ -169,16 +194,50 @@ mod tests {
 
     #[test]
     fn decision_allow_maps_to_once() {
-        assert_eq!(decision_to_reply(Decision::Allow).unwrap(), "once");
+        assert_eq!(decision_to_reply(Decision::Allow), Some("once"));
         assert_eq!(
-            decision_to_reply(Decision::AllowAndRemember).unwrap(),
-            "always"
+            decision_to_reply(Decision::AllowAndRemember),
+            Some("always")
         );
-        assert_eq!(decision_to_reply(Decision::Deny).unwrap(), "reject");
-        assert!(matches!(
-            decision_to_reply(Decision::Ask),
-            Err(ReplyError::Rejected(_))
-        ));
+        assert_eq!(decision_to_reply(Decision::Deny), Some("reject"));
+        assert_eq!(decision_to_reply(Decision::Ask), None);
+    }
+
+    #[test]
+    fn body_serialises_without_message() {
+        let json = serde_json::to_value(ReplyBody {
+            reply: "reject",
+            message: None,
+        })
+        .unwrap();
+        assert_eq!(json, serde_json::json!({ "reply": "reject" }));
+        let json = serde_json::to_value(ReplyBody {
+            reply: "reject",
+            message: Some("nope"),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "reply": "reject", "message": "nope" })
+        );
+    }
+
+    #[tokio::test]
+    async fn base_url_trailing_slash_does_not_double_up() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/permission/perm-1/reply"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(true))
+            .mount(&server)
+            .await;
+        let replier = HttpReplyReplier::new(format!("{}/", server.uri()), new_pending_map());
+        replier
+            .reply(&PermissionRequestId::new("perm-1"), Decision::Allow)
+            .await
+            .expect("ok");
     }
 
     #[tokio::test]
@@ -235,7 +294,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replier_404_maps_to_unknown_request() {
+    async fn replier_404_is_idempotent_success() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -252,11 +311,12 @@ mod tests {
             SessionId::new("sess-1"),
         );
         let replier = HttpReplyReplier::new(server.uri(), pending.clone());
-        let err = replier
+        // A duplicate click on an already-answered request must not
+        // surface an error to the UI.
+        replier
             .reply(&PermissionRequestId::new("missing"), Decision::Deny)
             .await
-            .expect_err("should 404");
-        assert!(matches!(err, ReplyError::UnknownRequest(_)));
+            .expect("404 is benign");
         // 404 also clears the stale entry.
         assert!(
             pending
@@ -286,14 +346,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replier_ask_rejects_without_posting() {
+    async fn replier_ask_is_noop_without_posting() {
         // No mock — if the replier POSTed we'd get a connection error
         // against a dead port.
         let replier = HttpReplyReplier::new("http://127.0.0.1:1", new_pending_map());
-        let err = replier
+        replier
             .reply(&PermissionRequestId::new("perm-1"), Decision::Ask)
             .await
-            .expect_err("ask rejected");
-        assert!(matches!(err, ReplyError::Rejected(_)));
+            .expect("ask is a no-op");
     }
 }
