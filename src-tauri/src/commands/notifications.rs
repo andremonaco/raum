@@ -52,7 +52,7 @@ pub fn notifications_focus_main<R: Runtime>(app: AppHandle<R>) -> Result<(), Str
 
 /// §11.4 — persist that the one-time "notifications denied" hint banner has
 /// been shown. Idempotent; safe to call more than once.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn notifications_mark_hint_shown(
     state: tauri::State<'_, AppHandleState>,
 ) -> Result<(), String> {
@@ -69,7 +69,7 @@ pub fn notifications_mark_hint_shown(
 /// Updates `notify_on_waiting`, `notify_on_done`, the banner master switch,
 /// the optional sound path, and the dock/taskbar `badge_mode` atomically in a
 /// single config write.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn config_set_notifications(
     state: tauri::State<'_, AppHandleState>,
     notify_on_waiting: bool,
@@ -127,7 +127,7 @@ const AUDIO_EXTENSIONS: &[&str] = &["aiff", "aif", "oga", "ogg", "wav", "mp3", "
 /// §11.5 — list OS-bundled alert sounds for the settings dropdown. Returns an
 /// empty `Vec` on platforms without a known sound directory; the caller is
 /// expected to gracefully degrade to the "None" / "Custom path" options.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn notifications_list_system_sounds() -> Vec<SystemSound> {
     let mut out: Vec<SystemSound> = Vec::new();
     for dir in system_sound_dirs() {
@@ -172,15 +172,30 @@ pub fn notifications_list_system_sounds() -> Vec<SystemSound> {
 /// Errors are swallowed into `Ok(())` and logged — notification delivery
 /// must not fail just because the user's sound file is missing or the
 /// player binary isn't installed.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn notifications_play_sound(path: String) -> Result<(), String> {
     spawn_event_sound(&path);
     Ok(())
 }
 
+/// Stop a user-supplied path from being parsed as an option by the player.
+///
+/// `afplay` does **not** understand the `--` end-of-options marker (it errors
+/// with "unknown argument: --"), so we can't rely on that alone; prefixing a
+/// leading-dash path with `./` makes it unambiguously a path for every player.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn option_safe_path(path: &str) -> std::borrow::Cow<'_, str> {
+    if path.starts_with('-') {
+        std::borrow::Cow::Owned(format!("./{path}"))
+    } else {
+        std::borrow::Cow::Borrowed(path)
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn spawn_event_sound(path: &str) {
-    match ProcessCommand::new("afplay").arg(path).spawn() {
+    let arg = option_safe_path(path);
+    match ProcessCommand::new("afplay").arg(arg.as_ref()).spawn() {
         Ok(child) => reap_detached(child),
         Err(e) => eprintln!("afplay spawn failed ({path}): {e}"),
     }
@@ -190,10 +205,17 @@ fn spawn_event_sound(path: &str) {
 fn spawn_event_sound(path: &str) {
     // libcanberra is the freedesktop event-sound standard; fall back to
     // paplay (PulseAudio / PipeWire compat shim) when it isn't installed.
+    // Both parse GNU-style options, so `--` terminates the option list.
+    let arg = option_safe_path(path);
     let attempt = ProcessCommand::new("canberra-gtk-play")
-        .args(["-f", path])
+        .args(["-f", arg.as_ref()])
         .spawn()
-        .or_else(|_| ProcessCommand::new("paplay").arg(path).spawn());
+        .or_else(|_| {
+            ProcessCommand::new("paplay")
+                .arg("--")
+                .arg(arg.as_ref())
+                .spawn()
+        });
     match attempt {
         Ok(child) => reap_detached(child),
         Err(e) => eprintln!("event-sound spawn failed ({path}): {e}"),
@@ -238,9 +260,22 @@ pub struct NotificationAuthorization {
 /// Probe the actual OS-level authorization for raum's notifications. Used in
 /// place of `@tauri-apps/plugin-notification`'s `isPermissionGranted` because
 /// the plugin's desktop impl returns `Granted` unconditionally.
+///
+/// Runs on the blocking pool: the macOS probe parks the calling thread on
+/// `recv_timeout` for up to 2 s waiting for the UserNotifications completion
+/// block, and the Linux probe blocks on a `dbus-send` subprocess. Either would
+/// freeze the UI if it ran inline on the main thread.
 #[tauri::command]
-pub fn notifications_check_authorization<R: Runtime>(
-    #[allow(unused_variables)] app: AppHandle<R>,
+pub async fn notifications_check_authorization<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<NotificationAuthorization, String> {
+    tauri::async_runtime::spawn_blocking(move || check_authorization_blocking(&app))
+        .await
+        .map_err(|e| format!("notifications_check_authorization join: {e}"))?
+}
+
+fn check_authorization_blocking<R: Runtime>(
+    #[allow(unused_variables)] app: &AppHandle<R>,
 ) -> Result<NotificationAuthorization, String> {
     #[cfg(target_os = "macos")]
     {
@@ -374,17 +409,28 @@ fn check_linux_dbus_notifications() -> &'static str {
 /// Open the OS notification settings panel so the user can toggle the
 /// permission directly. Per-platform deep links land on the right pane;
 /// Linux iterates known DE control panels and uses the first one present.
+///
+/// Every branch only spawns (never waits): `open` blocks until System Settings
+/// has finished launching, which is seconds on a cold start. Still on the
+/// blocking pool because the Linux branch probes several binaries in turn.
 #[tauri::command]
-pub fn notifications_open_system_settings() -> Result<(), String> {
+pub async fn notifications_open_system_settings() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(open_system_settings_blocking)
+        .await
+        .map_err(|e| format!("notifications_open_system_settings join: {e}"))?
+}
+
+fn open_system_settings_blocking() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         // The `Notifications-Settings.extension` URL is the macOS 13+ form;
         // older releases that don't recognise it just open System Settings
         // to the home page, which is still better than nothing.
-        ProcessCommand::new("open")
+        let child = ProcessCommand::new("open")
             .arg("x-apple.systempreferences:com.apple.Notifications-Settings.extension")
-            .status()
+            .spawn()
             .map_err(|e| e.to_string())?;
+        reap_detached(child);
         Ok(())
     }
     #[cfg(target_os = "linux")]
@@ -398,7 +444,8 @@ pub fn notifications_open_system_settings() -> Result<(), String> {
             ("xdg-open", &["settings://notifications"]),
         ];
         for (cmd, args) in candidates {
-            if ProcessCommand::new(cmd).args(*args).spawn().is_ok() {
+            if let Ok(child) = ProcessCommand::new(cmd).args(*args).spawn() {
+                reap_detached(child);
                 return Ok(());
             }
         }
