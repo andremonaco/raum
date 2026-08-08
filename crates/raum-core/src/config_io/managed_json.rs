@@ -433,6 +433,36 @@ mod tests {
     }
 
     #[test]
+    fn preserves_user_key_order() {
+        // serde_json's `preserve_order` feature keeps the user's own key
+        // order; without it every hook install rewrites their settings file
+        // alphabetically and shows up as a whole-file diff.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            "{\n  \"zeta\": 1,\n  \"alpha\": 2,\n  \"model\": \"opus\"\n}",
+        )
+        .unwrap();
+
+        apply_managed_hooks(&ManagedJsonHooks {
+            path: &path,
+            events: &["Notification"],
+            make_entry: &dummy_entry,
+        })
+        .unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let zeta = raw.find("\"zeta\"").expect("zeta survived");
+        let alpha = raw.find("\"alpha\"").expect("alpha survived");
+        let model = raw.find("\"model\"").expect("model survived");
+        assert!(
+            zeta < alpha && alpha < model,
+            "user key order was rewritten:\n{raw}"
+        );
+    }
+
+    #[test]
     fn atomic_write_creates_parent_dirs() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("nested").join("deep").join("settings.json");
