@@ -808,25 +808,23 @@ impl TmuxManager {
     /// server. A cold socket yields an empty listing rather than an error,
     /// matching [`Self::list_sessions`].
     ///
-    /// The filter narrows each session to the pane `display-message -t
-    /// <session>` would report: the active pane of the active window. Callers
-    /// key the rows by `#{session_name}`, and raum's own sessions hold one
-    /// pane — but a harness that runs `tmux split-window` inside raum's window
-    /// (see `ControlEvent::ForeignSplit`) adds panes we must not confuse with
-    /// the lead one. Without the filter a foreign pane's row would overwrite
-    /// the lead pane's, and a helper that exits would read as the session
-    /// itself dying.
+    /// Rows are narrowed to the pane `display-message -t <session>` would
+    /// report: the active pane of the active window. Callers key the rows by
+    /// `#{session_name}`, and raum's own sessions hold one pane — but a
+    /// harness that runs `tmux split-window` inside raum's window (see
+    /// `ControlEvent::ForeignSplit`) adds panes we must not confuse with the
+    /// lead one. Unnarrowed, a foreign pane's row would overwrite the lead
+    /// pane's, and a helper that exits would read as the session itself dying.
+    ///
+    /// The two flags are prepended to the caller's format and matched here
+    /// rather than passed to `list-panes -f`: tmux 3.4 returns an empty
+    /// listing for the equivalent `#{&&:...}` filter, so the server-side form
+    /// silently reports every session as gone on the distro tmux.
     fn list_panes_all(&self, format: &str) -> Result<String, TmuxError> {
+        let with_flags = format!("#{{pane_active}}\u{1f}#{{window_active}}\u{1f}{format}");
         let out = self
             .cmd()
-            .args([
-                "list-panes",
-                "-a",
-                "-f",
-                "#{&&:#{pane_active},#{window_active}}",
-                "-F",
-                format,
-            ])
+            .args(["list-panes", "-a", "-F", &with_flags])
             .output()?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
@@ -838,7 +836,23 @@ impl TmuxManager {
                 stderr: stderr.into_owned(),
             });
         }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let mut kept = String::with_capacity(stdout.len());
+        for raw in stdout.lines() {
+            let line = raw.trim_end_matches('\r');
+            let Some((pane_active, rest)) = line.split_once('\u{1f}') else {
+                continue;
+            };
+            let Some((window_active, row)) = rest.split_once('\u{1f}') else {
+                continue;
+            };
+            if pane_active.trim() != "1" || window_active.trim() != "1" {
+                continue;
+            }
+            kept.push_str(row);
+            kept.push('\n');
+        }
+        Ok(kept)
     }
 
     /// Capture the pane state needed to restore a fresh xterm.js instance
@@ -1350,6 +1364,10 @@ mod tests {
             matches!(polled, Ok(None)),
             "dead teammate pane leaked into the session's verdict: {polled:?}"
         );
+        // Same narrowing on the context read: the foreign pane must not add a
+        // second row for batch-a, nor overwrite the lead pane's.
+        let ctx = mgr2.pane_context_all().expect("pane_context_all");
+        assert_eq!(ctx.len(), 2, "foreign pane leaked a row: {ctx:?}");
 
         let _ = mgr.kill_server();
     }
