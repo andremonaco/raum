@@ -19,7 +19,6 @@
 //! frontend can drop the linked-state badge.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use raum_core::AgentKind;
 use raum_core::review::{
@@ -31,6 +30,7 @@ use tauri::{AppHandle, Emitter, Runtime, State};
 use tracing::{debug, warn};
 
 use crate::commands::agent::resolve_project_dir;
+use crate::git::git_bare;
 use crate::state::AppHandleState;
 
 #[derive(Debug, Serialize)]
@@ -394,7 +394,7 @@ fn harness_display_name(kind: AgentKind) -> &'static str {
 }
 
 fn detect_branch(cwd: &Path) -> Option<String> {
-    let out = Command::new("git")
+    let out = git_bare()
         .current_dir(cwd)
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
         .output()
@@ -411,7 +411,7 @@ fn detect_branch(cwd: &Path) -> Option<String> {
 /// renderer still produces something useful with `commits_ahead = 0` and
 /// an empty file list when this is wrong.
 fn detect_base_branch(cwd: &Path) -> Option<String> {
-    if let Ok(out) = Command::new("git")
+    if let Ok(out) = git_bare()
         .current_dir(cwd)
         .args(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
         .output()
@@ -426,7 +426,7 @@ fn detect_base_branch(cwd: &Path) -> Option<String> {
         }
     }
     for candidate in ["main", "master"] {
-        if Command::new("git")
+        if git_bare()
             .current_dir(cwd)
             .args(["rev-parse", "--verify", candidate])
             .output()
@@ -440,7 +440,7 @@ fn detect_base_branch(cwd: &Path) -> Option<String> {
 
 fn git_changed_files(cwd: &Path, base: &str) -> Vec<String> {
     let triple_dot = format!("{base}...HEAD");
-    let out = match Command::new("git")
+    let out = match git_bare()
         .current_dir(cwd)
         .args(["diff", "--name-only", &triple_dot])
         .output()
@@ -465,7 +465,7 @@ fn git_changed_files(cwd: &Path, base: &str) -> Vec<String> {
 /// Renames are split into both sides (`R old -> new`) so the reviewer
 /// sees both paths.
 fn git_uncommitted_files(cwd: &Path) -> Vec<String> {
-    let out = match Command::new("git")
+    let out = match git_bare()
         .current_dir(cwd)
         .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
         .output()
@@ -506,7 +506,7 @@ fn git_uncommitted_files(cwd: &Path) -> Vec<String> {
 
 fn git_commits_ahead(cwd: &Path, base: &str) -> usize {
     let range = format!("{base}..HEAD");
-    let Ok(out) = Command::new("git")
+    let Ok(out) = git_bare()
         .current_dir(cwd)
         .args(["rev-list", "--count", &range])
         .output()

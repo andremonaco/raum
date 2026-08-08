@@ -3,6 +3,7 @@
 mod cli;
 mod cli_worktree;
 mod commands;
+mod git;
 mod keymap;
 mod notifications;
 mod path_env;

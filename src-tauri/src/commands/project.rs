@@ -669,20 +669,23 @@ fn build_tree_from_git_lines(lines: impl Iterator<Item = String>) -> Vec<Gitigno
 /// matches git's own resolution (global gitignore, `.git/info/exclude`, nested
 /// `.gitignore` files). Used by the hydration picker.
 #[tauri::command]
-pub fn project_list_gitignored(
+pub async fn project_list_gitignored(
     state: tauri::State<'_, AppHandleState>,
     slug: String,
 ) -> Result<Vec<GitignoreNode>, String> {
-    let store = state
-        .config_store
-        .lock()
-        .map_err(|e| format!("config_store lock: {e}"))?;
-    let project = store
-        .read_project(&slug)
-        .map_err(|e| format!("read_project: {e}"))?
-        .ok_or_else(|| format!("project not found: {slug}"))?;
-
-    let root = project.root_path;
+    // Scope the guard: `git ls-files` on a big monorepo takes hundreds of ms
+    // and every other command that touches the config store would block on it.
+    let root = {
+        let store = state
+            .config_store
+            .lock()
+            .map_err(|e| format!("config_store lock: {e}"))?;
+        let project = store
+            .read_project(&slug)
+            .map_err(|e| format!("read_project: {e}"))?
+            .ok_or_else(|| format!("project not found: {slug}"))?;
+        project.root_path
+    };
     if !root.is_dir() {
         return Err(format!(
             "project root is not a directory: {}",
@@ -690,29 +693,34 @@ pub fn project_list_gitignored(
         ));
     }
 
-    // `--directory` collapses entirely-ignored subtrees (e.g. `node_modules/`)
-    // into a single entry so we never enumerate thousands of files inside them.
-    let output = std::process::Command::new("git")
-        .args([
-            "ls-files",
-            "--others",
-            "--ignored",
-            "--exclude-standard",
-            "--directory",
-            "--no-empty-directory",
-        ])
-        .current_dir(&root)
-        .output()
-        .map_err(|e| format!("git ls-files: {e}"))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        // `--directory` collapses entirely-ignored subtrees (e.g. `node_modules/`)
+        // into a single entry so we never enumerate thousands of files inside them.
+        let output = crate::git::git_bare()
+            .args([
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "--directory",
+                "--no-empty-directory",
+            ])
+            .current_dir(&root)
+            .output()
+            .map_err(|e| format!("git ls-files: {e}"))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("git ls-files failed: {stderr}"));
-    }
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("git ls-files failed: {stderr}"));
+        }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let nodes = build_tree_from_git_lines(stdout.lines().map(|l| l.to_string()));
-    Ok(nodes)
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(build_tree_from_git_lines(
+            stdout.lines().map(|l| l.to_string()),
+        ))
+    })
+    .await
+    .map_err(|e| format!("project_list_gitignored join: {e}"))?
 }
 
 /// List the immediate children of a directory inside a project root. Used by

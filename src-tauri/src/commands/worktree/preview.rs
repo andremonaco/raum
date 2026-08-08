@@ -11,18 +11,24 @@ use raum_hydration::{
     worktree_list as git_worktree_list,
 };
 
-use raum_hydration::get_raum_base_branch;
+use raum_hydration::orchestrate::raum_base_branch_map;
 
-use super::branches::fetch_upstream_branch;
-use super::config_io::{apply_strategy_override, load_effective, os_username};
+use super::branches::upstream_branch_map;
+use super::config_io::{apply_strategy_override, blocking, load_effective, os_username};
 use super::types::{WorktreeListItem, WorktreeManifestPreview, WorktreePathPreview};
 use crate::state::AppHandleState;
 
+/// Three git subprocesses total, regardless of worktree count: the list, one
+/// batched upstream lookup, one batched base-branch lookup. Resolving those two
+/// per entry cost `3N + 1` forks, and at boot the sidebar prewarm pays it for
+/// every worktree of every project.
 pub(super) fn list_worktree_items_for_root(
     root_path: &Path,
 ) -> Result<Vec<WorktreeListItem>, String> {
     let entries = git_worktree_list(root_path).map_err(|e| format!("list: {e}"))?;
     let root = root_path.to_string_lossy().into_owned();
+    let upstreams = upstream_branch_map(&root);
+    let bases = raum_base_branch_map(&root);
     Ok(entries
         .into_iter()
         .map(|e| {
@@ -30,11 +36,11 @@ pub(super) fn list_worktree_items_for_root(
             let upstream = e
                 .branch
                 .as_deref()
-                .and_then(|branch| fetch_upstream_branch(&path_str, branch));
+                .and_then(|branch| upstreams.get(branch).cloned());
             let base_branch = e
                 .branch
                 .as_deref()
-                .and_then(|branch| get_raum_base_branch(&root, branch));
+                .and_then(|branch| bases.get(branch).cloned());
             WorktreeListItem {
                 branch: e.branch,
                 path: path_str,
@@ -48,7 +54,7 @@ pub(super) fn list_worktree_items_for_root(
         .collect())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn worktree_preview_path(
     state: tauri::State<'_, AppHandleState>,
     project_slug: String,
@@ -95,7 +101,7 @@ pub fn worktree_preview_path(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn worktree_preview_manifest(
     state: tauri::State<'_, AppHandleState>,
     project_slug: String,
@@ -108,17 +114,23 @@ pub fn worktree_preview_manifest(
     })
 }
 
+/// Three git subprocesses, so the walk goes to the blocking pool — running it
+/// inline would stall the UI for the length of the process spawns.
 #[tauri::command]
-pub fn worktree_list(
+pub async fn worktree_list(
     state: tauri::State<'_, AppHandleState>,
     project_slug: String,
 ) -> Result<Vec<WorktreeListItem>, String> {
     let effective = load_effective(&state, &project_slug)?;
-    list_worktree_items_for_root(&effective.root_path)
+    let root_path = effective.root_path;
+    blocking("worktree_list", move || {
+        list_worktree_items_for_root(&root_path)
+    })
+    .await?
 }
 
 #[tauri::command]
-pub fn worktree_list_all(
+pub async fn worktree_list_all(
     state: tauri::State<'_, AppHandleState>,
 ) -> Result<HashMap<String, Vec<WorktreeListItem>>, String> {
     let projects = {
@@ -145,19 +157,22 @@ pub fn worktree_list_all(
         projects
     };
 
-    let mut out = HashMap::with_capacity(projects.len());
+    // Git subprocesses — never on the main thread, and one blocking task per
+    // project so N repos cost one repo's latency instead of N.
+    let mut tasks = tokio::task::JoinSet::new();
     for project in projects {
-        let slug = project.slug;
-        let root_path = project.root_path;
-        match list_worktree_items_for_root(&root_path) {
-            Ok(items) => {
-                out.insert(slug, items);
-            }
-            Err(e) => {
-                tracing::warn!(slug = %slug, error = %e, "worktree_list_all: list failed");
-                out.insert(slug, Vec::new());
-            }
-        }
+        tasks.spawn_blocking(move || {
+            let items = list_worktree_items_for_root(&project.root_path).unwrap_or_else(|e| {
+                tracing::warn!(slug = %project.slug, error = %e, "worktree_list_all: list failed");
+                Vec::new()
+            });
+            (project.slug, items)
+        });
+    }
+    let mut out = HashMap::new();
+    while let Some(res) = tasks.join_next().await {
+        let (slug, items) = res.map_err(|e| format!("worktree_list_all join: {e}"))?;
+        out.insert(slug, items);
     }
     Ok(out)
 }

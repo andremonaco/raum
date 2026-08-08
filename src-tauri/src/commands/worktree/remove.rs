@@ -3,7 +3,6 @@
 //! helpers reused by `worktree_merge`.
 
 use std::path::Path;
-use std::process::Command;
 
 use raum_hydration::worktree_remove as git_worktree_remove;
 use tauri::ipc::Channel;
@@ -14,6 +13,7 @@ use crate::commands::terminal::kill_session_inner;
 use crate::commands::worktree_progress::{
     ProgressEvent, StepStatus, emit_counter, emit_done, emit_failed, emit_step, emit_step_detail,
 };
+use crate::git::{git_bare, git_cmd};
 use crate::state::AppHandleState;
 
 /// Per-step labels emitted by [`worktree_remove`]. Same id contract as the
@@ -295,10 +295,7 @@ pub(super) fn sessions_for_worktree_strs(
 /// the matching entries from the bottom up so indexes stay valid. Best-
 /// effort: errors are ignored (worst case the stash stays; no data loss).
 pub(super) fn drop_stashes_for_branch(worktree_path: &str, branch: &str) {
-    let Ok(out) = Command::new("git")
-        .args(["-C", worktree_path, "stash", "list"])
-        .output()
-    else {
+    let Ok(out) = git_cmd(worktree_path).args(["stash", "list"]).output() else {
         return;
     };
     if !out.status.success() {
@@ -316,8 +313,8 @@ pub(super) fn drop_stashes_for_branch(worktree_path: &str, branch: &str) {
     // Drop from the highest index down so each `stash@{N}` stays valid.
     for idx in indexes.into_iter().rev() {
         let reference = format!("stash@{{{idx}}}");
-        let _ = Command::new("git")
-            .args(["-C", worktree_path, "stash", "drop", &reference])
+        let _ = git_cmd(worktree_path)
+            .args(["stash", "drop", &reference])
             .output();
     }
 }
@@ -327,7 +324,7 @@ pub(super) fn drop_stashes_for_branch(worktree_path: &str, branch: &str) {
 /// branches).
 pub(super) fn delete_local_branch(repo: &Path, branch: &str, force: bool) -> Result<(), String> {
     let flag = if force { "-D" } else { "-d" };
-    let out = Command::new("git")
+    let out = git_bare()
         .current_dir(repo)
         .args(["branch", flag, branch])
         .output()
