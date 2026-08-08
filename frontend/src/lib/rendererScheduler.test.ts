@@ -29,6 +29,8 @@ import {
   endBackgroundDemotion,
   registerPane,
   requestWebgl,
+  requestWebglIfSlotFree,
+  setPaneVisibility,
   snapshot,
   unregisterPane,
   __resetSchedulerForTests,
@@ -173,6 +175,30 @@ describe("rendererScheduler", () => {
     // run happened to reach.
     await endBackgroundDemotion();
     expect(snapshot().every((s) => s.renderer === "webgl")).toBe(true);
+  });
+
+  it("a pane hidden mid-promotion does not take a WebGL slot", async () => {
+    registerPane("a", fakeTerminal());
+    // The addon import is still in flight when the pane goes off-screen; the
+    // slot must not be claimed, or nothing can ever demote it back.
+    const promotion = requestWebgl("a");
+    setPaneVisibility("a", false);
+    await promotion;
+    expect(snapshot().find((s) => s.paneId === "a")?.renderer).toBe("canvas");
+  });
+
+  it("a focus promotion and an opportunistic one cannot both claim the last slot", async () => {
+    for (let i = 0; i < MAX_WEBGL_PANES - 1; i++) {
+      registerPane(`p-${i}`, fakeTerminal());
+      await requestWebgl(`p-${i}`);
+    }
+    registerPane("focused", fakeTerminal());
+    registerPane("visible", fakeTerminal());
+    const focus = requestWebgl("focused");
+    requestWebglIfSlotFree("visible"); // same tick, focus promotion unresolved
+    await focus;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(snapshot().filter((s) => s.renderer === "webgl")).toHaveLength(MAX_WEBGL_PANES);
   });
 
   it("re-promotion skips canvas-only panes and untouched ones", async () => {
