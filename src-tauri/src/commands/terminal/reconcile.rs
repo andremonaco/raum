@@ -22,6 +22,7 @@
 use std::collections::HashSet;
 
 use raum_core::AgentKind;
+use raum_core::store::TrackedSessionUpsert;
 use raum_tmux::TmuxSession;
 use tauri::{AppHandle, Runtime};
 use tracing::{info, warn};
@@ -105,27 +106,32 @@ pub(crate) async fn reconcile_inner<R: Runtime>(
         return Ok(Vec::new());
     }
 
+    // 1. Persist a tracked row per orphan so each session is authority going
+    //    forward: the reaper protects it, and the next boot rehydrates it
+    //    normally. Metadata (project/worktree) is unknown for an orphan — by
+    //    definition it had no surviving `sessions.toml` row — so `None`. One
+    //    batched write; per-job writes rewrote the whole file N times.
+    if let Ok(store) = state.config_store.lock() {
+        let rows: Vec<TrackedSessionUpsert<'_>> = plan
+            .iter()
+            .map(|job| TrackedSessionUpsert {
+                session_id: &job.session_id,
+                harness: job.kind,
+                project_slug: None,
+                worktree_id: None,
+                opencode_port: None,
+                created_at_unix_ms: job.created_unix.saturating_mul(1000),
+            })
+            .collect();
+        if let Err(e) = store.upsert_tracked_sessions(&rows) {
+            warn!(error=%e, count = rows.len(), "reconcile: upsert_tracked_sessions failed");
+        }
+    } else {
+        warn!("reconcile: config_store lock poisoned; skipping track");
+    }
+
     let mut adopted = Vec::new();
     for job in plan {
-        // 1. Persist a tracked row so the session is authority going forward:
-        //    the reaper protects it, and the next boot rehydrates it normally.
-        //    Metadata (project/worktree) is unknown for an orphan — by
-        //    definition it had no surviving `sessions.toml` row — so `None`.
-        if let Ok(store) = state.config_store.lock() {
-            if let Err(e) = store.upsert_tracked_session(
-                &job.session_id,
-                job.kind,
-                None,
-                None,
-                None,
-                job.created_unix.saturating_mul(1000),
-            ) {
-                warn!(error=%e, session_id=%job.session_id, "reconcile: upsert_tracked_session failed");
-            }
-        } else {
-            warn!(session_id=%job.session_id, "reconcile: config_store lock poisoned; skipping track");
-        }
-
         // 2. Probe pane health before adopting. `remain-on-exit on`
         //    (manager.rs) keeps a pane whose process has exited on the socket
         //    as a zombie, and `list_sessions` reports it as live — exactly why

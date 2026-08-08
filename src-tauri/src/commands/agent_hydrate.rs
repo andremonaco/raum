@@ -227,23 +227,44 @@ pub fn apply_rehydrate_plan<R: Runtime>(
     plan: Vec<RehydrateJob>,
 ) -> RehydrateReport {
     let mut report = RehydrateReport::default();
+    // Forget rows are pure deletions and each one used to rewrite the whole
+    // `sessions.toml`; drop them all in one atomic write before the rest of
+    // the plan runs.
+    let mut forget_ids: Vec<String> = Vec::new();
+    let mut plan_rest: Vec<RehydrateJob> = Vec::with_capacity(plan.len());
     for job in plan {
         match job {
-            RehydrateJob::Forget { session_id } => match state.config_store.lock() {
-                Ok(store) => {
-                    if let Err(e) = store.forget_session(&session_id) {
-                        warn!(error=%e, session_id=%session_id, "rehydrate: forget_session failed");
-                        report.errors.push((session_id.clone(), e.to_string()));
-                    } else {
-                        report.forgotten.push(session_id);
-                    }
-                }
-                Err(_) => {
+            RehydrateJob::Forget { session_id } => forget_ids.push(session_id),
+            other => plan_rest.push(other),
+        }
+    }
+    if !forget_ids.is_empty() {
+        match state.config_store.lock() {
+            Ok(store) => {
+                let outcome = {
+                    let ids: Vec<&str> = forget_ids.iter().map(String::as_str).collect();
+                    store.forget_sessions(&ids)
+                };
+                if let Err(e) = outcome {
+                    warn!(error=%e, count = forget_ids.len(), "rehydrate: forget_sessions failed");
                     report
                         .errors
-                        .push((session_id, "config_store lock poisoned".into()));
+                        .extend(forget_ids.into_iter().map(|id| (id, e.to_string())));
+                } else {
+                    report.forgotten = forget_ids;
                 }
-            },
+            }
+            Err(_) => report.errors.extend(
+                forget_ids
+                    .into_iter()
+                    .map(|id| (id, "config_store lock poisoned".into())),
+            ),
+        }
+    }
+    for job in plan_rest {
+        match job {
+            // Batched above.
+            RehydrateJob::Forget { .. } => {}
             RehydrateJob::Register {
                 session_id,
                 harness,

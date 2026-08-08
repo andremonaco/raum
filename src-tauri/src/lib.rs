@@ -536,6 +536,15 @@ pub fn run() {
             // and the dance's own `app.exit(0)` re-fires `ExitRequested`, which
             // we must NOT prevent the second time around.
             if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
+                // Backend half of the quit-flush: `sessions.toml` debounces
+                // its display-only `last_state` writes by 500 ms, which is
+                // longer than the drain grace, so drain it synchronously here.
+                // Idempotent, hence safe on both the intercepted event and the
+                // re-fire that follows our own `app.exit(0)`.
+                match app.state::<state::AppHandleState>().config_store.lock() {
+                    Ok(store) => store.flush_sessions(),
+                    Err(_) => warn!("quit-flush: config_store lock poisoned"),
+                }
                 // A non-`None` code means `app.exit(code)` was called
                 // deliberately (including by our own quit task) — let it
                 // proceed rather than re-intercepting.

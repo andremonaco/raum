@@ -41,6 +41,4 @@ pub use prereqs::{
     HarnessReport, HarnessStatus, PrereqReport, ToolStatus, check_harnesses, check_prereqs,
 };
 pub use sigil::{SIGIL_PALETTE, derive_sigil, is_valid_sigil, resolve_sigil};
-pub use store::{
-    ConfigStore, DebouncedWriter, StoreError, atomic_write, merge_project_with_raum_toml,
-};
+pub use store::{ConfigStore, StoreError, atomic_write, merge_project_with_raum_toml};

@@ -21,7 +21,9 @@
 //! This module owns the shared logic; the adapters supply the list of
 //! events and the per-entry value to splice in.
 
+use std::io::Write as _;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -160,9 +162,22 @@ pub fn is_raum_managed(v: &Value) -> bool {
         .is_some_and(|s| s == MARKER_BEGIN || s == MARKER_END)
 }
 
+/// Monotonic suffix for temp files, so two writers targeting the same
+/// settings file (two adapters installing hooks at once, or a second raum
+/// process) can never pick the same temp path and clobber each other's
+/// half-written bytes before either rename lands.
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// Write `bytes` to `path` through a sibling `.raum-tmp-*` file that is
-/// renamed on top of the destination. Parent directories are created
-/// on demand.
+/// `fsync`ed and then renamed on top of the destination. Parent directories
+/// are created on demand.
+///
+/// The sync before the rename is what makes the atomicity survive a power
+/// loss: otherwise the rename can be durable while the data blocks it points
+/// at are not, leaving a truncated `settings.json` where the user's config
+/// used to be. The parent-directory fsync afterwards makes the rename itself
+/// durable and is best-effort — some filesystems refuse to sync a directory
+/// handle.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)?;
@@ -170,9 +185,18 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .file_name()
         .and_then(|f| f.to_str())
         .unwrap_or("settings.json");
-    let tmp = parent.join(format!(".raum-tmp-{file_name}"));
-    std::fs::write(&tmp, bytes)?;
+    let pid = std::process::id();
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(".raum-tmp-{file_name}.{pid}.{seq}"));
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
     std::fs::rename(&tmp, path)?;
+    if let Ok(dir) = std::fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
     Ok(())
 }
 

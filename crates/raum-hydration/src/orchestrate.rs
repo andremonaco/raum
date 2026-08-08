@@ -461,6 +461,11 @@ pub fn target_is_inside_raum_dir(root: &Path, target: &Path) -> bool {
 /// * Existing file that already ignores `.raum` (or `.raum/`) → no-op.
 /// * Existing file without the entry → append a `.raum/` line (preserving a
 ///   trailing newline if one was present, adding one otherwise).
+///
+/// The rewrite goes through [`raum_core::store::atomic_write`] (temp file →
+/// fsync → rename) rather than an in-place `fs::write`. This file belongs to
+/// the user and is usually tracked by git: an interrupted in-place write
+/// truncates it and silently un-ignores whatever else it listed.
 pub fn ensure_raum_gitignored(root: &Path) -> std::io::Result<()> {
     let gitignore = root.join(".gitignore");
     match std::fs::read_to_string(&gitignore) {
@@ -473,13 +478,23 @@ pub fn ensure_raum_gitignored(root: &Path) -> std::io::Result<()> {
                 updated.push('\n');
             }
             updated.push_str(".raum/\n");
-            std::fs::write(&gitignore, updated)
+            atomic_write_io(&gitignore, updated.as_bytes())
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::write(&gitignore, ".raum/\n")
+            atomic_write_io(&gitignore, b".raum/\n")
         }
         Err(e) => Err(e),
     }
+}
+
+/// [`raum_core::store::atomic_write`] with its error mapped back to
+/// `std::io::Error` — every failure it can produce here is an I/O failure,
+/// the other `StoreError` variants are unreachable for a raw byte write.
+fn atomic_write_io(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    raum_core::store::atomic_write(path, bytes).map_err(|e| match e {
+        raum_core::store::StoreError::Io(io) => io,
+        other => std::io::Error::other(other.to_string()),
+    })
 }
 
 #[must_use]
