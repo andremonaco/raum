@@ -88,7 +88,8 @@ pub struct SessionRuntime {
     pub kind: AgentKind,
     /// Cancel tokens for every spawned channel (one per channel).
     pub cancel: CancellationToken,
-    /// Replier handle. `None` for observation-only harnesses (Codex).
+    /// Replier handle. `None` for the hook-script harnesses (Claude Code,
+    /// Codex), which answer over the raum-hooks event socket instead.
     pub replier: Option<Arc<dyn PermissionReplier>>,
     /// Keep join-handles out of the public surface; hold them so
     /// abort-on-drop semantics fire when the registry entry is removed.

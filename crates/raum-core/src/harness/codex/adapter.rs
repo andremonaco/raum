@@ -88,8 +88,8 @@ impl NotificationSetup for CodexAdapter {
     ///    so they bypass Codex's `/hooks` review queue
     ///    (openai/codex#20321).
     /// 4. `WriteJson { <project>/.codex/hooks.json }` — the user's
-    ///    existing file with raum's `UserPromptSubmit` and `Stop`
-    ///    entries merged in at group index 0
+    ///    existing file with raum's `PermissionRequest`,
+    ///    `UserPromptSubmit` and `Stop` entries merged in at group index 0
     ///    (`merge_codex_hooks_json`). **Skipped** when
     ///    `detect_version()` reports < [`CODEX_HOOKS_MINIMUM_VERSION`];
     ///    the `notify` path + OSC 9 scraper stay as the observation
@@ -398,9 +398,10 @@ impl HarnessRuntime for CodexAdapter {
     }
 
     fn replier(&self, _session: &SessionSpec) -> Option<Box<dyn PermissionReplier>> {
-        // Codex is observation-only for Phase 3. Upstream accepts
-        // `permissionDecision` in hook output but does not yet enforce
-        // it; a replier here would set mistaken user expectations.
+        // `None` for the same reason Claude Code returns `None`: the
+        // decision travels back over the parked event-socket writer,
+        // whose registry handle lives in `src-tauri`, not through a
+        // per-session replier object.
         None
     }
 

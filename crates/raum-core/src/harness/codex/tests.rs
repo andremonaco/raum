@@ -363,6 +363,88 @@ fn codex_hook_trusted_hash_matches_known_canonical_input() {
     );
 }
 
+#[test]
+fn permission_request_hash_includes_the_matcher() {
+    // Unlike `UserPromptSubmit` / `Stop`, `PermissionRequest` keeps its
+    // matcher through `matcher_pattern_for_event`, so the matcher IS
+    // part of the normalised identity Codex hashes. Getting this wrong
+    // is silent: the hash mismatches, the hook sits `Untrusted`, never
+    // runs, and approvals quietly fall back to Codex's own prompt.
+    use sha2::{Digest, Sha256};
+    let canonical = br#"{"event_name":"permission_request","hooks":[{"async":false,"command":"/tmp/codex.sh PermissionRequest","statusMessage":"raum: forwarding PermissionRequest","timeout":600,"type":"command"}],"matcher":".*"}"#;
+    let digest = Sha256::digest(canonical);
+    let mut expected = String::from("sha256:");
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(expected, "{byte:02x}");
+    }
+    assert_eq!(
+        codex_hook_trusted_hash("PermissionRequest", Path::new("/tmp/codex.sh")),
+        expected,
+        "PermissionRequest trusted_hash must hash the matcher too",
+    );
+}
+
+#[tokio::test]
+async fn plan_subscribes_permission_request() {
+    let dir = tempdir().unwrap();
+    let config_toml = dir.path().join("codex-config.toml");
+    let hooks_json = dir.path().join("codex-hooks.json");
+    let adapter = CodexAdapter::with_paths(
+        config_toml,
+        hooks_json.clone(),
+        Some(semver_lite::Version {
+            major: 0,
+            minor: 130,
+            patch: 0,
+        }),
+    );
+    let ctx = test_ctx(dir.path(), "demo");
+    let dispatcher_path = ctx.hooks_dir.join("codex.sh");
+    let plan = <CodexAdapter as NotificationSetup>::plan(&adapter, &ctx)
+        .await
+        .unwrap();
+
+    // hooks.json carries a raum-managed PermissionRequest entry at group
+    // index 0 pointing at `codex.sh PermissionRequest`.
+    let SetupAction::WriteJson { ref content, .. } = plan.actions[4] else {
+        panic!("expected WriteJson at index 4, got {:?}", plan.actions[4]);
+    };
+    let parsed: Value = serde_json::from_str(content).unwrap();
+    let entry = &parsed["hooks"]["PermissionRequest"].as_array().unwrap()[0];
+    assert_eq!(entry[MARKER_KEY].as_str().unwrap(), MARKER_BEGIN);
+    assert_eq!(entry["matcher"].as_str().unwrap(), ".*");
+    assert_eq!(
+        entry["hooks"][0]["command"].as_str().unwrap(),
+        format!("{} PermissionRequest", dispatcher_path.display()),
+    );
+    // A hook that runs async cannot apply control effects upstream, so
+    // the entry must never carry `"async": true`.
+    assert!(entry["hooks"][0]["async"].is_null());
+
+    // config.toml pre-seeds the matching trust state, keyed on the
+    // snake-cased event label at (group 0, handler 0).
+    let SetupAction::WriteToml { ref content, .. } = plan.actions[2] else {
+        panic!("expected WriteToml at index 2, got {:?}", plan.actions[2]);
+    };
+    let key = codex_hook_state_key(&hooks_json, "PermissionRequest", 0, 0);
+    assert!(key.ends_with(":permission_request:0:0"), "key: {key}");
+    let key_quoted = serde_json::to_string(&key).unwrap();
+    let hash_quoted = serde_json::to_string(&codex_hook_trusted_hash(
+        "PermissionRequest",
+        &dispatcher_path,
+    ))
+    .unwrap();
+    assert!(
+        content.contains(&format!("[hooks.state.{key_quoted}]")),
+        "config.toml missing PermissionRequest trust state: {content}",
+    );
+    assert!(
+        content.contains(&format!("trusted_hash = {hash_quoted}")),
+        "config.toml missing PermissionRequest trusted_hash: {content}",
+    );
+}
+
 #[tokio::test]
 async fn plan_preserves_user_config_toml_and_hooks_json() {
     // The graceful-merge contract: a user's own config.toml keys,

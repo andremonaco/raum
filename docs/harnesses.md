@@ -17,7 +17,7 @@ you see when things degrade, and how to uninstall cleanly.
 | ------------ | ----------------------------------------------------------------- | ----- | ---------------------------------------- | ---------------------------------------------------- |
 | Claude Code  | `PermissionRequest` / `Notification` hooks → UDS socket           | Yes   | Synchronous hook response                | TUI prompt not shown (hook returned answer)          |
 | OpenCode     | SSE `permission.asked` on `GET /event`                            | Yes   | Compatibility HTTP reply to local server | TUI dialog closes when server state updates          |
-| Codex        | hooks + `notify` + live OSC 9 from the attached pane             | No    | n/a — observation-only                   | TUI prompt unchanged; user answers in pane           |
+| Codex        | `PermissionRequest` hook + `notify` + live OSC 9 from the pane    | Yes (≥ 0.130) | Synchronous hook response         | TUI prompt not shown (hook returned answer)          |
 | Shell        | (out of scope)                                                    | No    | n/a                                      | n/a                                                  |
 
 **Reliability badges.** Each channel publishes a reliability signal that
@@ -55,11 +55,13 @@ is rendered in the **Harness Health** panel of the Settings modal.
   `Notification`, `Stop`, `UserPromptSubmit`, `StopFailure`.
 - **Reply flow**: Claude Code spawns the hook; the script opens the UDS
   socket, writes the request JSON, **blocks** reading for a decision
-  line up to `RAUM_HOOK_TIMEOUT_SECS` (default 55 s — 5 s headroom below
-  Claude's 60 s hook timeout). raum currently surfaces a focus-only
-  notification; the user answers in Claude's own TUI after jumping to
-  the pane. On timeout the script emits `permissionDecision: "ask"` so
-  Claude's native prompt fires — **graceful degradation is the default**.
+  line up to `RAUM_HOOK_TIMEOUT_SECS` (default 85 s — just under raum's
+  90 s socket sweeper, and comfortably inside Claude's 600 s default
+  `command`-hook budget, so the managed hook entry needs no explicit
+  `timeout` field). Answering in raum sends `allow` or `deny` back down
+  the parked socket; on timeout the script prints **nothing** and exits
+  0, so Claude's native prompt fires — **graceful degradation is the
+  default**.
 
 ### Codex
 
@@ -74,17 +76,24 @@ is rendered in the **Harness Health** panel of the Settings modal.
   each raum hook so they bypass Codex's `/hooks` review queue
   introduced in [openai/codex#20321][trust-pr]) and
   `<project>/.codex/hooks.json` (managed entries under
-  `UserPromptSubmit` and `Stop` only; `SessionStart` is deliberately
-  not subscribed to avoid silence-heuristic `Idle → Working`
-  promotion on Codex boot).
+  `PermissionRequest`, `UserPromptSubmit` and `Stop` only;
+  `SessionStart` is deliberately not subscribed to avoid
+  silence-heuristic `Idle → Working` promotion on Codex boot).
+- **Hook events covered**: `PermissionRequest` (synchronous),
+  `UserPromptSubmit`, `Stop`.
 - **Version gate**: Codex 0.130 renamed `[features].codex_hooks` →
   `[features].hooks` ([#20684][rename-pr]) and gated unmanaged hooks
   behind a `trusted_hash` review ([#20321][trust-pr]); raum's plan
   emits both the renamed flag and the matching hash, so we require
-  ≥ 0.130. Older binaries get `notify` + OSC 9 only. The version is
-  probed via `codex --version` at plan time. raum does **not** assume
-  a released `PermissionRequest` hook yet; supported builds derive
-  waiting-state from OSC 9 approval notifications instead.
+  ≥ 0.130. Older binaries get `notify` + OSC 9 only — no inline reply,
+  and waiting-state comes from OSC 9 approval notifications. The
+  version is probed via `codex --version` at plan time.
+- **`trusted_hash` gotcha**: the hash covers Codex's *normalised* hook
+  identity, and `PermissionRequest` is the one raum event that keeps
+  its `matcher` through that normalisation (`UserPromptSubmit` and
+  `Stop` have theirs forced to `None`). Hash the wrong shape and the
+  failure is silent: the entry sits `Untrusted`, never runs, and
+  approvals quietly fall back to Codex's own prompt.
 
 [rename-pr]: https://github.com/openai/codex/pull/20684
 [trust-pr]: https://github.com/openai/codex/pull/20321
@@ -94,8 +103,16 @@ is rendered in the **Harness Health** panel of the Settings modal.
 - **Notify mapping**: the managed `notify` script is treated as a turn-end
   signal only. `agent-turn-complete` becomes `TurnEnd`; unknown notify
   payloads are ignored rather than being treated as generic waiting-state.
-- **Reply**: none. Click on the notification focuses the Codex pane;
-  the user answers in Codex's own TUI.
+- **Reply**: synchronous hook response, same shape as Claude Code —
+  the dispatcher blocks on the event socket and answers with
+  `hookSpecificOutput.decision.behavior`. Codex's output schema is
+  `deny_unknown_fields` and knows only `allow` and `deny`: there is no
+  `"ask"` behaviour and no remember/always field (an allow maps to a
+  one-shot `ReviewDecision::Approved`, so the hook fires again next
+  time). "No decision" is therefore expressed by printing **nothing**
+  and exiting 0, which sends Codex down its normal approval path.
+  Below 0.130 there is no reply at all — clicking the notification
+  focuses the pane and the user answers in Codex's own TUI.
 
 ### OpenCode
 
@@ -176,19 +193,25 @@ raum requires Codex ≥ 0.130 for the hooks channel (the rename of
 `[features].codex_hooks` → `[features].hooks` and the `trusted_hash`
 review gate both landed in that release). On older releases raum falls
 back to `notify` + OSC 9 only, which covers turn-end reliably but
-leaves approval prompts on a heuristic signal. Upgrade Codex, then
+leaves approval prompts on a heuristic signal and disables inline
+Allow/Deny (there is no hook to answer). Upgrade Codex, then
 re-bind the project so raum re-writes `hooks.json` and refreshes the
 `[hooks.state]` trust entries in `~/.codex/config.toml`.
 
-### Blocking hook times out and Claude's TUI prompt fires instead
+### Blocking hook times out and the harness TUI prompt fires instead
 
 This is the documented failure-safe path: if raum is closed, crashed,
 or just slow to surface the notification, the hook script hits
-`RAUM_HOOK_TIMEOUT_SECS` (default 55 s), emits
-`permissionDecision: "ask"`, and Claude shows its own TUI. Nothing is
-lost. You can raise the timeout via env var, but keep it below 60 s —
-Claude Code's default hook timeout is 60 s and the script needs
-headroom to print stdout and exit.
+`RAUM_HOOK_TIMEOUT_SECS` (default 85 s) and gives up — both harnesses
+get empty stdout — and the harness shows its own TUI prompt. Nothing is
+lost.
+
+Both harnesses budget 600 s for a `command` hook, so the env var can be
+raised, but raum's socket sweeper drops an unanswered request after 90 s
+regardless: past that point the parked writer is gone, the script reads
+EOF and degrades immediately. The default is deliberately kept below the
+sweeper so the client-side wait — the only bound that still applies when
+raum itself is hung — is what ends the block.
 
 ## Uninstalling
 

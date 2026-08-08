@@ -75,10 +75,11 @@ pub trait HarnessRuntime: HarnessIdentity {
     /// [`crate::harness::channel::NotificationSink`].
     fn channels(&self, session: &SessionSpec) -> Vec<Box<dyn NotificationChannel>>;
 
-    /// Build a permission replier for this session, or `None` for
-    /// observation-only harnesses (Codex today). Returning `Some` does
-    /// **not** obligate the UI to use it — it just means "a reply channel
-    /// is available".
+    /// Build a permission replier for this session, or `None` when the
+    /// harness answers over some other transport — Claude Code and Codex
+    /// both reply through the blocking hook script parked on the
+    /// raum-hooks event socket. Returning `Some` does **not** obligate the
+    /// UI to use it — it just means "a reply channel is available".
     fn replier(&self, session: &SessionSpec) -> Option<Box<dyn PermissionReplier>>;
 
     /// Environment variables + extra CLI flags to inject into the spawn

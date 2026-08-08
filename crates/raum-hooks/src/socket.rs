@@ -49,12 +49,14 @@ pub const PERMISSION_EXPIRED_EVENT: &str = "PermissionExpired";
 /// server sees EOF milliseconds after the request while the client is still
 /// blocked reading its decision line. Reaping on EOF would drop the writer
 /// out from under that live client and dismiss a prompt the user never
-/// answered. The deadline sits above every client-side wait (default 55 s,
+/// answered. The deadline sits above every client-side wait (default 85 s,
 /// `DEFAULT_PERMISSION_TIMEOUT_SECS` in raum-core) so by the time it fires
 /// the script has provably given up. Tests pass an explicit deadline via
 /// [`spawn_event_socket_with_gc`] — a global test-mode shortening would
 /// race the park-then-assert tests, whose writers must stay parked across
-/// multi-hundred-ms poll windows.
+/// multi-hundred-ms poll windows. Changing either value must preserve that
+/// ordering: the script has to give up first, or the advertised answer
+/// window is really this deadline.
 const PERMISSION_GC_AFTER: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// A single hook event delivered over the UDS.

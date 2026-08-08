@@ -42,10 +42,10 @@ pub struct SetupContext {
     /// Adapters embed this when they generate shell scripts so they fail
     /// cleanly if raum is offline when the hook fires.
     pub event_socket_path: PathBuf,
-    /// Timeout the PermissionRequest hook script waits before falling back
-    /// to `"ask"` (so Claude Code shows its own TUI prompt). Configurable
-    /// per the plan document's risks section (default 55 s, leaving 5 s
-    /// headroom below Claude's 60 s hook timeout).
+    /// Timeout the PermissionRequest hook script waits before giving up and
+    /// printing nothing, so the harness shows its own TUI prompt. Default is
+    /// [`crate::harness::hook_script::DEFAULT_PERMISSION_TIMEOUT_SECS`], kept
+    /// below raum-hooks' 90 s sweeper deadline.
     pub permission_timeout: Duration,
     /// Project slug bound to this setup run. Adapters that write per-
     /// project config (OpenCode's future project overrides) read this.
@@ -97,7 +97,9 @@ impl SetupContext {
         Self {
             hooks_dir,
             event_socket_path,
-            permission_timeout: Duration::from_secs(55),
+            permission_timeout: Duration::from_secs(u64::from(
+                crate::harness::hook_script::DEFAULT_PERMISSION_TIMEOUT_SECS,
+            )),
             project_slug: project_slug.into(),
             project_dir: PathBuf::new(),
             home_dir: home,
