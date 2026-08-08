@@ -16,7 +16,7 @@
  * so membership memos never observe recency churn.
  */
 
-import { batch, createMemo, createRoot, createSignal, type Accessor } from "solid-js";
+import { batch, createMemo, createRoot, createSignal, untrack, type Accessor } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { createStore, reconcile } from "solid-js/store";
@@ -443,13 +443,31 @@ export function applyAgentStateToTerminal(sessionId: string, state: AgentState):
   }
 }
 
+/**
+ * Coarsest resolution the output stamp is ever read at. It only feeds
+ * recency ordering (`listCrossProjectHarnessSessions`) and inactivity
+ * windows measured in seconds, so re-stamping more often than this just
+ * clones the map and invalidates the sort memos for no observable gain —
+ * at ~60 parsed frames/second/pane that is the dominant cost of a busy grid.
+ */
+const OUTPUT_STAMP_RESOLUTION_MS = 250;
+
 /** Mark a session as just having produced output. Bypasses `byId` entirely
- *  so high-frequency PTY coalesces don't invalidate membership memos. */
+ *  so high-frequency PTY coalesces don't invalidate membership memos, and
+ *  throttled to `OUTPUT_STAMP_RESOLUTION_MS` so a streaming pane doesn't
+ *  clone the stamp map on every frame. */
 export function markOutput(sessionId: string): void {
   if (!terminalStore.byId[sessionId]) return;
+  const now = Date.now();
+  // `untrack` so a caller inside a computation never subscribes to the stamp
+  // map just by reporting output.
+  const previous = untrack(lastOutputBySession).get(sessionId);
+  if (previous !== undefined && now >= previous && now - previous < OUTPUT_STAMP_RESOLUTION_MS) {
+    return;
+  }
   setLastOutputBySession((prev) => {
     const next = new Map(prev);
-    next.set(sessionId, Date.now());
+    next.set(sessionId, now);
     return next;
   });
 }
@@ -574,15 +592,11 @@ function resolveHarnessIds(ids: ReadonlySet<string>): TerminalRecord[] {
 }
 
 const selectors: Selectors = createRoot(() => {
-  // Active = working harnesses, sorted by recency. Recency changes on
-  // every PTY tick, so we observe `lastOutputBySession` here — but the
-  // set that gets sorted is already narrowed to membership-changes-only.
-  const active = createMemo<TerminalRecord[]>(() => {
-    const records = resolveHarnessIds(workingIds());
-    const lo = lastOutputBySession();
-    records.sort((a, b) => (lo.get(b.session_id) ?? 0) - (lo.get(a.session_id) ?? 0));
-    return records;
-  });
+  // Active = working harnesses. Membership only: recency changes on every
+  // PTY tick, and observing it here would invalidate the memo (and every
+  // consumer) constantly. The recency sort lives at the one read site that
+  // needs the order — `listCrossProjectHarnessSessions`.
+  const active = createMemo<TerminalRecord[]>(() => resolveHarnessIds(workingIds()));
 
   // Waiting sorts by `created_unix`, which is immutable after spawn, so
   // the sort runs once per membership change — no recency dependency.
@@ -690,7 +704,8 @@ const selectors: Selectors = createRoot(() => {
   };
 });
 
-/** `Active` filter: working project-scoped harnesses sorted by most recent output. */
+/** `Active` filter: working project-scoped harnesses, unordered (sort at the
+ *  read site — see `listCrossProjectHarnessSessions`). */
 export const activeTerminals = selectors.activeTerminals;
 /** `Needs input` filter: waiting project-scoped harnesses sorted oldest-first. */
 export const waitingTerminals = selectors.waitingTerminals;
@@ -721,7 +736,12 @@ export type CrossProjectHarnessMode = "awaiting" | "working" | "completed";
 
 export function listCrossProjectHarnessSessions(mode: CrossProjectHarnessMode): TerminalRecord[] {
   if (mode === "awaiting") return waitingTerminals();
-  if (mode === "working") return activeTerminals();
+  if (mode === "working") {
+    const lo = lastOutputBySession();
+    return activeTerminals()
+      .slice()
+      .sort((left, right) => (lo.get(right.session_id) ?? 0) - (lo.get(left.session_id) ?? 0));
+  }
 
   // "completed" — idle harnesses across every project, sorted by most recent
   // output (or creation time, when no PTY tick has landed yet).

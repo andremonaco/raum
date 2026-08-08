@@ -21,7 +21,7 @@
  */
 
 import { createStore, reconcile, unwrap } from "solid-js/store";
-import { createSignal } from "solid-js";
+import { batch, createSignal } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
@@ -337,27 +337,32 @@ function currentTree(): LayoutNode | null {
  *  mutation. Projects the tree to rectangles on the LAYOUT_UNIT grid and
  *  stitches in pane content. */
 function rebuildCells(): void {
-  setLayoutRev((prev) => prev + 1);
-  const tree = currentTree();
-  if (!tree) {
-    setRuntimeLayoutStore("cells", []);
-    return;
-  }
-  const rects = projectToRects(tree, LAYOUT_UNIT);
-  const cells: RuntimeCell[] = rects
-    .map((r) => {
-      const pane = runtimeLayoutStore.panes[r.id];
-      if (!pane) return null;
-      // Unwrap the pane content so the reconciled array is composed of plain
-      // objects (reconcile compares structure, not proxies).
-      const plain = unwrap(pane) as PaneContent;
-      return { ...plain, x: r.x, y: r.y, w: r.w, h: r.h };
-    })
-    .filter((c): c is RuntimeCell => c !== null);
-  // `reconcile` diffs the current cells array against `cells` by the `id`
-  // key, producing surgical updates so chrome/projection consumers keep
-  // stable cell identity across layout mutations.
-  setRuntimeLayoutStore("cells", reconcile(cells, { key: "id", merge: true }));
+  // One update cycle for both writes — consumers that read `layoutRev` *and*
+  // `cells` would otherwise recompute twice per mutation, the second time
+  // against a half-updated store.
+  batch(() => {
+    setLayoutRev((prev) => prev + 1);
+    const tree = currentTree();
+    if (!tree) {
+      setRuntimeLayoutStore("cells", []);
+      return;
+    }
+    const rects = projectToRects(tree, LAYOUT_UNIT);
+    const cells: RuntimeCell[] = rects
+      .map((r) => {
+        const pane = runtimeLayoutStore.panes[r.id];
+        if (!pane) return null;
+        // Unwrap the pane content so the reconciled array is composed of plain
+        // objects (reconcile compares structure, not proxies).
+        const plain = unwrap(pane) as PaneContent;
+        return { ...plain, x: r.x, y: r.y, w: r.w, h: r.h };
+      })
+      .filter((c): c is RuntimeCell => c !== null);
+    // `reconcile` diffs the current cells array against `cells` by the `id`
+    // key, producing surgical updates so chrome/projection consumers keep
+    // stable cell identity across layout mutations.
+    setRuntimeLayoutStore("cells", reconcile(cells, { key: "id", merge: true }));
+  });
 }
 
 // ---- minimize / focus -----------------------------------------------------

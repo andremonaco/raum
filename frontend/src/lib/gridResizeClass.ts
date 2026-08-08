@@ -63,3 +63,50 @@ export function installWindowResizeClass(getRoot: () => HTMLElement | null): () 
     getRoot()?.classList.remove(WINDOW_RESIZE_ACTIVE_CLASS);
   };
 }
+
+/**
+ * Shared class-attribute observer for the grid root.
+ *
+ * Every mounted `<TerminalPane>` watches the same node for the same class flips
+ * (`is-resizing` / {@link WINDOW_RESIZE_ACTIVE_CLASS} clearing on pointerup) so
+ * it can issue one final resize flush. One `MutationObserver` per pane means N
+ * observers waking for a single attribute mutation on a grid that may hold a
+ * dozen panes; instead we keep ONE observer per root and fan out to registered
+ * listeners.
+ *
+ * Returns an unsubscribe function; the observer disconnects once its last
+ * listener leaves, so a fully unmounted grid holds nothing.
+ */
+type RootClassWatch = { observer: MutationObserver; listeners: Set<() => void> };
+
+const rootClassWatches = new WeakMap<HTMLElement, RootClassWatch>();
+
+export function observeGridRootClass(root: HTMLElement, listener: () => void): () => void {
+  if (typeof MutationObserver === "undefined") return () => {};
+  let watch = rootClassWatches.get(root);
+  if (!watch) {
+    const listeners = new Set<() => void>();
+    const observer = new MutationObserver(() => {
+      // Copy first: a listener may unsubscribe itself while we dispatch.
+      for (const fn of Array.from(listeners)) {
+        try {
+          fn();
+        } catch {
+          /* one pane's failure must not starve the others */
+        }
+      }
+    });
+    observer.observe(root, { attributes: true, attributeFilter: ["class"] });
+    watch = { observer, listeners };
+    rootClassWatches.set(root, watch);
+  }
+  const current = watch;
+  current.listeners.add(listener);
+  return () => {
+    current.listeners.delete(listener);
+    if (current.listeners.size === 0) {
+      current.observer.disconnect();
+      rootClassWatches.delete(root);
+    }
+  };
+}

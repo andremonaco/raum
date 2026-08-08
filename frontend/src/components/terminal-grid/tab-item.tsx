@@ -34,10 +34,13 @@ export const TabItem: Component<{
   const [menuMode, setMenuMode] = createSignal<"main" | "review">("main");
 
   /** Other open agent panes (excluding this tab's own pane and shells). The
-   *  context menu's "Review with →" submenu lists these as targets. */
+   *  context menu's "Review with →" submenu lists these as targets. Gated on
+   *  `menuOpen` so a closed menu (i.e. every tab, nearly always) doesn't walk
+   *  the whole cell list on every layout change. */
   const reviewCandidates = createMemo<Array<{ cellId: string; kind: AgentKind; label: string }>>(
     () => {
       const out: Array<{ cellId: string; kind: AgentKind; label: string }> = [];
+      if (!menuOpen()) return out;
       runtimeLayoutStore.cells.forEach((cell, idx) => {
         if (cell.id === props.cellId) return;
         if (cell.kind === "empty" || cell.kind === "shell") return;

@@ -413,18 +413,22 @@ const App: Component = () => {
     // clobber the on-disk layout. Hydrate UNCONDITIONALLY below so the saved
     // cells are always read (and the save gate opened by hydration's `finally`)
     // regardless of whether the config read succeeded.
-    let c: RaumConfigSnapshot = { onboarded: true };
-    try {
-      c = await invoke<RaumConfigSnapshot>("config_get");
-    } catch (e) {
-      // No Tauri host (browser dev / vitest) or a corrupt/poisoned config —
-      // fall back to the onboarded default so the wizard isn't shown, but do
-      // NOT open the save gate here: hydrateActiveLayout owns the gate and
-      // opening it without first reading the layout is exactly the clobber we
-      // are fixing.
-      console.warn("config_get failed; continuing with defaults", e);
-    }
-    const placed = await hydrateActiveLayout();
+    // Independent IPCs → issue both round-trips at once instead of paying the
+    // config latency before hydration even starts. Failure handling is
+    // unchanged: `config_get` swallows its own error into the default snapshot,
+    // hydration still owns the save gate and still propagates its own failures.
+    const [c, placed] = await Promise.all([
+      invoke<RaumConfigSnapshot>("config_get").catch((e): RaumConfigSnapshot => {
+        // No Tauri host (browser dev / vitest) or a corrupt/poisoned config —
+        // fall back to the onboarded default so the wizard isn't shown, but do
+        // NOT open the save gate here: hydrateActiveLayout owns the gate and
+        // opening it without first reading the layout is exactly the clobber we
+        // are fixing.
+        console.warn("config_get failed; continuing with defaults", e);
+        return { onboarded: true };
+      }),
+      hydrateActiveLayout(),
+    ]);
     // Fire-and-forget: the recovery toast must not gate the wizard/onboarding
     // resource resolving, and a slow `terminal_list` shouldn't delay first
     // paint. Errors are swallowed inside the helper.
