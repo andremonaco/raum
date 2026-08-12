@@ -50,9 +50,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use std::collections::HashSet;
+
 use ignore::WalkBuilder;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use tauri::Emitter;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -64,6 +67,25 @@ use crate::commands::notify_watch::{
 /// Coalesce a burst of edits (an agent saving many files at once) into one
 /// pulse. The status service debounces another 200 ms on top.
 const DEBOUNCE: Duration = Duration::from_millis(150);
+
+/// Max distinct directories carried in one `worktree-fs-changed` payload.
+/// A build storm inside an expanded `target/` can touch thousands of dirs per
+/// debounce window; past this cap the payload degrades to `dirs: null`
+/// ("refetch everything you have loaded") instead of an unbounded list.
+const BROWSER_DIR_CAP: usize = 64;
+
+/// Payload of the `worktree-fs-changed` event — the file browser's refresh
+/// signal. Unlike the status pulse, this stream is NOT gitignore-filtered
+/// (the browser lists everything on disk, Finder-style); only `.git` is
+/// excluded.
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FsChangedPayload {
+    /// The worktree path exactly as subscribed (what the frontend knows).
+    path: String,
+    /// Root-relative dirs whose listings changed; `None` = refetch all loaded.
+    dirs: Option<Vec<String>>,
+}
 
 /// Holds the live watcher and the root it watches so the supervisor can swap
 /// the watcher out on rebuild without disturbing anything else.
@@ -81,6 +103,9 @@ struct WatcherDeps {
     /// Newly created non-ignored directories → the dir-add drain (Linux only;
     /// macOS recursion covers new dirs for free, so the callback never sends).
     dir_tx: mpsc::UnboundedSender<PathBuf>,
+    /// Parent dir of every touched path (`.git` excluded, gitignore NOT
+    /// applied) → the browser debounce → a `worktree-fs-changed` emit.
+    browser_tx: mpsc::UnboundedSender<PathBuf>,
     error_state: Arc<Mutex<ErrorRateMap>>,
     health: Arc<Mutex<HealthState>>,
 }
@@ -95,6 +120,8 @@ const PER_DIR_WATCHES: bool = !cfg!(target_os = "macos");
 pub(super) struct WorktreeFsWatcher {
     supervisor: tauri::async_runtime::JoinHandle<()>,
     debounce: tauri::async_runtime::JoinHandle<()>,
+    /// Debounces the unfiltered stream into `worktree-fs-changed` emits.
+    browser_debounce: tauri::async_runtime::JoinHandle<()>,
     /// The per-dir add drain (inotify backends only; `None` on macOS, where the
     /// recursive stream covers new dirs). It holds a clone of `_inner`, so
     /// leaving it detached would keep the `Arc` — and with it the live notify
@@ -116,6 +143,7 @@ impl Drop for WorktreeFsWatcher {
     fn drop(&mut self) {
         self.supervisor.abort();
         self.debounce.abort();
+        self.browser_debounce.abort();
         if let Some(drain) = self.dir_drain.take() {
             drain.abort();
         }
@@ -131,7 +159,11 @@ impl WorktreeFsWatcher {
     pub(super) fn start(
         root: PathBuf,
         trigger_tx: mpsc::UnboundedSender<RefreshCause>,
+        app: tauri::AppHandle,
     ) -> notify::Result<Self> {
+        // The frontend keys worktrees by the path it subscribed with — carry
+        // that verbatim in the event payload, before canonicalization below.
+        let payload_path = root.to_string_lossy().to_string();
         // Canonicalize once up front. notify's FSEvents backend reports
         // canonical event paths, so a non-canonical root (e.g. a worktree under
         // a symlinked dir like macOS `/tmp` -> `/private/tmp`) would make every
@@ -145,9 +177,11 @@ impl WorktreeFsWatcher {
         // task; new-dir paths feed the dir-add drain (Linux only).
         let (raw_tx, mut raw_rx) = mpsc::unbounded_channel::<()>();
         let (dir_tx, mut dir_rx) = mpsc::unbounded_channel::<PathBuf>();
+        let (browser_tx, mut browser_rx) = mpsc::unbounded_channel::<PathBuf>();
         let deps = WatcherDeps {
             raw_tx,
             dir_tx,
+            browser_tx,
             error_state: Arc::new(Mutex::new(ErrorRateMap::default())),
             health: Arc::new(Mutex::new(HealthState::default())),
         };
@@ -155,6 +189,8 @@ impl WorktreeFsWatcher {
         // `deps` is cloned into the supervisor (for rebuilds) and the callback;
         // the debounce task owns the sole `raw_rx`.
         let watcher = build_watcher(root.clone(), &deps)?;
+        // Canonical root for rel-path computation in the browser emitter.
+        let evt_root = root.clone();
         let inner = Arc::new(Mutex::new(Inner { watcher, root }));
 
         let trigger_for_debounce = trigger_tx;
@@ -175,6 +211,44 @@ impl WorktreeFsWatcher {
                 if trigger_for_debounce.send(RefreshCause::FsEdit).is_err() {
                     return;
                 }
+            }
+        });
+
+        // Browser stream: collect the touched dirs over a debounce window,
+        // then emit one `worktree-fs-changed`. Past the cap the dir list
+        // degrades to `None` ("refetch all loaded") — the frontend only ever
+        // refetches levels it has loaded, so a build storm in a collapsed
+        // `target/` costs it nothing.
+        let browser_debounce = tauri::async_runtime::spawn(async move {
+            while let Some(first) = browser_rx.recv().await {
+                let mut dirs: HashSet<PathBuf> = HashSet::from([first]);
+                let deadline = tokio::time::Instant::now() + DEBOUNCE;
+                loop {
+                    tokio::select! {
+                        maybe = browser_rx.recv() => match maybe {
+                            Some(dir) => {
+                                if dirs.len() <= BROWSER_DIR_CAP {
+                                    dirs.insert(dir);
+                                }
+                            }
+                            None => return,
+                        },
+                        () = tokio::time::sleep_until(deadline) => break,
+                    }
+                }
+                let rel = (dirs.len() <= BROWSER_DIR_CAP).then(|| {
+                    dirs.iter()
+                        .filter_map(|d| {
+                            let r = d.strip_prefix(&evt_root).ok()?;
+                            Some(r.to_string_lossy().into_owned())
+                        })
+                        .collect::<Vec<_>>()
+                });
+                let payload = FsChangedPayload {
+                    path: payload_path.clone(),
+                    dirs: rel,
+                };
+                let _ = app.emit("worktree-fs-changed", &payload);
             }
         });
 
@@ -208,6 +282,7 @@ impl WorktreeFsWatcher {
         Ok(Self {
             supervisor,
             debounce,
+            browser_debounce,
             dir_drain,
             _inner: inner,
         })
@@ -238,6 +313,14 @@ fn build_watcher(root: PathBuf, deps: &WatcherDeps) -> notify::Result<Recommende
                 }
                 let mut pulse = false;
                 for path in &ev.paths {
+                    if under_git_dir(path, &cb_root) {
+                        continue;
+                    }
+                    // Browser stream: unfiltered (the file browser lists
+                    // gitignored files too). Send the containing dir.
+                    if let Some(parent) = path.parent() {
+                        let _ = deps.browser_tx.send(parent.to_path_buf());
+                    }
                     if !is_relevant(path, &cb_root, &gitignore) {
                         continue;
                     }
@@ -361,6 +444,15 @@ fn is_relevant(path: &Path, root: &Path, gitignore: &Gitignore) -> bool {
     !gitignore
         .matched_path_or_any_parents(path, false)
         .is_ignore()
+}
+
+/// True when `path` is `.git` itself or lives under it — the only exclusion
+/// the browser stream applies (it must see gitignored files).
+fn under_git_dir(path: &Path, root: &Path) -> bool {
+    path.strip_prefix(root)
+        .ok()
+        .and_then(|rel| rel.components().next())
+        .is_some_and(|c| c.as_os_str() == ".git")
 }
 
 /// True when `path`'s first component under `root` is one of
@@ -487,6 +579,19 @@ mod tests {
             Path::new("/other/.git/index"),
             root
         ));
+    }
+
+    #[test]
+    fn under_git_dir_only_excludes_git() {
+        let root = Path::new("/repo");
+        assert!(under_git_dir(Path::new("/repo/.git"), root));
+        assert!(under_git_dir(Path::new("/repo/.git/index"), root));
+        // The browser stream must keep everything else — including the
+        // gitignored churners the status stream drops.
+        assert!(!under_git_dir(Path::new("/repo/target/debug/x.o"), root));
+        assert!(!under_git_dir(Path::new("/repo/node_modules/a.js"), root));
+        assert!(!under_git_dir(Path::new("/repo/.github/ci.yml"), root));
+        assert!(!under_git_dir(Path::new("/other/.git/index"), root));
     }
 
     #[test]
