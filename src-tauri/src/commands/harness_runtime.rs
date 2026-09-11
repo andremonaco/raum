@@ -269,8 +269,7 @@ impl HarnessRuntimeRegistry {
     pub fn has_session(&self, session_id: &str) -> bool {
         self.sessions
             .lock()
-            .ok()
-            .is_some_and(|g| g.contains_key(session_id))
+            .is_ok_and(|g| g.contains_key(session_id))
     }
 
     /// End a session: cancel every channel task, drop the replier.
