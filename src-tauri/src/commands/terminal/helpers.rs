@@ -55,6 +55,14 @@ pub(super) fn contains_submit_input(keys: &str) -> bool {
 /// (permission request or idle prompt). In `Working` ESC is overloaded
 /// (menu-dismiss, vim, slash-menu cancel) and would cause constant false
 /// demotions back to `Idle`, so it is forwarded to the harness unchanged.
+///
+/// Only a *bare* ESC counts. xterm.js also routes CSI / SS3 sequences
+/// through the same data path — arrow keys (`ESC [ A`), and the DECSET
+/// 1004 focus reports `ESC [ I` / `ESC [ O` that fire every time the pane
+/// gains or loses focus. Matching those as an abort tore down a parked
+/// `PermissionRequest` the moment the user clicked into a waiting pane,
+/// which for Codex (native prompt gated on the hook) made the approval
+/// prompt appear only on focus.
 pub(super) fn contains_abort_input(
     keys: &str,
     state: Option<raum_core::agent::AgentState>,
@@ -62,7 +70,15 @@ pub(super) fn contains_abort_input(
     if keys.contains('\x03') {
         return true;
     }
-    matches!(state, Some(raum_core::agent::AgentState::Waiting)) && keys.contains('\x1b')
+    matches!(state, Some(raum_core::agent::AgentState::Waiting)) && has_bare_escape(keys)
+}
+
+/// An ESC byte not introducing a CSI (`ESC [`) or SS3 (`ESC O`) sequence.
+fn has_bare_escape(keys: &str) -> bool {
+    let b = keys.as_bytes();
+    b.iter()
+        .enumerate()
+        .any(|(i, &c)| c == 0x1b && !matches!(b.get(i + 1), Some(b'[' | b'O')))
 }
 
 /// tmux's `kill-session` exits non-zero when the target session doesn't exist.

@@ -7,7 +7,14 @@
 
 export const SCROLLBACK_MIN = 100;
 export const SCROLLBACK_MAX = 100_000;
-export const SCROLLBACK_DEFAULT = 100_000;
+/** Resident xterm window. Older lines are pulled from tmux's lossless
+ *  `history-limit` on demand when the user scrolls to the top (see
+ *  `findOlderLines`); each pull grows the window by `SCROLLBACK_LOAD_CHUNK`
+ *  up to `SCROLLBACK_MAX`. xterm pads every row to full width at 12 bytes a
+ *  cell, so a 100k-line window at 188 cols is ~225 MB per pane — nobody
+ *  scrolls through that, but every pane paid for it. */
+export const SCROLLBACK_DEFAULT = 10_000;
+export const SCROLLBACK_LOAD_CHUNK = 10_000;
 /** Shells are interactive, not transcript stores — 100k retained lines per
  *  shell pane is pure resident memory nobody scrolls back through. */
 export const SCROLLBACK_SHELL_DEFAULT = 10_000;

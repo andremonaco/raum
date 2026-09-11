@@ -57,7 +57,7 @@ import {
 } from "../lib/terminalRegistry";
 import { dropTargetPaneId } from "../lib/fileDrop";
 import { observeGridRootClass } from "../lib/gridResizeClass";
-import { scrollbackForKind } from "../lib/scrollbackConfig";
+import { SCROLLBACK_LOAD_CHUNK, SCROLLBACK_MAX, scrollbackForKind } from "../lib/scrollbackConfig";
 import {
   cancelTerminalSnapshotPersist,
   loadTerminalSnapshotBytes,
@@ -69,7 +69,12 @@ import {
   terminalResizeScheduleDelay,
 } from "../lib/terminalResize";
 import { createXtermWritePump } from "../lib/xtermWritePump";
-import { findSplicePoint, renderRecoveryPayload, SPLICE_TAIL_LINES } from "../lib/tmuxBackfill";
+import {
+  findOlderLines,
+  findSplicePoint,
+  renderRecoveryPayload,
+  SPLICE_TAIL_LINES,
+} from "../lib/tmuxBackfill";
 import {
   getXtermOptions,
   nudgeTerminalFontSize,
@@ -603,6 +608,82 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
     backfillTimer = setTimeout(onBackfillQuietTimer, BACKFILL_QUIET_MS);
   };
 
+  // Tier 3 — older history on demand. xterm holds a bounded window
+  // (`scrollbackForKind`); tmux keeps the lossless 100k. Scrolling to the top
+  // of the window pulls the next `SCROLLBACK_LOAD_CHUNK` lines out of tmux,
+  // anchored on xterm's first logical lines, and rebuilds the buffer as
+  // older + xterm's own serialized state — so modes, cursor and the recent
+  // frames stay exactly what xterm already showed. The pump is paused across
+  // the rebuild so no live frame can slip between serialize and reset.
+  let olderHistoryInFlight = false;
+  let olderHistoryExhaustedFor: string | null = null;
+  const xtermHeadLines = (target: Terminal): string[] => {
+    const buf = target.buffer.active;
+    const head: string[] = [];
+    for (let row = 0; row < buf.length && head.length <= SPLICE_TAIL_LINES; row++) {
+      const line = buf.getLine(row);
+      if (!line) break;
+      // tmux `-J` joins hard-wrapped rows into one logical line; mirror that.
+      const continued = buf.getLine(row + 1)?.isWrapped === true;
+      const text = line.translateToString(!continued);
+      if (line.isWrapped && head.length > 0) head[head.length - 1] += text;
+      else head.push(text);
+    }
+    return head;
+  };
+  const maybeLoadOlderHistory = (): void => {
+    const target = term;
+    const addon = serializeAddon;
+    const pump = outputPump;
+    const id = sessionId();
+    if (!target || !addon || !pump || !id) return;
+    if (olderHistoryInFlight || olderHistoryExhaustedFor === id) return;
+    const buf = target.buffer.active;
+    if (buf.type === "alternate" || buf.viewportY !== 0) return;
+    const window = target.options.scrollback ?? 0;
+    if (window >= SCROLLBACK_MAX) return;
+    olderHistoryInFlight = true;
+    const head = xtermHeadLines(target);
+    const prevLength = buf.length;
+    void invoke<string | null>("terminal_capture_history", {
+      sessionId: id,
+      lines: prevLength + SCROLLBACK_LOAD_CHUNK + SPLICE_TAIL_LINES,
+    })
+      .then((capture) => {
+        if (term !== target || sessionId() !== id || capture === null) return;
+        const older = findOlderLines(head, capture.split("\n"))?.slice(-SCROLLBACK_LOAD_CHUNK);
+        if (!older || older.length === 0) {
+          olderHistoryExhaustedFor = id;
+          return;
+        }
+        pump.pause();
+        // Queued behind whatever frame xterm is parsing right now; with the
+        // pump paused nothing else can follow it.
+        target.write("", () => {
+          let handedOff = false;
+          try {
+            const current = addon.serialize();
+            target.options.scrollback = Math.min(SCROLLBACK_MAX, window + SCROLLBACK_LOAD_CHUNK);
+            target.reset();
+            target.write(`${older.join("\r\n")}\r\n${current}`, () => {
+              // xterm's old row 0 now sits right after the prepended rows.
+              target.scrollToLine(Math.max(0, target.buffer.active.length - prevLength));
+              pump.resume();
+            });
+            handedOff = true;
+          } finally {
+            if (!handedOff) pump.resume();
+          }
+        });
+      })
+      .catch((e) => {
+        console.warn("[TerminalPane] terminal_capture_history failed", e);
+      })
+      .finally(() => {
+        olderHistoryInFlight = false;
+      });
+  };
+
   const normalBuffer = () => term?.buffer.normal ?? null;
   const hasDetachedHistory = (): boolean => {
     if (!term) return false;
@@ -806,6 +887,7 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       // the user is reading history.
       scrollDisposable = term.onScroll(() => {
         syncScrollState();
+        maybeLoadOlderHistory();
       });
 
       // Live retheme — when the user picks a different VSCode theme, push

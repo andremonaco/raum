@@ -177,6 +177,30 @@ describe("rendererScheduler", () => {
     expect(snapshot().every((s) => s.renderer === "webgl")).toBe(true);
   });
 
+  it("a hidden pane holds no renderer; a declined WebGL request installs canvas once", async () => {
+    let loads = 0;
+    const term = { loadAddon: () => void loads++ } as unknown as Terminal;
+    registerPane("a", term, { visible: false, forbidWebgl: true });
+    expect(loads).toBe(0);
+    setPaneVisibility("a", true);
+    expect(loads).toBe(0);
+    await requestWebgl("a");
+    expect(loads).toBe(1);
+    setPaneVisibility("a", false);
+    setPaneVisibility("a", true);
+    await requestWebgl("a");
+    expect(loads).toBe(2);
+  });
+
+  it("a granted WebGL request paints once — no canvas install first", async () => {
+    let loads = 0;
+    const term = { loadAddon: () => void loads++ } as unknown as Terminal;
+    registerPane("a", term);
+    await requestWebgl("a");
+    expect(loads).toBe(1);
+    expect(snapshot().find((s) => s.paneId === "a")?.renderer).toBe("webgl");
+  });
+
   it("a pane hidden mid-promotion does not take a WebGL slot", async () => {
     registerPane("a", fakeTerminal());
     // The addon import is still in flight when the pane goes off-screen; the

@@ -239,8 +239,9 @@ impl WorktreeStatusService {
                 // attach time, that the entry still owns *this* channel.
                 let attach_tx = trigger_tx.clone();
                 let build_path = path.clone();
+                let app = inner.app.clone();
                 let built = tokio::task::spawn_blocking(move || {
-                    WorktreeFsWatcher::start(PathBuf::from(&build_path), trigger_tx)
+                    WorktreeFsWatcher::start(PathBuf::from(&build_path), trigger_tx, app)
                 })
                 .await;
                 let watcher = match built {

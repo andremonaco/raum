@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { findSplicePoint, formatRecoveryMarker, renderRecoveryPayload } from "./tmuxBackfill";
+import {
+  findOlderLines,
+  findSplicePoint,
+  formatRecoveryMarker,
+  renderRecoveryPayload,
+} from "./tmuxBackfill";
 
 describe("findSplicePoint", () => {
   it("returns no match for empty inputs", () => {
@@ -124,5 +129,22 @@ describe("renderRecoveryPayload", () => {
     const payload = renderRecoveryPayload(["x", "y", "z"]);
     expect(payload.endsWith("x\r\ny\r\nz\r\n")).toBe(true);
     expect(payload).toContain("3 lines recovered");
+  });
+});
+
+describe("findOlderLines", () => {
+  it("returns the raw (escape-bearing) lines directly above xterm's head", () => {
+    const tmux = ["\x1b[31mold-1\x1b[0m", "old-2", "old-3 ", "h-1", "h-2", "h-3", "h-4", "tail"];
+    const head = ["h-1", "h-2", "h-3", "h-4"];
+    expect(findOlderLines(head, tmux)).toEqual(["\x1b[31mold-1\x1b[0m", "old-2", "old-3 "]);
+  });
+
+  it("returns an empty list when xterm already holds everything", () => {
+    const lines = ["h-1", "h-2", "h-3", "h-4", "tail"];
+    expect(findOlderLines(lines.slice(0, 4), lines)).toEqual([]);
+  });
+
+  it("returns null when the head cannot be located", () => {
+    expect(findOlderLines(["a", "b", "c", "d"], ["x", "y", "z", "w"])).toBeNull();
   });
 });

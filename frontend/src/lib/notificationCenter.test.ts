@@ -425,6 +425,38 @@ describe("notification center", () => {
     expect(pendingPermissionCount()).toBe(0);
   });
 
+  it("drops observation-only permissions when the session leaves waiting", async () => {
+    // No reply token ⇒ nothing is parked, so neither a reply nor an expiry
+    // will ever clear it. The session leaving `waiting` is its only signal.
+    await __handleNotificationEventForTests({
+      harness: "codex",
+      event: "PermissionRequest",
+      session_id: "codex-osc",
+      request_id: null,
+      permission_key: "codex-osc",
+      payload: null,
+    });
+    await __handleNotificationEventForTests({
+      harness: "codex",
+      event: "PermissionRequest",
+      session_id: "codex-osc",
+      request_id: "req-live",
+      permission_key: "req-live",
+      payload: null,
+    });
+    expect(pendingPermissionCount()).toBe(2);
+
+    __handleAgentStateChangedForTests({
+      session_id: "codex-osc",
+      harness: "codex",
+      from: "waiting",
+      to: "working",
+    });
+    // The replyable one stays (its own reply / expiry clears it).
+    expect(pendingPermissionCount()).toBe(1);
+    expect(pendingPermissionForSession("codex-osc")?.requestId).toBe("req-live");
+  });
+
   it("dismisses the OS banner when a request expires unanswered", async () => {
     await __handleNotificationEventForTests({
       harness: "claude-code",

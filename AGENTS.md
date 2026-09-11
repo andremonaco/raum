@@ -137,7 +137,7 @@ Install hooks once with `task hooks:install` so the chain runs automatically on 
 | Flush threshold | 131 072 bytes | `raum-tmux` |
 | Silence threshold (default) | 10 000 ms | `raum-core` |
 | Config write debounce | 500 ms | `raum-core` |
-| xterm scrollback | 100 000 lines | frontend + `raum-core` |
+| xterm scrollback | 10 000-line resident window, grows by 10 000 per top-scroll load from tmux, max 100 000 | frontend (`scrollbackConfig.ts`) |
 | Quickfire history | 100 entries | frontend |
 
 ## Dependencies & Licensing

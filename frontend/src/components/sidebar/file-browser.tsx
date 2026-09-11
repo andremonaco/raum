@@ -32,6 +32,7 @@ import {
   untrack,
 } from "solid-js";
 import { Portal } from "solid-js/web";
+import { listen } from "@tauri-apps/api/event";
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 
 import {
@@ -91,6 +92,13 @@ interface MenuState {
 /** Root directory key used by `worktree_list_dir`. */
 const ROOT = "";
 
+/** Payload of `worktree-fs-changed` (see worktree/fs_watcher.rs). */
+interface WorktreeFsChanged {
+  path: string;
+  /** Root-relative dirs whose listings changed; null = refetch all loaded. */
+  dirs: string[] | null;
+}
+
 export const FileBrowser: Component<FileBrowserProps> = (props) => {
   const badges = createMemo(() => changesByPath(props.status.changes));
 
@@ -103,11 +111,14 @@ export const FileBrowser: Component<FileBrowserProps> = (props) => {
 
   const loadDir = (relPath: string, force = false): void => {
     const current = dirs().get(relPath);
-    if (!force && (current?.loading || current?.entries)) return;
+    if (current?.loading || (!force && current?.entries)) return;
+    // A silent refresh keeps the old entries on screen (no spinner flash) and,
+    // on error, keeps them too — the next status push retries anyway.
+    const prevEntries = current?.entries;
     const worktreePath = props.worktree.path;
     // A worktree switch may land while a call is in flight — drop stale results.
     const stale = (): boolean => untrack(() => props.worktree.path) !== worktreePath;
-    putDir(relPath, { loading: true });
+    putDir(relPath, { loading: true, entries: prevEntries });
     void worktreeListDir(worktreePath, relPath)
       .then((entries) => {
         if (stale()) return;
@@ -115,7 +126,8 @@ export const FileBrowser: Component<FileBrowserProps> = (props) => {
       })
       .catch((e: unknown) => {
         if (stale()) return;
-        putDir(relPath, { loading: false, error: String(e) });
+        if (prevEntries) putDir(relPath, { loading: false, entries: prevEntries });
+        else putDir(relPath, { loading: false, error: String(e) });
       });
   };
 
@@ -149,6 +161,24 @@ export const FileBrowser: Component<FileBrowserProps> = (props) => {
       },
     ),
   );
+
+  // Live refresh: the working-tree watcher (worktree/fs_watcher.rs) emits
+  // `worktree-fs-changed` with the dirs whose listings changed — unfiltered
+  // except `.git`, so gitignored files (.env, build output) refresh too,
+  // Finder-style. Refetch every loaded level named in the payload; `dirs:
+  // null` means the burst overflowed the payload cap — refetch all loaded.
+  // Refetches are silent (old entries stay up while in flight).
+  createEffect(() => {
+    const unlisten = listen<WorktreeFsChanged>("worktree-fs-changed", (ev) => {
+      if (ev.payload.path !== untrack(() => props.worktree.path)) return;
+      const changed = ev.payload.dirs;
+      for (const [relPath, state] of untrack(dirs)) {
+        if (!state.entries) continue;
+        if (changed === null || changed.includes(relPath)) loadDir(relPath, true);
+      }
+    });
+    onCleanup(() => void unlisten.then((f) => f()));
+  });
 
   // ---------------------------------------------------------------------
   // Name filter (⌘F while focus is inside the tree)
@@ -287,7 +317,8 @@ export const FileBrowser: Component<FileBrowserProps> = (props) => {
   // synchronously before the cache was hoisted here.)
   const rootLoading = () => {
     const state = root();
-    return state === undefined || state.loading;
+    // A silent refresh keeps entries while loading — only spin with nothing to show.
+    return state === undefined || (state.loading && !state.entries);
   };
 
   return (
@@ -569,7 +600,7 @@ const TreeNode: Component<TreeNodeProps> = (props) => {
 
         <Show when={expanded()}>
           <Show
-            when={!level()?.loading}
+            when={!level()?.loading || level()?.entries}
             fallback={
               <div
                 class="flex items-center gap-1.5 py-0.5 font-mono text-[10px] text-foreground-dim"

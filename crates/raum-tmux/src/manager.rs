@@ -925,6 +925,17 @@ impl TmuxManager {
         })
     }
 
+    /// Replayable (`-e -J`) capture of the `lines` history rows above the
+    /// visible screen plus the screen itself, LF-separated. `None` while the
+    /// pane is in alternate-screen (its normal history sits behind the TUI).
+    /// Feeds the frontend's on-demand "older history" load: xterm.js holds a
+    /// bounded window, tmux keeps the lossless `history-limit`.
+    pub fn capture_pane_history(&self, id: &str, lines: u32) -> Result<Option<Vec<u8>>, TmuxError> {
+        let start = format!("-{lines}");
+        let (alternate_on, capture) = self.alternate_and_capture(id, &start, true)?;
+        Ok((!alternate_on).then_some(capture))
+    }
+
     /// Plain-text variant of [`Self::capture_pane_snapshot`] for the global
     /// search panel. Returns the pane's full scrollback (and the alt-screen
     /// frame, if active) as decoded UTF-8 with no ANSI escapes — ready to

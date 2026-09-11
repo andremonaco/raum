@@ -8,6 +8,9 @@ export interface XtermWritePump {
   rotate(resetOnFirstOutput: boolean): number;
   enqueue(generation: number, bytes: Uint8Array): void;
   queuedFrames(): number;
+  /** Hold frames in the queue (they keep accumulating) until `resume`. */
+  pause(): void;
+  resume(): void;
 }
 
 export interface XtermWritePumpOptions {
@@ -24,6 +27,7 @@ export function createXtermWritePump(options: XtermWritePumpOptions): XtermWrite
   let outputGeneration = 0;
   let resetOnFirstOutputGeneration: number | null = null;
   let writePumpActive = false;
+  let paused = false;
   let writeQueue: Array<{ generation: number; bytes: Uint8Array }> = [];
 
   const coalesceNextFrame = (): { generation: number; bytes: Uint8Array } | null => {
@@ -58,7 +62,7 @@ export function createXtermWritePump(options: XtermWritePumpOptions): XtermWrite
   };
 
   const pump = (): void => {
-    if (writePumpActive) return;
+    if (writePumpActive || paused) return;
     const terminal = options.getTerminal();
     if (!terminal) return;
     const frame = coalesceNextFrame();
@@ -104,5 +108,12 @@ export function createXtermWritePump(options: XtermWritePumpOptions): XtermWrite
       pump();
     },
     queuedFrames: () => writeQueue.length,
+    pause: () => {
+      paused = true;
+    },
+    resume: () => {
+      paused = false;
+      pump();
+    },
   };
 }

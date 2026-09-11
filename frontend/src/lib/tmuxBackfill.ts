@@ -111,6 +111,26 @@ export function findSplicePoint(xtermTail: string[], tmuxLines: string[]): Splic
   return empty;
 }
 
+/// tmux `capture-pane -e` only ever emits SGR sequences.
+const SGR_RE = /\x1b\[[0-9;]*m/g;
+
+/// The opposite splice: where do xterm's FIRST lines sit in tmux's capture,
+/// and what lies above them? Reversing both inputs turns the head-anchored
+/// question into the tail-anchored one `findSplicePoint` already answers.
+/// `tmuxLines` may carry SGR escapes (they are stripped for matching and kept
+/// in the result). Returns the raw lines directly above the anchor, oldest
+/// first, or `null` when xterm's head could not be located.
+export function findOlderLines(xtermHead: string[], tmuxLines: string[]): string[] | null {
+  const plain = tmuxLines.map((l) => l.replace(SGR_RE, ""));
+  const r = findSplicePoint([...xtermHead].reverse(), [...plain].reverse());
+  if (r.matchIndex < 0) return null;
+  // Reversal only trims the far end (history's oldest rows), so the anchor's
+  // top row maps back to `len - 1 - matchIndex` and the missing lines are the
+  // `missingCount` rows immediately above it.
+  const anchorTop = tmuxLines.length - 1 - r.matchIndex;
+  return tmuxLines.slice(anchorTop - r.missingCount, anchorTop);
+}
+
 /// Render the marker line announcing recovered content. Uses ANSI SGR for
 /// the dim style so it stands out without color noise.
 ///
