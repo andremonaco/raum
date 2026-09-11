@@ -863,16 +863,31 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       // exactly when it should. Capture phase on the pane host beats xterm's
       // own textarea listener; scoping to the textarea leaves the prompt
       // overlay's inputs untouched.
+      //
+      // Image-only clipboards (screenshots) carry no text, so a Cmd+V would
+      // otherwise reach xterm's own handler, which emits an empty bracketed
+      // paste. Instead send Ctrl+V (0x16): every harness (Claude Code, Codex,
+      // OpenCode) treats that as "read the image off the OS clipboard
+      // yourself", so raum never touches the image bytes.
       const onHostPaste = (ev: ClipboardEvent): void => {
         if (!term || ev.target !== term.textarea) return;
         const id = sessionId();
         if (!id) return;
-        const text = ev.clipboardData?.getData("text") ?? "";
-        if (!text) return;
         ev.preventDefault();
         ev.stopImmediatePropagation();
-        void invoke("terminal_paste_text", { sessionId: id, text }).catch((e) => {
-          console.error("[TerminalPane] terminal_paste_text failed", e);
+        const text = ev.clipboardData?.getData("text") ?? "";
+        if (text) {
+          void invoke("terminal_paste_text", { sessionId: id, text }).catch((e) => {
+            console.error("[TerminalPane] terminal_paste_text failed", e);
+          });
+          return;
+        }
+        const hasImage = Array.from(ev.clipboardData?.items ?? []).some((it) =>
+          it.type.startsWith("image/"),
+        );
+        if (!hasImage) return;
+        void invoke("terminal_send_keys", { sessionId: id, keys: "\x16" }).catch((e) => {
+          console.error("[TerminalPane] terminal_send_keys (image paste) failed", e);
         });
       };
       host.addEventListener("paste", onHostPaste, true);
@@ -2151,15 +2166,26 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       const id = sessionId();
       if (!id) return;
       let text = "";
+      let hasImage = false;
       try {
         text = (await navigator.clipboard?.readText?.()) ?? "";
+        if (!text) {
+          const items = (await navigator.clipboard?.read?.()) ?? [];
+          hasImage = items.some((it) => it.types.some((t) => t.startsWith("image/")));
+        }
       } catch {
         return;
       }
-      if (!text) return;
-      void invoke("terminal_paste_text", { sessionId: id, text }).catch((err) => {
-        console.error("[TerminalPane] terminal_paste_text failed", err);
-      });
+      if (text) {
+        void invoke("terminal_paste_text", { sessionId: id, text }).catch((err) => {
+          console.error("[TerminalPane] terminal_paste_text failed", err);
+        });
+      } else if (hasImage) {
+        // Same Ctrl+V hand-off as onHostPaste: the harness reads the image.
+        void invoke("terminal_send_keys", { sessionId: id, keys: "\x16" }).catch((err) => {
+          console.error("[TerminalPane] terminal_send_keys (image paste) failed", err);
+        });
+      }
     };
     contextActionsRef = {
       copySelection,
