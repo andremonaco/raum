@@ -177,6 +177,18 @@ describe("rendererScheduler", () => {
     expect(snapshot().every((s) => s.renderer === "webgl")).toBe(true);
   });
 
+  it("a hidden pane holds no renderer addon; showing it reinstalls canvas", () => {
+    let loads = 0;
+    const term = { loadAddon: () => void loads++ } as unknown as Terminal;
+    registerPane("a", term, { visible: false });
+    expect(loads).toBe(0);
+    setPaneVisibility("a", true);
+    expect(loads).toBe(1);
+    setPaneVisibility("a", false);
+    setPaneVisibility("a", true);
+    expect(loads).toBe(2);
+  });
+
   it("a pane hidden mid-promotion does not take a WebGL slot", async () => {
     registerPane("a", fakeTerminal());
     // The addon import is still in flight when the pane goes off-screen; the

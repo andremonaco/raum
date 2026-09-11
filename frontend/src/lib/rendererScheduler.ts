@@ -203,7 +203,7 @@ export function registerPane(
     pendingRepromote: false,
   };
   panes.set(paneId, entry);
-  installCanvas(entry);
+  if (entry.visible) installCanvas(entry);
 }
 
 export function unregisterPane(paneId: string): void {
@@ -227,7 +227,20 @@ export function setPaneVisibility(paneId: string, visible: boolean): void {
     );
   }
   entry.visible = visible;
-  if (!visible && entry.renderer === "webgl") {
+  if (!visible) {
+    // A hidden tab holds no renderer addon at all: xterm falls back to its
+    // DOM renderer, which owns no canvases. The canvas addon keeps four
+    // pane-sized GPU surfaces (~60 MB per pane at retina) alive even under
+    // `visibility: hidden`, so dozens of background tabs ran the WebContent
+    // process into the gigabytes.
+    try {
+      entry.addon?.dispose();
+    } catch {
+      /* best-effort */
+    }
+    entry.addon = null;
+    entry.renderer = "canvas";
+  } else if (entry.addon === null) {
     installCanvas(entry);
   }
 }
