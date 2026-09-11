@@ -14,18 +14,17 @@
  * (Popover vs. always-on pinned panel) is the caller's concern.
  */
 
-import { invoke } from "@tauri-apps/api/core";
 import { Component, For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import { attentionQueue, markAcknowledged, type AttentionItem } from "../stores/agentStore";
 import { projectBySlug } from "../stores/projectStore";
 import { terminalStore } from "../stores/terminalStore";
 import { resolveSessionTabLabel } from "../lib/harnessTabLabel";
-import { clearPendingPermission, pendingPermissionForSession } from "../lib/notificationCenter";
+import { pendingPermissionForSession, replyPermission } from "../lib/notificationCenter";
 import { permissionSummary } from "../lib/permissionSummary";
 import { HARNESS_ICONS, type HarnessIconKind } from "./icons";
 
 /** Format a blocked-since timestamp as a terse relative age ("8m", "2h"). */
-function formatAge(blockedSince: number, now: number): string {
+export function formatAge(blockedSince: number, now: number): string {
   if (!blockedSince) return "";
   const secs = Math.max(0, Math.floor((now - blockedSince) / 1000));
   if (secs < 60) return `${secs}s`;
@@ -37,7 +36,7 @@ function formatAge(blockedSince: number, now: number): string {
 }
 
 /** Human verb for the state prefix of the age label. */
-function stateVerb(state: AttentionItem["session"]["state"]): string {
+export function stateVerb(state: AttentionItem["session"]["state"]): string {
   if (state === "waiting") return "waiting";
   if (state === "errored") return "errored";
   if (state === "completed") return "done";
@@ -120,18 +119,9 @@ export const AttentionRail: Component<AttentionRailProps> = (props) => {
                 if (!p?.requestId || replying()) return;
                 setReplying(true);
                 try {
-                  await invoke("reply_permission", {
-                    args: {
-                      request_id: p.requestId,
-                      session_id: p.sessionId,
-                      decision,
-                    },
-                  });
-                  clearPendingPermission(p.permissionKey);
-                } catch (e) {
-                  // Transport failure: leave the row so the user can retry
-                  // (or answer in the harness's own prompt, which still fires).
-                  console.warn("reply_permission failed", e);
+                  // On failure the entry stays so the user can retry (or
+                  // answer in the harness's own prompt, which still fires).
+                  await replyPermission(p, decision);
                 } finally {
                   setReplying(false);
                 }

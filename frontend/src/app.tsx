@@ -8,6 +8,7 @@ import { TerminalGrid } from "./components/terminal-grid";
 import { OnboardingWizard } from "./components/onboarding-wizard";
 import { SpotlightDock } from "./components/spotlight-dock";
 import { Toaster } from "./components/ui/sonner";
+import { AttentionToasts } from "./components/attention-toasts";
 import { KeymapProvider, useKeymapAction } from "./lib/keymapContext";
 import {
   flushActiveLayoutNow,
@@ -473,6 +474,7 @@ const App: Component = () => {
         </Show>
         <SpotlightDock />
         <Toaster />
+        <AttentionToasts />
       </div>
     </KeymapProvider>
   );
