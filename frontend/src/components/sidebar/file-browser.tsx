@@ -32,6 +32,7 @@ import {
   untrack,
 } from "solid-js";
 import { Portal } from "solid-js/web";
+import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 
@@ -46,6 +47,15 @@ import { FileTypeIcon } from "../../lib/fileTypeIcon";
 import { STATUS_LETTER, changesByPath } from "../../lib/gitChangeDisplay";
 import type { FileChange } from "../../stores/worktreeStore";
 import { ChevronDownIcon, ChevronRightIcon, FolderIcon, LoaderIcon, SearchIcon } from "../icons";
+import { Button } from "../ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogPortal,
+  DialogTitle,
+} from "../ui/dialog";
 import { worktreeListDir } from "./git-commands";
 import { RaumLogo } from "./main-branch-picker";
 import { StatusLetter } from "./status-letter";
@@ -292,6 +302,35 @@ export const FileBrowser: Component<FileBrowserProps> = (props) => {
       .catch((e: unknown) => console.warn("clipboard.writeText failed", e));
   };
 
+  // Move to Trash. Recoverable by design — the backend hands the path to the
+  // OS trash (Finder's Trash / freedesktop ~/.local/share/Trash), never `rm`.
+  // The fs watcher repaints the listing on its own, but the parent level is
+  // reloaded explicitly so the row disappears the moment the call returns.
+  const [trashTarget, setTrashTarget] = createSignal<DirEntry | null>(null);
+  const [trashing, setTrashing] = createSignal(false);
+  const [trashError, setTrashError] = createSignal<string | null>(null);
+
+  const parentDirOf = (relPath: string): string => {
+    const cut = relPath.lastIndexOf("/");
+    return cut === -1 ? ROOT : relPath.slice(0, cut);
+  };
+
+  const confirmTrash = async (): Promise<void> => {
+    const entry = trashTarget();
+    if (!entry) return;
+    setTrashing(true);
+    setTrashError(null);
+    try {
+      await invoke("file_trash", { path: absOf(entry.relPath) });
+      setTrashTarget(null);
+      loadDir(parentDirOf(entry.relPath), true);
+    } catch (e: unknown) {
+      setTrashError(String(e));
+    } finally {
+      setTrashing(false);
+    }
+  };
+
   // One stable object for the tree's lifetime — every reactive read lives
   // behind an accessor, so `props.api()` itself never becomes a dependency.
   const treeApi: TreeApi = {
@@ -506,10 +545,69 @@ export const FileBrowser: Component<FileBrowserProps> = (props) => {
               >
                 Copy relative path
               </button>
+              <div class="my-1 border-t border-border-subtle" />
+              <button
+                type="button"
+                class="block w-full rounded px-2 py-1 text-left text-destructive hover:bg-destructive/10"
+                onClick={() => {
+                  setTrashError(null);
+                  setTrashTarget(target().entry);
+                  setMenu(null);
+                }}
+              >
+                Move to Trash
+              </button>
             </div>
           </Portal>
         )}
       </Show>
+
+      <Dialog
+        open={trashTarget() !== null}
+        onOpenChange={(isOpen) => {
+          if (!isOpen && !trashing()) setTrashTarget(null);
+        }}
+      >
+        <DialogPortal>
+          <DialogContent class="sm:max-w-[420px]">
+            <DialogHeader>
+              <DialogTitle class="text-sm">
+                Move {trashTarget()?.isDir ? "folder" : "file"} to Trash?
+              </DialogTitle>
+            </DialogHeader>
+            <div class="space-y-2 text-xs">
+              <p class="text-muted-foreground">
+                <span class="font-mono text-foreground">{trashTarget()?.relPath}</span>
+                {trashTarget()?.isDir ? " and everything inside it" : ""} goes to the system Trash —
+                recover it from there if this was a mistake.
+              </p>
+              <Show when={trashError()}>
+                <p class="text-destructive">{trashError()}</p>
+              </Show>
+            </div>
+            <DialogFooter>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                disabled={trashing()}
+                onClick={() => setTrashTarget(null)}
+              >
+                Cancel
+              </Button>
+              <Button
+                type="button"
+                variant="destructive"
+                size="sm"
+                disabled={trashing()}
+                onClick={() => void confirmTrash()}
+              >
+                {trashing() ? "Moving…" : "Move to Trash"}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </DialogPortal>
+      </Dialog>
     </div>
   );
 };

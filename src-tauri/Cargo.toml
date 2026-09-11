@@ -47,6 +47,7 @@ ignore = "0.4"
 notify = "6"
 dirs = "6"
 uuid = { version = "1", features = ["v4"] }
+trash = "5"
 
 [target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
 libc = "0.2"

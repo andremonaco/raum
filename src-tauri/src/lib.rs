@@ -337,6 +337,7 @@ pub fn run() {
             // File editor — read/write files on behalf of the frontend.
             commands::files::file_read,
             commands::files::file_write,
+            commands::files::file_trash,
             // Updater — persists the "check on launch" pref; actual
             // check/install happen via tauri-plugin-updater directly.
             commands::updater::config_set_updater_check_on_launch,
