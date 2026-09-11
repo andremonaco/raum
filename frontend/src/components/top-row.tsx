@@ -1272,9 +1272,21 @@ export const TopRow: Component = () => {
                     compact={compactTabs()}
                     onSelect={() => {
                       markStart("project-switch:active");
+                      const clickedAt = performance.now();
                       setActiveProjectSlug(project.slug);
                       setSelectedFilter("active");
                       setCrossProjectViewMode(null);
+                      // Click → first frame painted with the new project, into
+                      // the daily log next to the `webgl-install` lines.
+                      requestAnimationFrame(() =>
+                        requestAnimationFrame(() => {
+                          const ms = Math.round(performance.now() - clickedAt);
+                          void invoke("webview_wake_report", {
+                            phase: "project-switch-paint",
+                            ms,
+                          }).catch(() => {});
+                        }),
+                      );
                     }}
                     onRemove={() => setConfirmRemove(project)}
                     onHide={() => void setProjectHidden(project.slug, true)}

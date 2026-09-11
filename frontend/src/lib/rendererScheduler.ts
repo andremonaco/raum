@@ -138,6 +138,7 @@ async function installWebgl(entry: PaneEntry): Promise<boolean> {
   // canvas addon until here for the same reason.
   if (entry.forbidWebgl || !entry.visible || backgrounded) {
     if (backgrounded && entry.visible) entry.pendingRepromote = true;
+    ensureCanvas(entry);
     return false;
   }
   try {
@@ -146,6 +147,7 @@ async function installWebgl(entry: PaneEntry): Promise<boolean> {
     /* best-effort */
   }
   const webgl = new WebglAddon();
+  const startedMs = performance.now();
   try {
     webgl.onContextLoss(() => {
       emitWarn(`WebGL context lost on ${entry.paneId}; demoting to canvas for session`);
@@ -155,6 +157,7 @@ async function installWebgl(entry: PaneEntry): Promise<boolean> {
     entry.terminal.loadAddon(webgl);
     entry.addon = webgl;
     entry.renderer = "webgl";
+    reportWakePhase("webgl-install", performance.now() - startedMs);
     return true;
   } catch (err) {
     emitWarn(`WebGL renderer failed to load for ${entry.paneId}: ${String(err)}`);
@@ -172,17 +175,36 @@ let promotionsInFlight = 0;
  * `requestWebgl` this never evicts (and doesn't bump `mru`), so focus stays
  * the tiebreaker whenever the cap is contested.
  */
+let opportunisticQueue: Promise<void> = Promise.resolve();
 function promoteIfSlotFree(entry: PaneEntry): void {
-  if (backgrounded || entry.forbidWebgl || !entry.visible) return;
   if (entry.renderer === "webgl") return;
+  if (backgrounded || entry.forbidWebgl || !entry.visible) {
+    ensureCanvas(entry);
+    return;
+  }
   // `installWebgl` only flips `renderer` after its dynamic import resolves, so
   // a grid full of panes promoting at once would blow past the cap without
   // counting the promotions still in flight.
-  if (currentWebglCount() + promotionsInFlight >= MAX_WEBGL_PANES) return;
+  if (currentWebglCount() + promotionsInFlight >= MAX_WEBGL_PANES) {
+    ensureCanvas(entry);
+    return;
+  }
   promotionsInFlight += 1;
-  void installWebgl(entry).finally(() => {
-    promotionsInFlight -= 1;
-  });
+  // One promotion per frame: each is synchronous shader-compile + atlas +
+  // repaint work, and a project switch flips a whole grid visible in one
+  // tick. The focused pane (`requestWebgl`) skips this queue and paints in
+  // the first frame; the rest fill in behind it.
+  opportunisticQueue = opportunisticQueue
+    .then(yieldToFrame)
+    .then(() => installWebgl(entry))
+    .then(
+      () => {
+        promotionsInFlight -= 1;
+      },
+      () => {
+        promotionsInFlight -= 1;
+      },
+    );
 }
 
 /** Register a pane; the scheduler installs an initial canvas addon. */
@@ -203,7 +225,17 @@ export function registerPane(
     pendingRepromote: false,
   };
   panes.set(paneId, entry);
-  if (entry.visible) installCanvas(entry);
+}
+
+/**
+ * A visible pane that is NOT getting WebGL (cap hit, forbidden, backgrounded,
+ * hidden mid-promotion) still needs a renderer. Installed lazily here rather
+ * than eagerly on register/show, so a pane headed straight for WebGL is not
+ * painted twice — with a dozen panes flipping visible on a project switch,
+ * that double paint was a visible stall.
+ */
+function ensureCanvas(entry: PaneEntry): void {
+  if (entry.visible && entry.addon === null) installCanvas(entry);
 }
 
 export function unregisterPane(paneId: string): void {
@@ -240,9 +272,9 @@ export function setPaneVisibility(paneId: string, visible: boolean): void {
     }
     entry.addon = null;
     entry.renderer = "canvas";
-  } else if (entry.addon === null) {
-    installCanvas(entry);
   }
+  // Becoming visible installs nothing here: the pane's visibility effect
+  // requests WebGL next, and `ensureCanvas` covers every path that declines.
 }
 
 /**
@@ -264,10 +296,11 @@ export async function requestWebgl(paneId: string): Promise<void> {
   const entry = panes.get(paneId);
   if (!entry) return;
   entry.mru = mruCounter++;
-  if (backgrounded) return;
   if (entry.renderer === "webgl") return;
-  if (entry.forbidWebgl) return;
-  if (!entry.visible) return;
+  if (backgrounded || entry.forbidWebgl || !entry.visible) {
+    ensureCanvas(entry);
+    return;
+  }
 
   // Counts in-flight promotions for the same reason `promoteIfSlotFree` does:
   // otherwise a focus promotion and an opportunistic one in the same tick both
