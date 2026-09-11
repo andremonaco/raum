@@ -57,7 +57,9 @@ pub(crate) use kill::{
     kill_session_inner, protected_session_ids, sessions_for_project, sessions_for_worktree,
 };
 pub use kill::{terminal_kill, terminal_kill_orphans, terminal_reap_stale};
-pub use query::{terminal_list, terminal_pane_context, terminal_pane_context_batch};
+pub use query::{
+    terminal_capture_history, terminal_list, terminal_pane_context, terminal_pane_context_batch,
+};
 pub use reattach::{terminal_provider_replace, terminal_provider_replay, terminal_reattach};
 pub(crate) use reconcile::reconcile_inner;
 pub use reconcile::terminal_reconcile;
@@ -78,7 +80,8 @@ pub use io::{__cmd__terminal_paste_paths, __cmd__terminal_paste_text, __cmd__ter
 pub use kill::{__cmd__terminal_kill, __cmd__terminal_kill_orphans, __cmd__terminal_reap_stale};
 #[doc(hidden)]
 pub use query::{
-    __cmd__terminal_list, __cmd__terminal_pane_context, __cmd__terminal_pane_context_batch,
+    __cmd__terminal_capture_history, __cmd__terminal_list, __cmd__terminal_pane_context,
+    __cmd__terminal_pane_context_batch,
 };
 #[doc(hidden)]
 pub use reattach::{

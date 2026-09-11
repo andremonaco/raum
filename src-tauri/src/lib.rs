@@ -235,6 +235,7 @@ pub fn run() {
             commands::terminal::terminal_paste_text,
             commands::terminal::terminal_pane_context,
             commands::terminal::terminal_pane_context_batch,
+            commands::terminal::terminal_capture_history,
             commands::terminal::terminal_reap_stale,
             commands::terminal::terminal_kill_orphans,
             commands::terminal::terminal_reconcile,

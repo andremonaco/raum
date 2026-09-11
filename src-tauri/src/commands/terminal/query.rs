@@ -30,6 +30,22 @@ pub async fn terminal_pane_context(
     Ok(res.unwrap_or_default().into())
 }
 
+/// Older scrollback for the on-demand history load (see
+/// `TmuxManager::capture_pane_history`). `None` while the pane is alt-screen.
+#[tauri::command]
+pub async fn terminal_capture_history(
+    state: tauri::State<'_, AppHandleState>,
+    session_id: String,
+    lines: u32,
+) -> Result<Option<String>, String> {
+    let tmux = state.tmux.clone();
+    let res = tokio::task::spawn_blocking(move || tmux.capture_pane_history(&session_id, lines))
+        .await
+        .map_err(|e| format!("spawn_blocking join: {e}"))?
+        .map_err(|e| e.to_string())?;
+    Ok(res.map(|bytes| String::from_utf8_lossy(&bytes).into_owned()))
+}
+
 #[tauri::command]
 pub async fn terminal_pane_context_batch(
     state: tauri::State<'_, AppHandleState>,
