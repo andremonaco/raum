@@ -470,10 +470,33 @@ export function minimizeTab(
     return paneId;
   }
 
-  const newId = nextCellId();
+  const newPane = extractTabToPane(paneId, tabId);
+  if (!newPane) return null;
+  const newId = newPane.id;
+  if (opts?.activityMs !== undefined) newPane.lastActivityMs = opts.activityMs;
+  setRuntimeLayoutStore("panes", newId, newPane);
+
+  const nextSet = new Set(minimizedPaneIds());
+  nextSet.add(newId);
+  setMinimizedPaneIds(nextSet);
+  rebuildCells();
+  scheduleActiveSave();
+  return newId;
+}
+
+/** Pull `tabId` out of `paneId` into a fresh single-tab `PaneContent` that is
+ *  NOT yet registered in `panes` (callers register it and place it). The
+ *  source pane keeps its other tabs and re-picks a neighbor as active when the
+ *  moved tab was active (mirrors `removeCellTab`). Returns null when the pane
+ *  or tab is unknown, or when the pane has only one tab. */
+function extractTabToPane(paneId: string, tabId: string): PaneContent | null {
+  const pane = runtimeLayoutStore.panes[paneId];
+  if (!pane || pane.tabs.length <= 1) return null;
+  const tab = pane.tabs.find((t) => t.id === tabId);
+  if (!tab) return null;
   const movedTab = unwrap(tab) as CellTab;
   const newPane: PaneContent = {
-    id: newId,
+    id: nextCellId(),
     kind: pane.kind,
     tabs: [movedTab],
     activeTabId: movedTab.id,
@@ -482,24 +505,43 @@ export function minimizeTab(
   const worktreeId = movedTab.worktreeId ?? pane.worktreeId;
   if (projectSlug !== undefined) newPane.projectSlug = projectSlug;
   if (worktreeId !== undefined) newPane.worktreeId = worktreeId;
-  if (opts?.activityMs !== undefined) newPane.lastActivityMs = opts.activityMs;
-  setRuntimeLayoutStore("panes", newId, newPane);
-
-  // Reassign the source pane's active tab if we're moving the active one
-  // (mirror `removeCellTab`'s neighbor pick), then drop the tab from it.
   if (pane.activeTabId === tabId) {
     const idx = pane.tabs.findIndex((t) => t.id === tabId);
     const neighbor = idx > 0 ? pane.tabs[idx - 1] : pane.tabs[idx + 1];
     if (neighbor) setRuntimeLayoutStore("panes", paneId, "activeTabId", neighbor.id);
   }
   setRuntimeLayoutStore("panes", paneId, "tabs", (prev) => prev.filter((t) => t.id !== tabId));
+  return newPane;
+}
 
-  const nextSet = new Set(minimizedPaneIds());
-  nextSet.add(newId);
-  setMinimizedPaneIds(nextSet);
+/** Tab-strip drag: move `tabId` to position `toIndex` inside its own pane. */
+export function moveCellTab(cellId: string, tabId: string, toIndex: number): void {
+  const pane = runtimeLayoutStore.panes[cellId];
+  if (!pane) return;
+  const from = pane.tabs.findIndex((t) => t.id === tabId);
+  const to = Math.max(0, Math.min(toIndex, pane.tabs.length - 1));
+  if (from < 0 || from === to) return;
+  setRuntimeLayoutStore("panes", cellId, "tabs", (prev) => {
+    const next = prev.slice();
+    const [moved] = next.splice(from, 1);
+    next.splice(to, 0, moved);
+    return next;
+  });
   rebuildCells();
   scheduleActiveSave();
-  return newId;
+}
+
+/** Tab-strip drag pulled out of the header: extract `tabId` into its own
+ *  pane split to the right of the source pane. Returns the new pane id (the
+ *  caller then hands it to the regular pane DnD) or null for a single-tab
+ *  pane, which is dragged as a whole instead. Not undo-snapshotted: undoing
+ *  would drop the new leaf from the tree while its session pane stays
+ *  registered — an invisible live session. */
+export function detachCellTab(cellId: string, tabId: string): string | null {
+  const newPane = extractTabToPane(cellId, tabId);
+  if (!newPane) return null;
+  splitPane(newPane, cellId, "right");
+  return newPane.id;
 }
 
 /** Mirror `panes[id]` activity metadata into the matching `cells[i]`

@@ -32,3 +32,26 @@ if (typeof globalThis.ResizeObserver === "undefined") {
   (globalThis as unknown as { ResizeObserver: typeof NoopResizeObserver }).ResizeObserver =
     NoopResizeObserver;
 }
+
+// Node ≥ 25 defines its own `globalThis.localStorage` getter that returns
+// `undefined` unless `--localstorage-file` is passed, and it shadows the
+// jsdom implementation vitest would otherwise expose. Replace it with a
+// minimal in-memory Storage so persistence tests work without a node flag.
+if (typeof globalThis.localStorage === "undefined") {
+  const backing = new Map<string, string>();
+  const shim: Storage = {
+    get length() {
+      return backing.size;
+    },
+    clear: () => backing.clear(),
+    getItem: (key) => backing.get(String(key)) ?? null,
+    key: (index) => [...backing.keys()][index] ?? null,
+    removeItem: (key) => {
+      backing.delete(String(key));
+    },
+    setItem: (key, value) => {
+      backing.set(String(key), String(value));
+    },
+  };
+  Object.defineProperty(globalThis, "localStorage", { value: shim, configurable: true });
+}

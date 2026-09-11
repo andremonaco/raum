@@ -9,8 +9,10 @@ import { activeProjectSlug, projectBySlug } from "../../stores/projectStore";
 import {
   LAYOUT_UNIT,
   addCellTab,
+  detachCellTab,
   layoutRev,
   minimizePane,
+  moveCellTab,
   movePaneToEdge,
   movePaneToRootEdge,
   removeCellTab,
@@ -76,6 +78,80 @@ export const PaneHeader: Component<PaneHeaderProps> = (props) => {
     addCellTab(props.cellId, { projectSlug: slug, worktreeId });
   }
 
+  /** Hand a pane (the header's own, or a freshly detached tab's) to the
+   *  grid-wide pane DnD. `ev` is the pointermove that crossed the threshold. */
+  function startPaneDrag(ev: PointerEvent, sourceId: string) {
+    const rootEl = document.querySelector<HTMLElement>('[data-dnd-root="true"]');
+    if (!rootEl) return;
+    // Snapshot the cells so hit-testing uses the stable REAL layout
+    // throughout the drag, not the live (animating) DOM bounds. See
+    // BeginDragOptions.cells for the rationale — mixing animating rects
+    // with the cursor created a target/preview feedback loop. Scope the
+    // snapshot to the active project's pruned tree so DnD can't target
+    // panes from other tabs that aren't in the DOM.
+    const slug = activeProjectSlug();
+    const mainPath = projectBySlug().get(slug ?? "")?.rootPath;
+    const scope = activeWorktreeStore.byProject[slug ?? ""] ?? ALL_WORKTREES_SCOPE;
+    // Reuse the active-projection cache — the pointerdown path reads
+    // the same (layoutRev, slug, scope, mainPath) key that the grid's
+    // `projection()` memo just populated, so this is a map hit.
+    const projected = getScopedProjection(layoutRev(), slug, scope, mainPath);
+    const cellsSnapshot = runtimeLayoutStore.cells.flatMap((c) => {
+      const r = projected.rects.get(c.id);
+      return r ? [{ id: c.id, x: r.x, y: r.y, w: r.w, h: r.h }] : [];
+    });
+    // No dwell gate: a review now spawns a *fresh* reviewer pane next
+    // to the reviewed pane and leaves the dragged source pane intact,
+    // so there's no destructive commit to defend against. The release
+    // arms instantly regardless of whether the source has history.
+    const armDelayMs = 0;
+
+    beginDrag({
+      sourceId,
+      sourceKind: props.kind,
+      sourceLabel: KIND_LABELS[props.kind] ?? props.kind,
+      event: ev,
+      rootEl,
+      cells: cellsSnapshot,
+      layoutUnit: LAYOUT_UNIT,
+      armDelayMs,
+      // Magnetic snap eligibility: only engage when both source and
+      // target are review-eligible harnesses. Shell/empty panes never
+      // snap — dragging onto a Shell pane just falls through to normal
+      // edge-zone classification, which means edge-splits still work.
+      canSnapTo: (targetId) => {
+        if (props.kind === "shell" || props.kind === "empty") return false;
+        const target = runtimeLayoutStore.panes[targetId];
+        if (!target) return false;
+        return target.kind !== "shell" && target.kind !== "empty";
+      },
+      onDrop: ({ sourceId, targetId, zone, snapped, armed }) => {
+        if (!targetId || !zone || sourceId === targetId) return;
+        if (zone === "center") {
+          // Center drop on a sibling pane = start a cross-harness review.
+          // Center drop on the root sentinel = no-op (no target to review).
+          if (targetId === ROOT_TARGET) return;
+          // The review now spawns a fresh reviewer pane next to the
+          // reviewed pane and leaves the source intact, so no dwell
+          // gate is required — `armDelayMs === 0` means `armed` is
+          // always set on release here. We still require `snapped` so
+          // the gesture only fires when the magnet was visually
+          // engaged at the moment of release.
+          if (!snapped || !armed) return;
+          void startReviewFromDrop(sourceId, targetId);
+          return;
+        }
+        const direction = zoneToDirection(zone);
+        if (!direction) return;
+        if (targetId === ROOT_TARGET) {
+          movePaneToRootEdge(sourceId, direction);
+        } else {
+          movePaneToEdge(sourceId, targetId, direction);
+        }
+      },
+    });
+  }
+
   function onHeaderPointerDown(e: PointerEvent) {
     if (e.button !== 0) return;
     const target = e.target as HTMLElement | null;
@@ -86,91 +162,50 @@ export const PaneHeader: Component<PaneHeaderProps> = (props) => {
     const startX = e.clientX;
     const startY = e.clientY;
     const THRESHOLD = 4;
+    // Multi-tab panes drag the *tab* under the pointer: slide along the
+    // strip to reorder, pull out of the strip to detach it into its own
+    // pane (which then continues as a normal pane drag). A single-tab pane
+    // drags as a whole, as before.
+    const tabId = target?.closest<HTMLElement>(".pane-header-tab")?.dataset.tabId;
+    const tabDrag = tabId !== undefined && props.tabs.length > 1;
+    const strip = e.currentTarget as HTMLElement;
+    const DETACH_PX = 24;
+
+    function stop() {
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", stop);
+    }
 
     function onMove(ev: PointerEvent) {
       const dx = ev.clientX - startX;
       const dy = ev.clientY - startY;
       if (dx * dx + dy * dy < THRESHOLD * THRESHOLD) return;
-      document.removeEventListener("pointermove", onMove);
-      document.removeEventListener("pointerup", onUp);
-      const rootEl = document.querySelector<HTMLElement>('[data-dnd-root="true"]');
-      if (!rootEl) return;
-      // Snapshot the cells so hit-testing uses the stable REAL layout
-      // throughout the drag, not the live (animating) DOM bounds. See
-      // BeginDragOptions.cells for the rationale — mixing animating rects
-      // with the cursor created a target/preview feedback loop. Scope the
-      // snapshot to the active project's pruned tree so DnD can't target
-      // panes from other tabs that aren't in the DOM.
-      const slug = activeProjectSlug();
-      const mainPath = projectBySlug().get(slug ?? "")?.rootPath;
-      const scope = activeWorktreeStore.byProject[slug ?? ""] ?? ALL_WORKTREES_SCOPE;
-      // Reuse the active-projection cache — the pointerdown path reads
-      // the same (layoutRev, slug, scope, mainPath) key that the grid's
-      // `projection()` memo just populated, so this is a map hit.
-      const projected = getScopedProjection(layoutRev(), slug, scope, mainPath);
-      const cellsSnapshot = runtimeLayoutStore.cells.flatMap((c) => {
-        const r = projected.rects.get(c.id);
-        return r ? [{ id: c.id, x: r.x, y: r.y, w: r.w, h: r.h }] : [];
-      });
-      // No dwell gate: a review now spawns a *fresh* reviewer pane next
-      // to the reviewed pane and leaves the dragged source pane intact,
-      // so there's no destructive commit to defend against. The release
-      // arms instantly regardless of whether the source has history.
-      const armDelayMs = 0;
-
-      beginDrag({
-        sourceId: props.cellId,
-        sourceKind: props.kind,
-        sourceLabel: KIND_LABELS[props.kind] ?? props.kind,
-        event: ev,
-        rootEl,
-        cells: cellsSnapshot,
-        layoutUnit: LAYOUT_UNIT,
-        armDelayMs,
-        // Magnetic snap eligibility: only engage when both source and
-        // target are review-eligible harnesses. Shell/empty panes never
-        // snap — dragging onto a Shell pane just falls through to normal
-        // edge-zone classification, which means edge-splits still work.
-        canSnapTo: (targetId) => {
-          if (props.kind === "shell" || props.kind === "empty") return false;
-          const target = runtimeLayoutStore.panes[targetId];
-          if (!target) return false;
-          return target.kind !== "shell" && target.kind !== "empty";
-        },
-        onDrop: ({ sourceId, targetId, zone, snapped, armed }) => {
-          if (!targetId || !zone || sourceId === targetId) return;
-          if (zone === "center") {
-            // Center drop on a sibling pane = start a cross-harness review.
-            // Center drop on the root sentinel = no-op (no target to review).
-            if (targetId === ROOT_TARGET) return;
-            // The review now spawns a fresh reviewer pane next to the
-            // reviewed pane and leaves the source intact, so no dwell
-            // gate is required — `armDelayMs === 0` means `armed` is
-            // always set on release here. We still require `snapped` so
-            // the gesture only fires when the magnet was visually
-            // engaged at the moment of release.
-            if (!snapped || !armed) return;
-            void startReviewFromDrop(sourceId, targetId);
-            return;
-          }
-          const direction = zoneToDirection(zone);
-          if (!direction) return;
-          if (targetId === ROOT_TARGET) {
-            movePaneToRootEdge(sourceId, direction);
-          } else {
-            movePaneToEdge(sourceId, targetId, direction);
-          }
-        },
-      });
-    }
-
-    function onUp() {
-      document.removeEventListener("pointermove", onMove);
-      document.removeEventListener("pointerup", onUp);
+      if (!tabDrag) {
+        stop();
+        startPaneDrag(ev, props.cellId);
+        return;
+      }
+      const r = strip.getBoundingClientRect();
+      if (ev.clientY < r.top - DETACH_PX || ev.clientY > r.bottom + DETACH_PX) {
+        stop();
+        const newId = detachCellTab(props.cellId, tabId!);
+        if (newId) startPaneDrag(ev, newId);
+        return;
+      }
+      const tabEls = Array.from(strip.querySelectorAll<HTMLElement>(".pane-header-tab"));
+      let toIndex = tabEls.length - 1;
+      for (let i = 0; i < tabEls.length; i++) {
+        const tr = tabEls[i].getBoundingClientRect();
+        if (ev.clientX < tr.left + tr.width / 2) {
+          toIndex = i;
+          break;
+        }
+      }
+      moveCellTab(props.cellId, tabId!, toIndex);
     }
 
     document.addEventListener("pointermove", onMove);
-    document.addEventListener("pointerup", onUp);
+    document.addEventListener("pointerup", stop);
   }
 
   return (

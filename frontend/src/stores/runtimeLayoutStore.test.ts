@@ -43,6 +43,8 @@ import {
   minimizedPaneIds,
   minimizePane,
   minimizeTab,
+  moveCellTab,
+  detachCellTab,
   restorePane,
   setSessionId,
   setSplitRatios,
@@ -746,6 +748,45 @@ describe("runtimeLayoutStore (BSP)", () => {
     // The moved (first) tab carried no per-tab binding → inherits pane-level.
     expect(runtimeLayoutStore.panes[newId!].projectSlug).toBe("proj");
     expect(runtimeLayoutStore.panes[newId!].worktreeId).toBe("/wt/main");
+  });
+
+  // ── tab-strip drag: reorder + detach ────────────────────────────────────
+  it("moveCellTab reorders tabs inside a pane and clamps the index", () => {
+    splitPane(pane("a"), null, "right");
+    const t1 = runtimeLayoutStore.cells[0].tabs[0].id;
+    const t2 = addCellTab("a");
+    const t3 = addCellTab("a");
+    moveCellTab("a", t1, 2);
+    expect(runtimeLayoutStore.cells[0].tabs.map((t) => t.id)).toEqual([t2, t3, t1]);
+    moveCellTab("a", t1, -5);
+    expect(runtimeLayoutStore.cells[0].tabs.map((t) => t.id)).toEqual([t1, t2, t3]);
+    moveCellTab("a", "nope", 1);
+    expect(runtimeLayoutStore.cells[0].tabs.map((t) => t.id)).toEqual([t1, t2, t3]);
+  });
+
+  it("detachCellTab splits the tab out into its own pane right of the source", () => {
+    splitPane(pane("a", { kind: "claude-code" }), null, "right");
+    const t1 = runtimeLayoutStore.cells[0].tabs[0].id;
+    setTabSessionId("a", t1, "raum-a1");
+    const t2 = addCellTab("a"); // active
+    const newId = detachCellTab("a", t2);
+    expect(newId).not.toBeNull();
+    const ids = runtimeLayoutStore.cells.map((c) => c.id);
+    expect(ids).toEqual(["a", newId]);
+    const src = runtimeLayoutStore.cells[0];
+    expect(src.tabs.map((t) => t.id)).toEqual([t1]);
+    expect(src.activeTabId).toBe(t1);
+    const np = runtimeLayoutStore.cells[1];
+    expect(np.kind).toBe("claude-code");
+    expect(np.tabs.map((t) => t.id)).toEqual([t2]);
+    expect(np.x).toBeGreaterThan(src.x);
+    expect(minimizedPaneIds().has(newId!)).toBe(false);
+  });
+
+  it("detachCellTab refuses a single-tab pane", () => {
+    splitPane(pane("a"), null, "right");
+    expect(detachCellTab("a", runtimeLayoutStore.cells[0].tabs[0].id)).toBeNull();
+    expect(runtimeLayoutStore.cells).toHaveLength(1);
   });
 
   it("minimizeTab is a no-op for an unknown pane or tab", () => {
