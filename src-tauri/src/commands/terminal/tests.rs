@@ -186,6 +186,19 @@ mod misc_tests {
     }
 
     #[test]
+    fn abort_input_ignores_escape_sequences_while_waiting() {
+        // DECSET 1004 focus in/out reports — sent by xterm.js on every pane
+        // focus change; must never tear down a parked permission request.
+        assert!(!contains_abort_input("\x1b[I", Some(AgentState::Waiting)));
+        assert!(!contains_abort_input("\x1b[O", Some(AgentState::Waiting)));
+        // Arrow / SS3 keys navigate the harness's own prompt.
+        assert!(!contains_abort_input("\x1b[A", Some(AgentState::Waiting)));
+        assert!(!contains_abort_input("\x1bOA", Some(AgentState::Waiting)));
+        // A bare ESC still aborts, even trailing other bytes.
+        assert!(contains_abort_input("a\x1b", Some(AgentState::Waiting)));
+    }
+
+    #[test]
     fn abort_input_plain_keys_never_fire() {
         assert!(!contains_abort_input("", Some(AgentState::Waiting)));
         assert!(!contains_abort_input("hello", Some(AgentState::Waiting)));
