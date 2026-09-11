@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.19](https://github.com/andremonaco/raum/releases/tag/v0.1.19) - 2026-09-11
+
+### Fixed
+
+- fix(clippy): is_ok_and over ok().is_some_and for the newer stable lint
+- fix(terminal): only a bare ESC aborts a waiting harness
+- fix(hooks): evict stale parked permission requests on a newer event
+- perf(scrollback): bounded xterm window, older history pulled from tmux on demand
+
+
 ## [0.1.18](https://github.com/andremonaco/raum/releases/tag/v0.1.18) - 2026-08-08
 
 ### Added
