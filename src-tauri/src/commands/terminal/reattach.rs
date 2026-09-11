@@ -500,6 +500,7 @@ pub async fn terminal_reattach<R: Runtime>(
                 opencode_port: resolved_resume_target
                     .as_ref()
                     .and_then(|t| t.opencode_port),
+                skip_tracked_upsert: false,
             },
         )?;
     }

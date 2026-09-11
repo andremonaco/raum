@@ -144,6 +144,7 @@ export const TabItem: Component<{
     <Tooltip>
       <TooltipTrigger
         as="div"
+        data-tab-id={props.tab.id}
         class="pane-header-tab group relative flex h-[22px] min-w-[120px] max-w-[300px] grow basis-[180px] cursor-pointer select-none items-center gap-1.5 rounded-md px-2.5 text-[10px] uppercase leading-none tracking-wide transition-colors duration-150"
         classList={{
           "bg-selected text-foreground font-medium":

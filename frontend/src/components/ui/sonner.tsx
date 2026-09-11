@@ -19,6 +19,9 @@ export const Toaster: Component<ToasterProps> = (props) => {
       theme="system"
       position="top-right"
       closeButton
+      // No focus hotkey: sonner defaults to Alt+T, which would pull focus
+      // out of a terminal pane mid-typing.
+      hotkey={[]}
       duration={8_000}
       visibleToasts={4}
       toastOptions={{

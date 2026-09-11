@@ -43,6 +43,8 @@ import {
   minimizedPaneIds,
   minimizePane,
   minimizeTab,
+  moveCellTab,
+  detachCellTab,
   restorePane,
   setSessionId,
   setSplitRatios,
@@ -495,14 +497,13 @@ describe("runtimeLayoutStore (BSP)", () => {
     // Pretend `b` is hidden (the way the pruned tree would present it):
     // visibleLeafIds = [a, c], leftIds = [a], rightIds = [c]. The
     // visible siblings' combined runtime share is 0.5 + 0.25 = 0.75,
-    // and the user drags so that pruned [a:c] becomes [0.7, 0.3].
+    // and the user drags the visible boundary to 70 % of the grid.
     setSplitRatiosByBoundary({
       axis: "row",
       leftLeafIds: ["a"],
       rightLeafIds: ["c"],
       visibleLeafIds: ["a", "c"],
-      prunedLeftRatio: 0.7,
-      prunedRightRatio: 0.3,
+      boundary: 0.7,
     });
 
     const a = runtimeLayoutStore.cells.find((c) => c.id === "a")!;
@@ -514,6 +515,36 @@ describe("runtimeLayoutStore (BSP)", () => {
     // a and c divide the remaining 0.75 share in 0.7 : 0.3 proportions.
     expect(a.w).toBeCloseTo(LAYOUT_UNIT * 0.75 * 0.7, -1);
     expect(c.w).toBeCloseTo(LAYOUT_UNIT * 0.75 * 0.3, -1);
+  });
+
+  it("setSplitRatiosByBoundary lands on the requested position when pruning compacts nested same-axis splits", () => {
+    // Runtime: row[a, col[row[b, c], x]] with `x` hidden. Pruning drops x,
+    // collapses the col wrapper and compact() merges the nested row into
+    // row[a, b, c] (0.5, 0.25, 0.25). The divider between a and b is then
+    // NOT between runtime siblings: its LCA is the root row[a, col[...]].
+    splitPane(pane("a"), null, "right");
+    splitPane(pane("b"), "a", "right");
+    splitPane(pane("x"), "b", "bottom");
+    splitPane(pane("c"), "b", "right");
+    const b0 = runtimeLayoutStore.cells.find((c) => c.id === "b")!;
+    expect(b0.w).toBeCloseTo(LAYOUT_UNIT * 0.25, -1);
+
+    // Drag the a|b boundary to 60 % of the grid.
+    setSplitRatiosByBoundary({
+      axis: "row",
+      leftLeafIds: ["a"],
+      rightLeafIds: ["b"],
+      visibleLeafIds: ["a", "b", "c"],
+      boundary: 0.6,
+    });
+    const a = runtimeLayoutStore.cells.find((c) => c.id === "a")!;
+    const b = runtimeLayoutStore.cells.find((c) => c.id === "b")!;
+    const c = runtimeLayoutStore.cells.find((c) => c.id === "c")!;
+    // The boundary sits at exactly 60 %; b and c share the remaining 40 %.
+    expect(a.w).toBeCloseTo(LAYOUT_UNIT * 0.6, -1);
+    expect(b.x).toBeCloseTo(LAYOUT_UNIT * 0.6, -1);
+    expect(b.w).toBeCloseTo(LAYOUT_UNIT * 0.2, -1);
+    expect(c.w).toBeCloseTo(LAYOUT_UNIT * 0.2, -1);
   });
 
   it("setSplitRatiosByBoundary is a no-op when the leaves are missing or the axis disagrees", () => {
@@ -528,8 +559,7 @@ describe("runtimeLayoutStore (BSP)", () => {
       leftLeafIds: ["a"],
       rightLeafIds: ["b"],
       visibleLeafIds: ["a", "b"],
-      prunedLeftRatio: 0.9,
-      prunedRightRatio: 0.1,
+      boundary: 0.9,
     });
     expect(runtimeLayoutStore.cells.map((c) => c.w)).toEqual(before);
 
@@ -539,8 +569,7 @@ describe("runtimeLayoutStore (BSP)", () => {
       leftLeafIds: ["ghost"],
       rightLeafIds: ["b"],
       visibleLeafIds: ["a", "b"],
-      prunedLeftRatio: 0.9,
-      prunedRightRatio: 0.1,
+      boundary: 0.9,
     });
     expect(runtimeLayoutStore.cells.map((c) => c.w)).toEqual(before);
   });
@@ -746,6 +775,45 @@ describe("runtimeLayoutStore (BSP)", () => {
     // The moved (first) tab carried no per-tab binding → inherits pane-level.
     expect(runtimeLayoutStore.panes[newId!].projectSlug).toBe("proj");
     expect(runtimeLayoutStore.panes[newId!].worktreeId).toBe("/wt/main");
+  });
+
+  // ── tab-strip drag: reorder + detach ────────────────────────────────────
+  it("moveCellTab reorders tabs inside a pane and clamps the index", () => {
+    splitPane(pane("a"), null, "right");
+    const t1 = runtimeLayoutStore.cells[0].tabs[0].id;
+    const t2 = addCellTab("a");
+    const t3 = addCellTab("a");
+    moveCellTab("a", t1, 2);
+    expect(runtimeLayoutStore.cells[0].tabs.map((t) => t.id)).toEqual([t2, t3, t1]);
+    moveCellTab("a", t1, -5);
+    expect(runtimeLayoutStore.cells[0].tabs.map((t) => t.id)).toEqual([t1, t2, t3]);
+    moveCellTab("a", "nope", 1);
+    expect(runtimeLayoutStore.cells[0].tabs.map((t) => t.id)).toEqual([t1, t2, t3]);
+  });
+
+  it("detachCellTab splits the tab out into its own pane right of the source", () => {
+    splitPane(pane("a", { kind: "claude-code" }), null, "right");
+    const t1 = runtimeLayoutStore.cells[0].tabs[0].id;
+    setTabSessionId("a", t1, "raum-a1");
+    const t2 = addCellTab("a"); // active
+    const newId = detachCellTab("a", t2);
+    expect(newId).not.toBeNull();
+    const ids = runtimeLayoutStore.cells.map((c) => c.id);
+    expect(ids).toEqual(["a", newId]);
+    const src = runtimeLayoutStore.cells[0];
+    expect(src.tabs.map((t) => t.id)).toEqual([t1]);
+    expect(src.activeTabId).toBe(t1);
+    const np = runtimeLayoutStore.cells[1];
+    expect(np.kind).toBe("claude-code");
+    expect(np.tabs.map((t) => t.id)).toEqual([t2]);
+    expect(np.x).toBeGreaterThan(src.x);
+    expect(minimizedPaneIds().has(newId!)).toBe(false);
+  });
+
+  it("detachCellTab refuses a single-tab pane", () => {
+    splitPane(pane("a"), null, "right");
+    expect(detachCellTab("a", runtimeLayoutStore.cells[0].tabs[0].id)).toBeNull();
+    expect(runtimeLayoutStore.cells).toHaveLength(1);
   });
 
   it("minimizeTab is a no-op for an unknown pane or tab", () => {

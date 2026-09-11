@@ -43,6 +43,9 @@ import type { AgentKind } from "../lib/agentKind";
 import { applyAgentStateToTerminal, isHarnessKind, markOutput } from "../stores/terminalStore";
 import { type AgentState, seedAcknowledged, updateSessionState } from "../stores/agentStore";
 import { isTabAlive, isTabPendingReset } from "../stores/runtimeLayoutStore";
+import { type AttachPriority, acquireAttachSlot } from "../lib/attachScheduler";
+import { markBoot, registerPersistedPane, settlePersistedPane } from "../lib/bootTiming";
+import { awaitSessionReady } from "../lib/rehydrateGate";
 import {
   registerPane,
   requestWebgl,
@@ -472,6 +475,18 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
   // `"rehydrate:complete"` listener immediately, and prevents the post-gate
   // `decideInitialSurface()` from running against a disposed terminal.
   let cancelRehydrateGate: (() => void) | null = null;
+  // Boot bookkeeping for the FIRST attach only: hand back the bounded attach
+  // slot and count this pane as restored. Idempotent — retry chains
+  // (`reattach-in-flight`, fallback spawn) and onCleanup settle it once at most.
+  let releaseAttachSlot: (() => void) | null = null;
+  let countedPersistedPane = false;
+  const settleInitialAttach = (): void => {
+    releaseAttachSlot?.();
+    releaseAttachSlot = null;
+    if (!countedPersistedPane) return;
+    countedPersistedPane = false;
+    settlePersistedPane();
+  };
 
   // Tier 2 — tmux-history backfill for regular shell panes. tmux's attached
   // client can drop into redraw-compression mode when raum's drain pipeline
@@ -863,16 +878,31 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       // exactly when it should. Capture phase on the pane host beats xterm's
       // own textarea listener; scoping to the textarea leaves the prompt
       // overlay's inputs untouched.
+      //
+      // Image-only clipboards (screenshots) carry no text, so a Cmd+V would
+      // otherwise reach xterm's own handler, which emits an empty bracketed
+      // paste. Instead send Ctrl+V (0x16): every harness (Claude Code, Codex,
+      // OpenCode) treats that as "read the image off the OS clipboard
+      // yourself", so raum never touches the image bytes.
       const onHostPaste = (ev: ClipboardEvent): void => {
         if (!term || ev.target !== term.textarea) return;
         const id = sessionId();
         if (!id) return;
-        const text = ev.clipboardData?.getData("text") ?? "";
-        if (!text) return;
         ev.preventDefault();
         ev.stopImmediatePropagation();
-        void invoke("terminal_paste_text", { sessionId: id, text }).catch((e) => {
-          console.error("[TerminalPane] terminal_paste_text failed", e);
+        const text = ev.clipboardData?.getData("text") ?? "";
+        if (text) {
+          void invoke("terminal_paste_text", { sessionId: id, text }).catch((e) => {
+            console.error("[TerminalPane] terminal_paste_text failed", e);
+          });
+          return;
+        }
+        const hasImage = Array.from(ev.clipboardData?.items ?? []).some((it) =>
+          it.type.startsWith("image/"),
+        );
+        if (!hasImage) return;
+        void invoke("terminal_send_keys", { sessionId: id, keys: "\x16" }).catch((e) => {
+          console.error("[TerminalPane] terminal_send_keys (image paste) failed", e);
         });
       };
       host.addEventListener("paste", onHostPaste, true);
@@ -1176,6 +1206,19 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
     let hasSpawned = false;
     const persistedSessionId = props.sessionId;
     let persistedSessionMissing = false;
+    if (persistedSessionId) {
+      registerPersistedPane();
+      countedPersistedPane = true;
+    }
+    // The focused pane is "usable" the moment its first attach resolves: mark
+    // the startup metric and take keyboard focus so the first keystroke lands
+    // without a click. Never steals focus from an input the user already has.
+    const markInteractive = (): void => {
+      if (!props.active) return;
+      markBoot("first-interactive");
+      const ae = document.activeElement;
+      if (!ae || ae === document.body) term?.focus();
+    };
     let reattachInFlightRetries = 0;
 
     const owningTabAlive = (): boolean => {
@@ -1247,6 +1290,7 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         .then((result) => {
           const id = result.sessionId;
           reattachInFlightRetries = 0;
+          markInteractive();
           // Success — the output channel is live. Resize will be pushed by
           // the observer's first post-attach tick below.
           bridgeRecoveryInFlight = false;
@@ -1321,7 +1365,8 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
           setSessionId(null);
           setErrorMsg(null);
           trySpawn();
-        });
+        })
+        .finally(settleInitialAttach);
     };
 
     const tryReattach = (): void => {
@@ -1424,6 +1469,7 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       })
         .then(async (result) => {
           setRespawningDead(false);
+          markInteractive();
           if (result.historyStatus === "unavailable") {
             setErrorMsg(result.message ?? "Provider recovery is unavailable for this pane");
             if (result.recoverable) {
@@ -1482,7 +1528,8 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
           setErrorMsg(String(e));
           hasSpawned = false;
           persistedSessionMissing = true;
-        });
+        })
+        .finally(settleInitialAttach);
     };
 
     recoverDeadPaneRef = (): void => {
@@ -1587,13 +1634,15 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
           }
           setSessionId(id);
           props.onSpawned?.(id);
+          markInteractive();
         })
         .catch((e) => {
           console.error("[TerminalPane] terminal_spawn failed", e);
           setErrorMsg(String(e));
           // Spawn failed — let a later resize retry by releasing the gate.
           hasSpawned = false;
-        });
+        })
+        .finally(settleInitialAttach);
     };
 
     // Relaunch a crashed SHELL in place (Task 6). Harnesses get `--resume` via
@@ -1650,96 +1699,76 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
     // not commit to spawn/reattach before the backend rehydrate has had a chance
     // to mark recover sessions with `recoverable_after_reboot` — otherwise the
     // ghost-upsert lands AFTER the pane already reattached -> not-found ->
-    // trySpawn (fresh harness, lost conversation). We race a bounded poll of
-    // `terminal_rehydrate_ready` / the `"rehydrate:complete"` event against a
-    // timeout so a stuck backend can never hang the pane. Resolves at most once.
-    const REHYDRATE_GATE_TIMEOUT_MS = 4000;
-    const REHYDRATE_POLL_MS = 100;
+    // trySpawn (fresh harness, lost conversation). The shared gate in
+    // `lib/rehydrateGate.ts` releases this pane as soon as its OWN row is
+    // known (`terminal-session-upserted`), or when the whole rehydrate latches
+    // (`terminal_rehydrate_ready` / `"rehydrate:complete"` / hard timeout), so
+    // a stuck backend can never hang the pane. Resolves at most once.
     let rehydrateGateSettled = false;
-    // Resolves to `true` when the gate settled normally (ready / event / hard
-    // timeout) and the caller should run the decision, or `false` when the gate
-    // was cancelled by onCleanup (pane unmounted mid-gate) — in which case the
-    // caller must NOT run `decideInitialSurface()` on the torn-down pane.
+    // Resolves to `true` when the gate settled normally and the caller should
+    // run the decision, or `false` when the gate was cancelled by onCleanup
+    // (pane unmounted mid-gate) — in which case the caller must NOT run
+    // `decideInitialSurface()` on the torn-down pane.
     const awaitRehydrateReady = (): Promise<boolean> => {
       // Panes with no persisted session can't be recover candidates — spawn
       // immediately, don't pay the gate latency.
       if (!persistedSessionId) return Promise.resolve(true);
       return new Promise<boolean>((resolve) => {
         let done = false;
-        let pollTimer: ReturnType<typeof setTimeout> | null = null;
-        let hardTimer: ReturnType<typeof setTimeout> | null = null;
-        let unlistenReady: UnlistenFn | null = null;
-        const teardown = (): void => {
-          if (pollTimer !== null) clearTimeout(pollTimer);
-          if (hardTimer !== null) clearTimeout(hardTimer);
-          pollTimer = null;
-          hardTimer = null;
-          unlistenReady?.();
-          unlistenReady = null;
-          cancelRehydrateGate = null;
-        };
-        const finish = (): void => {
-          if (done) return;
-          done = true;
-          rehydrateGateSettled = true;
-          teardown();
-          resolve(true);
-        };
-        // Invoked from onCleanup: stop the poll + listener immediately and
-        // resolve `false` so the post-gate decision is skipped on the dead pane.
         cancelRehydrateGate = (): void => {
           if (done) return;
           done = true;
-          teardown();
+          cancelRehydrateGate = null;
           resolve(false);
         };
-        const poll = (): void => {
+        void awaitSessionReady(persistedSessionId).then(() => {
           if (done) return;
-          void invoke<boolean>("terminal_rehydrate_ready")
-            .then((ready) => {
-              if (ready) finish();
-              else if (!done) pollTimer = setTimeout(poll, REHYDRATE_POLL_MS);
-            })
-            .catch(() => {
-              // Older backend without the command — don't gate at all.
-              finish();
-            });
-        };
-        // Late-attaching listeners can miss the one-shot event, hence the poll;
-        // but the event still lets us proceed the instant rehydrate finishes.
-        void listen("rehydrate:complete", () => finish())
-          .then((u) => {
-            if (done) u();
-            else unlistenReady = u;
-          })
-          .catch(() => {
-            /* event bus unavailable (tests) — poll/timeout still cover it. */
-          });
-        hardTimer = setTimeout(finish, REHYDRATE_GATE_TIMEOUT_MS);
-        poll();
+          done = true;
+          rehydrateGateSettled = true;
+          cancelRehydrateGate = null;
+          resolve(true);
+        });
       });
     };
 
-    // Run the initial decision once rehydrate has settled (or timed out). Guards
-    // against re-entry so multiple resize/visibility triggers collapse to one
-    // gated decision; subsequent retries (post-gate) call decideInitialSurface
-    // directly because rehydrateGateSettled short-circuits the await.
+    // Run the initial decision once rehydrate has settled (or timed out) AND a
+    // bounded attach slot is free. `initialDecisionStarted` stays latched
+    // through both waits so resize/visibility retriggers can't skip the queue;
+    // later retries (post-gate) call decideInitialSurface directly because
+    // rehydrateGateSettled short-circuits the await.
+    // ponytail: priority sampled once at enqueue; add a bump() if switching
+    // projects mid-boot feels slow.
     let initialDecisionStarted = false;
     const runGatedInitialDecision = (): void => {
       if (hasSpawned) return;
+      if (initialDecisionStarted) return;
       if (rehydrateGateSettled || !persistedSessionId) {
         decideInitialSurface();
         return;
       }
-      if (initialDecisionStarted) return;
       initialDecisionStarted = true;
-      void awaitRehydrateReady().then((shouldDecide) => {
-        initialDecisionStarted = false;
+      void awaitRehydrateReady().then(async (shouldDecide) => {
         // Skip the decision when the gate was cancelled by onCleanup — `term` is
         // already null and the trySpawn/tryReattach/tryRecoverAfterReboot guards
         // would early-return anyway, but not running at all avoids the stray
         // late call entirely.
-        if (shouldDecide) decideInitialSurface();
+        if (!shouldDecide) {
+          initialDecisionStarted = false;
+          return;
+        }
+        const priority: AttachPriority = props.active ? 0 : props.visible === false ? 2 : 1;
+        const release = await acquireAttachSlot(priority);
+        initialDecisionStarted = false;
+        if (!term) {
+          // Unmounted while queued.
+          release();
+          return;
+        }
+        releaseAttachSlot = release;
+        decideInitialSurface();
+        // Bailed before invoking (viewport too small, tab gone): free the slot
+        // now; the ResizeObserver retry runs ungated later.
+        if (!hasSpawned) settleInitialAttach();
       });
     };
 
@@ -2151,15 +2180,26 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       const id = sessionId();
       if (!id) return;
       let text = "";
+      let hasImage = false;
       try {
         text = (await navigator.clipboard?.readText?.()) ?? "";
+        if (!text) {
+          const items = (await navigator.clipboard?.read?.()) ?? [];
+          hasImage = items.some((it) => it.types.some((t) => t.startsWith("image/")));
+        }
       } catch {
         return;
       }
-      if (!text) return;
-      void invoke("terminal_paste_text", { sessionId: id, text }).catch((err) => {
-        console.error("[TerminalPane] terminal_paste_text failed", err);
-      });
+      if (text) {
+        void invoke("terminal_paste_text", { sessionId: id, text }).catch((err) => {
+          console.error("[TerminalPane] terminal_paste_text failed", err);
+        });
+      } else if (hasImage) {
+        // Same Ctrl+V hand-off as onHostPaste: the harness reads the image.
+        void invoke("terminal_send_keys", { sessionId: id, keys: "\x16" }).catch((err) => {
+          console.error("[TerminalPane] terminal_send_keys (image paste) failed", err);
+        });
+      }
     };
     contextActionsRef = {
       copySelection,
@@ -2300,6 +2340,7 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
     // the post-gate decision from running on this disposed pane.
     cancelRehydrateGate?.();
     cancelRehydrateGate = null;
+    settleInitialAttach();
     cancelBackfill();
     clearResizeRepin();
     try {

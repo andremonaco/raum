@@ -8,6 +8,7 @@ import { TerminalGrid } from "./components/terminal-grid";
 import { OnboardingWizard } from "./components/onboarding-wizard";
 import { SpotlightDock } from "./components/spotlight-dock";
 import { Toaster } from "./components/ui/sonner";
+import { AttentionToasts } from "./components/attention-toasts";
 import { KeymapProvider, useKeymapAction } from "./lib/keymapContext";
 import {
   flushActiveLayoutNow,
@@ -15,10 +16,13 @@ import {
   markActiveLayoutHydrated,
   markActiveLayoutHydrationSettled,
   openActiveLayoutSaveGate,
+  runtimeLayoutStore,
+  setFocusedPaneId,
   setRuntimeLayout,
   type ActiveLayoutState,
   type CellKind,
 } from "./stores/runtimeLayoutStore";
+import { markBoot } from "./lib/bootTiming";
 import type { TerminalListItem } from "./stores/terminalStore";
 import { installQuitFlush } from "./lib/quitFlush";
 import { startNotificationCenter } from "./lib/notificationCenter";
@@ -181,6 +185,17 @@ async function hydrateActiveLayout(): Promise<Set<string> | null> {
 
     setRuntimeLayout(cells);
 
+    // Restore keyboard focus to the pane that had it at save time (falling
+    // back to the active project's first in-grid cell) so exactly one surface
+    // is `active` from the first render: it takes the WebGL priority slot,
+    // bypasses the bounded attach queue, and grabs focus on attach.
+    const inTree = runtimeLayoutStore.cells;
+    const focusTarget =
+      inTree.find((c) => c.id === saved.focused_pane_id) ??
+      inTree.find((c) => !saved.project_slug || c.projectSlug === saved.project_slug) ??
+      inTree[0];
+    if (focusTarget) setFocusedPaneId(focusTarget.id);
+
     // Session ids the saved layout actually placed into the grid. The boot
     // recovery toast diffs this against the live `terminal_list` to count
     // sessions that survived but landed in the dock as orphans.
@@ -212,6 +227,7 @@ async function hydrateActiveLayout(): Promise<Set<string> | null> {
     // grid empty on the next launch with every live session adrift in the
     // dock as an orphan.
     openActiveLayoutSaveGate();
+    markBoot("layout-hydrated");
     // Mark the hydration ATTEMPT finished on every exit (success, empty,
     // timeout, corrupt) so the grid's loading skeleton always resolves — to
     // the saved layout, the first-run CTA, or the spawn picker — instead of
@@ -473,6 +489,7 @@ const App: Component = () => {
         </Show>
         <SpotlightDock />
         <Toaster />
+        <AttentionToasts />
       </div>
     </KeymapProvider>
   );

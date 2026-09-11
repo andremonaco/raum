@@ -236,6 +236,29 @@ export function clearPendingPermission(permissionKey: string): void {
 }
 
 /**
+ * Answer a parked permission request. Resolves `true` when the reply was
+ * delivered (the entry is dropped); `false` on transport failure, in which
+ * case the entry stays so the caller can retry or answer in the harness TUI.
+ * Shared by the "Needs you" rail and the attention toasts.
+ */
+export async function replyPermission(
+  p: PendingPermission,
+  decision: "allow" | "deny",
+): Promise<boolean> {
+  if (!p.requestId) return false;
+  try {
+    await invoke("reply_permission", {
+      args: { request_id: p.requestId, session_id: p.sessionId, decision },
+    });
+    clearPendingPermission(p.permissionKey);
+    return true;
+  } catch (e) {
+    console.warn("reply_permission failed", e);
+    return false;
+  }
+}
+
+/**
  * Drop every open request owned by a session that is *gone* (only
  * `agent-session-removed` qualifies — a session merely leaving `waiting`
  * can still own live requests, see `handleAgentStateChanged`). Dismisses

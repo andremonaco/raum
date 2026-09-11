@@ -794,6 +794,11 @@ pub struct ActiveLayoutState {
     /// worktree row was active before the app was last closed.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub worktree_scopes: BTreeMap<String, String>,
+    /// Cell id of the pane that held keyboard focus at save time. Restored on
+    /// launch so the first keystroke lands without a click, and used by the
+    /// boot rehydrate to register that pane's session first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focused_pane_id: Option<String>,
     #[serde(default, alias = "cell")]
     pub cells: Vec<ActiveLayoutCell>,
 }
@@ -1096,6 +1101,7 @@ mod tests {
             project_slug: Some("acme".into()),
             worktree_id: Some("/path/to/wt".into()),
             worktree_scopes,
+            focused_pane_id: Some("cell-1".into()),
             cells: vec![
                 ActiveLayoutCell {
                     id: "cell-1".into(),

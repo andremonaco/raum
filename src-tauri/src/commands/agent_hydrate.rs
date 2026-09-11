@@ -25,11 +25,11 @@
 //! `bootstrap_rehydrate_sessions` bootstrap in `lib.rs` runs reap first
 //! so dead sessions disappear from `live_ids` before the plan is built.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use raum_core::agent::{AgentKind, AgentState};
-use raum_core::config::TrackedSession;
+use raum_core::config::{ActiveLayoutState, TrackedSession};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Runtime};
 use tracing::{info, warn};
@@ -239,6 +239,52 @@ fn is_expired_completed(row: &TrackedSession, now_unix_ms: u64) -> bool {
             > COMPLETED_RECOVER_TTL_MS
 }
 
+/// Reorder `plan` so the sessions the user will look at first are registered
+/// (and their `terminal-session-upserted` fired) first: the focused pane's
+/// active tab, then active tabs of the active project's cells, then the rest
+/// of that project, then everything else. Stable within each tier so the
+/// caller's order is otherwise preserved. Pure; `Forget` rows keep rank 3 —
+/// they are batched out before the loop anyway.
+pub fn prioritize_plan(
+    mut plan: Vec<RehydrateJob>,
+    layout: &ActiveLayoutState,
+) -> Vec<RehydrateJob> {
+    let mut rank: HashMap<&str, u8> = HashMap::new();
+    for cell in &layout.cells {
+        let in_active_project =
+            layout.project_slug.is_some() && cell.project_slug == layout.project_slug;
+        let focused = layout.focused_pane_id.as_deref() == Some(cell.id.as_str());
+        for tab in &cell.tabs {
+            let Some(sid) = tab.session_id.as_deref() else {
+                continue;
+            };
+            let active_tab = tab.id == cell.active_tab_id;
+            let r = if focused && active_tab {
+                0
+            } else if in_active_project && active_tab {
+                1
+            } else if in_active_project {
+                2
+            } else {
+                3
+            };
+            let slot = rank.entry(sid).or_insert(3);
+            *slot = (*slot).min(r);
+        }
+    }
+    let rank_of = |job: &RehydrateJob| -> u8 {
+        match job {
+            RehydrateJob::Register { session_id, .. }
+            | RehydrateJob::Recover { session_id, .. } => {
+                rank.get(session_id.as_str()).copied().unwrap_or(3)
+            }
+            RehydrateJob::Forget { .. } => 3,
+        }
+    };
+    plan.sort_by_key(rank_of);
+    plan
+}
+
 /// Run every job in `plan`. Best-effort: per-session errors are
 /// collected into the report but don't abort the rest of the
 /// rehydrate.
@@ -286,6 +332,17 @@ pub fn apply_rehydrate_plan<R: Runtime>(
             ),
         }
     }
+    // One `list-panes -a` for every row instead of one `display-message` fork
+    // per row. A failed listing (not a cold server — that lists empty) falls
+    // back to the per-session probe inside `apply_register_job`.
+    let dead_map: Option<HashMap<String, Option<i32>>> = match state.tmux.check_panes_dead_all() {
+        Ok(map) => Some(map),
+        Err(e) => {
+            warn!(error = %e, "rehydrate: list-panes probe failed; probing per session");
+            None
+        }
+    };
+    let started = std::time::Instant::now();
     for job in plan_rest {
         match job {
             // Batched above.
@@ -303,6 +360,13 @@ pub fn apply_rehydrate_plan<R: Runtime>(
                 last_state: _,
                 created_at_unix_ms,
             } => {
+                // A session absent from the listing was killed between
+                // `list_sessions` and now: treat as dead so it gets the
+                // Recover overlay rather than a bridge that fails to open.
+                let pane_dead_status = match &dead_map {
+                    Some(map) => map.get(&session_id).copied().unwrap_or(Some(-1)),
+                    None => state.tmux.check_pane_dead(&session_id).ok().flatten(),
+                };
                 let outcome = apply_register_job(
                     app,
                     state,
@@ -312,6 +376,7 @@ pub fn apply_rehydrate_plan<R: Runtime>(
                     worktree_id.as_deref(),
                     opencode_port,
                     created_at_unix_ms,
+                    pane_dead_status,
                 );
                 match outcome {
                     Ok(RegisterOutcome::Alive) => {
@@ -359,6 +424,7 @@ pub fn apply_rehydrate_plan<R: Runtime>(
         forgotten = report.count_forgotten(),
         recoverable_after_reboot = report.count_recoverable_after_reboot(),
         errors = report.count_errors(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
         "rehydrate: plan applied",
     );
     let summary = report.summary();
@@ -391,15 +457,15 @@ fn apply_register_job<R: Runtime>(
     worktree_id: Option<&str>,
     opencode_port: Option<u16>,
     created_at_unix_ms: u64,
+    // Pane health, probed by the caller (one `list-panes -a` for the whole
+    // plan). `remain-on-exit on` keeps dead panes visible on the tmux socket —
+    // `list_sessions` happily reports them as live, so without this the user
+    // gets a sidebar full of zombie panes that show "lost tty" the moment
+    // they're clicked. See plan §1 of the recovery work.
+    pane_dead_status: Option<i32>,
 ) -> Result<RegisterOutcome, String> {
     let project_dir: PathBuf = resolve_project_dir(state, project_slug, worktree_id);
 
-    // Probe pane health before registering. `remain-on-exit on` keeps
-    // dead panes visible on the tmux socket — `list_sessions` happily
-    // reports them as live, so without this probe the user gets a
-    // sidebar full of zombie panes that show "lost tty" the moment
-    // they're clicked. See plan §1 of the recovery work.
-    let pane_dead_status: Option<i32> = state.tmux.check_pane_dead(session_id).ok().flatten();
     let mut outcome = RegisterOutcome::Alive;
     let effective_opencode_port = opencode_port;
     let mut ghost_dead = false;
@@ -451,6 +517,10 @@ fn apply_register_job<R: Runtime>(
             hook_fallback,
             RegisterOptions {
                 opencode_port: effective_opencode_port,
+                // Every Register row came FROM `sessions.toml` with these exact
+                // (write-once) values, so the per-session upsert would only
+                // rewrite the file N times with no change. Skip the fsyncs.
+                skip_tracked_upsert: true,
                 ..RegisterOptions::default()
             },
         )?;
@@ -866,6 +936,81 @@ mod tests {
             plan.iter()
                 .all(|j| !matches!(j, RehydrateJob::Forget { .. })),
             "no Forget jobs — recoverable rows must keep their state",
+        );
+    }
+
+    #[test]
+    fn prioritize_plan_puts_focused_then_active_project_first() {
+        use raum_core::config::{ActiveLayoutCell, ActiveLayoutTab};
+        let tab = |id: &str, sid: &str| ActiveLayoutTab {
+            id: id.into(),
+            session_id: Some(sid.into()),
+            label: None,
+            project_slug: None,
+            worktree_id: None,
+        };
+        let cell =
+            |id: &str, slug: &str, active: &str, tabs: Vec<ActiveLayoutTab>| ActiveLayoutCell {
+                id: id.into(),
+                x: 0,
+                y: 0,
+                w: 1,
+                h: 1,
+                kind: AgentKind::ClaudeCode,
+                title: None,
+                project_slug: Some(slug.into()),
+                worktree_id: None,
+                active_tab_id: active.into(),
+                tabs,
+                minimized: false,
+            };
+        let layout = ActiveLayoutState {
+            project_slug: Some("acme".into()),
+            focused_pane_id: Some("c2".into()),
+            cells: vec![
+                cell(
+                    "c1",
+                    "acme",
+                    "t1",
+                    vec![tab("t1", "s-active-tab"), tab("t2", "s-hidden-tab")],
+                ),
+                cell("c2", "acme", "t3", vec![tab("t3", "s-focused")]),
+                cell("c3", "other", "t4", vec![tab("t4", "s-other-project")]),
+            ],
+            ..ActiveLayoutState::default()
+        };
+        let reg = |sid: &str| RehydrateJob::Register {
+            session_id: sid.into(),
+            harness: AgentKind::ClaudeCode,
+            project_slug: None,
+            worktree_id: None,
+            opencode_port: None,
+            last_state: None,
+            created_at_unix_ms: 0,
+        };
+        let plan = vec![
+            reg("s-untracked-in-layout"),
+            reg("s-other-project"),
+            reg("s-hidden-tab"),
+            reg("s-active-tab"),
+            reg("s-focused"),
+        ];
+        let ids: Vec<String> = prioritize_plan(plan, &layout)
+            .into_iter()
+            .map(|j| match j {
+                RehydrateJob::Register { session_id, .. } => session_id,
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "s-focused",
+                "s-active-tab",
+                "s-hidden-tab",
+                "s-untracked-in-layout",
+                "s-other-project",
+            ]
         );
     }
 }

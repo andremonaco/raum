@@ -12,12 +12,14 @@
  * everything aligned with the pane layer on window resize — no JS required.
  *
  * Divider resize math:
- *   Each divider knows its parent split's along-axis extent in root-%
- *   (`parentAlongPct`). At pointerdown we capture the grid's pixel size,
- *   so `parentAlongPx = gridPx * parentAlongPct / 100`. A pointer delta of
- *   `dx` pixels then maps to a ratio delta of `dx / parentAlongPx`, which
- *   the store applies to whichever runtime split actually owns the
- *   visible boundary.
+ *   At pointerdown we capture the grid's pixel size. A pointer delta of
+ *   `dx` pixels then moves the boundary by `dx / gridPx` of the root, and
+ *   the store receives the resulting *absolute* boundary position (0..1 of
+ *   the root, visible geometry) and solves for the ratios of whichever
+ *   runtime split actually owns that boundary. Absolute, not a ratio pair:
+ *   pruning + `compact()` can merge nested same-axis splits, so the pruned
+ *   pair a divider sits between need not be a sibling pair in the runtime
+ *   tree, and a pair remap would land the divider away from the cursor.
  *
  * Boundary identity:
  *   Dividers are computed against the *pruned* tree (active project +
@@ -34,7 +36,7 @@
 
 import { Component, For, Show, createMemo, createSignal } from "solid-js";
 
-import { MIN_RATIO, leafIds as treeLeafIds, type LayoutNode } from "../lib/layoutTree";
+import { leafIds as treeLeafIds, type LayoutNode } from "../lib/layoutTree";
 import { setSplitRatiosByBoundary } from "../stores/runtimeLayoutStore";
 
 /** Keyboard nudge step, as a fraction of the parent split's along-axis
@@ -53,22 +55,23 @@ interface DividerSpec {
   id: string;
   rect: PctRect;
   axis: "row" | "col";
-  /** Index of the sibling BEFORE this divider, within the *pruned* split.
-   *  Combined with the snapshot of pruned ratios at pointerdown, this is
-   *  what the drag math feeds back through `setSplitRatiosByBoundary`. */
+  /** Index of the sibling BEFORE this divider, within the *pruned* split
+   *  (with `prunedRatios`, feeds `aria-valuenow`). */
   index: number;
-  /** Pruned-tree ratios for the siblings this divider sits between. The
-   *  drag turns these into the new pair `(left, right)` while keeping
-   *  every other pruned sibling untouched. */
+  /** Pruned-tree ratios of the split this divider belongs to. */
   prunedRatios: readonly number[];
+  /** Along-axis start / end of the two siblings this divider sits between,
+   *  in root-%. Double-click resets the boundary to their midpoint. */
+  pairStartPct: number;
+  pairEndPct: number;
   /** Visible leaf ids on each side of the boundary. The store walks the
    *  *runtime* tree to find the LCA that owns these two groups, which
    *  keeps drags correct even when pruning / `compact` reshape the
    *  visible tree away from the runtime one. */
   leftLeafIds: readonly string[];
   rightLeafIds: readonly string[];
-  /** Along-axis extent of the parent split, in root-% (used to convert
-   *  pointer pixel deltas into ratio deltas during drag). */
+  /** Along-axis extent of the parent split, in root-% (keyboard nudges
+   *  step by a fraction of it). */
   parentAlongPct: number;
 }
 
@@ -129,6 +132,7 @@ function walk(node: LayoutNode, rect: PctRect, out: DividerSpec[]): void {
 
   for (let i = 0; i < node.children.length - 1; i++) {
     const left = childRects[i];
+    const right = childRects[i + 1];
     const spec: DividerSpec = {
       // Identity follows the leaves on each side, not the path — the
       // pruned tree's path can shift between renders but the
@@ -140,6 +144,8 @@ function walk(node: LayoutNode, rect: PctRect, out: DividerSpec[]): void {
       leftLeafIds: childLeafIds[i],
       rightLeafIds: childLeafIds[i + 1],
       parentAlongPct,
+      pairStartPct: node.axis === "row" ? left.left : left.top,
+      pairEndPct: node.axis === "row" ? right.left + right.width : right.top + right.height,
       rect:
         node.axis === "row"
           ? {
@@ -207,17 +213,15 @@ const Divider: Component<{ spec: DividerSpec; visibleLeafIds: readonly string[] 
     if (!grid) return;
     const gridRect = grid.getBoundingClientRect();
     const rowAxis = isRow();
-    const parentAlongPx =
-      ((rowAxis ? gridRect.width : gridRect.height) * props.spec.parentAlongPct) / 100;
-    if (parentAlongPx <= 0) return;
+    const gridAlongPx = rowAxis ? gridRect.width : gridRect.height;
+    if (gridAlongPx <= 0) return;
     const startClient = rowAxis ? e.clientX : e.clientY;
+    const startBoundary = (rowAxis ? props.spec.rect.left : props.spec.rect.top) / 100;
 
     // Snapshot every input the boundary mutator needs so a mid-drag
     // remount (fresh DividerSpec at the same array position) can't
     // shift which boundary we're editing.
     const axis = props.spec.axis;
-    const idx = props.spec.index;
-    const startRatios = [...props.spec.prunedRatios];
     const leftLeafIds = [...props.spec.leftLeafIds];
     const rightLeafIds = [...props.spec.rightLeafIds];
     const visibleLeafIds = [...props.visibleLeafIds];
@@ -228,44 +232,32 @@ const Divider: Component<{ spec: DividerSpec; visibleLeafIds: readonly string[] 
     document.body.style.userSelect = "none";
 
     let rafId: number | null = null;
-    let pendingPair: { left: number; right: number } | null = null;
+    let pending: number | null = null;
+
+    const apply = (): void => {
+      if (pending === null) return;
+      setSplitRatiosByBoundary({
+        axis,
+        leftLeafIds,
+        rightLeafIds,
+        visibleLeafIds,
+        boundary: pending,
+      });
+      pending = null;
+    };
 
     const scheduleApply = (): void => {
-      if (rafId !== null || pendingPair === null) return;
+      if (rafId !== null || pending === null) return;
       rafId = requestAnimationFrame(() => {
         rafId = null;
-        if (pendingPair !== null) {
-          setSplitRatiosByBoundary({
-            axis,
-            leftLeafIds,
-            rightLeafIds,
-            visibleLeafIds,
-            prunedLeftRatio: pendingPair.left,
-            prunedRightRatio: pendingPair.right,
-          });
-          pendingPair = null;
-        }
+        apply();
       });
     };
 
     const onMove = (ev: PointerEvent): void => {
       const now = rowAxis ? ev.clientX : ev.clientY;
-      const deltaFrac = (now - startClient) / parentAlongPx;
-      let l = startRatios[idx] + deltaFrac;
-      let r = startRatios[idx + 1] - deltaFrac;
-      // Clamp to MIN_RATIO on each side; store's normalize re-enforces
-      // but early clamp keeps the live render stable.
-      if (l < MIN_RATIO) {
-        const adj = MIN_RATIO - l;
-        l = MIN_RATIO;
-        r -= adj;
-      }
-      if (r < MIN_RATIO) {
-        const adj = MIN_RATIO - r;
-        r = MIN_RATIO;
-        l -= adj;
-      }
-      pendingPair = { left: l, right: r };
+      // The store clamps to MIN_RATIO per side; no early clamp needed.
+      pending = startBoundary + (now - startClient) / gridAlongPx;
       scheduleApply();
     };
 
@@ -277,17 +269,7 @@ const Divider: Component<{ spec: DividerSpec; visibleLeafIds: readonly string[] 
       setIsDragging(false);
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
-      if (pendingPair) {
-        setSplitRatiosByBoundary({
-          axis,
-          leftLeafIds,
-          rightLeafIds,
-          visibleLeafIds,
-          prunedLeftRatio: pendingPair.left,
-          prunedRightRatio: pendingPair.right,
-        });
-        pendingPair = null;
-      }
+      apply();
       if (rafId !== null) {
         cancelAnimationFrame(rafId);
         rafId = null;
@@ -301,16 +283,12 @@ const Divider: Component<{ spec: DividerSpec; visibleLeafIds: readonly string[] 
 
   function onDoubleClick(e: MouseEvent): void {
     e.stopPropagation();
-    const ratios = props.spec.prunedRatios;
-    const i = props.spec.index;
-    const avg = (ratios[i] + ratios[i + 1]) / 2;
     setSplitRatiosByBoundary({
       axis: props.spec.axis,
       leftLeafIds: [...props.spec.leftLeafIds],
       rightLeafIds: [...props.spec.rightLeafIds],
       visibleLeafIds: [...props.visibleLeafIds],
-      prunedLeftRatio: avg,
-      prunedRightRatio: avg,
+      boundary: (props.spec.pairStartPct + props.spec.pairEndPct) / 200,
     });
   }
 
@@ -332,27 +310,13 @@ const Divider: Component<{ spec: DividerSpec; visibleLeafIds: readonly string[] 
     if (delta === 0) return;
     e.preventDefault();
     e.stopPropagation();
-    const ratios = props.spec.prunedRatios;
-    const i = props.spec.index;
-    let l = ratios[i] + delta;
-    let r = ratios[i + 1] - delta;
-    if (l < MIN_RATIO) {
-      const adj = MIN_RATIO - l;
-      l = MIN_RATIO;
-      r -= adj;
-    }
-    if (r < MIN_RATIO) {
-      const adj = MIN_RATIO - r;
-      r = MIN_RATIO;
-      l -= adj;
-    }
+    const pos = (rowAxis ? props.spec.rect.left : props.spec.rect.top) / 100;
     setSplitRatiosByBoundary({
       axis: props.spec.axis,
       leftLeafIds: [...props.spec.leftLeafIds],
       rightLeafIds: [...props.spec.rightLeafIds],
       visibleLeafIds: [...props.visibleLeafIds],
-      prunedLeftRatio: l,
-      prunedRightRatio: r,
+      boundary: pos + (delta * props.spec.parentAlongPct) / 100,
     });
   }
 

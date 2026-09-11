@@ -97,6 +97,10 @@ export interface ActiveLayoutState {
    *  per-project worktree pin survives a restart and is reapplied as soon as
    *  they switch back to that project. */
   worktree_scopes?: Record<string, string>;
+  /** Cell id that held keyboard focus at save time. Restored on launch so the
+   *  first keystroke lands without a click; the backend rehydrate registers
+   *  that pane's session first. */
+  focused_pane_id?: string;
   cells: ActiveLayoutCell[];
 }
 
@@ -470,10 +474,33 @@ export function minimizeTab(
     return paneId;
   }
 
-  const newId = nextCellId();
+  const newPane = extractTabToPane(paneId, tabId);
+  if (!newPane) return null;
+  const newId = newPane.id;
+  if (opts?.activityMs !== undefined) newPane.lastActivityMs = opts.activityMs;
+  setRuntimeLayoutStore("panes", newId, newPane);
+
+  const nextSet = new Set(minimizedPaneIds());
+  nextSet.add(newId);
+  setMinimizedPaneIds(nextSet);
+  rebuildCells();
+  scheduleActiveSave();
+  return newId;
+}
+
+/** Pull `tabId` out of `paneId` into a fresh single-tab `PaneContent` that is
+ *  NOT yet registered in `panes` (callers register it and place it). The
+ *  source pane keeps its other tabs and re-picks a neighbor as active when the
+ *  moved tab was active (mirrors `removeCellTab`). Returns null when the pane
+ *  or tab is unknown, or when the pane has only one tab. */
+function extractTabToPane(paneId: string, tabId: string): PaneContent | null {
+  const pane = runtimeLayoutStore.panes[paneId];
+  if (!pane || pane.tabs.length <= 1) return null;
+  const tab = pane.tabs.find((t) => t.id === tabId);
+  if (!tab) return null;
   const movedTab = unwrap(tab) as CellTab;
   const newPane: PaneContent = {
-    id: newId,
+    id: nextCellId(),
     kind: pane.kind,
     tabs: [movedTab],
     activeTabId: movedTab.id,
@@ -482,24 +509,43 @@ export function minimizeTab(
   const worktreeId = movedTab.worktreeId ?? pane.worktreeId;
   if (projectSlug !== undefined) newPane.projectSlug = projectSlug;
   if (worktreeId !== undefined) newPane.worktreeId = worktreeId;
-  if (opts?.activityMs !== undefined) newPane.lastActivityMs = opts.activityMs;
-  setRuntimeLayoutStore("panes", newId, newPane);
-
-  // Reassign the source pane's active tab if we're moving the active one
-  // (mirror `removeCellTab`'s neighbor pick), then drop the tab from it.
   if (pane.activeTabId === tabId) {
     const idx = pane.tabs.findIndex((t) => t.id === tabId);
     const neighbor = idx > 0 ? pane.tabs[idx - 1] : pane.tabs[idx + 1];
     if (neighbor) setRuntimeLayoutStore("panes", paneId, "activeTabId", neighbor.id);
   }
   setRuntimeLayoutStore("panes", paneId, "tabs", (prev) => prev.filter((t) => t.id !== tabId));
+  return newPane;
+}
 
-  const nextSet = new Set(minimizedPaneIds());
-  nextSet.add(newId);
-  setMinimizedPaneIds(nextSet);
+/** Tab-strip drag: move `tabId` to position `toIndex` inside its own pane. */
+export function moveCellTab(cellId: string, tabId: string, toIndex: number): void {
+  const pane = runtimeLayoutStore.panes[cellId];
+  if (!pane) return;
+  const from = pane.tabs.findIndex((t) => t.id === tabId);
+  const to = Math.max(0, Math.min(toIndex, pane.tabs.length - 1));
+  if (from < 0 || from === to) return;
+  setRuntimeLayoutStore("panes", cellId, "tabs", (prev) => {
+    const next = prev.slice();
+    const [moved] = next.splice(from, 1);
+    next.splice(to, 0, moved);
+    return next;
+  });
   rebuildCells();
   scheduleActiveSave();
-  return newId;
+}
+
+/** Tab-strip drag pulled out of the header: extract `tabId` into its own
+ *  pane split to the right of the source pane. Returns the new pane id (the
+ *  caller then hands it to the regular pane DnD) or null for a single-tab
+ *  pane, which is dragged as a whole instead. Not undo-snapshotted: undoing
+ *  would drop the new leaf from the tree while its session pane stays
+ *  registered — an invisible live session. */
+export function detachCellTab(cellId: string, tabId: string): string | null {
+  const newPane = extractTabToPane(cellId, tabId);
+  if (!newPane) return null;
+  splitPane(newPane, cellId, "right");
+  return newPane.id;
 }
 
 /** Mirror `panes[id]` activity metadata into the matching `cells[i]`
@@ -757,6 +803,9 @@ function buildActiveLayoutPayload(): ActiveLayoutState {
     saved_at: Math.floor(Date.now() / 1000),
     ...(activeProjectSlug() !== undefined ? { project_slug: activeProjectSlug() } : {}),
     ...(Object.keys(scopes).length > 0 ? { worktree_scopes: scopes } : {}),
+    ...(focusedPaneId() && inTreeIds.has(focusedPaneId()!)
+      ? { focused_pane_id: focusedPaneId()! }
+      : {}),
     cells: [
       ...inTreeCells.map((c) => ({
         id: c.id,
@@ -1152,8 +1201,13 @@ export function setSplitRatiosByBoundary(args: {
   leftLeafIds: readonly string[];
   rightLeafIds: readonly string[];
   visibleLeafIds: readonly string[];
-  prunedLeftRatio: number;
-  prunedRightRatio: number;
+  /** Where the boundary should land, as a 0..1 fraction of the grid root
+   *  along `axis`, measured in the *visible* (pruned) geometry the user
+   *  actually sees. An absolute position rather than a ratio pair: pruning
+   *  + `compact()` can merge nested same-axis splits, so the pruned pair the
+   *  divider sits between need not be a sibling pair in the runtime tree,
+   *  and a ratio-pair remap would land the divider away from the cursor. */
+  boundary: number;
 }): void {
   const tree = currentTree();
   if (!tree || tree.kind === "leaf") return;
@@ -1164,48 +1218,70 @@ export function setSplitRatiosByBoundary(args: {
   if (!lca) return;
   if (lca.node.axis !== args.axis) return;
 
-  // Sum of LCA child-ratios whose subtree currently has any visible leaf.
-  // Pruned ratios are runtime ratios divided by this sum; we invert to map
-  // the user's pruned-space delta back to runtime-space deltas.
-  let visibleSum = 0;
-  for (let i = 0; i < lca.node.children.length; i++) {
-    if (subtreeContainsAny(lca.node.children[i], visibleSet)) {
-      visibleSum += lca.node.ratios[i];
+  const ratios = lca.node.ratios;
+  const oldCombined = ratios[lca.leftIdx] + ratios[lca.rightIdx];
+  // Floor both sides so a pane can't be dragged into oblivion; keeping the
+  // pair sum at `oldCombined` leaves hidden siblings' shares untouched.
+  const lo = Math.min(MIN_RATIO, oldCombined / 2);
+  const hi = oldCombined - lo;
+  const withLeft = (l: number): LayoutNode => {
+    const next = [...ratios];
+    next[lca.leftIdx] = l;
+    next[lca.rightIdx] = oldCombined - l;
+    return setRatiosAt(tree, lca.path, normalizeRatios(next));
+  };
+
+  // Where the boundary lands for a given left ratio is measured, not
+  // modelled: the pruned tree the grid renders comes out of sequential
+  // `removeLeaf` + `compact`, whose renormalisation (nested same-axis
+  // splits merge BEFORE hidden siblings drop) has no clean closed form.
+  // The position is monotone in `l`, so bisect on the measured value.
+  // ponytail: ~16 prunes per pointer frame; switch to secant if it shows up.
+  const measure = (l: number): number | null =>
+    prunedBoundary(withLeft(l), visibleSet, rightSet, args.axis);
+  const pLo = measure(lo);
+  const pHi = measure(hi);
+  if (pLo === null || pHi === null) return;
+  let a = lo;
+  let b = hi;
+  if (args.boundary <= pLo) b = lo;
+  else if (args.boundary >= pHi) a = hi;
+  else {
+    for (let i = 0; i < 16 && b - a > 1e-5; i++) {
+      const mid = (a + b) / 2;
+      const p = measure(mid);
+      if (p === null) return;
+      if (p < args.boundary) a = mid;
+      else b = mid;
     }
   }
-  if (!Number.isFinite(visibleSum) || visibleSum <= 0) return;
 
-  // Floor the requested pruned ratios so a single pane can't be dragged
-  // into oblivion. The downstream `normalizeRatios` would re-floor anyway,
-  // but doing it here keeps the left+right sum stable so hidden siblings
-  // retain their original ratios after the rebuild.
-  const minPruned = MIN_RATIO;
-  let l = Math.max(args.prunedLeftRatio, minPruned);
-  let r = Math.max(args.prunedRightRatio, minPruned);
-  const prunedSum = l + r;
-  if (prunedSum <= 0) return;
-
-  // Original combined share at the LCA, in runtime coords.
-  const oldCombined = lca.node.ratios[lca.leftIdx] + lca.node.ratios[lca.rightIdx];
-  // Distribute that combined share by the new pruned ratio.
-  l = (l / prunedSum) * oldCombined;
-  r = (r / prunedSum) * oldCombined;
-
-  const nextRatios = [...lca.node.ratios];
-  nextRatios[lca.leftIdx] = l;
-  nextRatios[lca.rightIdx] = r;
-  const next = setRatiosAt(tree, lca.path, normalizeRatios(nextRatios));
-  setRuntimeLayoutStore("tree", next);
+  setRuntimeLayoutStore("tree", withLeft((a + b) / 2));
   rebuildCells();
   scheduleActiveSave();
 }
 
-function subtreeContainsAny(node: LayoutNode, ids: ReadonlySet<string>): boolean {
-  if (node.kind === "leaf") return ids.has(node.id);
-  for (const c of node.children) {
-    if (subtreeContainsAny(c, ids)) return true;
+/** Along-axis start (0..1 of the root) of the visible group `rightSet` once
+ *  `tree` is pruned to `visible` exactly the way the grid renders it (see
+ *  `pruneTreeByScope`: drop every non-visible leaf in leaf order). Null when
+ *  nothing visible remains. */
+function prunedBoundary(
+  tree: LayoutNode,
+  visible: ReadonlySet<string>,
+  rightSet: ReadonlySet<string>,
+  axis: Axis,
+): number | null {
+  let pruned: LayoutNode | null = tree;
+  for (const id of treeLeafIds(tree)) {
+    if (visible.has(id)) continue;
+    pruned = removeLeaf(pruned, id);
+    if (!pruned) return null;
   }
-  return false;
+  let min = Infinity;
+  for (const r of projectToRects(pruned, LAYOUT_UNIT)) {
+    if (rightSet.has(r.id)) min = Math.min(min, axis === "row" ? r.x : r.y);
+  }
+  return Number.isFinite(min) ? min / LAYOUT_UNIT : null;
 }
 
 /** Reset every split in the tree to even ratios. Topology preserved; only
@@ -1789,36 +1865,23 @@ export function nudgeFocusedDivider(dir: KeyDirection, stepFrac = 0.03): void {
 
   const lowRect = focusedIsLow ? curRect : nbrRect;
   const highRect = focusedIsLow ? nbrRect : curRect;
-  const lowExtent = axis === "row" ? lowRect.w : lowRect.h;
-  const highExtent = axis === "row" ? highRect.w : highRect.h;
-  const combined = lowExtent + highExtent;
+  const lowEnd = axis === "row" ? lowRect.x + lowRect.w : lowRect.y + lowRect.h;
+  const combined = axis === "row" ? lowRect.w + highRect.w : lowRect.h + highRect.h;
   if (combined <= 0) return;
-  let lowFrac = lowExtent / combined;
-  let highFrac = highExtent / combined;
 
-  // Apply the grow/shrink intent to the FOCUSED pane's fraction (grow =
-  // bigger), whichever side of the divider it sits on.
-  const focusedDelta = growIntent ? stepFrac : -stepFrac;
-  if (focusedIsLow) {
-    lowFrac += focusedDelta;
-    highFrac -= focusedDelta;
-  } else {
-    highFrac += focusedDelta;
-    lowFrac -= focusedDelta;
-  }
-  // Clamp into [MIN_RATIO, 1 - MIN_RATIO]; setSplitRatiosByBoundary re-floors
-  // anyway, but clamping here keeps the pair summing to ~1 so the divider lands
-  // where we intend.
-  lowFrac = Math.min(Math.max(lowFrac, MIN_RATIO), 1 - MIN_RATIO);
-  highFrac = Math.min(Math.max(highFrac, MIN_RATIO), 1 - MIN_RATIO);
+  // Apply the grow/shrink intent to the FOCUSED pane: the boundary moves
+  // away from it to grow, toward it to shrink, by `stepFrac` of the pair.
+  const towardHigh = growIntent === focusedIsLow;
+  const boundary = (lowEnd + (towardHigh ? 1 : -1) * stepFrac * combined) / LAYOUT_UNIT;
 
+  // Every leaf counts as visible here: the rects above came from the full
+  // runtime projection, so the store must solve in that same geometry.
   setSplitRatiosByBoundary({
     axis,
     leftLeafIds: [lowId],
     rightLeafIds: [highId],
-    visibleLeafIds: [lowId, highId],
-    prunedLeftRatio: lowFrac,
-    prunedRightRatio: highFrac,
+    visibleLeafIds: treeLeafIds(tree),
+    boundary,
   });
 }
 

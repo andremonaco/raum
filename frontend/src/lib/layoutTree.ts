@@ -552,13 +552,20 @@ export function buildFromRects(rects: Rect[], unit = 10000): LayoutNode | null {
   return built;
 }
 
+/** Edge slack, in layout units, when looking for a guillotine cut.
+ *  `projectToRects` rounds every edge independently, so a saved layout can
+ *  have a right edge at 482 next to a left edge at 481. Without slack no
+ *  cut matches and `partition` falls to the banding heuristic, which
+ *  rebuilds a tree whose geometry no longer resembles the saved rects. */
+const CUT_SLACK = 2;
+
 function partition(rects: Rect[], x: number, y: number, w: number, h: number): LayoutNode {
   if (rects.length === 1) return leaf(rects[0].id);
   // Try vertical cuts (split axis = "row"): find an x between rectangles.
   const xs = [...new Set(rects.map((r) => r.x))].filter((v) => v > x).sort((a, b) => a - b);
   for (const cut of xs) {
-    const left = rects.filter((r) => r.x + r.w <= cut);
-    const right = rects.filter((r) => r.x >= cut);
+    const left = rects.filter((r) => r.x + r.w <= cut + CUT_SLACK);
+    const right = rects.filter((r) => !left.includes(r) && r.x >= cut - CUT_SLACK);
     if (left.length > 0 && right.length > 0 && left.length + right.length === rects.length) {
       const lw = cut - x;
       const rw = x + w - cut;
@@ -575,8 +582,8 @@ function partition(rects: Rect[], x: number, y: number, w: number, h: number): L
   // Try horizontal cuts (split axis = "col"): find a y between rectangles.
   const ys = [...new Set(rects.map((r) => r.y))].filter((v) => v > y).sort((a, b) => a - b);
   for (const cut of ys) {
-    const top = rects.filter((r) => r.y + r.h <= cut);
-    const bottom = rects.filter((r) => r.y >= cut);
+    const top = rects.filter((r) => r.y + r.h <= cut + CUT_SLACK);
+    const bottom = rects.filter((r) => !top.includes(r) && r.y >= cut - CUT_SLACK);
     if (top.length > 0 && bottom.length > 0 && top.length + bottom.length === rects.length) {
       const th = cut - y;
       const bh = y + h - cut;

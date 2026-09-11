@@ -499,6 +499,10 @@ pub struct RegisterOptions {
     /// Session-scoped OpenCode server port. When present, the runtime uses it
     /// instead of guessing the default/random OpenCode port.
     pub opencode_port: Option<u16>,
+    /// When `true`, skip the per-session `upsert_tracked_session` write (an
+    /// fsync'd rewrite of `sessions.toml`). The boot rehydrate registers N
+    /// sessions back to back and batches all their rows into one write itself.
+    pub skip_tracked_upsert: bool,
 }
 
 /// Backwards-compatible wrapper. Same signature as before the
@@ -613,7 +617,8 @@ pub fn register_harness_session_runtime_opts<R: Runtime>(
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
-    if let Ok(store) = state.config_store.lock()
+    if !opts.skip_tracked_upsert
+        && let Ok(store) = state.config_store.lock()
         && let Err(e) = store.upsert_tracked_session(
             session_id,
             harness,

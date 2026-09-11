@@ -340,4 +340,27 @@ describe("projection round-trip", () => {
       `${r.id}:${r.x},${r.y},${r.w},${r.h}`;
     expect(rects2.map(key).sort()).toEqual(rects.map(key).sort());
   });
+
+  it("tolerates 1-unit rounding seams instead of falling back to banding", () => {
+    // Independently rounded edges: `a` ends at 482 while `b` starts at 481,
+    // and `c`/`d` in the bottom band share the same seam. A strict cut
+    // search finds nothing and the banding fallback would place every pane
+    // in a synthetic band. With slack the true guillotine cuts are found and
+    // the rebuilt rects stay within a unit of the saved ones.
+    const rects = [
+      { id: "a", x: 0, y: 0, w: 2482, h: 5000 },
+      { id: "b", x: 2481, y: 0, w: 7519, h: 5000 },
+      { id: "c", x: 0, y: 5000, w: 3001, h: 5000 },
+      { id: "d", x: 3000, y: 5000, w: 7000, h: 5000 },
+    ];
+    const rebuilt = buildFromRects(rects, 10000);
+    const back = projectToRects(rebuilt, 10000);
+    for (const r of rects) {
+      const got = back.find((g) => g.id === r.id)!;
+      expect(Math.abs(got.x - r.x)).toBeLessThanOrEqual(2);
+      expect(Math.abs(got.y - r.y)).toBeLessThanOrEqual(2);
+      expect(Math.abs(got.w - r.w)).toBeLessThanOrEqual(2);
+      expect(Math.abs(got.h - r.h)).toBeLessThanOrEqual(2);
+    }
+  });
 });

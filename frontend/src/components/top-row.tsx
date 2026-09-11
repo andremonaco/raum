@@ -618,21 +618,14 @@ export const TopRow: Component = () => {
   }
 
   // Attention rail pin: the rail anchors off the awaiting counter as a
-  // click-to-open Popover. Default-open whenever something is waiting so the
-  // user lands in mission-control without a click; they can dismiss it and it
-  // stays closed until the next time `waitingCount` rises from zero.
+  // click-to-open Popover. It no longer auto-opens — `AttentionToasts`
+  // surfaces every new queue entry as a top-right toast, and a popover
+  // dropping onto the same corner would double-notify. Closes itself once
+  // the queue drains.
   const [railOpen, setRailOpen] = createSignal(false);
-  // Drive the pin off the FULL attention queue (waiting + errored +
-  // completed-unread), not just `waitingCount` — otherwise an agent that
-  // ERRORS populates the rail but never auto-surfaces it, and a failed agent
-  // sits unseen behind a "0" badge, undercutting the who-needs-me promise.
   const attentionCount = createMemo(() => attentionQueue().length);
-  let prevAttention = 0;
   createEffect(() => {
-    const n = attentionCount();
-    if (n > 0 && prevAttention === 0) setRailOpen(true);
-    if (n === 0) setRailOpen(false);
-    prevAttention = n;
+    if (attentionCount() === 0) setRailOpen(false);
   });
 
   // Round-robin cursor for "focus-next-waiting": each press advances through
@@ -1466,7 +1459,17 @@ export const TopRow: Component = () => {
                     </button>
                   </div>
                   <PopoverPortal>
-                    <PopoverContent class="w-80 p-1" data-testid="attention-rail-popover">
+                    <PopoverContent
+                      class="w-80 p-1"
+                      data-testid="attention-rail-popover"
+                      // The rail auto-opens when an agent needs attention; it
+                      // must never steal keyboard focus from whatever pane the
+                      // user is typing in (a stray Enter on the first row would
+                      // jump them to another project). Same on close: don't
+                      // yank focus back to the trigger. Mouse clicks still work.
+                      onOpenAutoFocus={(e) => e.preventDefault()}
+                      onCloseAutoFocus={(e) => e.preventDefault()}
+                    >
                       <AttentionRail onClose={() => setRailOpen(false)} />
                     </PopoverContent>
                   </PopoverPortal>
