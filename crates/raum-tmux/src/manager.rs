@@ -775,6 +775,17 @@ impl TmuxManager {
         }
     }
 
+    /// [`Self::check_pane_dead`] for every session on the socket in one
+    /// `list-panes -a` fork: `session name -> Some(exit_code)` when dead,
+    /// `None` when running; a session missing from the map is not on the
+    /// server. Uncached — the listing is as fresh as a per-session probe, so
+    /// callers that act on the answer immediately (the boot rehydrate) may use
+    /// it in place of N `check_pane_dead` forks.
+    pub fn check_panes_dead_all(&self) -> Result<HashMap<String, Option<i32>>, TmuxError> {
+        self.list_panes_all(DEAD_POLL_FORMAT)
+            .map(|listing| parse_panes_dead(&listing))
+    }
+
     /// [`Self::check_pane_dead`] for the 300 ms pane-death poll: answers from a
     /// single `list-panes -a` covering every pane on the socket, cached for
     /// [`DEAD_POLL_CACHE_TTL`]. The per-session `display-message` cost one tmux
@@ -783,8 +794,9 @@ impl TmuxManager {
     /// Semantics match `check_pane_dead` exactly — `Ok(Some(code))` dead,
     /// `Ok(None)` alive, `Err` when the session is not on the server (killed
     /// externally, or the server itself is gone). Only for the polling monitor:
-    /// callers that act on the answer immediately (respawn, rehydrate probes)
-    /// must keep using `check_pane_dead` so they never read a stale tick.
+    /// callers that act on the answer immediately (respawn) must use
+    /// `check_pane_dead` or the uncached [`Self::check_panes_dead_all`] so they
+    /// never read a stale tick.
     pub fn check_pane_dead_polled(&self, id: &str) -> Result<Option<i32>, TmuxError> {
         let mut guard = self
             .dead_cache

@@ -107,6 +107,7 @@ pub fn run() {
     }
 
     let _log_guard = logging::init_tracing(&paths::logs_dir());
+    let _ = BOOT_STARTED.set(std::time::Instant::now());
     info!("raum starting");
 
     // Lift the launchd-imposed 256-fd ceiling before anything opens
@@ -390,6 +391,7 @@ pub fn run() {
 
             // Show after all titlebar setup to avoid flashing native chrome.
             main_window.show().unwrap();
+            info!(elapsed_ms = boot_elapsed_ms(), "boot: window shown");
 
             // First-launch convenience: make `raum <dir>` work from a terminal
             // for direct-download installs without a manual menu click. Silent,
@@ -674,6 +676,16 @@ fn bootstrap_apply_server_options(app: &mut tauri::App) {
     });
 }
 
+/// Process start (after tracing init). Every `boot:` log line reports its
+/// offset from here so startup and recovery are measurable from the daily log.
+static BOOT_STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+fn boot_elapsed_ms() -> u64 {
+    BOOT_STARTED.get().map_or(0, |t| {
+        u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
+    })
+}
+
 /// Maximum time `bootstrap_rehydrate_sessions` waits for the event
 /// socket bootstrap to publish a `channel_event_tx` before proceeding
 /// without one. 1 s is short enough that the UI never notices; if
@@ -726,26 +738,12 @@ fn bootstrap_rehydrate_sessions(app: &mut tauri::App) {
         // (tracked row + ghost) and thus protected; age alone can no longer
         // kill a live session at boot.
 
-        // 1. Wait (bounded) for the event-socket bootstrap to publish
-        // `channel_event_tx`.
-        let deadline = std::time::Instant::now() + REHYDRATE_EVENT_SOCKET_WAIT;
-        loop {
-            let ready = {
-                let state: tauri::State<'_, state::AppHandleState> = app_handle.state();
-                state
-                    .channel_event_tx
-                    .lock()
-                    .ok()
-                    .and_then(|g| g.clone())
-                    .is_some()
-            };
-            if ready || std::time::Instant::now() >= deadline {
-                break;
-            }
-            tokio::time::sleep(REHYDRATE_EVENT_SOCKET_POLL).await;
-        }
+        // The event-socket wait (step 2b) is only needed by the register
+        // step; start the clock now and overlap it with the tmux listing,
+        // the tracked read, the snapshot GC and the plan build.
+        let socket_deadline = std::time::Instant::now() + REHYDRATE_EVENT_SOCKET_WAIT;
 
-        // 2. Build the plan.
+        // 1. Build the plan.
         let live_ids: std::collections::HashSet<String> = match tokio::task::spawn_blocking({
             let tmux = tmux.clone();
             move || tmux.list_sessions()
@@ -843,6 +841,37 @@ fn bootstrap_rehydrate_sessions(app: &mut tauri::App) {
             &live_ids,
             commands::terminal::now_unix_millis(),
         );
+        // Register the pane the user will look at first, first: its
+        // `terminal-session-upserted` releases that pane's frontend gate
+        // before the rest of the plan runs.
+        let layout = {
+            let state: tauri::State<'_, state::AppHandleState> = app_handle.state();
+            let store = state
+                .config_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            store.read_active_layout().unwrap_or_default()
+        };
+        let plan = commands::agent_hydrate::prioritize_plan(plan, &layout);
+
+        // 2b. Wait (bounded) for the event-socket bootstrap to publish
+        // `channel_event_tx` — the register step needs it to tell
+        // hook-installed sessions apart from silence-only ones.
+        loop {
+            let ready = {
+                let state: tauri::State<'_, state::AppHandleState> = app_handle.state();
+                state
+                    .channel_event_tx
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.clone())
+                    .is_some()
+            };
+            if ready || std::time::Instant::now() >= socket_deadline {
+                break;
+            }
+            tokio::time::sleep(REHYDRATE_EVENT_SOCKET_POLL).await;
+        }
 
         // 3. Apply. The applier spawns inside the same task; it runs
         // quickly because all per-session work is in-memory registry
@@ -933,6 +962,7 @@ fn latch_rehydrate_done<R: Runtime>(app: &tauri::AppHandle<R>) {
     // The separate `app.emit` below still drives the one-shot event path for
     // already-listening panes.
     state.rehydrate_done_tx.send_replace(true);
+    info!(elapsed_ms = boot_elapsed_ms(), "boot: rehydrate latched");
     if let Err(e) = app.emit("rehydrate:complete", true) {
         warn!(error = %e, "rehydrate: failed to emit rehydrate:complete");
     }

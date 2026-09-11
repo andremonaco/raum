@@ -97,6 +97,10 @@ export interface ActiveLayoutState {
    *  per-project worktree pin survives a restart and is reapplied as soon as
    *  they switch back to that project. */
   worktree_scopes?: Record<string, string>;
+  /** Cell id that held keyboard focus at save time. Restored on launch so the
+   *  first keystroke lands without a click; the backend rehydrate registers
+   *  that pane's session first. */
+  focused_pane_id?: string;
   cells: ActiveLayoutCell[];
 }
 
@@ -799,6 +803,9 @@ function buildActiveLayoutPayload(): ActiveLayoutState {
     saved_at: Math.floor(Date.now() / 1000),
     ...(activeProjectSlug() !== undefined ? { project_slug: activeProjectSlug() } : {}),
     ...(Object.keys(scopes).length > 0 ? { worktree_scopes: scopes } : {}),
+    ...(focusedPaneId() && inTreeIds.has(focusedPaneId()!)
+      ? { focused_pane_id: focusedPaneId()! }
+      : {}),
     cells: [
       ...inTreeCells.map((c) => ({
         id: c.id,
