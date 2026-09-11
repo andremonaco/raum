@@ -612,6 +612,13 @@ function handleAgentStateChanged(payload: AgentStateChangedPayload): void {
   // `permission-expired`.
   if (payload.from === "waiting" && payload.to !== "waiting") {
     void clearOsNotifications(sessionId, ["needs_input"]);
+    // Observation-only entries (no reply token — Codex OSC 9, legacy
+    // scripts) have no authority of their own to clear them: nothing is
+    // parked, so no reply and no expiry ever arrives. Once the session has
+    // left `waiting` they only inflate the Critical badge.
+    setPendingPermissions((prev) =>
+      prev.filter((p) => p.sessionId !== sessionId || p.requestId !== null),
+    );
   }
 
   if (payload.to === "completed" || payload.to === "errored") {
