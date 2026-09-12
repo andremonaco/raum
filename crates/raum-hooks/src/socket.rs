@@ -42,12 +42,9 @@ const MAX_EVENT_LINE_BYTES: u64 = 64 * 1024;
 const ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Synthetic event emitted by the socket server itself when a parked
-/// `PermissionRequest` was collected without a reply: either still
-/// unanswered [`PERMISSION_GC_AFTER`] after parking (the hook script hit its
-/// client-side timeout or was killed), or evicted because a newer
-/// `PermissionRequest` / `Stop` from the same session proved the harness had
-/// moved past it (see [`PendingRequests::evict_session`]). Consumers use it
-/// to garbage-collect
+/// `PermissionRequest` was still unanswered [`PERMISSION_GC_AFTER`] after
+/// parking — i.e. the hook script hit its client-side timeout (and answered
+/// "ask" to the harness) or was killed. Consumers use it to garbage-collect
 /// any per-request UI state (pending-permission badges) and to re-arm the
 /// session's activity heuristic; it must never be classified as a state
 /// transition of its own.
@@ -178,32 +175,12 @@ impl PendingRequests {
     /// question — the harness will cancel its own prompt and any
     /// remaining parked writers for the session become stale.
     pub fn drop_session(&self, session_id: &str) -> usize {
-        self.evict_session(session_id, None).len()
-    }
-
-    /// Remove every parked writer for `session_id` except `keep_request`,
-    /// returning the evicted keys so the caller can emit
-    /// [`PERMISSION_EXPIRED_EVENT`] for each. A harness prompts one
-    /// request at a time per session, so a newer `PermissionRequest` (or a
-    /// turn-ending `Stop`) is proof the older parked ones were answered in
-    /// the harness's own TUI — without this they sit until the deadline
-    /// sweeper and stack up as stale rows in the UI.
-    pub fn evict_session(&self, session_id: &str, keep_request: Option<&str>) -> Vec<PendingKey> {
         let Ok(mut g) = self.inner.lock() else {
-            return Vec::new();
+            return 0;
         };
-        let stale: Vec<PendingKey> = g
-            .keys()
-            .filter(|key| {
-                key.session_id.as_deref() == Some(session_id)
-                    && Some(key.request_id.as_str()) != keep_request
-            })
-            .cloned()
-            .collect();
-        for key in &stale {
-            g.remove(key);
-        }
-        stale
+        let before = g.len();
+        g.retain(|key, _| key.session_id.as_deref() != Some(session_id));
+        before - g.len()
     }
 
     /// Write `decision` (followed by a newline) to the parked writer
@@ -372,20 +349,15 @@ pub fn spawn_event_socket_with_gc(
                         Ok(ev) => {
                             debug!(?ev, "hook event");
                             let has_request_id = ev.request_id.is_some();
-                            // Evict stale parked requests BEFORE parking or
-                            // forwarding this one, so the expiry for the old
-                            // rows reaches the UI ahead of the new request.
-                            if let Some(sid) = ev.session_id.as_deref()
-                                && matches!(
-                                    ev.event.as_str(),
-                                    "PermissionRequest" | "Stop" | "StopFailure"
-                                )
-                            {
-                                for key in pending.evict_session(sid, ev.request_id.as_deref()) {
-                                    debug!(?key, "stale permission request evicted by newer event");
-                                    let _ = tx.send(expired_event(&ev.harness, &key)).await;
-                                }
-                            }
+                            // No eviction on a newer event from the same
+                            // session: Claude Code runs matching hooks in
+                            // parallel (parallel tool calls, background
+                            // subagents, in-process teammates all share one
+                            // `RAUM_SESSION`), so several parked requests
+                            // per session are the normal case, and a `Stop`
+                            // from the lead says nothing about them. Only
+                            // the deadline sweeper and the user's own abort
+                            // (`drop_session`) may collect a parked writer.
                             if let Some(req_id) = ev.request_id.as_deref() {
                                 if let Some(wh) = write_half_slot.take() {
                                     let key =
@@ -472,9 +444,8 @@ fn spawn_permission_sweeper(
     });
 }
 
-/// The synthetic [`PERMISSION_EXPIRED_EVENT`] for a parked request that
-/// was collected without a reply — by the deadline sweeper or by a newer
-/// event from the same session.
+/// The synthetic [`PERMISSION_EXPIRED_EVENT`] for a parked request the
+/// deadline sweeper collected without a reply.
 fn expired_event(harness: &str, key: &PendingKey) -> HookEvent {
     HookEvent {
         harness: harness.to_string(),
@@ -680,12 +651,54 @@ mod tests {
         assert_eq!(line.trim(), "deny");
     }
 
+    /// Claude Code runs matching hooks in parallel (parallel tool calls,
+    /// background subagents, in-process teammates), all under one
+    /// `RAUM_SESSION`. A newer request must not collect an older one.
+    #[tokio::test]
+    async fn concurrent_requests_for_one_session_both_stay_parked() {
+        let dir = tempdir().unwrap();
+        let sock_path = dir.path().join("events.sock");
+        let mut handle = spawn_event_socket(&sock_path).unwrap();
+
+        let mut clients = Vec::new();
+        for rid in ["req-a", "req-b"] {
+            let mut client = UnixStream::connect(&sock_path).await.unwrap();
+            let raw = format!(
+                "{{\"harness\":\"claude-code\",\"event\":\"PermissionRequest\",\
+                 \"session_id\":\"raum-s\",\"request_id\":\"{rid}\",\"payload\":{{}}}}\n"
+            );
+            client.write_all(raw.as_bytes()).await.unwrap();
+            client.flush().await.unwrap();
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(2), handle.rx.recv())
+                .await
+                .expect("timed out")
+                .expect("closed");
+            assert_eq!(ev.event, "PermissionRequest");
+            clients.push(client);
+        }
+        for _ in 0..50 {
+            if handle.pending.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(handle.pending.len(), 2, "second request evicted the first");
+
+        // Both are still answerable, in either order.
+        for (i, rid) in ["req-b", "req-a"].into_iter().enumerate() {
+            let key = PendingKey::new(Some("raum-s".into()), rid);
+            handle.pending.reply(&key, "allow").await.unwrap();
+            let client = &mut clients[1 - i];
+            let mut buf = String::new();
+            BufReader::new(client).read_line(&mut buf).await.unwrap();
+            assert_eq!(buf.trim(), "allow");
+        }
+        assert!(handle.pending.is_empty());
+    }
+
     #[tokio::test]
     async fn drop_session_evicts_only_matching_session() {
-        // Registry-level: the socket path itself never parks two requests
-        // for one session any more (a newer one evicts the older — see
-        // `newer_request_from_same_session_evicts_stale_parked_ones`), so
-        // park directly to exercise `drop_session` on a mixed set.
+        // Park directly to exercise `drop_session` on a mixed set.
         let pending = PendingRequests::new();
         let mut keep_alive = Vec::new();
         for (sid, rid) in [
@@ -758,102 +771,6 @@ mod tests {
         assert_eq!(expiry.request_id.as_deref(), Some("req-exp"));
         assert_eq!(expiry.source.as_deref(), Some("raum-socket"));
         assert!(handle.pending.is_empty());
-    }
-
-    #[tokio::test]
-    async fn newer_request_from_same_session_evicts_stale_parked_ones() {
-        let dir = tempdir().unwrap();
-        let sock_path = dir.path().join("events.sock");
-        // Long deadline: eviction, not the sweeper, must be what fires.
-        let mut handle =
-            spawn_event_socket_with_gc(&sock_path, std::time::Duration::from_secs(60)).unwrap();
-
-        async fn send(sock_path: &Path, raw: &str) -> tokio::net::UnixStream {
-            let mut client = UnixStream::connect(sock_path).await.unwrap();
-            client.write_all(raw.as_bytes()).await.unwrap();
-            client.flush().await.unwrap();
-            client
-        }
-        async fn recv(handle: &mut EventSocketHandle) -> HookEvent {
-            tokio::time::timeout(std::time::Duration::from_secs(2), handle.rx.recv())
-                .await
-                .expect("timed out waiting for event")
-                .expect("channel closed")
-        }
-
-        // Request A parks; the user answers it in the harness TUI (the
-        // client goes away without a reply), then the harness prompts B.
-        let _a = send(
-            &sock_path,
-            "{\"harness\":\"codex\",\"event\":\"PermissionRequest\",\
-             \"session_id\":\"raum-s\",\"request_id\":\"req-a\",\"payload\":{}}\n",
-        )
-        .await;
-        assert_eq!(recv(&mut handle).await.request_id.as_deref(), Some("req-a"));
-        // Another session's parked request must survive untouched.
-        let _other = send(
-            &sock_path,
-            "{\"harness\":\"codex\",\"event\":\"PermissionRequest\",\
-             \"session_id\":\"raum-other\",\"request_id\":\"req-o\",\"payload\":{}}\n",
-        )
-        .await;
-        assert_eq!(recv(&mut handle).await.request_id.as_deref(), Some("req-o"));
-        for _ in 0..50 {
-            if handle.pending.len() == 2 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert_eq!(handle.pending.len(), 2);
-
-        let _b = send(
-            &sock_path,
-            "{\"harness\":\"codex\",\"event\":\"PermissionRequest\",\
-             \"session_id\":\"raum-s\",\"request_id\":\"req-b\",\"payload\":{}}\n",
-        )
-        .await;
-        // Expiry for A is emitted BEFORE B is forwarded.
-        let expiry = recv(&mut handle).await;
-        assert_eq!(expiry.event, PERMISSION_EXPIRED_EVENT);
-        assert_eq!(expiry.session_id.as_deref(), Some("raum-s"));
-        assert_eq!(expiry.request_id.as_deref(), Some("req-a"));
-        let b = recv(&mut handle).await;
-        assert_eq!(b.event, "PermissionRequest");
-        assert_eq!(b.request_id.as_deref(), Some("req-b"));
-        for _ in 0..50 {
-            if handle
-                .pending
-                .drop_key(&PendingKey::new(Some("raum-s".into()), "req-a"))
-            {
-                panic!("stale request A should have been evicted");
-            }
-            if handle.pending.len() == 2 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert_eq!(
-            handle.pending.len(),
-            2,
-            "B and the other session's request remain"
-        );
-
-        // A turn-ending Stop evicts whatever is still parked for the session.
-        let _stop = send(
-            &sock_path,
-            "{\"harness\":\"codex\",\"event\":\"Stop\",\"session_id\":\"raum-s\",\"payload\":{}}\n",
-        )
-        .await;
-        let expiry = recv(&mut handle).await;
-        assert_eq!(expiry.event, PERMISSION_EXPIRED_EVENT);
-        assert_eq!(expiry.request_id.as_deref(), Some("req-b"));
-        assert_eq!(recv(&mut handle).await.event, "Stop");
-        assert_eq!(handle.pending.len(), 1);
-        assert!(
-            handle
-                .pending
-                .drop_key(&PendingKey::new(Some("raum-other".into()), "req-o"))
-        );
     }
 
     #[tokio::test]
