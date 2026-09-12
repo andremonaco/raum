@@ -355,6 +355,7 @@ pub fn run() {
             commands::webview_health::webview_ready,
             commands::webview_health::webview_pong,
             commands::webview_health::webview_wake_report,
+            commands::webview_health::webview_navigation_report,
         ])
         .setup(|app| {
             let main_window = app.get_webview_window("main").unwrap();

@@ -1,4 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+
+const invokeMock = vi.fn();
+
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: (...args: unknown[]) => invokeMock(...args),
+}));
 
 import { createXtermWritePump, type TerminalOutputWriter } from "./xtermWritePump";
 
@@ -135,5 +141,63 @@ describe("createXtermWritePump", () => {
     const joined = terminal.parsed.join("");
     expect(joined).toContain("FRESH");
     expect(joined).not.toContain("STALE-SNAPSHOT");
+  });
+
+  // Task 7.2: queued frames alone hide a fat backlog (one 4 MiB frame reads as
+  // "1"), and a stalled writer is only visible as queue age.
+  it("accounts queued bytes and oldest-frame age across enqueue, flush and rotate", () => {
+    const terminal = new FakeTerminal();
+    let clock = 0;
+    const pump = createXtermWritePump({ getTerminal: () => terminal, now: () => clock });
+
+    expect(pump.queuedBytes()).toBe(0);
+    expect(pump.oldestFrameAgeMs()).toBe(0);
+
+    // First frame writes straight through, so only the later ones queue.
+    pump.enqueue(pump.generation(), new Uint8Array(4));
+    clock = 10;
+    pump.enqueue(pump.generation(), new Uint8Array(8));
+    clock = 20;
+    pump.enqueue(pump.generation(), new Uint8Array(16));
+
+    expect(pump.queuedFrames()).toBe(2);
+    expect(pump.queuedBytes()).toBe(24);
+    clock = 30;
+    // Age is measured from the OLDEST queued frame, not the newest.
+    expect(pump.oldestFrameAgeMs()).toBe(20);
+
+    terminal.flushOne();
+    expect(pump.queuedFrames()).toBe(0);
+    expect(pump.queuedBytes()).toBe(0);
+    expect(pump.oldestFrameAgeMs()).toBe(0);
+
+    clock = 40;
+    pump.enqueue(pump.generation(), new Uint8Array(32));
+    expect(pump.queuedBytes()).toBe(32);
+    pump.rotate(false);
+    expect(pump.queuedFrames()).toBe(0);
+    expect(pump.queuedBytes()).toBe(0);
+    expect(pump.oldestFrameAgeMs()).toBe(0);
+  });
+
+  it("keeps byte accounting exact when queued frames coalesce after a rotate", () => {
+    const terminal = new FakeTerminal();
+    let clock = 0;
+    const pump = createXtermWritePump({ getTerminal: () => terminal, now: () => clock });
+    const stale = pump.generation();
+
+    pump.enqueue(stale, new Uint8Array(4));
+    pump.enqueue(stale, new Uint8Array(64));
+    const fresh = pump.rotate(false);
+    clock = 5;
+    pump.enqueue(fresh, new Uint8Array(8));
+    // The in-flight write from the stale generation still holds the pump.
+    pump.enqueue(fresh, new Uint8Array(16));
+    expect(pump.queuedBytes()).toBe(24);
+
+    terminal.flushOne();
+    // Both fresh frames coalesce into the next write; nothing is left owing.
+    expect(pump.queuedFrames()).toBe(0);
+    expect(pump.queuedBytes()).toBe(0);
   });
 });

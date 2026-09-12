@@ -15,9 +15,23 @@ vi.mock("../lib/keymapContext", () => ({
 
 let surfaceMounts = 0;
 let surfaceCleanups = 0;
+// Counts every call to the whole-session surface projector. Focus changes must
+// not move this number — that is the point of task 5.2.
+let projectorCalls = 0;
+
+vi.mock("../lib/terminalSurfaceProjection", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../lib/terminalSurfaceProjection")>();
+  return {
+    ...actual,
+    projectTerminalSurfaces: (args: Parameters<typeof actual.projectTerminalSurfaces>[0]) => {
+      projectorCalls += 1;
+      return actual.projectTerminalSurfaces(args);
+    },
+  };
+});
 
 vi.mock("./terminal-pane", () => ({
-  TerminalPane: (props: { surfaceKey?: string; visible?: boolean }) => {
+  TerminalPane: (props: { surfaceKey?: string; visible?: boolean; active?: boolean }) => {
     onMount(() => {
       surfaceMounts += 1;
     });
@@ -28,6 +42,7 @@ vi.mock("./terminal-pane", () => ({
       <div
         data-testid={`terminal-surface-${props.surfaceKey ?? "unknown"}`}
         data-visible={props.visible ? "true" : "false"}
+        data-active={props.active ? "true" : "false"}
       />
     );
   },
@@ -36,7 +51,10 @@ vi.mock("./terminal-pane", () => ({
 import { TerminalGrid } from "./terminal-grid";
 import {
   __resetRuntimeLayoutForTests,
+  focusedPaneId,
   LAYOUT_UNIT,
+  setActiveTabId,
+  setFocusedPaneId,
   setRuntimeLayout,
   toggleMaximize,
 } from "../stores/runtimeLayoutStore";
@@ -48,6 +66,9 @@ import {
 import { __resetTerminalStoreForTests, setTerminals } from "../stores/terminalStore";
 import { setCrossProjectViewMode } from "./top-row";
 import { __setDragStateForTests } from "../lib/paneDnD";
+import { setPresentationPolicy } from "../lib/rendererScheduler";
+import { __resetProjectionCacheForTests } from "../lib/scopedProjection";
+import { activeWorktreeStore, setActiveWorktree } from "../stores/worktreeStore";
 
 function seedProjects(): void {
   setProjects([
@@ -125,9 +146,14 @@ describe("TerminalGrid persistent surfaces", () => {
   beforeEach(() => {
     surfaceMounts = 0;
     surfaceCleanups = 0;
+    projectorCalls = 0;
     setCrossProjectViewMode(null);
     __setDragStateForTests(null);
     __resetRuntimeLayoutForTests();
+    // `__resetRuntimeLayoutForTests` rewinds `layoutRev` to 0, so a cached
+    // projection from the previous test would otherwise be reused for a
+    // completely different tree at the same key.
+    __resetProjectionCacheForTests();
     __resetProjectStoreForTests();
     __resetTerminalStoreForTests();
     seedProjects();
@@ -137,7 +163,64 @@ describe("TerminalGrid persistent surfaces", () => {
 
   afterEach(() => {
     __setDragStateForTests(null);
+    setPresentationPolicy("legacy");
     cleanup();
+  });
+
+  /** The positioned surface frame that owns a mocked pane. */
+  function frameOf(key: string): HTMLElement {
+    const el = screen.getByTestId(`terminal-surface-${key}`).closest(".terminal-surface-frame");
+    if (!el) throw new Error(`no surface frame for ${key}`);
+    return el as HTMLElement;
+  }
+
+  function dragFrom(sourceId: string): void {
+    __setDragStateForTests({
+      sourceId,
+      sourceKind: "codex",
+      sourceLabel: "Codex",
+      startPointerX: 0,
+      startPointerY: 0,
+      targetId: null,
+      zone: null,
+      targetRect: null,
+      snapped: false,
+      snapHystRect: null,
+      armed: false,
+      armStartedAtMs: null,
+      armDelayMs: 0,
+      escapedTargetId: null,
+    });
+  }
+
+  it("legacy policy leaves hidden hosts in layout", () => {
+    render(() => <TerminalGrid />);
+    const beta = frameOf("tab-beta");
+    expect(beta.style.display).toBe("");
+    expect(beta.style.visibility).toBe("hidden");
+  });
+
+  it("warm-residency takes hidden hosts out of layout, except mid-gesture", () => {
+    setPresentationPolicy("warm-residency");
+    render(() => <TerminalGrid />);
+
+    const alpha = frameOf("tab-alpha");
+    const beta = frameOf("tab-beta");
+    expect(alpha.style.display).toBe("");
+    expect(beta.style.display).toBe("none");
+    // The cached rect survives hiding: show must not wait for geometry.
+    expect(beta.style.getPropertyValue("--w-pct")).toBe("100%");
+
+    // Drag source: the surface rides the cursor transform, so it has to stay
+    // laid out for the whole gesture.
+    dragFrom("cell-beta");
+    expect(beta.style.display).toBe("");
+    __setDragStateForTests(null);
+    expect(beta.style.display).toBe("none");
+
+    // Maximize animation target: same reason, until the transition ends.
+    toggleMaximize("cell-beta");
+    expect(beta.style.display).toBe("");
   });
 
   it("keeps terminal surfaces mounted across project switches and cross-project filters", () => {
@@ -452,5 +535,99 @@ describe("TerminalGrid persistent surfaces", () => {
     expect(sourceSurface.classList.contains("is-snapped")).toBe(false);
     expect(siblingChrome.classList.contains("pane-review-snap-target")).toBe(false);
     expect(screen.queryByTestId("review-snap-overlay")).toBeNull();
+  });
+
+  it("derives pane-active state from focus without re-running the projector", () => {
+    render(() => <TerminalGrid />);
+
+    const alpha = screen.getByTestId("terminal-surface-tab-alpha");
+    const beta = screen.getByTestId("terminal-surface-tab-beta");
+    expect(alpha).toHaveAttribute("data-active", "false");
+
+    const projectionsAfterMount = projectorCalls;
+    const mountsAfterMount = surfaceMounts;
+
+    setFocusedPaneId("cell-alpha");
+    expect(alpha).toHaveAttribute("data-active", "true");
+    // Hidden surface in another project: never active, even when its cell id
+    // happens to be the focused one.
+    expect(beta).toHaveAttribute("data-active", "false");
+
+    setFocusedPaneId("cell-beta");
+    expect(alpha).toHaveAttribute("data-active", "false");
+    expect(beta).toHaveAttribute("data-active", "false");
+
+    // The whole point: focus touched only the two focus consumers. No global
+    // re-projection, no remount, no teardown.
+    expect(projectorCalls).toBe(projectionsAfterMount);
+    expect(surfaceMounts).toBe(mountsAfterMount);
+    expect(surfaceCleanups).toBe(0);
+  });
+
+  it("flips only the affected hosts' visibility on an A→B project switch", () => {
+    render(() => <TerminalGrid />);
+
+    const alpha = screen.getByTestId("terminal-surface-tab-alpha");
+    const beta = screen.getByTestId("terminal-surface-tab-beta");
+    expect(alpha).toHaveAttribute("data-visible", "true");
+    expect(beta).toHaveAttribute("data-visible", "false");
+
+    const mountsBefore = surfaceMounts;
+    setActiveProjectSlug("beta");
+
+    expect(alpha).toHaveAttribute("data-visible", "false");
+    expect(beta).toHaveAttribute("data-visible", "true");
+    expect(surfaceMounts).toBe(mountsBefore);
+    expect(surfaceCleanups).toBe(0);
+    // Same DOM nodes — the hosts were updated in place, not recreated.
+    expect(screen.getByTestId("terminal-surface-tab-alpha")).toBe(alpha);
+    expect(screen.getByTestId("terminal-surface-tab-beta")).toBe(beta);
+  });
+
+  it("keeps active tab selection off the geometry projection path", () => {
+    setRuntimeLayout([
+      {
+        id: "cell-alpha",
+        x: 0,
+        y: 0,
+        w: LAYOUT_UNIT,
+        h: LAYOUT_UNIT,
+        kind: "codex",
+        projectSlug: "alpha",
+        activeTabId: "tab-alpha",
+        tabs: [
+          { id: "tab-alpha", sessionId: "session-alpha" },
+          { id: "tab-alpha-2", sessionId: "session-alpha-2" },
+        ],
+      },
+    ]);
+
+    render(() => <TerminalGrid />);
+    const first = screen.getByTestId("terminal-surface-tab-alpha");
+    const second = screen.getByTestId("terminal-surface-tab-alpha-2");
+    expect(first).toHaveAttribute("data-visible", "true");
+    expect(second).toHaveAttribute("data-visible", "false");
+
+    const mountsBefore = surfaceMounts;
+    setActiveTabId("cell-alpha", "tab-alpha-2");
+
+    expect(first).toHaveAttribute("data-visible", "false");
+    expect(second).toHaveAttribute("data-visible", "true");
+    expect(surfaceMounts).toBe(mountsBefore);
+    expect(surfaceCleanups).toBe(0);
+  });
+  it("a notification for a main-worktree pane widens a pinned feature-worktree scope", () => {
+    render(() => <TerminalGrid />);
+    // cell-alpha has no worktreeId: it lives in the main worktree, which the
+    // scope prune keys by the project root path.
+    setActiveWorktree("alpha", "/tmp/alpha/.raum/feature");
+    window.dispatchEvent(
+      new CustomEvent("terminal-focus-requested", { detail: { sessionId: "session-alpha" } }),
+    );
+    expect(activeWorktreeStore.byProject["alpha"]).toEqual({
+      mode: "worktree",
+      path: "/tmp/alpha",
+    });
+    expect(focusedPaneId()).toBe("cell-alpha");
   });
 });

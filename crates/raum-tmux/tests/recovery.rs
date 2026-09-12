@@ -368,6 +368,15 @@ async fn pty_bridge_preserves_large_burst_markers() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
+    // The attached client's first paint races the burst: a fast runner can
+    // finish the whole 2.5k-line loop (and capture-pane can see both markers)
+    // before `tmux attach` has handshaked and the PTY reader delivered a single
+    // frame. The pane keeps repainting for the trailing `sleep 2`, so give the
+    // bridge a bounded window to forward anything at all.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while *received_bytes.lock().unwrap() == 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert!(
         *received_bytes.lock().unwrap() > 0,
         "PTY bridge should have forwarded some bytes from the burst"

@@ -48,6 +48,8 @@ import { SerializeAddon } from "@xterm/addon-serialize";
 import { invoke } from "@tauri-apps/api/core";
 import type { Terminal } from "@xterm/xterm";
 
+import { countScoped } from "./navigationDiagnostics";
+
 const SNAPSHOT_DEBOUNCE_MS = 2000;
 /**
  * Hard ceiling on how long a continuously-emitting pane can defer its snapshot.
@@ -103,6 +105,53 @@ const sources = new Map<string, SnapshotSource>();
 const armedAt = new Map<string, number>();
 
 /**
+ * Task 7.6 instrumentation. SerializeAddon's scan is synchronous main-thread
+ * work, and every pane arms its own independent 2000 ms debounce, so bursts of
+ * panes whose timers have drifted into alignment produce back-to-back jobs the
+ * per-session numbers alone can't show. Recorded, not acted on: the scheduling
+ * decision is measurement-gated (see measurements/output-decision.md).
+ */
+const ALIGNED_BURST_WINDOW_MS = 50;
+const lastSerializeMs = new Map<string, number>();
+let lastSerializeStartMs: number | null = null;
+let alignedBurstStreak = 0;
+let maxAlignedBurst = 0;
+
+function recordSerialize(sessionId: string | undefined, startedAt: number): void {
+  const durationMs = Date.now() - startedAt;
+  if (sessionId) lastSerializeMs.set(sessionId, durationMs);
+  alignedBurstStreak =
+    lastSerializeStartMs !== null && startedAt - lastSerializeStartMs <= ALIGNED_BURST_WINDOW_MS
+      ? alignedBurstStreak + 1
+      : 1;
+  lastSerializeStartMs = startedAt;
+  if (alignedBurstStreak > maxAlignedBurst) maxAlignedBurst = alignedBurstStreak;
+  countScoped("snapshot-serialize", durationMs);
+}
+
+/** Read the 7.6 counters (duty-cycle report, tests). Counts every synchronous
+ *  serialization, overflow retries included. */
+export function snapshotSerializeStats(): {
+  lastDurationMsBySession: Record<string, number>;
+  alignedBurstStreak: number;
+  maxAlignedBurst: number;
+} {
+  return {
+    lastDurationMsBySession: Object.fromEntries(lastSerializeMs),
+    alignedBurstStreak,
+    maxAlignedBurst,
+  };
+}
+
+/** Test-only: drop the recorded serialization counters. */
+export function __resetSnapshotSerializeStatsForTests(): void {
+  lastSerializeMs.clear();
+  lastSerializeStartMs = null;
+  alignedBurstStreak = 0;
+  maxAlignedBurst = 0;
+}
+
+/**
  * SerializeAddon owner for a pane. The addon must be loaded into the same
  * xterm instance whose buffer it's serializing, so we never construct a
  * pane-less serializer here — callers create the addon at xterm init and
@@ -117,10 +166,13 @@ function serializeAt(
   addon: SerializeAddon,
   scrollback: number,
   excludeAltBuffer: boolean,
+  sessionId?: string,
 ): Uint8Array | null {
+  const startedAt = Date.now();
   const text = addon.serialize({ scrollback, excludeAltBuffer });
-  if (!text) return null;
-  return textEncoder.encode(text);
+  const bytes = text ? textEncoder.encode(text) : null;
+  recordSerialize(sessionId, startedAt);
+  return bytes;
 }
 
 /**
@@ -166,7 +218,7 @@ export async function persistTerminalSnapshot(
   const excludeAltBuffer = shouldExcludeAltBuffer(source.term);
   let scrollback = SCROLLBACK_CHECKPOINT;
   for (let attempt = 0; attempt < OVERFLOW_RETRIES; attempt += 1) {
-    const bytes = serializeAt(source.addon, scrollback, excludeAltBuffer);
+    const bytes = serializeAt(source.addon, scrollback, excludeAltBuffer, sessionId);
     if (!bytes || bytes.byteLength === 0) return;
     try {
       const accepted = await invoke<boolean>("terminal_snapshot_persist", bytes, {

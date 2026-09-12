@@ -14,6 +14,8 @@ import {
   toggleMaximize,
   type RuntimeCell,
 } from "../../stores/runtimeLayoutStore";
+import { activeProjectSlug } from "../../stores/projectStore";
+import { activateView, crossProjectViewMode } from "../../lib/viewActivation";
 import { isReviewLinked } from "../../stores/reviewLinkStore";
 import { FileDropOverlay } from "./file-drop-overlay";
 import { PaneHeader } from "./pane-header";
@@ -39,7 +41,16 @@ export const LeafFrame: Component<{ cell: RuntimeCell; maximizedPaneId: string |
   const dragBodyIcon = createMemo(() => HARNESS_ICONS[props.cell.kind as HarnessIconKind]);
 
   function onFocusCapture(): void {
-    setFocusedPaneId(props.cell.id);
+    // Routed through the shared activation helper so a chrome click claims the
+    // same batch + navigation generation as every other entry point (a stale
+    // scheduled focus from an earlier navigation then can't steal it back).
+    // Spotlight (cross-project) frames just take focus: activating would
+    // switch the project underneath the spotlight and re-resolve the cell
+    // against a scope it may not be in.
+    const slug = props.cell.projectSlug ?? activeProjectSlug();
+    if (slug && crossProjectViewMode() === null) {
+      activateView({ projectSlug: slug, cellId: props.cell.id, source: "mouse" });
+    } else setFocusedPaneId(props.cell.id);
     // Mirror of `claimFocus` in surfaces.tsx — covers clicks landing on
     // the chrome layer (tabs, header chrome). Acknowledges any unread
     // completion on the active tab so re-clicking the already-focused

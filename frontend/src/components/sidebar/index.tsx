@@ -30,10 +30,9 @@ import {
   ALL_WORKTREES_SCOPE,
   activeWorktreeStore,
   refreshWorktreeList,
-  setActiveWorktree,
-  setActiveWorktreeAll,
   worktreesByProject,
 } from "../../stores/worktreeStore";
+import { activateView } from "../../lib/viewActivation";
 import { activeProjectSlug, projectStore, refreshProjects } from "../../stores/projectStore";
 import { harnessCountsForProject, harnessCountsForWorktree } from "../../stores/terminalStore";
 import { AlertCircleIcon, CheckIcon, GridEqualIcon, LoaderIcon } from "../icons";
@@ -161,7 +160,13 @@ export const Sidebar: Component = () => {
                       classList={{ "sidebar-row-active": isAllActiveMini() }}
                       aria-current={isAllActiveMini() ? "true" : undefined}
                       title={`All scopes — ${allCounts().active} active · ${allCounts().waiting} waiting · ${allCounts().idle} idle`}
-                      onClick={() => setActiveWorktreeAll(project().slug)}
+                      onClick={() =>
+                        activateView({
+                          projectSlug: project().slug,
+                          scope: ALL_WORKTREES_SCOPE,
+                          source: "mouse",
+                        })
+                      }
                     >
                       <GridEqualIcon
                         class="size-3"
@@ -193,7 +198,13 @@ export const Sidebar: Component = () => {
                             classList={{ "sidebar-row-active": isActiveWt() }}
                             aria-current={isActiveWt() ? "true" : undefined}
                             title={`${wtName()} — ${counts().active} active · ${counts().waiting} waiting · ${counts().idle} idle`}
-                            onClick={() => setActiveWorktree(project().slug, wt.path)}
+                            onClick={() =>
+                              activateView({
+                                projectSlug: project().slug,
+                                scope: { mode: "worktree", path: wt.path },
+                                source: "mouse",
+                              })
+                            }
                           >
                             {/* Active — spinning loader, emerald when > 0 */}
                             <span

@@ -3,9 +3,15 @@ import { Component, For, Show, createEffect, createMemo, createSignal, onCleanup
 import { type Rect } from "../../lib/layoutTree";
 import { dropTargetPaneId } from "../../lib/fileDrop";
 import { ROOT_TARGET, dragState } from "../../lib/paneDnD";
-import { type TerminalSurfaceDescriptor } from "../../lib/terminalSurfaceProjection";
+import {
+  sameSurfaceDescriptor,
+  type TerminalSurfaceDescriptor,
+} from "../../lib/terminalSurfaceProjection";
+import { getPresentationPolicy } from "../../lib/rendererScheduler";
+import { activateView, crossProjectViewMode } from "../../lib/viewActivation";
 import {
   LAYOUT_UNIT,
+  focusedPaneId,
   maxAnimTargetId,
   removeCellTab,
   runtimeLayoutStore,
@@ -14,6 +20,7 @@ import {
   setTabSessionId,
   toggleMaximize,
 } from "../../stores/runtimeLayoutStore";
+import { activeProjectSlug } from "../../stores/projectStore";
 import { agentStore, isAcknowledgedReactive, markAcknowledged } from "../../stores/agentStore";
 import { TerminalPane } from "../terminal-pane";
 import { AutoLabelBinder } from "./auto-label-binder";
@@ -32,7 +39,17 @@ export const TerminalSurfaceLayer: Component<{ surfaces: TerminalSurfaceDescript
     <div class="terminal-surface-layer absolute inset-0">
       <For each={keys()}>
         {(key) => {
-          const surface = createMemo(() => byKey().get(key) ?? null);
+          // Per-key identity guard: the global projector reruns whenever ANY
+          // surface's geometry/membership changes, but a host only needs a new
+          // descriptor when one of ITS fields actually moved. Returning the
+          // previous object keeps every downstream memo in this host from
+          // re-evaluating (and, at 100 sessions, keeps a single pane's rect
+          // change off the other 99 hosts).
+          const surface = createMemo<TerminalSurfaceDescriptor | null>((prev) => {
+            const next = byKey().get(key) ?? null;
+            if (prev && next && sameSurfaceDescriptor(prev, next)) return prev;
+            return next;
+          }, null);
           return (
             <Show when={surface()}>{(current) => <TerminalSurfaceHost surface={current()} />}</Show>
           );
@@ -62,6 +79,19 @@ export const TerminalSurfaceHost: Component<{ surface: TerminalSurfaceDescriptor
 
   const rect = createMemo(() => props.surface.rect ?? lastRect());
   const visible = createMemo(() => props.surface.visible && rect() !== null);
+  // Focus lives OUTSIDE the surface projection (it used to be a projector
+  // input, so every pane click rebuilt the whole descriptor list). Reproduce
+  // the projector's old `visible && activeTab && focusedCell === cellId` from
+  // narrow accessors instead: the scalar focused-cell signal plus this pane's
+  // own `activeTabId`. Orphan surfaces have no cell/tab and are never active.
+  const isActiveTab = createMemo(() => {
+    const { cellId, tabId } = props.surface;
+    if (!cellId || !tabId) return false;
+    return runtimeLayoutStore.panes[cellId]?.activeTabId === tabId;
+  });
+  const isActive = createMemo(
+    () => visible() && isActiveTab() && focusedPaneId() === props.surface.cellId,
+  );
   // True when this surface owns the pane currently being dragged. The
   // `.surface-dragging-source` CSS rule then translates it with the same
   // `--drag-dx`/`--drag-dy` the chrome uses, so the live terminal rides
@@ -108,24 +138,55 @@ export const TerminalSurfaceHost: Component<{ surface: TerminalSurfaceDescriptor
   const isMaxAnimTarget = createMemo(
     () => !!props.surface.cellId && maxAnimTargetId() === props.surface.cellId,
   );
+  // Under `warm-residency` a hidden host is taken out of layout entirely:
+  // `visibility: hidden` still lays out and still lets xterm paint into its
+  // canvases, which is exactly the hidden work task 4.3 removes. Two
+  // transitions must keep their current presentation until the gesture ends,
+  // because both animate a surface the projection has already stopped calling
+  // visible: the drag source (it rides `--drag-dx/dy` and must stay painted
+  // under the cursor) and the maximize animation target. Siblings of a
+  // maximized pane are unaffected — the projector keeps them `visible` and CSS
+  // covers them by z-index, so they never reach this branch.
+  const hiddenByDisplay = createMemo(
+    () =>
+      !visible() &&
+      getPresentationPolicy() === "warm-residency" &&
+      !isDragSource() &&
+      !isMaxAnimTarget(),
+  );
   const style = createMemo<Record<string, string>>(() => {
+    // The last known rect is kept either way: show must not have to wait for a
+    // geometry round-trip to know where the pane goes.
     const r = rect() ?? { id: props.surface.key, x: 0, y: 0, w: LAYOUT_UNIT, h: LAYOUT_UNIT };
-    return {
+    const style: Record<string, string> = {
       ...rectStyle(r),
       visibility: visible() ? "visible" : "hidden",
       // Ghost surface must pass pointer events through so destination panes
       // remain hit-testable during the drag.
       "pointer-events": visible() && !isDragSource() ? "auto" : "none",
     };
+    // Dropped from the object (not set to `block`) when it no longer applies:
+    // Solid removes keys that leave the style object, and the frame's own CSS
+    // owns its display mode.
+    if (hiddenByDisplay()) style.display = "none";
+    return style;
   });
 
   function claimFocus(): void {
     const { cellId, tabId, sessionId } = props.surface;
     if (!cellId) return;
-    if (tabId && runtimeLayoutStore.panes[cellId]?.activeTabId !== tabId) {
-      setActiveTabId(cellId, tabId);
+    const slug = props.surface.projectSlug ?? activeProjectSlug();
+    if (slug && crossProjectViewMode() === null) {
+      // Same batch/generation path as every other entry point. Scope is
+      // omitted: clicking a pane never changes the sidebar selection.
+      activateView({ projectSlug: slug, cellId, tabId, source: "mouse" });
+    } else {
+      // Project-less shell pane, or a pane projected by the cross-project
+      // spotlight: neither may switch the active project or re-resolve the
+      // cell against a scope it is not in — just take focus.
+      if (tabId) setActiveTabId(cellId, tabId);
+      setFocusedPaneId(cellId);
     }
-    setFocusedPaneId(cellId);
     // Acknowledge unread completion on this surface's session so the
     // green pane chrome clears even when the click lands inside an
     // already-focused pane — the focus signal stays equal in that
@@ -197,7 +258,7 @@ export const TerminalSurfaceHost: Component<{ surface: TerminalSurfaceDescriptor
           tabId={props.surface.tabId}
           borderColor="transparent"
           visible={visible()}
-          active={props.surface.active}
+          active={isActive()}
           initialPrompt={props.surface.initialPrompt}
           modelOverride={props.surface.modelOverride}
           recoverableAfterReboot={props.surface.recoverableAfterReboot}

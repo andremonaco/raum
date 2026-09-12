@@ -44,6 +44,7 @@
 //! Kept cross-platform on purpose: webkit2gtk has the same web-process-crash
 //! failure mode on Linux, and the check is free while the page is healthy.
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -296,6 +297,75 @@ pub fn webview_pong(state: tauri::State<'_, crate::state::AppHandleState>, nonce
 #[tauri::command]
 pub fn webview_wake_report(phase: String, ms: u64) {
     tracing::info!(phase = %phase, ms, "webview wake");
+}
+
+/// One correlated navigation record from the frontend recorder
+/// (`frontend/src/lib/navigationDiagnostics.ts`). Opaque IDs only — by
+/// construction the payload carries no project paths and no terminal text.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NavigationRecord {
+    id: u64,
+    kind: String,
+    source: String,
+    /// Webview-relative `performance.now()` at intent start.
+    start_ms: f64,
+    /// Milestone name -> ms offset from the record start. Ordered so the log
+    /// line is stable across flushes.
+    #[serde(default)]
+    milestones: BTreeMap<String, f64>,
+    #[serde(default)]
+    target: BTreeMap<String, String>,
+    #[serde(default)]
+    event_delay_ms: Option<f64>,
+    #[serde(default)]
+    result: Option<String>,
+}
+
+/// Count plus accumulated duration for one scoped hot path.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScopedCounter {
+    count: u64,
+    total_ms: f64,
+}
+
+/// One flush from the frontend recorder: at most one per second, never one
+/// invoke per record.
+#[derive(Debug, serde::Deserialize)]
+pub struct NavigationReport {
+    #[serde(default)]
+    records: Vec<NavigationRecord>,
+    #[serde(default)]
+    counters: BTreeMap<String, ScopedCounter>,
+}
+
+/// Frontend -> backend navigation diagnostics, so interaction milestones land
+/// in the daily log next to the probe/reload/reattach markers and "switching
+/// feels slow" becomes attributable per phase.
+#[tauri::command]
+pub fn webview_navigation_report(payload: NavigationReport) {
+    for record in payload.records {
+        tracing::info!(
+            id = record.id,
+            kind = %record.kind,
+            source = %record.source,
+            start_ms = record.start_ms,
+            result = record.result.as_deref().unwrap_or("unfinished"),
+            event_delay_ms = ?record.event_delay_ms,
+            target = ?record.target,
+            milestones = ?record.milestones,
+            "navigation",
+        );
+    }
+    for (name, counter) in payload.counters {
+        tracing::info!(
+            name = %name,
+            count = counter.count,
+            total_ms = counter.total_ms,
+            "navigation counter",
+        );
+    }
 }
 
 /// Releases `probe_in_flight` when the probe task ends — including panic

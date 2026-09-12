@@ -191,3 +191,12 @@ tasks:
       - echo "Sweeping target/release (dropping non-current toolchains)..."
       - CARGO_TARGET_DIR=target/release cargo sweep --installed
       - echo "Done."
+
+  # ---------------------------------------------------------------------------
+  # Measurement fixtures
+  # ---------------------------------------------------------------------------
+
+  fixture:nav:
+    desc: 'Isolated navigation fixture (openspec instant-view-switching §1.1). Args after `--`, e.g. `task fixture:nav -- --profile stress`'
+    dir: frontend
+    cmd: bun run scripts/nav-fixture.ts {{.CLI_ARGS}}

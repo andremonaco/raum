@@ -36,10 +36,15 @@ import { initHomeDir } from "./lib/pathDisplay";
 import { installFileDrop } from "./lib/fileDrop";
 import { installPaneFocusAcknowledger } from "./lib/paneFocusAcknowledger";
 import { installWebviewHealth } from "./lib/webviewHealth";
-import { installBackgroundRendererDemotion } from "./lib/rendererScheduler";
+import {
+  reclaimBackgroundPresentation,
+  resumePresentation,
+  suspendHiddenPresentation,
+} from "./lib/rendererScheduler";
+import { installWindowActivation } from "./lib/windowActivation";
 import { flushPendingAcks } from "./stores/agentStore";
 import { previewOnboarding, setPreviewOnboarding } from "./lib/devOnboardingPreview";
-import { startShellContextPoller } from "./lib/shellContextPoller";
+import { pollShellContextNow, startShellContextPoller } from "./lib/shellContextPoller";
 import {
   hydrateActiveWorktreeScopes,
   prewarmAllWorktrees,
@@ -344,10 +349,10 @@ const App: Component = () => {
     // writes queued here still land — otherwise the post-unlock reload
     // re-surfaces completions the user already dismissed, and a layout
     // mutation inside its 500 ms debounce is lost (the dock-orphan bug).
-    // Registered BEFORE the renderer demotion below on purpose: listeners
-    // run in registration order, and these IPC calls must be queued before
-    // the demotion's synchronous canvas-rebuild work eats the remaining
-    // pre-suspension time. (Terminal snapshots are deliberately NOT
+    // Registered BEFORE the window-activation coordinator below on purpose:
+    // listeners run in registration order, and these IPC calls must be queued
+    // before its paint-suspension work eats the remaining pre-suspension
+    // time. (Terminal snapshots are deliberately NOT
     // flushed here — visibilitychange fires on every app switch, and a
     // full SerializeAddon pass over every pane per Cmd-Tab is too heavy;
     // their debounce plus the quit flush cover them.)
@@ -363,9 +368,37 @@ const App: Component = () => {
     };
     window.addEventListener("pagehide", flushBeforePageDeath);
     document.addEventListener("visibilitychange", flushWhenHidden);
-    // Shed WebGL contexts while the page is hidden (screen lock) to make
-    // that WebContent kill less likely in the first place.
-    const stopBackgroundDemotion = installBackgroundRendererDemotion();
+    // One coordinator owns blur / hide / reclaim / return. It suspends
+    // painting the moment the page is hidden (screen lock, full occlusion),
+    // reclaims the expensive renderer resources only once a five-second wall
+    // clock grace has actually elapsed while still hidden, and resumes on
+    // return — coalescing the Tauri focus event and the DOM visibility event
+    // for one return into a single activation. Peripheral refreshes (status
+    // subscriptions, shell labels) run after the first usable frame rather
+    // than competing with it.
+    const stopWindowActivation = installWindowActivation({
+      now: () => Date.now(),
+      setTimeout: (callback, delayMs) => window.setTimeout(callback, delayMs),
+      clearTimeout: (handle) => window.clearTimeout(handle),
+      isHidden: () => document.hidden,
+      subscribeVisibility: (callback) => {
+        document.addEventListener("visibilitychange", callback);
+        return () => document.removeEventListener("visibilitychange", callback);
+      },
+      subscribeNativeFocus: (callback) =>
+        getCurrentWindow().onFocusChanged(({ payload: focused }) => callback(focused)),
+      onHidden: suspendHiddenPresentation,
+      onReclaim: reclaimBackgroundPresentation,
+      onReturn: () => resumePresentation(),
+      onAfterUsable: () => {
+        // The status push is declarative + idempotent, so it costs nothing
+        // when everything is healthy — but it lets the backend detect and
+        // respawn a watch task that died silently while the sidebar kept the
+        // same rows (the frozen-diffstat case with no refcount change).
+        resyncStatusSubscriptions();
+        pollShellContextNow();
+      },
+    });
     const stopShellContextPoller = startShellContextPoller();
     installPaneFocusAcknowledger();
     // Contract 1 (quit-flush): listen for the backend's `app-will-quit` and
@@ -382,36 +415,15 @@ const App: Component = () => {
         stopQuitFlush = unlisten;
       })
       .catch((e) => console.warn("installQuitFlush failed", e));
-    // On window focus, re-push the worktree-status subscription set. The push
-    // is declarative + idempotent, so this costs nothing when everything is
-    // healthy, but it lets the backend detect and respawn any watch task that
-    // died silently while the sidebar kept the same rows — the case where the
-    // sidebar diffstat freezes with no refcount change to trigger a fresh push.
-    let stopFocusResync: (() => void) | undefined;
-    void Promise.resolve()
-      .then(() =>
-        getCurrentWindow().onFocusChanged(({ payload: focused }) => {
-          if (focused) resyncStatusSubscriptions();
-        }),
-      )
-      .then((unlisten) => {
-        if (disposed) {
-          unlisten();
-          return;
-        }
-        stopFocusResync = unlisten;
-      })
-      .catch((e) => console.warn("status subscription focus resync failed", e));
     onCleanup(() => {
       disposed = true;
       stopFileDrop?.();
       stopWebviewHealth?.();
-      stopBackgroundDemotion();
+      stopWindowActivation();
       window.removeEventListener("pagehide", flushBeforePageDeath);
       document.removeEventListener("visibilitychange", flushWhenHidden);
       stopShellContextPoller();
       stopQuitFlush?.();
-      stopFocusResync?.();
     });
   });
 
