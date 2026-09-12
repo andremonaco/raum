@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.21](https://github.com/andremonaco/raum/releases/tag/v0.1.21) - 2026-09-12
+
+### Fixed
+
+- fix(hooks): keep concurrent parked permission requests for one session
+- fix(harness): launch and resume Claude with --teammate-mode in-process
+
+### Other
+
+- test(tmux): wait for the first forwarded frame in the large-burst bridge test
+
+
 ## [0.1.20](https://github.com/andremonaco/raum/releases/tag/v0.1.20) - 2026-09-11
 
 ### Fixed
