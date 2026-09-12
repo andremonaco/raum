@@ -1577,9 +1577,16 @@ export function setTabAutoLabel(
 }
 
 export function setActiveTabId(cellId: string, tabId: string): void {
-  if (!runtimeLayoutStore.panes[cellId]) return;
+  const pane = runtimeLayoutStore.panes[cellId];
+  if (!pane || pane.activeTabId === tabId) return;
   setRuntimeLayoutStore("panes", cellId, "activeTabId", tabId);
-  rebuildCells();
+  // Mirror into the derived `cells` row directly instead of calling
+  // `rebuildCells()`. The active tab is metadata, not geometry: a full rebuild
+  // bumps `layoutRev`, and every scoped-projection cache entry for every
+  // project is keyed on that revision (see `lib/scopedProjection.ts`). Tab
+  // selection would otherwise throw away the whole prewarmed geometry cache.
+  const idx = runtimeLayoutStore.cells.findIndex((c) => c.id === cellId);
+  if (idx >= 0) setRuntimeLayoutStore("cells", idx, "activeTabId", tabId);
   scheduleActiveSave();
 }
 

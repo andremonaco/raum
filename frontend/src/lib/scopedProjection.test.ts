@@ -17,6 +17,7 @@ import {
   __projectionCacheSizeForTests,
   __resetProjectionCacheForTests,
   getScopedProjection,
+  projectionPrewarmSteps,
   setProjectionCacheMaxSize,
 } from "./scopedProjection";
 import { ALL_WORKTREES_SCOPE, type WorktreeScope } from "../stores/worktreeStore";
@@ -114,4 +115,63 @@ describe("scopedProjection cache", () => {
 
   // Unused helper keeps the type import alive for explicit signature clarity.
   void cellFrom;
+});
+
+describe("projectionPrewarmSteps", () => {
+  beforeEach(() => {
+    __resetRuntimeLayoutForTests();
+    __resetProjectionCacheForTests();
+  });
+
+  function steps(scopes?: Record<string, WorktreeScope | undefined>) {
+    return projectionPrewarmSteps({
+      layoutRev: layoutRev(),
+      tree: runtimeLayoutStore.tree,
+      panes: runtimeLayoutStore.panes,
+      projects: [
+        { slug: "alpha", rootPath: "/tmp/alpha" },
+        { slug: "beta", rootPath: "/tmp/beta" },
+      ],
+      scopesByProject: scopes,
+    });
+  }
+
+  it("emits one work item per (project, scope) and computes nothing up front", () => {
+    splitPane(pane("a"), null, "right");
+    splitPane(pane("b", { projectSlug: "beta", worktreeId: "/tmp/beta" }), "a", "right");
+
+    const work = steps({ beta: { mode: "worktree", path: "/tmp/beta" } });
+    // alpha:all, beta:all, beta:/tmp/beta
+    expect(work).toHaveLength(3);
+    expect(__projectionCacheSizeForTests()).toBe(0);
+
+    // Each tick warms exactly one entry — a caller can bail between any two.
+    work[0]();
+    expect(__projectionCacheSizeForTests()).toBe(1);
+    work[1]();
+    expect(__projectionCacheSizeForTests()).toBe(2);
+  });
+
+  it("lets a superseded revision abandon the rest of the pass", () => {
+    splitPane(pane("a"), null, "right");
+    const staleRev = layoutRev();
+    const work = steps();
+
+    work[0]();
+    expect(__projectionCacheSizeForTests()).toBe(1);
+
+    // A real layout mutation bumps the revision; the caller drops the
+    // remaining steps rather than warming keys nobody will read.
+    splitPane(pane("c"), "a", "bottom");
+    expect(layoutRev()).not.toBe(staleRev);
+
+    const fresh = steps();
+    fresh[0]();
+    // The abandoned step's key is dead: warming the new revision adds an entry
+    // instead of reusing the stale one.
+    expect(__projectionCacheSizeForTests()).toBe(2);
+    expect(call("alpha", ALL_WORKTREES_SCOPE, "/tmp/alpha")).toBe(
+      call("alpha", ALL_WORKTREES_SCOPE, "/tmp/alpha"),
+    );
+  });
 });

@@ -642,6 +642,25 @@ describe("runtimeLayoutStore (BSP)", () => {
     expect(layoutRev()).toBeGreaterThan(beforeRemove);
   });
 
+  it("setActiveTabId does not bump layoutRev", () => {
+    splitPane(pane("a"), null, "right");
+    const firstTabId = runtimeLayoutStore.cells[0].tabs[0].id;
+    const secondTabId = addCellTab("a");
+    const stable = layoutRev();
+
+    setActiveTabId("a", firstTabId);
+    expect(runtimeLayoutStore.cells[0].activeTabId).toBe(firstTabId);
+    // Tab selection is metadata, not geometry: bumping the revision would
+    // invalidate every project's cached scoped projection (scopedProjection.ts).
+    expect(layoutRev()).toBe(stable);
+
+    setActiveTabId("a", secondTabId);
+    expect(layoutRev()).toBe(stable);
+    // Re-selecting the already-active tab is a no-op.
+    setActiveTabId("a", secondTabId);
+    expect(layoutRev()).toBe(stable);
+  });
+
   it("setTabAutoLabel does not bump layoutRev when the value is unchanged", () => {
     splitPane(pane("a"), null, "right");
     const tabId = runtimeLayoutStore.cells[0].tabs[0].id;

@@ -33,12 +33,12 @@ import {
   pruneWorktreeStatus,
   refreshWorktreeList,
   refreshWorktreeStatuses,
-  setActiveWorktree,
   worktreesByProject,
   type Worktree,
   type WorktreeScope,
 } from "../../stores/worktreeStore";
 import { activeProjectSlug, removeProject, type ProjectListItem } from "../../stores/projectStore";
+import { activateView } from "../../lib/viewActivation";
 import { harnessCountsForProject } from "../../stores/terminalStore";
 import { PlusIcon } from "../icons";
 import { CreateWorktreeModal } from "../create-worktree-modal";
@@ -142,7 +142,13 @@ const ProjectAccordion: Component<{
       setOpenPath(null); // collapse; the active scope is left untouched
     } else {
       setOpenPath(path);
-      setActiveWorktree(slug(), path);
+      // Scope + focus land in one batch, and the helper restores the pane the
+      // user last had focused in THIS worktree (falling back to a live one).
+      activateView({
+        projectSlug: slug(),
+        scope: { mode: "worktree", path },
+        source: "mouse",
+      });
     }
   };
 

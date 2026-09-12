@@ -5,6 +5,12 @@ import type { TerminalRecord } from "../stores/terminalStore";
 
 export type SurfaceSource = "layout" | "orphan";
 
+/**
+ * One mounted terminal presentation. Deliberately carries NO focus state:
+ * focus changes would otherwise rerun the whole-session projection on every
+ * pane click. `<TerminalSurfaceHost>` derives `active` from the scalar
+ * focused-cell signal instead.
+ */
 export interface TerminalSurfaceDescriptor {
   key: string;
   source: SurfaceSource;
@@ -16,7 +22,6 @@ export interface TerminalSurfaceDescriptor {
   worktreeId?: string;
   rect: Rect | null;
   visible: boolean;
-  active: boolean;
   maximized: boolean;
   /** Cross-harness review: forwarded into the next `terminal_spawn`. Set on
    *  the tab by the review-intent drop handler; cleared once consumed. */
@@ -28,6 +33,53 @@ export interface TerminalSurfaceDescriptor {
    *  session. Drives `<TerminalPane>`'s auto-fire of `terminal_respawn_dead`
    *  on first mount when the previous tmux server died across a reboot. */
   recoverableAfterReboot?: boolean;
+}
+
+/**
+ * Shallow field-by-field equality for one surface. `TerminalSurfaceLayer`
+ * uses it to hand the SAME descriptor object back to a host when nothing that
+ * host cares about changed, so an unrelated re-projection doesn't cascade
+ * through every host's memos. Deliberately explicit rather than a JSON
+ * round-trip: serialization is both slower and silently wrong on `undefined`.
+ * Every field of `TerminalSurfaceDescriptor` must appear here — including
+ * session, recovery and pending review-spawn inputs, which must keep
+ * propagating.
+ */
+export function sameSurfaceDescriptor(
+  a: TerminalSurfaceDescriptor,
+  b: TerminalSurfaceDescriptor,
+): boolean {
+  return (
+    a.key === b.key &&
+    a.source === b.source &&
+    a.kind === b.kind &&
+    a.sessionId === b.sessionId &&
+    a.cellId === b.cellId &&
+    a.tabId === b.tabId &&
+    a.projectSlug === b.projectSlug &&
+    a.worktreeId === b.worktreeId &&
+    a.visible === b.visible &&
+    a.maximized === b.maximized &&
+    a.initialPrompt === b.initialPrompt &&
+    a.recoverableAfterReboot === b.recoverableAfterReboot &&
+    sameRect(a.rect, b.rect) &&
+    sameModelOverride(a.modelOverride, b.modelOverride)
+  );
+}
+
+function sameRect(a: Rect | null, b: Rect | null): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return a.id === b.id && a.x === b.x && a.y === b.y && a.w === b.w && a.h === b.h;
+}
+
+function sameModelOverride(
+  a: TerminalSurfaceDescriptor["modelOverride"],
+  b: TerminalSurfaceDescriptor["modelOverride"],
+): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return a.model === b.model && a.effort === b.effort;
 }
 
 export interface ProjectTerminalSurfacesArgs {
@@ -43,7 +95,6 @@ export interface ProjectTerminalSurfacesArgs {
   projectedSessionIds: readonly string[];
   projectedRectMap: ReadonlyMap<string, Rect>;
   terminalById: Readonly<Record<string, TerminalRecord | undefined>>;
-  focusedPaneId: string | null;
   maximizedPaneId: string | null;
   /**
    * Speculative cell rects from the live drag preview tree. When present and
@@ -159,7 +210,6 @@ export function projectTerminalSurfaces(
           worktreeId,
           rect,
           visible,
-          active: visible && activeTab && args.focusedPaneId === cell.id,
           maximized,
           initialPrompt: tab.initialPrompt,
           modelOverride: tab.modelOverride,
@@ -193,7 +243,6 @@ export function projectTerminalSurfaces(
           worktreeId,
           rect: null,
           visible: false,
-          active: false,
           maximized: false,
           recoverableAfterReboot: tab.sessionId
             ? !!args.terminalById[tab.sessionId]?.recoverable_after_reboot
@@ -221,7 +270,6 @@ export function projectTerminalSurfaces(
         worktreeId: record.worktree_id ?? undefined,
         rect: visible ? projectedRect : null,
         visible,
-        active: false,
         maximized: false,
         recoverableAfterReboot: !!record.recoverable_after_reboot,
       },

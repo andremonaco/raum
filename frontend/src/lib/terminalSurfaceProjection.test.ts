@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { LAYOUT_UNIT, type PaneContent, type RuntimeCell } from "../stores/runtimeLayoutStore";
 import type { TerminalRecord } from "../stores/terminalStore";
 import type { Rect } from "./layoutTree";
-import { projectTerminalSurfaces } from "./terminalSurfaceProjection";
+import { projectTerminalSurfaces, sameSurfaceDescriptor } from "./terminalSurfaceProjection";
 
 function rect(id: string, x = 0, y = 0): Rect {
   return { id, x, y, w: LAYOUT_UNIT / 2, h: LAYOUT_UNIT / 2 };
@@ -49,7 +49,6 @@ describe("terminalSurfaceProjection", () => {
       projectedSessionIds: [],
       projectedRectMap: new Map(),
       terminalById: {},
-      focusedPaneId: "alpha",
       maximizedPaneId: null,
     });
     const second = projectTerminalSurfaces({
@@ -60,7 +59,6 @@ describe("terminalSurfaceProjection", () => {
       projectedSessionIds: [],
       projectedRectMap: new Map(),
       terminalById: {},
-      focusedPaneId: "beta",
       maximizedPaneId: null,
     });
 
@@ -83,7 +81,6 @@ describe("terminalSurfaceProjection", () => {
       projectedSessionIds: ["session-alpha"],
       projectedRectMap: new Map([["session-alpha", rect("session-alpha", 5000, 0)]]),
       terminalById: { "session-alpha": terminal("session-alpha") },
-      focusedPaneId: null,
       maximizedPaneId: null,
     });
 
@@ -111,7 +108,6 @@ describe("terminalSurfaceProjection", () => {
       projectedSessionIds: [],
       projectedRectMap: new Map(),
       terminalById: {},
-      focusedPaneId: "duplicate",
       maximizedPaneId: null,
     });
 
@@ -138,7 +134,6 @@ describe("terminalSurfaceProjection", () => {
       projectedSessionIds: [],
       projectedRectMap: new Map(),
       terminalById: {},
-      focusedPaneId: "alpha",
       maximizedPaneId: null,
     });
 
@@ -160,7 +155,6 @@ describe("terminalSurfaceProjection", () => {
       projectedSessionIds: [],
       projectedRectMap: new Map(),
       terminalById: {},
-      focusedPaneId: "beta",
       maximizedPaneId: "beta",
     });
 
@@ -202,7 +196,6 @@ describe("terminalSurfaceProjection", () => {
       projectedSessionIds: [],
       projectedRectMap: new Map(),
       terminalById: {},
-      focusedPaneId: "source",
       maximizedPaneId: null,
       previewRectMap: new Map([
         ["sibling", previewSiblingRect],
@@ -231,7 +224,6 @@ describe("terminalSurfaceProjection", () => {
       projectedSessionIds: ["session-owner"],
       projectedRectMap: new Map([["session-owner", projected]]),
       terminalById: { "session-owner": terminal("session-owner") },
-      focusedPaneId: null,
       maximizedPaneId: null,
       previewRectMap: new Map([["owner", preview]]),
       dragSourceId: null,
@@ -257,7 +249,6 @@ describe("terminalSurfaceProjection", () => {
       projectedSessionIds: [],
       projectedRectMap: new Map(),
       terminalById: {},
-      focusedPaneId: null,
       maximizedPaneId: null,
     });
     expect(surfaces).toHaveLength(1);
@@ -268,7 +259,6 @@ describe("terminalSurfaceProjection", () => {
       sessionId: "session-stashed",
       rect: null,
       visible: false,
-      active: false,
       maximized: false,
     });
   });
@@ -285,7 +275,6 @@ describe("terminalSurfaceProjection", () => {
         "orphan-session": terminal("orphan-session"),
         "hidden-orphan": terminal("hidden-orphan"),
       },
-      focusedPaneId: null,
       maximizedPaneId: null,
     });
 
@@ -296,5 +285,74 @@ describe("terminalSurfaceProjection", () => {
       visible: true,
     });
     expect(surfaces.find((surface) => surface.key === "orphan:hidden-orphan")).toBeUndefined();
+  });
+
+  it("carries no focus state: identical inputs minus focus produce identical descriptors", () => {
+    const alpha = cell("alpha", "alpha");
+    const beta = cell("beta", "alpha");
+    const args = {
+      cells: [alpha, beta],
+      activeRectMap: new Map([
+        ["alpha", rect("alpha")],
+        ["beta", rect("beta", 5000, 0)],
+      ]),
+      minimizedPaneIds: new Set<string>(),
+      crossProjectMode: null,
+      projectedSessionIds: [],
+      projectedRectMap: new Map(),
+      terminalById: {},
+      maximizedPaneId: null,
+    };
+
+    const first = projectTerminalSurfaces(args);
+    const second = projectTerminalSurfaces(args);
+
+    // `active` is gone from the descriptor entirely — the host derives it from
+    // the scalar focused-cell signal, so the projector has nothing focus-shaped
+    // left to rerun for.
+    expect(first.every((s) => !("active" in s))).toBe(true);
+    expect(first).toHaveLength(second.length);
+    for (let i = 0; i < first.length; i++) {
+      expect(sameSurfaceDescriptor(first[i], second[i])).toBe(true);
+    }
+  });
+
+  describe("sameSurfaceDescriptor", () => {
+    const base = (): ReturnType<typeof projectTerminalSurfaces>[number] =>
+      projectTerminalSurfaces({
+        cells: [cell("alpha", "alpha")],
+        activeRectMap: new Map([["alpha", rect("alpha")]]),
+        minimizedPaneIds: new Set(),
+        crossProjectMode: null,
+        projectedSessionIds: [],
+        projectedRectMap: new Map(),
+        terminalById: {},
+        maximizedPaneId: null,
+      })[0];
+
+    it("treats structurally equal descriptors as the same", () => {
+      expect(sameSurfaceDescriptor(base(), base())).toBe(true);
+    });
+
+    it("notices a moved rect", () => {
+      const moved = { ...base(), rect: rect("alpha", 100, 0) };
+      expect(sameSurfaceDescriptor(base(), moved)).toBe(false);
+    });
+
+    it("notices session, recovery and pending review-spawn changes", () => {
+      expect(sameSurfaceDescriptor(base(), { ...base(), sessionId: "other" })).toBe(false);
+      expect(sameSurfaceDescriptor(base(), { ...base(), recoverableAfterReboot: true })).toBe(
+        false,
+      );
+      expect(sameSurfaceDescriptor(base(), { ...base(), initialPrompt: "review" })).toBe(false);
+      expect(sameSurfaceDescriptor(base(), { ...base(), modelOverride: { model: "opus" } })).toBe(
+        false,
+      );
+    });
+
+    it("notices visibility and maximize changes", () => {
+      expect(sameSurfaceDescriptor(base(), { ...base(), visible: false })).toBe(false);
+      expect(sameSurfaceDescriptor(base(), { ...base(), maximized: true })).toBe(false);
+    });
   });
 });

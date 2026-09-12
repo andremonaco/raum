@@ -62,21 +62,17 @@ import { ROOT_TARGET, dragPointerX, dragPointerY, dragState } from "../../lib/pa
 import { WINDOW_RESIZE_ACTIVE_CLASS, installWindowResizeClass } from "../../lib/gridResizeClass";
 import { timeMemoSettle } from "../../lib/perf";
 import {
-  prewarmProjectionCache,
+  projectionPrewarmSteps,
   setProjectionCacheMaxSize,
   type ScopedProjection,
 } from "../../lib/scopedProjection";
+import { activateView, currentNavigationGeneration } from "../../lib/viewActivation";
 import {
   projectTerminalSurfaces,
   type TerminalSurfaceDescriptor,
 } from "../../lib/terminalSurfaceProjection";
 import { listTerminals } from "../../lib/terminalRegistry";
-import {
-  activeProjectSlug,
-  projectBySlug,
-  projectStore,
-  setActiveProjectSlug,
-} from "../../stores/projectStore";
+import { activeProjectSlug, projectBySlug, projectStore } from "../../stores/projectStore";
 import {
   LAYOUT_UNIT,
   addCellTab,
@@ -149,14 +145,18 @@ export const TerminalGrid: Component = () => {
 
   // PREWARM (deferred + gesture-gated).
   //
-  // `prewarmProjectionCache` re-projects EVERY known project's tree, and
-  // `layoutRev` bumps once per rAF frame while a divider is being dragged —
-  // so running it inline meant paying the full cross-project projection cost
-  // dozens of times a second for geometry the user is still changing. Instead
-  // the effect only arms a short trailing timer; a burst of revs coalesces to
-  // a single prewarm, and while a pane drag or a divider/window resize is in
-  // flight the timer simply re-arms until the gesture settles.
+  // Prewarming re-projects EVERY known project's tree, and `layoutRev` bumps
+  // once per rAF frame while a divider is being dragged — so running it inline
+  // meant paying the full cross-project projection cost dozens of times a
+  // second for geometry the user is still changing. Instead the effect only
+  // arms a short trailing timer; a burst of revs coalesces to a single
+  // prewarm, and while a pane drag or a divider/window resize is in flight the
+  // timer simply re-arms until the gesture settles. The pass itself is then
+  // sliced one (project, scope) at a time — see `runPrewarmSlice`.
   const PREWARM_IDLE_MS = 150;
+  /** Deadline fallback for `requestIdleCallback` so a permanently busy app
+   *  still warms one scope at a time instead of never warming at all. */
+  const PREWARM_DEADLINE_MS = 500;
   let prewarmTimer: ReturnType<typeof setTimeout> | null = null;
   const gridGestureActive = (): boolean => {
     if (dragState() !== null) return true;
@@ -166,6 +166,55 @@ export const TerminalGrid: Component = () => {
       root.classList.contains("is-resizing") || root.classList.contains(WINDOW_RESIZE_ACTIVE_CLASS)
     );
   };
+  // One (project, scope) per idle slice — never the whole all-project pass in
+  // a single timeout. Each slice re-checks the captured layout revision and
+  // navigation generation, so a switch mid-pass abandons the remaining work
+  // instead of holding the main thread while the user waits for their view.
+  let prewarmSteps: Array<() => void> = [];
+  let prewarmRev = -1;
+  let prewarmNav = -1;
+  let cancelPrewarmSlice: (() => void) | null = null;
+
+  function scheduleIdleSlice(cb: () => void): () => void {
+    const idle = (globalThis as { requestIdleCallback?: typeof requestIdleCallback })
+      .requestIdleCallback;
+    if (typeof idle === "function") {
+      // `timeout` is the deadline fallback: an app that never goes idle still
+      // makes prewarm progress instead of starving forever.
+      const id = idle(() => cb(), { timeout: PREWARM_DEADLINE_MS });
+      return () => cancelIdleCallback(id);
+    }
+    const id = setTimeout(cb, 0);
+    return () => clearTimeout(id);
+  }
+
+  function abandonPrewarm(): void {
+    prewarmSteps = [];
+    cancelPrewarmSlice?.();
+    cancelPrewarmSlice = null;
+  }
+
+  function runPrewarmSlice(): void {
+    cancelPrewarmSlice = null;
+    // Superseded: a real layout mutation invalidated the cache keys we were
+    // warming, or the user navigated. Drop the rest and let the trailing timer
+    // start a fresh pass once things settle.
+    if (prewarmRev !== layoutRev() || prewarmNav !== currentNavigationGeneration()) {
+      abandonPrewarm();
+      schedulePrewarm();
+      return;
+    }
+    if (gridGestureActive()) {
+      abandonPrewarm();
+      schedulePrewarm();
+      return;
+    }
+    const step = prewarmSteps.shift();
+    if (!step) return;
+    step();
+    if (prewarmSteps.length > 0) cancelPrewarmSlice = scheduleIdleSlice(runPrewarmSlice);
+  }
+
   const runPrewarm = (): void => {
     prewarmTimer = null;
     // Still mid-gesture — check back rather than projecting geometry that is
@@ -177,13 +226,17 @@ export const TerminalGrid: Component = () => {
     const projects = projectStore.items;
     if (projects.length === 0) return;
     setProjectionCacheMaxSize(Math.max(16, projects.length * 2));
-    prewarmProjectionCache({
-      layoutRev: layoutRev(),
+    abandonPrewarm();
+    prewarmRev = layoutRev();
+    prewarmNav = currentNavigationGeneration();
+    prewarmSteps = projectionPrewarmSteps({
+      layoutRev: prewarmRev,
       tree: runtimeLayoutStore.tree,
       panes: runtimeLayoutStore.panes,
       projects,
       scopesByProject: activeWorktreeStore.byProject,
     });
+    if (prewarmSteps.length > 0) cancelPrewarmSlice = scheduleIdleSlice(runPrewarmSlice);
   };
   function schedulePrewarm(): void {
     if (prewarmTimer !== null) clearTimeout(prewarmTimer);
@@ -207,6 +260,7 @@ export const TerminalGrid: Component = () => {
       clearTimeout(prewarmTimer);
       prewarmTimer = null;
     }
+    abandonPrewarm();
   });
 
   // Pruned tree + rect projection for the active project tab. Both drop
@@ -370,7 +424,9 @@ export const TerminalGrid: Component = () => {
       projectedSessionIds: projectedSessionIds(),
       projectedRectMap: projectedRectMap(),
       terminalById: terminalStore.byId,
-      focusedPaneId: focusedPaneId(),
+      // NO focused-pane input: focus is derived per host inside
+      // `<TerminalSurfaceHost>` so a pane click can't rebuild every
+      // descriptor in the app.
       maximizedPaneId: effectiveMaximizedPaneId(),
       // Live drag preview: route sibling cells to their projected rects so
       // their terminals reflow in lockstep with the chrome layer's
@@ -606,7 +662,7 @@ export const TerminalGrid: Component = () => {
 
   function findLayoutOwner(
     sessionId: string,
-  ): { cellId: string; tabId: string; projectSlug?: string } | null {
+  ): { cellId: string; tabId: string; projectSlug?: string; worktreeId?: string } | null {
     for (const cell of runtimeLayoutStore.cells) {
       for (const tab of cell.tabs) {
         if (tab.sessionId !== sessionId) continue;
@@ -614,6 +670,7 @@ export const TerminalGrid: Component = () => {
           cellId: cell.id,
           tabId: tab.id,
           projectSlug: tab.projectSlug ?? cell.projectSlug,
+          worktreeId: tab.worktreeId ?? cell.worktreeId,
         };
       }
     }
@@ -626,15 +683,44 @@ export const TerminalGrid: Component = () => {
       if (!sessionId) return;
 
       const owner = findLayoutOwner(sessionId);
-      if (owner) {
-        if (owner.projectSlug) setActiveProjectSlug(owner.projectSlug);
+      if (!owner) {
+        // Not in the grid (a dock orphan, say): nothing to select, but the
+        // surface may still be mounted — focus it where it stands.
+        focusRegisteredSession(sessionId);
+        return;
+      }
+      // Put the pane back in the tree FIRST: the activation helper validates
+      // the target against the scoped projection, which only sees in-tree
+      // cells.
+      if (minimizedPaneIds().has(owner.cellId)) restorePane(owner.cellId);
+      if (!owner.projectSlug) {
+        // Project-less shell: visible in every project's grid, so plain focus
+        // — there is no project/scope to activate.
         setActiveTabId(owner.cellId, owner.tabId);
-        if (minimizedPaneIds().has(owner.cellId)) restorePane(owner.cellId);
         setFocusedPaneId(owner.cellId);
         setCrossProjectViewMode(null);
+        focusRegisteredSession(sessionId);
+        return;
       }
-
-      focusRegisteredSession(sessionId);
+      // A pinned worktree scope that doesn't contain the target would prune it
+      // straight back out, so widen to the owner's worktree. An "all" scope
+      // (the default) already shows every cell — leave the user's pin alone.
+      // A pane without a stored worktree id lives in the main worktree (the
+      // scope prune's fallback bucket), so compare against the project root
+      // rather than treating it as "fits any pin".
+      const pinned = activeWorktreeStore.byProject[owner.projectSlug];
+      const ownerWorktree = owner.worktreeId ?? projectBySlug().get(owner.projectSlug)?.rootPath;
+      activateView({
+        projectSlug: owner.projectSlug,
+        scope:
+          ownerWorktree && pinned?.mode === "worktree" && pinned.path !== ownerWorktree
+            ? { mode: "worktree", path: ownerWorktree }
+            : undefined,
+        cellId: owner.cellId,
+        tabId: owner.tabId,
+        crossProjectMode: null,
+        source: "notification",
+      });
     }
 
     window.addEventListener("terminal-focus-requested", onTerminalFocusRequested);
@@ -644,8 +730,12 @@ export const TerminalGrid: Component = () => {
   });
 
   function onRestoreFromDock(cellId: string): void {
+    // Put the pane back in the tree FIRST: the activation helper validates the
+    // target against the scoped projection, which only sees in-tree cells.
     restorePane(cellId);
-    setFocusedPaneId(cellId);
+    const slug = runtimeLayoutStore.panes[cellId]?.projectSlug ?? activeProjectSlug();
+    if (slug) activateView({ projectSlug: slug, cellId, source: "dock" });
+    else setFocusedPaneId(cellId);
   }
 
   // Drive --drag-dx / --drag-dy on the grid root from the drag pointer.

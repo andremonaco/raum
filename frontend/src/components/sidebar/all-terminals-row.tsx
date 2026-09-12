@@ -12,7 +12,8 @@
  */
 
 import { Component } from "solid-js";
-import { setActiveWorktreeAll } from "../../stores/worktreeStore";
+import { ALL_WORKTREES_SCOPE } from "../../stores/worktreeStore";
+import { activateView } from "../../lib/viewActivation";
 import { Tooltip, TooltipContent, TooltipPortal, TooltipTrigger } from "../ui/tooltip";
 import { HarnessCounter } from "./harness-counter";
 import type { AllTerminalsRowProps } from "./types";
@@ -29,7 +30,15 @@ export const AllTerminalsRow: Component<AllTerminalsRowProps> = (rowProps) => {
           class="flex w-full items-center gap-2.5 rounded px-1.5 py-1.5 hover:bg-hover"
           aria-current={rowProps.isActive ? "true" : undefined}
           aria-label={`All terminals across every worktree in ${rowProps.projectName}`}
-          onClick={() => setActiveWorktreeAll(rowProps.projectSlug)}
+          onClick={() =>
+            // Explicit All Worktrees — distinct from an omitted scope, which
+            // would restore whatever the project last had selected.
+            activateView({
+              projectSlug: rowProps.projectSlug,
+              scope: ALL_WORKTREES_SCOPE,
+              source: "mouse",
+            })
+          }
         >
           <span class={lineClass()} />
           <HarnessCounter counts={rowProps.counts} compact />

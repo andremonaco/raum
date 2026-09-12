@@ -13,6 +13,7 @@ import {
   Component,
   For,
   Show,
+  batch,
   createEffect,
   createMemo,
   createSignal,
@@ -28,7 +29,6 @@ import {
   projectBySlug,
   refreshProjects,
   reopenProject,
-  setActiveProjectSlug,
   setProjectHidden,
   subscribeProjectEvents,
   upsertProject,
@@ -122,6 +122,12 @@ import {
   subscribeWorktreeStatusEvents,
 } from "../stores/worktreeStore";
 import { resolveSpawnWorktree } from "../lib/resolveSpawnWorktree";
+import {
+  activateView,
+  crossProjectViewMode,
+  setCrossProjectViewMode,
+  type CrossProjectViewMode,
+} from "../lib/viewActivation";
 import { ProjectSettingsDialog } from "./project-settings-dialog";
 import { AttentionRail } from "./attention-rail";
 
@@ -138,12 +144,12 @@ export { selectedFilter, setSelectedFilter };
  * each pane's header glows with its owning project's color. `null` = normal
  * single-project grid. Mutually exclusive with `selectedFilter`, which stays
  * project-scoped.
+ *
+ * The signal itself lives in `lib/viewActivation.ts` so the shared activation
+ * batch can clear it without a component → lib import cycle; it is re-exported
+ * here because every consumer already imports it from this module.
  */
-export type CrossProjectViewMode = "awaiting" | "completed" | "working";
-const [crossProjectViewMode, setCrossProjectViewMode] = createSignal<CrossProjectViewMode | null>(
-  null,
-);
-export { crossProjectViewMode, setCrossProjectViewMode };
+export { crossProjectViewMode, setCrossProjectViewMode, type CrossProjectViewMode };
 
 /** Drive a terminal-launch (`raum <dir>`) open and reconcile the surrounding
  *  view: when an existing project is focused, leave any cross-project view and
@@ -949,10 +955,15 @@ export const TopRow: Component = () => {
       unregs.push(
         keymap.register(`select-project-${i}`, () => {
           const target = visibleProjects()[idx];
-          if (target) {
-            setActiveProjectSlug(target.slug);
+          if (!target) return;
+          batch(() => {
             setSelectedFilter("active");
-          }
+            activateView({
+              projectSlug: target.slug,
+              crossProjectMode: null,
+              source: "keyboard",
+            });
+          });
         }),
       );
     }
@@ -984,8 +995,14 @@ export const TopRow: Component = () => {
       const current = activeProjectSlug();
       const idx = items.findIndex((p) => p.slug === current);
       const next = idx === -1 ? 0 : (idx + dir + items.length) % items.length;
-      setActiveProjectSlug(items[next]!.slug);
-      setSelectedFilter("active");
+      batch(() => {
+        setSelectedFilter("active");
+        activateView({
+          projectSlug: items[next]!.slug,
+          crossProjectMode: null,
+          source: "keyboard",
+        });
+      });
     };
   }
 
@@ -1031,8 +1048,10 @@ export const TopRow: Component = () => {
   // the user just reopened would never actually surface.
   function reopenAndFocus(slug: string): void {
     reopenProject(slug);
-    setSelectedFilter("active");
-    setCrossProjectViewMode(null);
+    batch(() => {
+      setSelectedFilter("active");
+      activateView({ projectSlug: slug, crossProjectMode: null, source: "mouse" });
+    });
   }
 
   // Toggle a cross-project view from a clickable counter on the right side of
@@ -1266,9 +1285,17 @@ export const TopRow: Component = () => {
                     onSelect={() => {
                       markStart("project-switch:active");
                       const clickedAt = performance.now();
-                      setActiveProjectSlug(project.slug);
-                      setSelectedFilter("active");
-                      setCrossProjectViewMode(null);
+                      batch(() => {
+                        setSelectedFilter("active");
+                        // Scope omitted on purpose: a tab click restores the
+                        // project's last worktree selection rather than
+                        // resetting it to All Worktrees.
+                        activateView({
+                          projectSlug: project.slug,
+                          crossProjectMode: null,
+                          source: "mouse",
+                        });
+                      });
                       // Click → first frame painted with the new project, into
                       // the daily log next to the `webgl-install` lines.
                       requestAnimationFrame(() =>

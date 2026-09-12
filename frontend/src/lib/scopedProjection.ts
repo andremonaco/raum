@@ -80,35 +80,42 @@ export function getScopedProjection(params: {
   return entry;
 }
 
-export function prewarmProjectionCache(params: {
+/**
+ * Split the prewarm into one work item per (project, scope) instead of
+ * projecting every project in a single pass. The caller runs them one per
+ * idle slice and re-checks `layoutRev` / the navigation generation between
+ * items, so a prewarm can never hold the main thread through a whole
+ * all-project projection while the user is trying to navigate.
+ *
+ * Nothing is computed until a step is called; each step is exactly one
+ * `getScopedProjection` (a cache hit is a map lookup).
+ */
+export function projectionPrewarmSteps(params: {
   layoutRev: number;
   tree: LayoutNode | null;
   panes: Record<string, PaneContent>;
   projects: readonly { slug: string; rootPath: string }[];
   scopesByProject?: Record<string, WorktreeScope | undefined>;
-}): void {
-  for (const project of params.projects) {
+}): Array<() => void> {
+  const steps: Array<() => void> = [];
+  const warm = (slug: string, scope: WorktreeScope, mainPath: string): void => {
     getScopedProjection({
       layoutRev: params.layoutRev,
       tree: params.tree,
       panes: params.panes,
-      slug: project.slug,
-      scope: { mode: "all" },
-      mainPath: project.rootPath,
+      slug,
+      scope,
+      mainPath,
     });
-
+  };
+  for (const project of params.projects) {
+    steps.push(() => warm(project.slug, { mode: "all" }, project.rootPath));
     const scope = params.scopesByProject?.[project.slug];
     if (scope && scope.mode !== "all") {
-      getScopedProjection({
-        layoutRev: params.layoutRev,
-        tree: params.tree,
-        panes: params.panes,
-        slug: project.slug,
-        scope,
-        mainPath: project.rootPath,
-      });
+      steps.push(() => warm(project.slug, scope, project.rootPath));
     }
   }
+  return steps;
 }
 
 export function __resetProjectionCacheForTests(): void {

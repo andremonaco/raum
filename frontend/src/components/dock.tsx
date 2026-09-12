@@ -25,6 +25,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { leafIds as treeLeafIds } from "../lib/layoutTree";
 import { kindDisplayLabel, type AgentKind } from "../lib/agentKind";
 import { listTerminals } from "../lib/terminalRegistry";
+import { activateView } from "../lib/viewActivation";
 import {
   adoptOrphanSession,
   compactTree,
@@ -584,13 +585,32 @@ const OrphanChip: Component<OrphanChipProps> = (props) => {
   const reliability = () => agentStore.sessions[props.record.session_id]?.reliability ?? null;
 
   const onAdopt = (): void => {
+    const {
+      session_id: sessionId,
+      kind,
+      project_slug: slug,
+      worktree_id: worktreeId,
+    } = props.record;
     const newPaneId = adoptOrphanSession({
-      sessionId: props.record.session_id,
-      kind: props.record.kind,
-      projectSlug: props.record.project_slug ?? undefined,
-      worktreeId: props.record.worktree_id ?? undefined,
+      sessionId,
+      kind,
+      projectSlug: slug ?? undefined,
+      worktreeId: worktreeId ?? undefined,
     });
-    setFocusedPaneId(newPaneId);
+    if (!slug) {
+      // Project-less shell: visible in every project's grid, so plain focus.
+      setFocusedPaneId(newPaneId);
+      return;
+    }
+    // The adopted pane carries the orphan's OWN project + worktree. Activate
+    // both, otherwise the pane is immediately pruned out of the current scope
+    // and focus lands on something invisible.
+    activateView({
+      projectSlug: slug,
+      scope: worktreeId ? { mode: "worktree", path: worktreeId } : undefined,
+      cellId: newPaneId,
+      source: "dock",
+    });
   };
 
   // Killing a recovered survivor is destructive and irreversible (the tmux
