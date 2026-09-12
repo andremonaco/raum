@@ -34,21 +34,16 @@ cask "raum" do
   # the whole upgrade rolls back: the user stays pinned to their installed
   # version until they delete the symlink by hand.
   #
-  # Drop the orphan first (preflight runs before any artifact is installed,
-  # whatever its position in this file). Only a symlink pointing into a
-  # raum.app bundle is touched — exactly the link we, or a manual DMG
-  # install, created — and the `binary` stanza recreates it immediately.
-  preflight do
-    stale_cli = Pathname("#{HOMEBREW_PREFIX}/bin/raum")
-    if stale_cli.symlink? && stale_cli.readlink.to_s.end_with?("raum.app/Contents/Resources/raum-cli")
-      begin
-        FileUtils.rm stale_cli
-      rescue Errno::EACCES, Errno::EPERM
-        # Not writable without sudo. Fall through: linking raises the error
-        # above, and `brew upgrade --cask --force raum` still gets through.
-        opoo "Could not remove the stale #{stale_cli} symlink; retry with --force if linking fails."
-      end
-    end
+  # Drop the orphan first (preflight steps run before any artifact is
+  # installed, whatever their position in this file). Only a symlink
+  # pointing into a raum.app bundle is touched — exactly the link we, or a
+  # manual DMG install, created — and the `binary` stanza recreates it
+  # immediately. Without `sudo:` the removal is best-effort: an unwritable
+  # prefix leaves the link in place and linking raises the error above,
+  # where `brew upgrade --cask --force raum` still gets through.
+  preflight_steps do
+    remove "bin/raum", base: :homebrew_prefix,
+           symlink_target_contains: "raum.app/Contents/Resources/raum-cli"
   end
 
   zap trash: [
