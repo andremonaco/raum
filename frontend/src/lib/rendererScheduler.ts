@@ -16,9 +16,8 @@
  * few seconds so an A->B->A navigation costs no renderer work at all. Budgets
  * (entry count + estimated backing bytes) and a deferred, cancellable
  * reclamation bound how much stays resident. `legacy` selects exactly the
- * pre-residency lifecycle and is the default until the native spike in
- * `openspec/changes/instant-view-switching/measurements/presentation-policy.md`
- * has run.
+ * pre-residency lifecycle as an explicit rollback. Warm residency is the
+ * default so inactive terminals do not participate in browser layout.
  *
  * Promotion is asynchronous (the WebGL addon is dynamically imported), so a
  * pane owns at most one promotion *job* at a time. A job carries the entry's
@@ -68,18 +67,16 @@ const POLICY_STORAGE_KEY = "raum:presentation-policy";
 /**
  * There is no persisted UI-settings store on the frontend boot path (the only
  * comparable knob, the terminal font size, also lives in `localStorage`), so
- * the switch is read once here. Flip it with
- * `localStorage.setItem("raum:presentation-policy", "warm-residency")` and
- * reload, or call `setPresentationPolicy` from the console.
+ * the switch is read once here. Warm residency applies unless explicitly
+ * rolled back with `localStorage.setItem("raum:presentation-policy", "legacy")`
+ * and an app restart. Remove the key and restart to restore the default.
  */
 function readInitialPolicy(): PresentationPolicy {
   try {
-    return localStorage.getItem(POLICY_STORAGE_KEY) === "warm-residency"
-      ? "warm-residency"
-      : "legacy";
+    return localStorage.getItem(POLICY_STORAGE_KEY) === "legacy" ? "legacy" : "warm-residency";
   } catch {
-    // No DOM storage (tests, locked-down webview): stay on the safe default.
-    return "legacy";
+    // Storage availability must not determine navigation performance.
+    return "warm-residency";
   }
 }
 

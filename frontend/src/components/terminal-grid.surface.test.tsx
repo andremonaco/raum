@@ -144,6 +144,7 @@ function seedTerminals(): void {
 
 describe("TerminalGrid persistent surfaces", () => {
   beforeEach(() => {
+    setPresentationPolicy("warm-residency");
     surfaceMounts = 0;
     surfaceCleanups = 0;
     projectorCalls = 0;
@@ -194,6 +195,7 @@ describe("TerminalGrid persistent surfaces", () => {
   }
 
   it("legacy policy leaves hidden hosts in layout", () => {
+    setPresentationPolicy("legacy");
     render(() => <TerminalGrid />);
     const beta = frameOf("tab-beta");
     expect(beta.style.display).toBe("");
