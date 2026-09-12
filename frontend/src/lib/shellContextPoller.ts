@@ -41,6 +41,16 @@ async function fetchIndividually(
   return Object.fromEntries(entries);
 }
 
+/** The running poller's tick, so the window-activation coordinator can ask
+ *  for one refresh right after a return without owning a second listener.
+ *  The tick dedupes itself (`inFlight`) and skips while hidden. */
+let activeTick: (() => void) | null = null;
+
+/** Refresh shell labels now (no-op when no poller is running). */
+export function pollShellContextNow(): void {
+  activeTick?.();
+}
+
 export function startShellContextPoller(): () => void {
   let stopped = false;
   let inFlight = false;
@@ -79,20 +89,14 @@ export function startShellContextPoller(): () => void {
     void tick();
   }, SHELL_CONTEXT_POLL_MS);
 
-  // Refresh immediately on re-show so the labels aren't up to one poll window
-  // stale after the ticks that were skipped while hidden.
-  const onVisibilityChange = (): void => {
-    if (!document.hidden) void tick();
-  };
-  if (typeof document !== "undefined") {
-    document.addEventListener("visibilitychange", onVisibilityChange);
-  }
+  // The re-show refresh is driven by `windowActivation`'s after-usable
+  // callback (via `pollShellContextNow`), so it lands after the first usable
+  // frame instead of competing with it.
+  activeTick = () => void tick();
 
   return () => {
     stopped = true;
+    activeTick = null;
     window.clearInterval(timer);
-    if (typeof document !== "undefined") {
-      document.removeEventListener("visibilitychange", onVisibilityChange);
-    }
   };
 }
