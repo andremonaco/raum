@@ -149,6 +149,17 @@ pub fn harness_launch_command_with_prompt_and_override(
     }
 }
 
+// raum renders one tmux pane per terminal. Claude's auto/tmux teammate mode
+// splits that window behind xterm's back, leaving the lead at reduced width.
+// Keep teammates in the lead UI unless the user explicitly opts into splits.
+fn claude_entrypoint(flags: Option<&str>) -> &'static str {
+    if flags_contain_token(flags, "--teammate-mode") {
+        "claude"
+    } else {
+        "claude --teammate-mode in-process"
+    }
+}
+
 fn render_claude(flags: Option<&str>, prompt_suffix: &str, ovr: Option<&ModelOverride>) -> String {
     let mut prefix = String::new();
     if let Some(o) = ovr {
@@ -163,12 +174,13 @@ fn render_claude(flags: Option<&str>, prompt_suffix: &str, ovr: Option<&ModelOve
             let _ = write!(prefix, "--effort {} ", shell_single_quote(effort));
         }
     }
+    let command = claude_entrypoint(flags);
     let trimmed_prefix = prefix.trim_end();
     match (flags, trimmed_prefix.is_empty()) {
-        (Some(f), true) => format!("claude {f}{prompt_suffix}"),
-        (Some(f), false) => format!("claude {trimmed_prefix} {f}{prompt_suffix}"),
-        (None, true) => format!("claude{prompt_suffix}"),
-        (None, false) => format!("claude {trimmed_prefix}{prompt_suffix}"),
+        (Some(f), true) => format!("{command} {f}{prompt_suffix}"),
+        (Some(f), false) => format!("{command} {trimmed_prefix} {f}{prompt_suffix}"),
+        (None, true) => format!("{command}{prompt_suffix}"),
+        (None, false) => format!("{command} {trimmed_prefix}{prompt_suffix}"),
     }
 }
 
@@ -310,10 +322,13 @@ pub fn harness_resume_command(
     let flags = extra_flags.map(str::trim).filter(|s| !s.is_empty());
 
     match kind {
-        AgentKind::ClaudeCode => Some(match flags {
-            Some(f) => format!("claude --resume {id_quoted} {f}"),
-            None => format!("claude --resume {id_quoted}"),
-        }),
+        AgentKind::ClaudeCode => {
+            let command = claude_entrypoint(flags);
+            Some(match flags {
+                Some(f) => format!("{command} --resume {id_quoted} {f}"),
+                None => format!("{command} --resume {id_quoted}"),
+            })
+        }
         AgentKind::Codex => Some(match flags {
             Some(f) => format!("codex resume {f} {id_quoted}"),
             None => format!("codex resume {id_quoted}"),
@@ -394,15 +409,30 @@ mod tests {
     fn claude_without_flags() {
         assert_eq!(
             harness_launch_command(AgentKind::ClaudeCode, None, None).as_deref(),
-            Some("claude"),
+            Some("claude --teammate-mode in-process"),
         );
+    }
+
+    #[test]
+    fn explicit_teammate_mode_is_preserved_on_launch_and_resume() {
+        for flags in ["--teammate-mode tmux", "--teammate-mode=auto"] {
+            assert_eq!(
+                harness_launch_command(AgentKind::ClaudeCode, Some(flags), None).unwrap(),
+                format!("claude {flags}"),
+            );
+            assert_eq!(
+                harness_resume_command(AgentKind::ClaudeCode, Some(flags), None, "session")
+                    .unwrap(),
+                format!("claude --resume 'session' {flags}"),
+            );
+        }
     }
 
     #[test]
     fn claude_with_flags() {
         assert_eq!(
             harness_launch_command(AgentKind::ClaudeCode, Some("--verbose"), None).as_deref(),
-            Some("claude --verbose"),
+            Some("claude --teammate-mode in-process --verbose"),
         );
     }
 
@@ -410,7 +440,7 @@ mod tests {
     fn empty_flags_treated_as_none() {
         assert_eq!(
             harness_launch_command(AgentKind::ClaudeCode, Some("   "), None).as_deref(),
-            Some("claude"),
+            Some("claude --teammate-mode in-process"),
         );
     }
 
@@ -481,7 +511,7 @@ mod tests {
             Some("review the diff"),
         )
         .unwrap();
-        assert_eq!(cmd, "claude 'review the diff'");
+        assert_eq!(cmd, "claude --teammate-mode in-process 'review the diff'");
     }
 
     #[test]
@@ -493,7 +523,7 @@ mod tests {
             Some("hi"),
         )
         .unwrap();
-        assert_eq!(cmd, "claude --verbose 'hi'");
+        assert_eq!(cmd, "claude --teammate-mode in-process --verbose 'hi'");
     }
 
     #[test]
@@ -546,11 +576,11 @@ mod tests {
     fn empty_prompt_is_treated_as_none() {
         let cmd = harness_launch_command_with_prompt(AgentKind::ClaudeCode, None, None, Some(""))
             .unwrap();
-        assert_eq!(cmd, "claude");
+        assert_eq!(cmd, "claude --teammate-mode in-process");
         let cmd2 =
             harness_launch_command_with_prompt(AgentKind::ClaudeCode, None, None, Some("   "))
                 .unwrap();
-        assert_eq!(cmd2, "claude");
+        assert_eq!(cmd2, "claude --teammate-mode in-process");
     }
 
     #[test]
@@ -572,7 +602,7 @@ mod tests {
             Some("don't break"),
         )
         .unwrap();
-        assert_eq!(cmd, r"claude 'don'\''t break'");
+        assert_eq!(cmd, r"claude --teammate-mode in-process 'don'\''t break'");
     }
 
     #[test]
@@ -622,7 +652,7 @@ mod tests {
     #[test]
     fn resume_claude_no_flags() {
         let cmd = harness_resume_command(AgentKind::ClaudeCode, None, None, "abc-uuid").unwrap();
-        assert_eq!(cmd, "claude --resume 'abc-uuid'");
+        assert_eq!(cmd, "claude --teammate-mode in-process --resume 'abc-uuid'");
     }
 
     #[test]
@@ -630,7 +660,10 @@ mod tests {
         let cmd =
             harness_resume_command(AgentKind::ClaudeCode, Some("--verbose"), None, "abc-uuid")
                 .unwrap();
-        assert_eq!(cmd, "claude --resume 'abc-uuid' --verbose");
+        assert_eq!(
+            cmd,
+            "claude --teammate-mode in-process --resume 'abc-uuid' --verbose"
+        );
     }
 
     #[test]
@@ -708,7 +741,10 @@ mod tests {
         // Defensive — the harnesses generate UUIDs/ULIDs without quotes,
         // but we shell-quote the id anyway to keep the contract uniform.
         let cmd = harness_resume_command(AgentKind::ClaudeCode, None, None, "weird'id").unwrap();
-        assert_eq!(cmd, r"claude --resume 'weird'\''id'");
+        assert_eq!(
+            cmd,
+            r"claude --teammate-mode in-process --resume 'weird'\''id'"
+        );
     }
 
     // ---- preexisting tests below ------------------------------------
@@ -732,7 +768,10 @@ mod tests {
             Some(&override_("opus", Some("high"))),
         )
         .unwrap();
-        assert_eq!(cmd, "claude --model 'opus' --effort 'high' 'review'");
+        assert_eq!(
+            cmd,
+            "claude --teammate-mode in-process --model 'opus' --effort 'high' 'review'"
+        );
     }
 
     #[test]
@@ -746,7 +785,10 @@ mod tests {
         )
         .unwrap();
         // user's --model wins; --effort still injected (no conflict)
-        assert_eq!(cmd, "claude --effort 'high' --model claude-sonnet-4-6");
+        assert_eq!(
+            cmd,
+            "claude --teammate-mode in-process --effort 'high' --model claude-sonnet-4-6"
+        );
     }
 
     #[test]
@@ -759,7 +801,10 @@ mod tests {
             Some(&override_("opus", Some("high"))),
         )
         .unwrap();
-        assert_eq!(cmd, "claude --model 'opus' --effort low --verbose");
+        assert_eq!(
+            cmd,
+            "claude --teammate-mode in-process --model 'opus' --effort low --verbose"
+        );
     }
 
     #[test]
@@ -772,7 +817,10 @@ mod tests {
             Some(&override_("claude-opus-4-7", None)),
         )
         .unwrap();
-        assert_eq!(cmd, "claude --model 'claude-opus-4-7'");
+        assert_eq!(
+            cmd,
+            "claude --teammate-mode in-process --model 'claude-opus-4-7'"
+        );
     }
 
     #[test]
@@ -887,7 +935,7 @@ mod tests {
             Some(&override_("   ", Some(""))),
         )
         .unwrap();
-        assert_eq!(cmd, "claude");
+        assert_eq!(cmd, "claude --teammate-mode in-process");
     }
 
     #[test]

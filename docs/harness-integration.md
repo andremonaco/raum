@@ -38,6 +38,20 @@ affected harness falls back to the silence heuristic.
 
 ## Claude Code adapter
 
+raum launches and resumes Claude with `--teammate-mode in-process` so agent
+teammates stay in Claude's main terminal UI. In `auto` or `tmux` mode, Claude
+can split raum's underlying tmux window: the lead becomes narrower while
+raum displays only its output, leaving blank space on the right. An explicit
+`--teammate-mode` in the harness's `extra_flags` overrides this default.
+This does not change Claude settings outside raum or disable agent teams.
+See [Claude's display-mode documentation](https://code.claude.com/docs/en/agent-teams#choose-a-display-mode).
+
+For an existing affected session, inspect `tmux -L raum list-panes -a` and
+zoom the lead pane with `tmux -L raum resize-pane -Z -t <lead-pane-id>` if
+the window is not already zoomed. This restores its width without stopping
+teammates; another split can undo the zoom. The launch default takes effect
+when starting or resuming a Claude process with the updated raum build.
+
 `ClaudeCodeAdapter` writes the hook block into the project's
 `<project>/.claude/settings.local.json` — the officially-documented
 personal, auto-gitignored settings layer. This keeps raum's
