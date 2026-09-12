@@ -6,7 +6,14 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: (...args: unknown[]) => invokeMock(...args),
 }));
 
+const countScopedMock = vi.fn();
+
+vi.mock("./navigationDiagnostics", () => ({
+  countScoped: (...args: unknown[]) => countScopedMock(...args),
+}));
+
 import {
+  __resetSnapshotSerializeStatsForTests,
   cancelTerminalSnapshotPersist,
   flushAllTerminalSnapshotsNow,
   loadTerminalSnapshotBytes,
@@ -14,6 +21,7 @@ import {
   persistTerminalSnapshot,
   scheduleTerminalSnapshotPersist,
   serializeTerminalSnapshot,
+  snapshotSerializeStats,
   type SnapshotSource,
 } from "./terminalSnapshotPersistence";
 
@@ -302,6 +310,72 @@ describe("terminalSnapshotPersistence", () => {
       );
       // Clean up the re-armed timer so afterEach doesn't double-fire.
       cancelTerminalSnapshotPersist("sess-burst");
+    });
+  });
+
+  // Task 7.6: serialization is synchronous main-thread work and every pane arms
+  // its own 2000 ms timer, so the aggregate duty cycle — and whether those
+  // timers have drifted into alignment — is what the scheduling decision needs.
+  describe("serialization counters", () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+      vi.setSystemTime(1_000_000);
+      countScopedMock.mockReset();
+      __resetSnapshotSerializeStatsForTests();
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+      __resetSnapshotSerializeStatsForTests();
+    });
+
+    /** Fake addon that burns `costMs` of (fake) wall clock per serialize. */
+    function makeCostlySource(costMs: number, text = "body"): SnapshotSource {
+      return {
+        term: makeTerm(),
+        addon: {
+          serialize: () => {
+            vi.setSystemTime(Date.now() + costMs);
+            return text;
+          },
+        } as unknown as SnapshotSource["addon"],
+      };
+    }
+
+    it("counts every synchronous serialization, retries included", async () => {
+      invokeMock.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+      await persistTerminalSnapshot("sess-c", makeCostlySource(7));
+      // One rejected serialize at 10k rows, one accepted at 5k.
+      expect(countScopedMock.mock.calls).toEqual([
+        ["snapshot-serialize", 7],
+        ["snapshot-serialize", 7],
+      ]);
+      expect(snapshotSerializeStats().lastDurationMsBySession["sess-c"]).toBe(7);
+    });
+
+    it("records the last duration per session", async () => {
+      invokeMock.mockResolvedValue(true);
+      await persistTerminalSnapshot("sess-a", makeCostlySource(3));
+      await persistTerminalSnapshot("sess-b", makeCostlySource(11));
+      expect(snapshotSerializeStats().lastDurationMsBySession).toEqual({
+        "sess-a": 3,
+        "sess-b": 11,
+      });
+    });
+
+    it("counts back-to-back serializations as one aligned burst and resets after a gap", () => {
+      const source = makeSource({ 100_000: "hi" });
+      serializeTerminalSnapshot(source);
+      expect(snapshotSerializeStats().alignedBurstStreak).toBe(1);
+
+      serializeTerminalSnapshot(source);
+      expect(snapshotSerializeStats().alignedBurstStreak).toBe(2);
+
+      vi.setSystemTime(Date.now() + 200);
+      serializeTerminalSnapshot(source);
+      const stats = snapshotSerializeStats();
+      expect(stats.alignedBurstStreak).toBe(1);
+      expect(stats.maxAlignedBurst).toBe(2);
     });
   });
 });

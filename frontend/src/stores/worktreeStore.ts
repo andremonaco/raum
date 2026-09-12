@@ -4,7 +4,7 @@
  * per project and nothing else.
  */
 
-import { createStore } from "solid-js/store";
+import { createStore, reconcile } from "solid-js/store";
 import { createSignal } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
@@ -121,6 +121,12 @@ export function setActiveWorktree(projectSlug: string, worktreePath: string | un
 export function setActiveWorktreeAll(projectSlug: string): void {
   setActiveWorktreeStore("byProject", projectSlug, ALL_WORKTREES_SCOPE);
   scheduleActiveSave();
+}
+
+/** Test-only: drop every per-project scope selection so suites don't leak the
+ *  sidebar scope into one another. */
+export function __resetActiveWorktreeScopesForTests(): void {
+  setActiveWorktreeStore("byProject", reconcile({}));
 }
 
 /** Hydrate the per-project scope map from a saved active-layout snapshot.
@@ -317,17 +323,49 @@ export async function subscribeWorktreeStatusEvents(): Promise<UnlistenFn> {
  */
 const statusStreamRefs = new Map<string, number>();
 let statusSubscribePushPending = false;
+/** In-flight `worktree_status_subscribe`, so N focus signals cost one call. */
+let statusSubscribeInFlight: Promise<unknown> | null = null;
+/** Set changed (or a force-resync arrived) while a push was in flight. */
+let statusSubscribeDirty = false;
+/** Next push must go out even if the set is unchanged (dead-task revival). */
+let statusSubscribeForce = false;
+/** Sorted-joined key of the last set actually pushed; null = never pushed. */
+let lastPushedKey: string | null = null;
 
-function pushStatusSubscriptions(): void {
+function runStatusSubscriptionPush(): void {
+  const paths = [...statusStreamRefs.keys()].sort();
+  const key = paths.join("\u0000");
+  const force = statusSubscribeForce;
+  statusSubscribeForce = false;
+  // A refcount churn that nets out to the same set is a no-op for the backend;
+  // only an explicit resync re-pushes an unchanged set (see below).
+  if (!force && key === lastPushedKey) return;
+  lastPushedKey = key;
+  statusSubscribeInFlight = invoke("worktree_status_subscribe", { paths })
+    .catch(() => {
+      /* Tauri context unavailable (tests), or backend too old —
+         status then degrades to one-shot fetches. */
+    })
+    .finally(() => {
+      statusSubscribeInFlight = null;
+      if (!statusSubscribeDirty) return;
+      statusSubscribeDirty = false;
+      pushStatusSubscriptions();
+    });
+}
+
+function pushStatusSubscriptions(force = false): void {
+  if (force) statusSubscribeForce = true;
+  // One request at a time: later signals collapse into a single re-run.
+  if (statusSubscribeInFlight) {
+    statusSubscribeDirty = true;
+    return;
+  }
   if (statusSubscribePushPending) return;
   statusSubscribePushPending = true;
   queueMicrotask(() => {
     statusSubscribePushPending = false;
-    const paths = [...statusStreamRefs.keys()];
-    void invoke("worktree_status_subscribe", { paths }).catch(() => {
-      /* Tauri context unavailable (tests), or backend too old —
-         status then degrades to one-shot fetches. */
-    });
+    runStatusSubscriptionPush();
   });
 }
 
@@ -357,7 +395,11 @@ export function releaseWorktreeStatusStream(path: string): void {
  * frozen until a project switch.
  */
 export function resyncStatusSubscriptions(): void {
-  pushStatusSubscriptions();
+  // Forced: reviving a silently-dead watch task is the whole point, and the
+  // set is unchanged by definition on a focus resync, so the equality skip in
+  // `runStatusSubscriptionPush` must not swallow it. Repeated focus signals
+  // still collapse into one request via the in-flight dedupe.
+  pushStatusSubscriptions(true);
 }
 
 /**
