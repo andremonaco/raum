@@ -25,6 +25,7 @@ import {
   createEffect,
   createSignal,
   createUniqueId,
+  on,
   onCleanup,
   onMount,
 } from "solid-js";
@@ -67,9 +68,11 @@ import {
   scheduleTerminalSnapshotPersist,
 } from "../lib/terminalSnapshotPersistence";
 import {
+  isForcedResizeReason,
   isViewportAtBottom,
   shouldAutoStickToBottomOnResize,
   terminalResizeScheduleDelay,
+  type ResizeReason,
 } from "../lib/terminalResize";
 import { createXtermWritePump } from "../lib/xtermWritePump";
 import {
@@ -436,7 +439,7 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
   // last pointerup style mutation and the last ResizeObserver callback do not
   // have a guaranteed ordering across WebKit/Chromium.
   let resizePendingFromDrag = false;
-  let requestVisibleResize: ((force?: boolean) => void) | null = null;
+  let requestVisibleResize: ((reason: ResizeReason) => void) | null = null;
   let bridgeRecoveryInFlight = false;
   // Reactive so the "Reconnecting… (N/3)" overlay can show the count
   // live; underlying mutation still uses the setter from inside the
@@ -770,14 +773,43 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
     }
   };
 
-  createEffect(() => {
-    const visible = props.visible !== false;
-    setPaneVisibility(paneId, visible);
-    if (!visible) return;
-    requestVisibleResize?.(true);
-    if (props.active) void requestWebgl(paneId);
-    else requestWebglIfSlotFree(paneId);
-  });
+  // Presentation residency only. This deliberately does NOT read `props.active`
+  // in tracked scope: focusing a sibling pane leaves this one's geometry
+  // untouched, and re-running here used to force a fit + tmux resize on every
+  // focus change (change `instant-view-switching`, design decision 2). `on`
+  // runs its callback untracked, so the reads inside stay out of the deps.
+  createEffect(
+    on(
+      () => props.visible !== false,
+      (visible) => {
+        setPaneVisibility(paneId, visible);
+        if (!visible) return;
+        // Geometry re-check: identical dims short-circuit before any fit. Also
+        // releases the initial spawn/reattach decision for a pane that mounted
+        // hidden (`trySpawn` refuses while `visible === false`).
+        requestVisibleResize?.("show");
+        // `setPaneVisibility` installs no addon on show — the scheduler leaves
+        // that to this call.
+        if (props.active) void requestWebgl(paneId);
+        else requestWebglIfSlotFree(paneId);
+      },
+    ),
+  );
+
+  // Focus owns input ownership and renderer promotion ONLY — no fit, no
+  // resize, no attach. Deferred: the initial promotion belongs to the
+  // registration in `onMount` (the scheduler entry doesn't exist yet here).
+  createEffect(
+    on(
+      () => props.active === true,
+      (active) => {
+        if (props.visible === false) return;
+        if (active) void requestWebgl(paneId);
+        else requestWebglIfSlotFree(paneId);
+      },
+      { defer: true },
+    ),
+  );
 
   onMount(() => {
     if (!host) return;
@@ -930,23 +962,26 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       });
 
       // Live font-zoom — push the app-wide font size into this instance when the
-      // user hits ⌘+ / ⌘- / ⌘0 in any pane. Skip the very first run (the term
-      // was already constructed at the current size) so this only fires on real
-      // changes, then refit so cols/rows + the tmux PTY track the new metrics.
-      let fontZoomPrimed = false;
-      createEffect(() => {
-        const size = terminalFontSize();
-        if (!fontZoomPrimed) {
-          fontZoomPrimed = true;
-          return;
-        }
-        if (!term) return;
-        term.options.fontSize = size;
-        // Route through the shared resize pump (fit + throttled terminal_resize).
-        // `requestVisibleResize` is assigned later in onMount; by the time a zoom
-        // change fires (post-setup) it is always set.
-        requestVisibleResize?.(true);
-      });
+      // user hits ⌘+ / ⌘- / ⌘0 in any pane, then refit so cols/rows + the tmux
+      // PTY track the new metrics. `on(..., { defer: true })` skips the first
+      // run (the terminal was just constructed at the current size) AND keeps
+      // the resize pump's own reads (`props.visible`, `props.kind`) out of this
+      // effect's dependencies — otherwise every hide/show re-ran the zoom
+      // effect and forced a resize.
+      createEffect(
+        on(
+          terminalFontSize,
+          (size) => {
+            if (!term) return;
+            term.options.fontSize = size;
+            // Route through the shared resize pump (fit + throttled
+            // terminal_resize). `requestVisibleResize` is assigned later in
+            // onMount; by the time a zoom change fires it is always set.
+            requestVisibleResize?.("font");
+          },
+          { defer: true },
+        ),
+      );
     } catch (err) {
       // jsdom lacks `matchMedia` and a real canvas context, so xterm.js
       // can't fully initialize during unit tests. Swallow the error so the
@@ -1128,27 +1163,60 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
     let lastCols = -1;
     let lastRows = -1;
     let resizeInFlight = false;
-    let resizeQueued = false;
-    let forceNextResize = false;
+    // Latest request that arrived while a round-trip was outstanding, and the
+    // reason the currently armed timer will fire with. Only the newest survives;
+    // dims are re-measured at fire time, so an older response completing can
+    // never overwrite newer geometry.
+    let queuedReason: ResizeReason | null = null;
+    let pendingReason: ResizeReason | null = null;
     let lastResizeDispatchMs = 0;
-    const pushResize = (): void => {
+    // Host box + cell metrics the last successful fit measured. A show that
+    // returns to exactly these skips the fit entirely: xterm is already sized
+    // for this host, so there is nothing to measure and nothing to tell tmux.
+    const fitted = { width: -1, height: -1, fontSize: -1, dpr: -1 };
+    const currentDpr = (): number => globalThis.devicePixelRatio || 1;
+    /** Measured host box, or null while the host is `display:none` / zero-sized
+     *  — fitting then yields junk dims that must never reach tmux. */
+    const hostBox = (): { width: number; height: number } | null => {
+      if (!host) return null;
+      const width = host.clientWidth;
+      const height = host.clientHeight;
+      if (width <= 0 || height <= 0) return null;
+      return { width, height };
+    };
+    const fitIsCurrent = (box: { width: number; height: number }): boolean =>
+      fitted.width === box.width &&
+      fitted.height === box.height &&
+      fitted.fontSize === (term?.options.fontSize ?? -1) &&
+      fitted.dpr === currentDpr();
+    /** A pending forced sync outranks a later soft reason; everything else is
+     *  latest-wins (the dims themselves are always measured fresh). */
+    const mergeReason = (prev: ResizeReason | null, next: ResizeReason): ResizeReason =>
+      prev && isForcedResizeReason(prev) ? prev : next;
+    const pushResize = (reason: ResizeReason): void => {
       if (props.visible === false) return;
       if (!term || !fit) return;
       if (resizeInFlight) {
-        resizeQueued = true;
+        queuedReason = mergeReason(queuedReason, reason);
         return;
       }
-      const force = forceNextResize;
-      forceNextResize = false;
+      const box = hostBox();
+      if (!box) return;
+      const force = isForcedResizeReason(reason);
       const shouldRepin = shouldAutoStickToBottomOnResize(props.kind) && isViewportAtBottom(term);
       try {
         fit.fit();
       } catch {
         return;
       }
+      fitted.width = box.width;
+      fitted.height = box.height;
+      fitted.fontSize = term.options.fontSize ?? -1;
+      fitted.dpr = currentDpr();
       const id = sessionId();
       if (!id) return;
       if (!force && term.cols === lastCols && term.rows === lastRows) return;
+      if (term.cols < MIN_REATTACH_COLS || term.rows < MIN_REATTACH_ROWS) return;
       lastCols = term.cols;
       lastRows = term.rows;
       if (shouldRepin) scheduleResizeRepin(false);
@@ -1169,27 +1237,72 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         })
         .finally(() => {
           resizeInFlight = false;
-          if (!resizeQueued) return;
-          resizeQueued = false;
-          scheduleResize(true);
+          const next = queuedReason;
+          queuedReason = null;
+          if (next) scheduleResize(next);
         });
     };
-    const scheduleResize = (force = false): void => {
-      if (props.visible === false) return;
-      if (force) forceNextResize = true;
-      resizeQueued = true;
+    /** Re-measure a show exactly once after the DOM has committed. Under the
+     *  `warm-residency` presentation policy a hidden host is `display: none`,
+     *  so it still measures 0x0 in the same Solid flush that runs the
+     *  visibility effect — measuring only there would leave the pane
+     *  permanently unfitted. rAF is raced against a timeout because rAF does
+     *  not fire on a hidden page. */
+    let showRetryArmed = false;
+    const retryShowAfterCommit = (): void => {
+      if (showRetryArmed) return;
+      showRetryArmed = true;
+      let fired = false;
+      const retry = (): void => {
+        if (fired) return;
+        fired = true;
+        showRetryArmed = false;
+        if (props.visible === false || !term) return;
+        const box = hostBox();
+        // Still unmeasurable: the host is genuinely not laid out. Do not chain
+        // another frame — the next real show/geometry event re-arms this.
+        if (!box || fitIsCurrent(box)) return;
+        armResize("show");
+      };
+      try {
+        requestAnimationFrame(retry);
+      } catch {
+        /* non-DOM environment */
+      }
+      setTimeout(retry, 0);
+    };
+    const armResize = (reason: ResizeReason): void => {
+      pendingReason = mergeReason(pendingReason, reason);
       if (resizeTimer !== null) {
-        if (!force && !isHarnessKind(props.kind)) return;
+        // A shell's ordinary geometry stream stays on its existing throttle
+        // window; every other reason re-arms so it fires on the short path.
+        if (reason === "geometry" && !isHarnessKind(props.kind)) return;
         clearTimeout(resizeTimer);
         resizeTimer = null;
       }
       const elapsed = performance.now() - lastResizeDispatchMs;
-      const delay = terminalResizeScheduleDelay(props.kind, force, elapsed);
+      const delay = terminalResizeScheduleDelay(props.kind, pendingReason, elapsed);
       resizeTimer = setTimeout(() => {
         resizeTimer = null;
-        resizeQueued = false;
-        pushResize();
+        const fire = pendingReason ?? reason;
+        pendingReason = null;
+        pushResize(fire);
       }, delay);
+    };
+    const scheduleResize = (reason: ResizeReason): void => {
+      if (props.visible === false) return;
+      // Showing a view whose host still measures exactly what xterm last fitted
+      // to is free: no fit, no tmux round-trip, and no harness settle timer in
+      // front of the view becoming usable.
+      if (reason === "show") {
+        const box = hostBox();
+        if (!box) {
+          retryShowAfterCommit();
+          return;
+        }
+        if (fitIsCurrent(box)) return;
+      }
+      armResize(reason);
     };
     // §4.1 — gated spawn. Harnesses (Ink-based TUIs) paint their banner at
     // the moment of attach, so the very first PTY frame should land at the
@@ -1772,8 +1885,8 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
       });
     };
 
-    requestVisibleResize = (force = false): void => {
-      scheduleResize(force);
+    requestVisibleResize = (reason: ResizeReason): void => {
+      scheduleResize(reason);
       runGatedInitialDecision();
     };
 
@@ -1831,7 +1944,9 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
           applyAgentStateToTerminal(nextId, "idle");
           setBridgeRecoveryAttempts(0);
           setBridgeRecoveryUiState("idle");
-          requestVisibleResize?.(true);
+          // The backend minted a fresh PTY: tell it our dims even if xterm's
+          // are unchanged.
+          requestVisibleResize?.("recovery-sync");
         })
         .catch((e) => {
           selfHealInFlight = false;
@@ -1911,7 +2026,7 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
           if (isDragging()) {
             resizePendingFromDrag = true;
           }
-          scheduleResize();
+          scheduleResize("geometry");
           return;
         }
         if (!initialSpawnGateOpen) return;
@@ -1935,7 +2050,7 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         // Drag just ended and the last ResizeObserver tick may have raced
         // with pointerup. Force the pump to measure now so tmux lands on the
         // committed geometry without waiting for the next throttle window.
-        scheduleResize(true);
+        scheduleResize("geometry-commit");
       });
     }
 
@@ -2017,9 +2132,10 @@ export const TerminalPane: Component<TerminalPaneProps> = (props) => {
         // lands late still routes to recovery before hasSpawned latches.
         runGatedInitialDecision();
         if (persistedSessionId) {
-          // Post-reattach the ResizeObserver pushes a terminal_resize to match
-          // the current host dims if the viewport changed since the prior run.
-          scheduleResize();
+          // Post-reattach: match the current host dims if the viewport changed
+          // since the prior run. Not a forced sync — the attach itself already
+          // told the backend the dims it measured.
+          scheduleResize("geometry");
         }
       });
     });
