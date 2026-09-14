@@ -42,9 +42,12 @@ const MAX_EVENT_LINE_BYTES: u64 = 64 * 1024;
 const ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Synthetic event emitted by the socket server itself when a parked
-/// `PermissionRequest` was still unanswered [`PERMISSION_GC_AFTER`] after
-/// parking — i.e. the hook script hit its client-side timeout (and answered
-/// "ask" to the harness) or was killed. Consumers use it to garbage-collect
+/// `PermissionRequest` was collected without a reply: answered in the
+/// harness's own TUI (a `PostToolUse` for the same tool call arrived — see
+/// [`PendingRequests::evict_answered`]), or still unanswered
+/// [`PERMISSION_GC_AFTER`] after parking — i.e. the hook script hit its
+/// client-side timeout (and answered "ask" to the harness) or was killed.
+/// Consumers use it to garbage-collect
 /// any per-request UI state (pending-permission badges) and to re-arm the
 /// session's activity heuristic; it must never be classified as a state
 /// transition of its own.
@@ -127,7 +130,36 @@ fn is_peer_gone(kind: std::io::ErrorKind) -> bool {
 /// any session once.
 #[derive(Debug, Default, Clone)]
 pub struct PendingRequests {
-    inner: Arc<Mutex<HashMap<PendingKey, OwnedWriteHalf>>>,
+    inner: Arc<Mutex<HashMap<PendingKey, Parked>>>,
+}
+
+/// A parked `PermissionRequest` connection plus what it asked about.
+#[derive(Debug)]
+struct Parked {
+    writer: OwnedWriteHalf,
+    /// `(tool_name, tool_input)` from the request payload, when present.
+    /// A later `PostToolUse` with the same pair for the same session is the
+    /// harness telling us the user allowed it in its own TUI.
+    tool: Option<(String, serde_json::Value)>,
+    /// Park order, so a session with several identical parked calls
+    /// (parallel tool calls) resolves the oldest first.
+    seq: u64,
+}
+
+/// `(tool_name, tool_input)` from a hook payload, which arrives either as a
+/// JSON object or (from the shell/python dispatchers) as a JSON string.
+fn tool_call(payload: &serde_json::Value) -> Option<(String, serde_json::Value)> {
+    let parsed;
+    let obj = match payload.as_str() {
+        Some(raw) => {
+            parsed = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+            &parsed
+        }
+        None => payload,
+    };
+    let name = obj.get("tool_name")?.as_str()?.to_string();
+    let input = obj.get("tool_input")?.clone();
+    Some((name, input))
 }
 
 /// Composite key for the pending-request registry.
@@ -157,9 +189,46 @@ impl PendingRequests {
     /// the same key — the old writer is dropped, which on Unix closes
     /// the connection and lets the hook script error out of its read.
     pub fn park(&self, key: PendingKey, writer: OwnedWriteHalf) {
+        self.park_call(key, writer, None);
+    }
+
+    /// [`Self::park`] remembering the `(tool_name, tool_input)` the request
+    /// is about, so [`Self::evict_answered`] can match it later.
+    pub fn park_call(
+        &self,
+        key: PendingKey,
+        writer: OwnedWriteHalf,
+        tool: Option<(String, serde_json::Value)>,
+    ) {
         if let Ok(mut g) = self.inner.lock() {
-            g.insert(key, writer);
+            let seq = g.values().map(|p| p.seq).max().map_or(0, |n| n + 1);
+            g.insert(key, Parked { writer, tool, seq });
         }
+    }
+
+    /// The harness ran `tool` for `session_id`: the user answered the
+    /// matching prompt in the harness's own TUI, so the oldest parked request
+    /// for the same `(tool_name, tool_input)` is stale. Remove it (dropping
+    /// the writer EOFs the script, which answers nothing — the harness has
+    /// already moved on) and return its key so the caller can emit
+    /// [`PERMISSION_EXPIRED_EVENT`]. Requests for other tool calls in the
+    /// same session stay parked: Claude Code prompts for parallel tool
+    /// calls concurrently.
+    pub fn evict_answered(
+        &self,
+        session_id: &str,
+        tool: &(String, serde_json::Value),
+    ) -> Option<PendingKey> {
+        let mut g = self.inner.lock().ok()?;
+        let key = g
+            .iter()
+            .filter(|(k, p)| {
+                k.session_id.as_deref() == Some(session_id) && p.tool.as_ref() == Some(tool)
+            })
+            .min_by_key(|(_, p)| p.seq)
+            .map(|(k, _)| k.clone())?;
+        g.remove(&key);
+        Some(key)
     }
 
     /// Remove the writer for `key` without replying. Used when the
@@ -196,7 +265,7 @@ impl PendingRequests {
                 .lock()
                 .map_err(|_| ReplyError::Transport("pending map poisoned".into()))?;
             if let Some(w) = guard.remove(key) {
-                Some(w)
+                Some(w.writer)
             } else if key.session_id.is_some() {
                 // Phase 2 fallback: some scripts may emit without
                 // `session_id`; try the session-less variant with the
@@ -205,7 +274,7 @@ impl PendingRequests {
                     session_id: None,
                     request_id: key.request_id.clone(),
                 };
-                guard.remove(&fallback)
+                guard.remove(&fallback).map(|w| w.writer)
             } else {
                 None
             }
@@ -243,6 +312,17 @@ impl PendingRequests {
             debug!(error=%e, "reply: peer closed after reading decision; treating as delivered");
         }
         Ok(())
+    }
+
+    /// Number of requests still parked for `session_id`. A session with
+    /// any left is still blocked on a prompt, so callers must not demote it
+    /// out of Waiting just because one request was answered.
+    pub fn parked_for_session(&self, session_id: &str) -> usize {
+        self.inner.lock().map_or(0, |g| {
+            g.keys()
+                .filter(|k| k.session_id.as_deref() == Some(session_id))
+                .count()
+        })
     }
 
     /// Number of currently-parked requests. Diagnostics only.
@@ -349,20 +429,32 @@ pub fn spawn_event_socket_with_gc(
                         Ok(ev) => {
                             debug!(?ev, "hook event");
                             let has_request_id = ev.request_id.is_some();
-                            // No eviction on a newer event from the same
-                            // session: Claude Code runs matching hooks in
-                            // parallel (parallel tool calls, background
+                            // No blanket eviction on a newer event from the
+                            // same session: Claude Code runs matching hooks
+                            // in parallel (parallel tool calls, background
                             // subagents, in-process teammates all share one
                             // `RAUM_SESSION`), so several parked requests
                             // per session are the normal case, and a `Stop`
-                            // from the lead says nothing about them. Only
-                            // the deadline sweeper and the user's own abort
-                            // (`drop_session`) may collect a parked writer.
+                            // from the lead says nothing about them. What
+                            // does prove a specific request answered is the
+                            // harness running that very tool call: Claude
+                            // Code leaves the blocking hook running after a
+                            // TUI answer, so `PostToolUse` is the only
+                            // signal. Evict BEFORE forwarding so the expiry
+                            // reaches the UI ahead of the Working edge.
+                            if ev.event == "PostToolUse"
+                                && let Some(sid) = ev.session_id.as_deref()
+                                && let Some(tool) = tool_call(&ev.payload)
+                                && let Some(key) = pending.evict_answered(sid, &tool)
+                            {
+                                debug!(?key, "parked permission request answered in harness TUI");
+                                let _ = tx.send(expired_event(&ev.harness, &key)).await;
+                            }
                             if let Some(req_id) = ev.request_id.as_deref() {
                                 if let Some(wh) = write_half_slot.take() {
                                     let key =
                                         PendingKey::new(ev.session_id.clone(), req_id.to_string());
-                                    pending.park(key.clone(), wh);
+                                    pending.park_call(key.clone(), wh, tool_call(&ev.payload));
                                     spawn_permission_sweeper(
                                         pending.clone(),
                                         tx.clone(),
@@ -444,8 +536,9 @@ fn spawn_permission_sweeper(
     });
 }
 
-/// The synthetic [`PERMISSION_EXPIRED_EVENT`] for a parked request the
-/// deadline sweeper collected without a reply.
+/// The synthetic [`PERMISSION_EXPIRED_EVENT`] for a parked request
+/// collected without a reply — answered in the harness TUI, or swept at
+/// the deadline.
 fn expired_event(harness: &str, key: &PendingKey) -> HookEvent {
     HookEvent {
         harness: harness.to_string(),
@@ -683,16 +776,106 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert_eq!(handle.pending.len(), 2, "second request evicted the first");
+        assert_eq!(handle.pending.parked_for_session("raum-s"), 2);
+        assert_eq!(handle.pending.parked_for_session("raum-other"), 0);
 
         // Both are still answerable, in either order.
         for (i, rid) in ["req-b", "req-a"].into_iter().enumerate() {
             let key = PendingKey::new(Some("raum-s".into()), rid);
             handle.pending.reply(&key, "allow").await.unwrap();
+            assert_eq!(handle.pending.parked_for_session("raum-s"), 1 - i);
             let client = &mut clients[1 - i];
             let mut buf = String::new();
             BufReader::new(client).read_line(&mut buf).await.unwrap();
             assert_eq!(buf.trim(), "allow");
         }
+        assert!(handle.pending.is_empty());
+    }
+
+    /// The user answered request B in Claude Code's own dialog. Claude Code
+    /// leaves the hook running, so the only proof is the `PostToolUse` for
+    /// the same tool call: B is evicted (expiry emitted BEFORE the
+    /// PostToolUse is forwarded), sibling A and another session stay parked.
+    #[tokio::test]
+    async fn post_tool_use_evicts_the_matching_parked_request() {
+        let dir = tempdir().unwrap();
+        let sock_path = dir.path().join("events.sock");
+        let mut handle =
+            spawn_event_socket_with_gc(&sock_path, std::time::Duration::from_secs(60)).unwrap();
+
+        async fn send(sock_path: &Path, raw: &str) -> UnixStream {
+            let mut client = UnixStream::connect(sock_path).await.unwrap();
+            client.write_all(raw.as_bytes()).await.unwrap();
+            client.flush().await.unwrap();
+            client
+        }
+        async fn recv(handle: &mut EventSocketHandle) -> HookEvent {
+            tokio::time::timeout(std::time::Duration::from_secs(2), handle.rx.recv())
+                .await
+                .expect("timed out waiting for event")
+                .expect("channel closed")
+        }
+        // Payload as the python dispatcher sends it: a JSON *string*.
+        fn req(sid: &str, rid: &str, cmd: &str) -> String {
+            let payload = serde_json::json!({
+                "tool_name": "Bash",
+                "tool_input": { "command": cmd, "description": "d" },
+            })
+            .to_string();
+            serde_json::json!({
+                "harness": "claude-code", "event": "PermissionRequest",
+                "session_id": sid, "request_id": rid, "payload": payload,
+            })
+            .to_string()
+                + "\n"
+        }
+
+        let _a = send(&sock_path, &req("raum-s", "req-a", "ls")).await;
+        assert_eq!(recv(&mut handle).await.request_id.as_deref(), Some("req-a"));
+        let _b = send(&sock_path, &req("raum-s", "req-b", "rm x")).await;
+        assert_eq!(recv(&mut handle).await.request_id.as_deref(), Some("req-b"));
+        let _o = send(&sock_path, &req("raum-other", "req-o", "rm x")).await;
+        assert_eq!(recv(&mut handle).await.request_id.as_deref(), Some("req-o"));
+        for _ in 0..50 {
+            if handle.pending.len() == 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(handle.pending.len(), 3);
+
+        // Key order differs from the request's — matching is structural.
+        let post = serde_json::json!({
+            "harness": "claude-code", "event": "PostToolUse", "session_id": "raum-s",
+            "payload": {
+                "tool_name": "Bash",
+                "tool_input": { "description": "d", "command": "rm x" },
+                "tool_response": "ok",
+            },
+        })
+        .to_string()
+            + "\n";
+        let _p = send(&sock_path, &post).await;
+        let expiry = recv(&mut handle).await;
+        assert_eq!(expiry.event, PERMISSION_EXPIRED_EVENT);
+        assert_eq!(expiry.session_id.as_deref(), Some("raum-s"));
+        assert_eq!(expiry.request_id.as_deref(), Some("req-b"));
+        assert_eq!(recv(&mut handle).await.event, "PostToolUse");
+        assert_eq!(handle.pending.len(), 2);
+        assert!(
+            handle
+                .pending
+                .drop_key(&PendingKey::new(Some("raum-s".into()), "req-a"))
+        );
+        assert!(
+            handle
+                .pending
+                .drop_key(&PendingKey::new(Some("raum-other".into()), "req-o"))
+        );
+
+        // A PostToolUse with no parked match is forwarded, nothing emitted.
+        let _p2 = send(&sock_path, &post).await;
+        assert_eq!(recv(&mut handle).await.event, "PostToolUse");
         assert!(handle.pending.is_empty());
     }
 

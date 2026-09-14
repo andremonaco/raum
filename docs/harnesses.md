@@ -52,7 +52,10 @@ is rendered in the **Harness Health** panel of the Settings modal.
   installs under `~/.claude/settings.json` or `<project>/.claude/settings.json`
   are swept on every reinstall.
 - **Hook events covered**: `PermissionRequest` (synchronous),
-  `Notification`, `Stop`, `UserPromptSubmit`, `StopFailure`.
+  `Notification`, `Stop`, `UserPromptSubmit`, `StopFailure`, `PostToolUse`
+  (clears a parked permission request the user answered in Claude Code's
+  own dialog — Claude Code does not kill the blocking hook on a TUI
+  answer, so the matching `PostToolUse` is the only signal).
 - **Reply flow**: Claude Code spawns the hook; the script opens the UDS
   socket, writes the request JSON, **blocks** reading for a decision
   line up to `RAUM_HOOK_TIMEOUT_SECS` (default 85 s — just under raum's
