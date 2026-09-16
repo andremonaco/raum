@@ -3,6 +3,12 @@
 //! forwards both HEAD and index touches to the worktree status service so
 //! commits/stages typed into a pane terminal refresh the sidebar promptly.
 //!
+//! It also watches `<root>/.git/refs/remotes/origin/` and `packed-refs`. A push
+//! from a pane rewrites the remote-tracking ref, which is the cheapest possible
+//! "I just pushed" signal — no GitHub round trip — and it nudges the PR service
+//! so the pull-request chip jumps into its hot tick instead of waiting up to
+//! five minutes for the next poll.
+//!
 //! Watches `<root>/.git/` (main project) plus every
 //! `<root>/.git/worktrees/*/` (linked worktrees) non-recursively, filtering
 //! notify events by filename to only pulse on HEAD or `index` touches
@@ -55,11 +61,14 @@ const DEBOUNCE: Duration = Duration::from_millis(150);
 
 /// What a filtered notify event touched. `Head` identifies a branch switch
 /// (emits `worktree-branches-changed` + status pulse); `Index` is a
-/// commit/stage/reset from any git client (status pulse only).
+/// commit/stage/reset from any git client (status pulse only); `Remote` is a
+/// remote-tracking ref move, i.e. a push or fetch (PR-service pulse only —
+/// nothing local changed, so the working-tree status is unaffected).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PulseKind {
     Head,
     Index,
+    Remote,
 }
 
 /// Holds the current `RecommendedWatcher` plus the dirs it's watching, so
@@ -140,12 +149,18 @@ impl GitHeadWatcher {
         tauri::async_runtime::spawn(async move {
             while let Some(first) = pulse_rx.recv().await {
                 let mut saw_head = first == PulseKind::Head;
+                let mut saw_local = first != PulseKind::Remote;
+                let mut saw_remote = first == PulseKind::Remote;
                 let deadline = tokio::time::Instant::now() + DEBOUNCE;
                 loop {
                     tokio::select! {
                         maybe = pulse_rx.recv() => {
                             match maybe {
-                                Some(kind) => saw_head |= kind == PulseKind::Head,
+                                Some(kind) => {
+                                    saw_head |= kind == PulseKind::Head;
+                                    saw_local |= kind != PulseKind::Remote;
+                                    saw_remote |= kind == PulseKind::Remote;
+                                }
                                 None => return,
                             }
                         }
@@ -159,8 +174,14 @@ impl GitHeadWatcher {
                         warn!(slug = %emit_slug, error = %e, "worktree-branches-changed emit failed");
                     }
                 }
-                if let Some(tx) = &status_pulse {
+                // Only local writes can change a working tree's status; a push
+                // that moved a remote-tracking ref must not respawn every
+                // `git status` in the project.
+                if saw_local && let Some(tx) = &status_pulse {
                     let _ = tx.send(emit_slug.clone());
+                }
+                if saw_remote {
+                    github_remote_pulse(&emit_app, &emit_slug);
                 }
             }
         });
@@ -323,6 +344,8 @@ fn build_watcher(
                         let _ = cb_pulse.send(PulseKind::Head);
                     } else if event_touches_index(&ev) {
                         let _ = cb_pulse.send(PulseKind::Index);
+                    } else if event_touches_remote_ref(&ev) {
+                        let _ = cb_pulse.send(PulseKind::Remote);
                     }
                 }
             }
@@ -426,15 +449,21 @@ async fn supervise_watcher(
     }
 }
 
-/// Collect every directory whose `HEAD` file identifies a branch — the main
-/// `<root>/.git/` plus `<root>/.git/worktrees/<id>/` for each linked
-/// worktree. Only existing dirs with a HEAD inside are returned so a
-/// never-initialised worktree doesn't pollute the watch set.
+/// Collect every directory the watcher cares about — the main `<root>/.git/`
+/// plus `<root>/.git/worktrees/<id>/` for each linked worktree (both keyed on
+/// having a `HEAD`, so a never-initialised worktree doesn't pollute the set),
+/// plus `<root>/.git/refs/remotes/origin/` when it exists. The remote dir is
+/// re-checked on every rescan and rebuild, so a repo that gains an `origin`
+/// while raum is running starts pulsing without a restart.
 fn discover_watch_dirs(root: &Path) -> HashSet<PathBuf> {
     let mut dirs = HashSet::new();
     let git_dir = resolve_git_dir(root);
     if git_dir.join("HEAD").is_file() {
         dirs.insert(git_dir.clone());
+    }
+    let origin_refs = git_dir.join("refs").join("remotes").join("origin");
+    if origin_refs.is_dir() {
+        dirs.insert(origin_refs);
     }
     if let Ok(entries) = std::fs::read_dir(git_dir.join("worktrees")) {
         for entry in entries.flatten() {
@@ -465,6 +494,38 @@ fn event_touches_index(ev: &notify::Event) -> bool {
     ev.paths
         .iter()
         .any(|p| p.file_name().is_some_and(|n| n == "index"))
+}
+
+/// True when the event touched a remote-tracking ref: either a loose ref
+/// under `refs/remotes/origin/` (including the nested dirs a branch name with
+/// a slash creates) or the `packed-refs` file a fetch rewrites wholesale.
+fn event_touches_remote_ref(ev: &notify::Event) -> bool {
+    ev.paths.iter().any(|p| {
+        p.file_name().is_some_and(|n| n == "packed-refs")
+            || p.to_string_lossy().contains("/refs/remotes/origin")
+    })
+}
+
+/// Forward a push/fetch pulse to the GitHub PR service so every subscribed
+/// worktree of this project re-reads its pull request now rather than on its
+/// next tick. A no-op when the service never started or the project's root
+/// can't be resolved.
+fn github_remote_pulse<R: Runtime>(app: &AppHandle<R>, slug: &str) {
+    use tauri::Manager;
+
+    let Some(state) = app.try_state::<AppHandleState>() else {
+        return;
+    };
+    let Some(svc) = crate::commands::github::pr_service::service_handle(&state) else {
+        return;
+    };
+    let root = state
+        .config_store
+        .lock()
+        .ok()
+        .and_then(|store| store.read_project(slug).ok().flatten())
+        .and_then(|project| crate::commands::worktree::main_repo_root(&project.root_path));
+    svc.trigger_project(root.as_deref());
 }
 
 /// Resolve `<root>/.git` to its actual directory. A plain `.git` directory is
@@ -555,6 +616,39 @@ mod tests {
         .add_path(PathBuf::from("/repo/.git/index"));
         assert!(!event_touches_head(&ev));
         assert!(event_touches_index(&ev));
+    }
+
+    #[test]
+    fn remote_ref_writes_pulse_only_the_remote_kind() {
+        let push = notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
+            .add_path(PathBuf::from("/repo/.git/refs/remotes/origin/feat/x"));
+        assert!(event_touches_remote_ref(&push));
+        assert!(!event_touches_head(&push));
+        assert!(!event_touches_index(&push));
+
+        let fetch = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Data(
+            notify::event::DataChange::Any,
+        )))
+        .add_path(PathBuf::from("/repo/.git/packed-refs"));
+        assert!(event_touches_remote_ref(&fetch));
+
+        // A local branch ref is not a push.
+        let local = notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
+            .add_path(PathBuf::from("/repo/.git/refs/heads/feat"));
+        assert!(!event_touches_remote_ref(&local));
+    }
+
+    #[test]
+    fn discover_watch_dirs_includes_origin_refs_when_present() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let git = root.join(".git");
+        std::fs::create_dir_all(git.join("refs/remotes/origin")).unwrap();
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        let dirs = discover_watch_dirs(root);
+        assert_eq!(dirs.len(), 2);
+        assert!(dirs.contains(&git.join("refs/remotes/origin")));
     }
 
     #[test]

@@ -40,7 +40,7 @@ use super::gh;
 use super::types::{
     CheckBucket, PrChangedPayload, PrTransitionKind, PrTransitionPayload, PullRequest, RawPr,
 };
-use crate::commands::worktree::status_service::main_repo_root;
+use crate::commands::worktree::main_repo_root;
 use crate::state::AppHandleState;
 
 /// Trigger bursts coalesce into one recompute within this window.

@@ -20,6 +20,8 @@
 //! * [`search`] — spotlight pull-request search.
 //! * [`merge`] — repo merge policy and `gh pr merge`.
 
+#![allow(dead_code)]
+
 pub mod gh;
 mod merge;
 pub mod pr_service;
@@ -33,10 +35,15 @@ mod tests;
 // Glob re-exports: `tauri::generate_handler!` resolves each command at the
 // path `commands::github::<name>`, which needs both the function and its
 // hidden `__cmd__<name>` shim visible here.
+#[allow(unused_imports)]
 pub use gh::*;
+#[allow(unused_imports)]
 pub use merge::*;
+#[allow(unused_imports)]
 pub use pr_service::*;
+#[allow(unused_imports)]
 pub use repo_service::*;
+#[allow(unused_imports)]
 pub use search::*;
 // The wire types are only named across the IPC boundary, never by this crate.
 #[allow(unused_imports)]
