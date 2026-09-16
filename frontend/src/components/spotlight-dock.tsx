@@ -14,7 +14,10 @@
  *     and scrolls xterm to the match when the hit came from xterm's own
  *     buffer (tmux-only hits just focus the pane),
  *   - project file matches across all worktrees of the active project
- *     (click → open in FileEditorModal).
+ *     (click → open in FileEditorModal),
+ *   - open pull requests of the active project (`#123`, `pr:…`, or any query
+ *     of three characters or more) — activating one focuses the worktree the
+ *     branch is checked out in, or opens the PR on github.com.
  *
  * Keyboard nav: ↑/↓ to select, Enter to activate, Escape to close.
  */
@@ -66,6 +69,9 @@ import {
 // until that sibling lands. Listed as a consumed contract.
 import { LAYOUT_PRESETS, applyLayoutPreset } from "../lib/layoutPresets";
 import { setPreviewOnboarding } from "../lib/devOnboardingPreview";
+import { GITHUB_COMMANDS, type PullRequestSummary } from "../lib/githubTypes";
+import { bucketDotClass, focusWorktree, openExternal } from "../lib/githubAttention";
+import { highlightParts, parsePrQuery, prBranchLabel, prMetaLabel } from "../lib/githubSpotlight";
 import { emit as emitTauriEvent } from "@tauri-apps/api/event";
 const FileEditorModal = lazy(() =>
   import("./file-editor-modal").then((m) => ({ default: m.FileEditorModal })),
@@ -128,7 +134,8 @@ type CommandItem = {
   accelerator: string | undefined;
   run: () => void;
 };
-type ResultItem = RecentItem | HarnessItem | FileItem | ScrollbackItem | CommandItem;
+type PrItem = { type: "pr"; pr: PullRequestSummary; term: string };
+type ResultItem = RecentItem | HarnessItem | FileItem | ScrollbackItem | CommandItem | PrItem;
 
 // ---------------------------------------------------------------------------
 // Command verbs
@@ -309,12 +316,15 @@ export const SpotlightDock: Component = () => {
   const [scrollbackHits, setScrollbackHits] = createSignal<ScrollbackMatch[]>([]);
   const [selectedIdx, setSelectedIdx] = createSignal(-1);
   const [editorPath, setEditorPath] = createSignal<string | null>(null);
+  const [prHits, setPrHits] = createSignal<PullRequestSummary[]>([]);
 
   let inputRef: HTMLInputElement | undefined;
   let fileSearchTimer: ReturnType<typeof setTimeout> | null = null;
   let fileToken = 0;
   let scrollbackSearchTimer: ReturnType<typeof setTimeout> | null = null;
   let scrollbackCancel: { aborted: boolean } | null = null;
+  let prSearchTimer: ReturnType<typeof setTimeout> | null = null;
+  let prToken = 0;
 
   const keymap = useKeymap();
 
@@ -356,6 +366,7 @@ export const SpotlightDock: Component = () => {
         // Query comes from the top-bar; just reset the result lists.
         setFileHits([]);
         setScrollbackHits([]);
+        setPrHits([]);
         setSelectedIdx(-1);
       } else {
         const initial = spotlightPendingQuery();
@@ -363,6 +374,7 @@ export const SpotlightDock: Component = () => {
         setQuery(initial);
         setFileHits([]);
         setScrollbackHits([]);
+        setPrHits([]);
         setSelectedIdx(-1);
         if (initial) scheduleSearch(initial);
         requestAnimationFrame(() => {
@@ -404,6 +416,38 @@ export const SpotlightDock: Component = () => {
       scrollbackSearchTimer = null;
       void runScrollback(q);
     }, 180);
+
+    // PR search leaves the machine (one `gh` subprocess per call), so it gets
+    // the longest debounce and drops stale responses via `prToken`.
+    if (prSearchTimer !== null) clearTimeout(prSearchTimer);
+    prSearchTimer = setTimeout(() => {
+      prSearchTimer = null;
+      void runPrSearch(q);
+    }, 250);
+  }
+
+  async function runPrSearch(q: string): Promise<void> {
+    const slug = activeProjectSlug();
+    const parsed = parsePrQuery(q);
+    if (!slug || !parsed) {
+      prToken++;
+      setPrHits([]);
+      return;
+    }
+    const token = ++prToken;
+    try {
+      const hits = await invoke<PullRequestSummary[]>(GITHUB_COMMANDS.prSearch, {
+        projectSlug: slug,
+        query: parsed.term,
+        limit: 8,
+      });
+      if (token === prToken) setPrHits(hits);
+    } catch {
+      // `gh` missing, not authenticated, or no GitHub remote — the group just
+      // doesn't appear. Never a toast: PR search is an extra, not the point of
+      // the palette.
+      if (token === prToken) setPrHits([]);
+    }
   }
 
   async function runScrollback(q: string): Promise<void> {
@@ -689,6 +733,12 @@ export const SpotlightDock: Component = () => {
       .map((r) => r.cmd);
   });
 
+  const prItems = createMemo<PrItem[]>(() => {
+    const parsed = parsePrQuery(query());
+    if (!parsed) return [];
+    return prHits().map((pr): PrItem => ({ type: "pr", pr, term: parsed.term }));
+  });
+
   const allItems = createMemo<ResultItem[]>(() => {
     const q = query().trim();
     if (!q) {
@@ -696,10 +746,17 @@ export const SpotlightDock: Component = () => {
       const recents = recentSearches().map((r): RecentItem => ({ type: "recent", query: r }));
       return [...recents, ...harnessMatches()];
     }
+    // `#123` / `pr:` is an unambiguous ask for pull requests, so that group
+    // leads. A plain word is more likely a terminal or a file, so the PRs sit
+    // below the sessions instead.
+    const prefixed = parsePrQuery(q)?.prefixed ?? false;
+    const prs = prItems();
     return [
+      ...(prefixed ? prs : []),
       ...commandMatches(),
       ...fileHits().map((hit): FileItem => ({ type: "file", hit })),
       ...harnessMatches(),
+      ...(prefixed ? [] : prs),
       ...scrollbackItems(),
     ];
   });
@@ -715,6 +772,16 @@ export const SpotlightDock: Component = () => {
       // `run()` is responsible for closing the dock (most do it before an
       // async dispatch so focus lands on the target, not the palette).
       item.run();
+      return;
+    }
+    if (item.type === "pr") {
+      addRecentSearch(query());
+      const slug = activeProjectSlug();
+      // Checked out locally → jump to it; otherwise the PR only exists on
+      // github.com, so hand it to the browser.
+      if (item.pr.worktreePath && slug) focusWorktree(slug, item.pr.worktreePath, "github");
+      else openExternal(item.pr.url);
+      closeSpotlight();
       return;
     }
     if (item.type === "harness") {
@@ -801,6 +868,7 @@ export const SpotlightDock: Component = () => {
     window.removeEventListener("keydown", onKeyDown, { capture: true });
     if (fileSearchTimer !== null) clearTimeout(fileSearchTimer);
     if (scrollbackSearchTimer !== null) clearTimeout(scrollbackSearchTimer);
+    if (prSearchTimer !== null) clearTimeout(prSearchTimer);
     if (scrollbackCancel) scrollbackCancel.aborted = true;
   });
 
@@ -816,6 +884,7 @@ export const SpotlightDock: Component = () => {
     const fileCount = fileHits().length;
     const scrollbackCount = scrollbackHits().length;
     const commandCount = commandMatches().length;
+    const prCount = prItems().length;
     return {
       hasRecent,
       hasHarnesses,
@@ -823,6 +892,7 @@ export const SpotlightDock: Component = () => {
       fileCount,
       scrollbackCount,
       commandCount,
+      prCount,
       items,
     };
   });
@@ -860,6 +930,7 @@ export const SpotlightDock: Component = () => {
                       setQuery("");
                       setFileHits([]);
                       setScrollbackHits([]);
+                      setPrHits([]);
                       setSelectedIdx(-1);
                     }}
                     aria-label="Clear"
@@ -897,6 +968,7 @@ export const SpotlightDock: Component = () => {
                 sections().items.length > 0 ||
                 (query().trim().length > 0 &&
                   sections().commandCount === 0 &&
+                  sections().prCount === 0 &&
                   sections().harnessCount === 0 &&
                   sections().scrollbackCount === 0 &&
                   sections().fileCount === 0)
@@ -909,6 +981,7 @@ export const SpotlightDock: Component = () => {
                   when={
                     query().trim().length > 0 &&
                     sections().commandCount === 0 &&
+                    sections().prCount === 0 &&
                     sections().harnessCount === 0 &&
                     sections().scrollbackCount === 0 &&
                     sections().fileCount === 0
@@ -949,8 +1022,16 @@ export const SpotlightDock: Component = () => {
                         item.type === "scrollback" &&
                         (idx() === 0 || sections().items[idx() - 1]?.type !== "scrollback"),
                     );
+                    const isFirstPr = createMemo(
+                      () =>
+                        item.type === "pr" &&
+                        (idx() === 0 || sections().items[idx() - 1]?.type !== "pr"),
+                    );
                     return (
                       <>
+                        <Show when={isFirstPr()}>
+                          <SectionHeader label="Pull requests" count={sections().prCount} />
+                        </Show>
                         <Show when={isFirstCommand()}>
                           <SectionHeader label="Commands" count={sections().commandCount} />
                         </Show>
@@ -1042,6 +1123,39 @@ const ItemContent: Component<{
                 {formatAccelerator(cmd().accelerator!)}
               </kbd>
             </Show>
+          </>
+        );
+      }}
+    </Match>
+    <Match when={props.item.type === "pr" && (props.item as PrItem)}>
+      {(row) => {
+        const parts = createMemo(() => highlightParts(row().pr.title, row().term));
+        const meta = createMemo(() => prMetaLabel(row().pr));
+        return (
+          <>
+            {/* The dot is the only coloured element on the row. */}
+            <span class={`size-2 shrink-0 rounded-full ${bucketDotClass(row().pr.rollup)}`} />
+            <span class="shrink-0 font-mono text-[11px] text-muted-foreground">
+              #{row().pr.number}
+            </span>
+            <span class="min-w-0 flex-1 truncate text-foreground/90">
+              {parts().before}
+              <Show when={parts().match}>
+                <mark class="rounded-sm bg-yellow-300/30 px-0.5 text-foreground">
+                  {parts().match}
+                </mark>
+              </Show>
+              {parts().after}
+            </span>
+            <span class="min-w-0 max-w-[35%] shrink truncate text-[10px] text-muted-foreground/50">
+              {prBranchLabel(row().pr)}
+            </span>
+            <Show when={meta()}>
+              <span class="shrink-0 text-[10px] text-muted-foreground/60">{meta()}</span>
+            </Show>
+            <kbd class="ml-1 shrink-0 rounded border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
+              {row().pr.worktreePath ? "↵ focus" : "↵ open ↗"}
+            </kbd>
           </>
         );
       }}

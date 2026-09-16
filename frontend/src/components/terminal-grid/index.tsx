@@ -616,6 +616,7 @@ export const TerminalGrid: Component = () => {
           worktreeId?: string;
           splitDirection?: "right" | "bottom";
           initialPrompt?: string;
+          modelOverride?: { model: string; effort?: string };
         }>
       ).detail;
       if (!detail || !detail.kind || detail.kind === "empty") return;
@@ -626,9 +627,12 @@ export const TerminalGrid: Component = () => {
       const newPane: PaneContent = {
         id,
         kind: detail.kind,
-        // `initialPrompt` (set e.g. by the sidebar Commit button) is forwarded
-        // to `terminal_spawn` so the harness launches pre-loaded with a task.
-        tabs: [{ id: tabId, initialPrompt: detail.initialPrompt }],
+        // `initialPrompt` / `modelOverride` (set e.g. by the sidebar
+        // Commit & push button) are forwarded to `terminal_spawn` so the
+        // harness launches pre-loaded with a task at the requested tier.
+        tabs: [
+          { id: tabId, initialPrompt: detail.initialPrompt, modelOverride: detail.modelOverride },
+        ],
         activeTabId: tabId,
         projectSlug: detail.projectSlug,
         worktreeId: detail.worktreeId,
