@@ -193,7 +193,7 @@ pub async fn drive_event_socket<R: Runtime>(
         }
         let siblings_parked = ev.event == "PostToolUse"
             && ev.session_id.as_deref().is_some_and(|sid| {
-                state.event_socket.lock().ok().is_some_and(|slot| {
+                state.event_socket.lock().is_ok_and(|slot| {
                     slot.as_ref()
                         .is_some_and(|h| h.pending.parked_for_session(sid) > 0)
                 })
