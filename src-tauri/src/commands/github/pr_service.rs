@@ -61,7 +61,7 @@ const TICK_ERROR: Duration = Duration::from_secs(30);
 
 /// The fields `gh pr view` has to return to build a [`PullRequest`].
 const PR_VIEW_FIELDS: &str = "number,title,url,state,isDraft,author,baseRefName,headRefName,\
-headRefOid,reviewDecision,mergeable,mergeStateStatus,statusCheckRollup,updatedAt";
+headRefOid,reviewDecision,mergeable,mergeStateStatus,statusCheckRollup,commits,updatedAt";
 
 #[derive(Debug)]
 struct WatchEntry {

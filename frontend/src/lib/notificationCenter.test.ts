@@ -697,6 +697,7 @@ function pullRequest(over: Partial<PullRequest> = {}): PullRequest {
     checks: [],
     checksSummary: { total: 7, pass: 7, fail: 0, pending: 0, skipped: 0 },
     rollup: "pass",
+    commitCount: 3,
     updatedAt: "2026-09-16T10:00:00Z",
     ...over,
   };

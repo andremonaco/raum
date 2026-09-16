@@ -47,6 +47,7 @@ function makePr(state: MergeStateStatus, pending: number): PullRequest {
     })),
     checksSummary: { total: pending, pass: 0, fail: 0, pending, skipped: 0 },
     rollup: pending > 0 ? "pending" : "pass",
+    commitCount: 3,
     updatedAt: "2026-09-16T12:00:00Z",
   };
 }

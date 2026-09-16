@@ -64,6 +64,8 @@ export interface PullRequest {
   /** Rollup of `checks`: fail if any failed, pending if any pending, pass otherwise
    *  (skipped when there are no checks at all). */
   rollup: CheckBucket;
+  /** Commits the merge would land on the base branch. 0 for search results. */
+  commitCount: number;
   updatedAt: string;
 }
 

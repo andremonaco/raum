@@ -43,10 +43,46 @@ export interface MergePrSheetProps {
   onClose: () => void;
 }
 
-const METHODS: ReadonlyArray<{ id: MergeMethod; label: string; flag: string }> = [
-  { id: "squash", label: "Squash and merge", flag: "--squash" },
-  { id: "rebase", label: "Rebase and merge", flag: "--rebase" },
-  { id: "merge", label: "Create a merge commit", flag: "--merge" },
+/** "3 commits" / "1 commit"; "the commits" when gh gave no count. */
+function commitsPhrase(pr: PullRequest): string {
+  if (pr.commitCount === 0) return "the commits";
+  return `${pr.commitCount} commit${pr.commitCount === 1 ? "" : "s"}`;
+}
+
+/**
+ * One-line consequence per method, phrased against THIS PR's branches so the
+ * user can glimpse what lands on the base without knowing git internals.
+ */
+const METHODS: ReadonlyArray<{
+  id: MergeMethod;
+  label: string;
+  flag: string;
+  hint: (pr: PullRequest) => string;
+}> = [
+  {
+    id: "squash",
+    label: "Squash and merge",
+    flag: "--squash",
+    hint: (pr) =>
+      `Combines ${commitsPhrase(pr)} from ${pr.headRefName} into one new commit on ${pr.baseRefName}. ` +
+      `${pr.baseRefName} stays linear; the individual commits survive only on ${pr.headRefName}.`,
+  },
+  {
+    id: "rebase",
+    label: "Rebase and merge",
+    flag: "--rebase",
+    hint: (pr) =>
+      `Replays ${commitsPhrase(pr)} from ${pr.headRefName} on top of ${pr.baseRefName} with new hashes. ` +
+      `${pr.baseRefName} stays linear and keeps every commit; no merge commit.`,
+  },
+  {
+    id: "merge",
+    label: "Create a merge commit",
+    flag: "--merge",
+    hint: (pr) =>
+      `Adds one merge commit on ${pr.baseRefName} that joins ${pr.headRefName}. ` +
+      `All ${commitsPhrase(pr)} keep their hashes; ${pr.baseRefName} history shows the branch.`,
+  },
 ];
 
 function methodAllowed(policy: MergePolicy | null, method: MergeMethod): boolean {
@@ -182,30 +218,37 @@ export const MergePrSheet: Component<MergePrSheetProps> = (props) => {
                 </div>
               </Show>
 
-              <fieldset class="space-y-1.5" aria-label="Merge method">
+              <fieldset class="space-y-2.5" aria-label="Merge method">
                 <For each={METHODS}>
                   {(m) => {
                     const allowed = () => methodAllowed(policy(), m.id);
                     return (
                       <label
-                        class="flex cursor-pointer items-center gap-2.5 text-foreground"
+                        class="flex cursor-pointer items-start gap-2.5 text-foreground"
                         classList={{ "cursor-not-allowed opacity-45": !allowed() }}
                       >
                         <input
                           type="radio"
                           name="merge-method"
-                          class="size-3.5 shrink-0 accent-foreground"
+                          class="mt-0.5 size-3.5 shrink-0 accent-foreground"
                           value={m.id}
                           checked={method() === m.id}
                           disabled={!allowed()}
                           onChange={() => setMethod(m.id)}
                         />
-                        <span>{m.label}</span>
-                        <Show when={policy() && !allowed()}>
-                          <span class="text-muted-foreground">
-                            Not allowed by repository settings
+                        <span class="min-w-0 space-y-0.5">
+                          <span class="block">
+                            {m.label}
+                            <Show when={policy() && !allowed()}>
+                              <span class="ml-2 text-muted-foreground">
+                                Not allowed by repository settings
+                              </span>
+                            </Show>
                           </span>
-                        </Show>
+                          <span class="block text-[11px] leading-snug text-muted-foreground">
+                            {m.hint(props.pr)}
+                          </span>
+                        </span>
                       </label>
                     );
                   }}

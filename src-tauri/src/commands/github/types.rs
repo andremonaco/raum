@@ -91,6 +91,9 @@ pub struct PullRequest {
     pub checks: Vec<Check>,
     pub checks_summary: ChecksSummary,
     pub rollup: CheckBucket,
+    /// Commits on the head branch that are not on the base — what a merge
+    /// would land. 0 when the record came from `gh pr list` (search).
+    pub commit_count: usize,
     pub updated_at: String,
 }
 
@@ -278,6 +281,8 @@ pub(super) struct RawPr {
     pub mergeable: String,
     pub merge_state_status: String,
     pub status_check_rollup: Vec<RawCheck>,
+    /// Only the length is used; the per-commit payload is skipped on decode.
+    pub commits: Vec<serde::de::IgnoredAny>,
     pub updated_at: String,
 }
 
@@ -554,6 +559,7 @@ impl RawPr {
             checks,
             checks_summary,
             rollup,
+            commit_count: self.commits.len(),
             updated_at: self.updated_at,
         }
     }

@@ -55,6 +55,7 @@ const pr = (number: number): PullRequest => ({
   checks: [],
   checksSummary: { total: 0, pass: 0, fail: 0, pending: 0, skipped: 0 },
   rollup: "pass",
+  commitCount: 3,
   updatedAt: "2026-09-16T12:00:00Z",
 });
 
