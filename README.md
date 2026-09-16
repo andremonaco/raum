@@ -29,6 +29,7 @@
 - **Stay in flow on permission prompts.** raum hooks into each harness's notification surface, pops a notification when a pane needs permission, and focuses the right terminal so you can answer in-context.
 - **Git worktrees that hydrate themselves.** Create a worktree from the UI; raum copies or symlinks the dotfiles, caches, and env files you've marked — no manual `cp -r node_modules` ever again.
 - **Global scrollback search.** `⌘F` opens a spotlight dock that searches scrollback across every open pane (100 000 lines deep), jumps to project files, and switches harness sessions.
+- **Pull requests where the branch lives.** Install GitHub's `gh` CLI and every worktree row shows its PR, check rollup, review state, deployments and releases — merge from the sidebar without opening github.com.
 - **Your config, your files.** Everything lives in plain TOML under `~/.config/raum/`. Commit a `.raum.toml` to a repo to share worktree and hydration defaults with your team.
 
 ## Install
@@ -94,6 +95,7 @@ Remappable in Settings → Keybindings, or directly in `~/.config/raum/keybindin
 - [Quickstart](docs/quickstart.md) — five-minute tour.
 - [Configuration reference](docs/config.md) — every TOML key and default.
 - [Harness integration](docs/harness-integration.md) — how raum writes hooks and the `<raum-managed>` block.
+- [GitHub integration](docs/github-integration.md) — opt-in PR status, deployments, releases and merge through the `gh` CLI.
 - [Harness matrix](docs/harnesses.md) — what raum observes and replies to, per harness.
 - [Privacy](docs/privacy.md) — what raum reads, writes, and sends (spoiler: just a single update check, no telemetry).
 
