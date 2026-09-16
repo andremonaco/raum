@@ -17,10 +17,12 @@
  * every tab switch.
  */
 
-import { Component, Show, createSignal } from "solid-js";
+import { Component, Show, createEffect, createMemo, createSignal } from "solid-js";
 
+import { ghUsable, prForPath } from "../../stores/githubStore";
 import { FolderIcon, GitBranchIcon, HistoryIcon } from "../icons";
 import { ChangesView } from "./changes-view";
+import { GithubMarkIcon, GithubView } from "./github-view";
 import { FileBrowser } from "./file-browser";
 import { HistoryView } from "./history-view";
 import { ViewTabBar } from "./view-tab-bar";
@@ -34,18 +36,35 @@ const TABS: readonly ViewTabItem[] = [
   { id: "files", label: "Files", icon: FolderIcon },
 ];
 
+const GITHUB_TAB: ViewTabItem = { id: "github", label: "GitHub", icon: GithubMarkIcon };
+
 export const WorktreeDetail: Component<WorktreeDetailProps> = (props) => {
-  const [tab, setTab] = createSignal<ExpandedTabId>("changes");
-  const [visited, setVisited] = createSignal<ReadonlySet<ExpandedTabId>>(new Set(["changes"]));
+  const initial = props.initialTab ?? "changes";
+  const [tab, setTab] = createSignal<ExpandedTabId>(initial);
+  const [visited, setVisited] = createSignal<ReadonlySet<ExpandedTabId>>(
+    new Set(["changes", initial]),
+  );
 
   const selectTab = (id: ExpandedTabId) => {
     setTab(id);
     setVisited((prev) => (prev.has(id) ? prev : new Set(prev).add(id)));
   };
+  // Let the owning tab deep-link into a view while this detail stays mounted.
+  createEffect(() => props.onReady?.(selectTab));
+
+  // The GitHub tab exists only when `gh` is installed and authenticated AND
+  // the backend reported this worktree as a GitHub remote. No event yet counts
+  // as "maybe" — the view renders its own loading line.
+  const githubVisible = createMemo(
+    () => ghUsable() && prForPath(props.worktree.path)?.available !== false,
+  );
+  const tabs = createMemo<readonly ViewTabItem[]>(() =>
+    githubVisible() ? [...TABS, GITHUB_TAB] : TABS,
+  );
 
   return (
     <div class="flex flex-col">
-      <ViewTabBar tabs={TABS} active={tab()} onChange={selectTab} />
+      <ViewTabBar tabs={tabs()} active={tab()} onChange={selectTab} />
 
       {/* Changes is always mounted (cheapest view + the default landing tab). */}
       <div role="tabpanel" hidden={tab() !== "changes"}>
@@ -65,6 +84,17 @@ export const WorktreeDetail: Component<WorktreeDetailProps> = (props) => {
             worktree={props.worktree}
             active={tab() === "history"}
             onOpenDiff={props.onOpenDiff}
+          />
+        </div>
+      </Show>
+
+      <Show when={visited().has("github") && githubVisible()}>
+        <div role="tabpanel" hidden={tab() !== "github"}>
+          <GithubView
+            worktree={props.worktree}
+            projectSlug={props.projectSlug}
+            status={props.status}
+            isMain={props.isMain ?? false}
           />
         </div>
       </Show>

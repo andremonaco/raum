@@ -73,6 +73,8 @@ disclaim_tcc_responsibility = false # macOS TCC; see "macOS App Data prompts"
 | `terminals.restart_server_on_next_launch` | `false`                                                          | Written by raum, not by hand. One-shot: set when the user accepts the tmux-server restart prompt, consumed at the next launch. Removed at 0.2.0. |
 | `terminals.server_restart_hint_dismissed` | `false`                                                          | Written by raum, not by hand. Set when the user dismisses that prompt for good. Removed at 0.2.0. |
 | `keybindings.overrides`                   | `{}`                                                             | Accelerator overrides; see below. |
+| `commit.harness`                          | _unset_                                                          | Harness the sidebar "Commit & push" button spawns (`claude-code` / `codex` / `opencode`). Unset = first installed. |
+| `commit.<harness>.model` / `.effort`      | _unset_                                                          | Model and effort the commit agent runs for that harness (`commit.claude-code`, `commit.codex`, `commit.opencode`). Unset = raum's cheap tier: Claude `haiku` effort `low`, Codex `gpt-5.6-luna` reasoning `low`, OpenCode its default. A `--model` in that harness's `extra_flags` wins. |
 
 Internal constants (not exposed as keys, documented here for reference):
 

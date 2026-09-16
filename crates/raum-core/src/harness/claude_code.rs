@@ -8,7 +8,7 @@
 //! must never land in `settings.json`, which is the shared/team-checked-in
 //! layer. Phase 2 expanded coverage from `{Notification, Stop,
 //! UserPromptSubmit}` to the full set `{PermissionRequest, Notification,
-//! Stop, UserPromptSubmit, StopFailure}`. The `PermissionRequest` hook is
+//! Stop, UserPromptSubmit, StopFailure, PostToolUse}`. The `PermissionRequest` hook is
 //! the only synchronous one — see [`crate::harness::reply`] for the
 //! decision wire format.
 //!
@@ -64,12 +64,21 @@ use super::hook_script_path;
 /// * `UserPromptSubmit` — user submitted a prompt (Working edge).
 /// * `StopFailure` — turn ended due to an API error (rate limit, auth,
 ///   billing, …). Observability only — hooks cannot decide here.
+/// * `PostToolUse` — fire-and-forget. The only signal that a permission
+///   prompt was answered in Claude Code's own TUI: Claude Code leaves the
+///   blocking `PermissionRequest` hook running (verified on 2.1.270 — the
+///   script is neither killed nor EOF'd when the dialog is answered), so
+///   the parked request would otherwise sit until the 90 s socket sweeper.
+///   The socket server matches `tool_name` + `tool_input` against the
+///   session's parked requests and evicts the oldest match. Also a
+///   deterministic Working edge.
 pub const RAUM_HOOK_EVENTS: &[&str] = &[
     "PermissionRequest",
     "Notification",
     "Stop",
     "UserPromptSubmit",
     "StopFailure",
+    "PostToolUse",
 ];
 
 /// Claude Code adapter. Binary is looked up as `claude` on `$PATH`.

@@ -301,6 +301,15 @@ pub fn run() {
             commands::worktree_status_batch,
             commands::worktree_status_subscribe,
             commands::worktree_status_refresh,
+            // GitHub integration (opt-in, via the user's own `gh` CLI).
+            commands::github::github_status,
+            commands::github::github_pr_subscribe,
+            commands::github::github_pr_refresh,
+            commands::github::github_pr_search,
+            commands::github::github_merge_policy,
+            commands::github::github_pr_merge,
+            commands::github::github_repo_subscribe,
+            commands::github::github_repo_refresh,
             commands::git_log,
             commands::git_commit_files,
             commands::git_diff_commit,
@@ -325,6 +334,8 @@ pub fn run() {
             notifications::send::notifications_send,
             notifications::clear::notifications_clear,
             commands::config_set_harness_flags,
+            commands::config_set_commit_harness,
+            commands::config_set_commit_model,
             commands::config_set_claude_fullscreen,
             commands::config_set_worktree_path_pattern,
             commands::config_set_appearance_theme,
@@ -438,6 +449,11 @@ pub fn run() {
             // here: the frontend activates a project tab within a beat of
             // launch and only that project gets one.
             bootstrap_status_service(app);
+
+            // PR chips, deployments and releases. Independent of the status
+            // service but focus-gated the same way; no `gh` runs until the
+            // frontend subscribes.
+            bootstrap_github_services(app);
 
             // §7.6 — bring up the hook-event UDS socket and bridge it into
             // the agent state machines. Failures here downgrade to the
@@ -1252,6 +1268,37 @@ fn bootstrap_status_service(app: &mut tauri::App) {
         });
     } else {
         warn!("bootstrap_status_service: main window not found");
+    }
+}
+
+/// Construct the two GitHub poll services and park them on managed state.
+/// Like the status service they pause while the window is backgrounded and
+/// catch up on focus gain, so an app nobody is looking at spawns no `gh`
+/// processes at all.
+fn bootstrap_github_services(app: &mut tauri::App) {
+    let pr = commands::github::GithubPrService::new(app.handle().clone());
+    let repo = commands::github::GithubRepoService::new(app.handle().clone());
+    let state: tauri::State<'_, state::AppHandleState> = app.state();
+    if let Ok(mut slot) = state.github_pr.lock() {
+        *slot = Some(pr.clone());
+    } else {
+        warn!("bootstrap_github_services: github_pr mutex poisoned");
+    }
+    if let Ok(mut slot) = state.github_repo.lock() {
+        *slot = Some(repo.clone());
+    } else {
+        warn!("bootstrap_github_services: github_repo mutex poisoned");
+    }
+
+    if let Some(win) = app.get_webview_window("main") {
+        win.on_window_event(move |event| {
+            if let tauri::WindowEvent::Focused(focused) = event {
+                pr.set_focused(*focused);
+                repo.set_focused(*focused);
+            }
+        });
+    } else {
+        warn!("bootstrap_github_services: main window not found");
     }
 }
 

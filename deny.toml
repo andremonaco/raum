@@ -68,7 +68,7 @@ allow = [
 # Bans (duplicates, wildcards, git sources)
 # ---------------------------------------------------------------------------
 [bans]
-multiple-versions = "warn"
+multiple-versions = "allow"
 wildcards = "warn"
 highlight = "all"
 allow = []

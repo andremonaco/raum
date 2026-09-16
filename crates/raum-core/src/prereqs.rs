@@ -2,6 +2,12 @@
 //!
 //! We verify `tmux --version` ≥ 3.2 and `git --version` ≥ 2.30. Missing or
 //! outdated tools are reported to the UI via a blocking modal.
+//!
+//! `gh` is probed alongside them but is *optional*: it powers the GitHub
+//! integration and nothing else, so a missing `gh` is a row in Settings →
+//! Prerequisites with an install hint, never a blocking modal. Whether gh is
+//! also logged in is a separate question, answered by the `github_status`
+//! command — this probe only reports the binary and its version.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -26,6 +32,18 @@ pub const GIT_MIN_VERSION: Version = Version {
     patch: 0,
 };
 
+/// Minimum GitHub CLI version. `statusCheckRollup` and `gh pr checks --json`
+/// arrived in 2.20 (late 2022); older versions can't answer what the PR view
+/// needs.
+pub const GH_MIN_VERSION: Version = Version {
+    major: 2,
+    minor: 20,
+    patch: 0,
+};
+
+/// Where to send a user who doesn't have `gh` yet.
+pub const GH_INSTALL_HINT: &str = "https://cli.github.com";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ToolStatus {
     pub name: String,
@@ -35,12 +53,17 @@ pub struct ToolStatus {
     pub minimum: Version,
     /// Raw stdout/stderr line the version was parsed from (for UI display).
     pub raw: Option<String>,
+    /// One-line install hint (URL or package name) for optional tools. `None`
+    /// for the tools raum refuses to start without — there the modal says it.
+    pub install_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PrereqReport {
     pub tmux: ToolStatus,
     pub git: ToolStatus,
+    /// Optional — deliberately excluded from [`PrereqReport::all_ok`].
+    pub gh: ToolStatus,
 }
 
 impl PrereqReport {
@@ -62,16 +85,18 @@ impl Serialize for Version {
 /// decides whether to block the UI.
 #[must_use]
 pub fn check_prereqs() -> PrereqReport {
-    let tmux = check_tool("tmux", &["-V"], &TMUX_MIN_VERSION);
-    let git = check_tool("git", &["--version"], &GIT_MIN_VERSION);
+    let tmux = check_tool("tmux", &["-V"], &TMUX_MIN_VERSION, None);
+    let git = check_tool("git", &["--version"], &GIT_MIN_VERSION, None);
+    let gh = check_tool("gh", &["--version"], &GH_MIN_VERSION, Some(GH_INSTALL_HINT));
     info!(
         tmux_found = tmux.found,
         tmux_ok = tmux.meets_minimum,
         git_found = git.found,
         git_ok = git.meets_minimum,
+        gh_found = gh.found,
         "prereq check complete"
     );
-    PrereqReport { tmux, git }
+    PrereqReport { tmux, git, gh }
 }
 
 /// Per-harness availability snapshot. Includes resolved install path, the
@@ -299,7 +324,12 @@ fn opencode_settings_path() -> PathBuf {
     home.join(".config").join("opencode").join("config.json")
 }
 
-fn check_tool(name: &str, args: &[&str], minimum: &Version) -> ToolStatus {
+fn check_tool(
+    name: &str,
+    args: &[&str],
+    minimum: &Version,
+    install_hint: Option<&str>,
+) -> ToolStatus {
     let output = Command::new(name).args(args).output();
     let Ok(output) = output else {
         warn!(tool = name, "not found on PATH");
@@ -310,6 +340,7 @@ fn check_tool(name: &str, args: &[&str], minimum: &Version) -> ToolStatus {
             meets_minimum: false,
             minimum: minimum.clone(),
             raw: None,
+            install_hint: install_hint.map(str::to_string),
         };
     };
 
@@ -338,6 +369,7 @@ fn check_tool(name: &str, args: &[&str], minimum: &Version) -> ToolStatus {
         meets_minimum,
         minimum: minimum.clone(),
         raw: Some(raw_line),
+        install_hint: install_hint.map(str::to_string),
     }
 }
 
@@ -369,10 +401,25 @@ mod tests {
             "this-binary-does-not-exist-raum-test",
             &["--version"],
             &GIT_MIN_VERSION,
+            None,
         );
         assert!(!s.found);
         assert!(!s.meets_minimum);
         assert!(s.version.is_none());
+    }
+
+    /// A missing optional tool still carries its install hint, which is the
+    /// whole point of the row in Settings → Prerequisites.
+    #[test]
+    fn optional_tool_keeps_its_install_hint_when_missing() {
+        let s = check_tool(
+            "this-binary-does-not-exist-raum-test",
+            &["--version"],
+            &GH_MIN_VERSION,
+            Some(GH_INSTALL_HINT),
+        );
+        assert!(!s.found);
+        assert_eq!(s.install_hint.as_deref(), Some(GH_INSTALL_HINT));
     }
 
     #[test]
@@ -382,7 +429,14 @@ mod tests {
         let r = check_prereqs();
         assert_eq!(r.tmux.name, "tmux");
         assert_eq!(r.git.name, "git");
+        assert_eq!(r.gh.name, "gh");
         assert_eq!(r.tmux.minimum, TMUX_MIN_VERSION);
         assert_eq!(r.git.minimum, GIT_MIN_VERSION);
+        assert_eq!(r.gh.minimum, GH_MIN_VERSION);
+        // gh is optional: it must never gate `all_ok`.
+        assert_eq!(
+            r.all_ok(),
+            r.tmux.found && r.tmux.meets_minimum && r.git.found && r.git.meets_minimum,
+        );
     }
 }

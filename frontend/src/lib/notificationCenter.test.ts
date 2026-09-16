@@ -30,10 +30,17 @@ vi.mock("@tauri-apps/api/window", () => ({
     onFocusChanged: async () => () => {},
   }),
 }));
+// `githubAttention` reaches for the opener plugin when a row is activated.
+const mockOpenUrl = vi.fn();
+vi.mock("@tauri-apps/plugin-opener", () => ({
+  openUrl: (...args: unknown[]) => mockOpenUrl(...args),
+}));
 
 import {
   __clearPendingPermissionForTests,
   __handleAgentStateChangedForTests,
+  __handleGithubDeploymentTransitionForTests,
+  __handleGithubPrTransitionForTests,
   __handleNotificationEventForTests,
   __handlePermissionExpiredForTests,
   __handleSessionRemovedForTests,
@@ -47,6 +54,8 @@ import {
   startNotificationCenter,
   syncDockBadge,
 } from "./notificationCenter";
+import { githubAttention } from "./githubAttention";
+import type { DeploymentEnv, PrTransitionKind, PullRequest } from "./githubTypes";
 import { __resetProjectStoreForTests, upsertProject } from "../stores/projectStore";
 import { __resetTerminalStoreForTests, upsertTerminal } from "../stores/terminalStore";
 import type { AgentKind } from "../stores/agentStore";
@@ -663,6 +672,233 @@ describe("notification center", () => {
     expect(seen).toEqual(["click-target"]);
 
     window.removeEventListener("terminal-focus-requested", dom);
+    dispose();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GitHub transitions
+// ---------------------------------------------------------------------------
+
+function pullRequest(over: Partial<PullRequest> = {}): PullRequest {
+  return {
+    number: 412,
+    title: "Fix the flaky bridge test",
+    url: "https://github.com/acme/raum/pull/412",
+    state: "OPEN",
+    isDraft: false,
+    author: "andre",
+    baseRefName: "main",
+    headRefName: "fix/flaky-bridge",
+    headRefOid: "abc1234",
+    reviewDecision: "APPROVED",
+    mergeable: "MERGEABLE",
+    mergeStateStatus: "CLEAN",
+    checks: [],
+    checksSummary: { total: 7, pass: 7, fail: 0, pending: 0, skipped: 0 },
+    rollup: "pass",
+    commitCount: 3,
+    updatedAt: "2026-09-16T10:00:00Z",
+    ...over,
+  };
+}
+
+function prTransition(kind: PrTransitionKind, pr: PullRequest, path = "/tmp/raum/.raum/flaky") {
+  return { path, kind, pr };
+}
+
+function deployment(over: Partial<DeploymentEnv> = {}): DeploymentEnv {
+  return {
+    environment: "staging",
+    state: "FAILURE",
+    bucket: "fail",
+    ref: "main",
+    sha: "abc1234",
+    message: "deploy job exited 1",
+    createdAt: "2026-09-16T10:00:00Z",
+    updatedAt: "2026-09-16T10:05:00Z",
+    environmentUrl: null,
+    logUrl: "https://github.com/acme/raum/actions/runs/1",
+    ...over,
+  };
+}
+
+describe("github transitions", () => {
+  beforeEach(async () => {
+    listenHandlers.clear();
+    mockInvoke.mockReset();
+    mockInvoke.mockResolvedValue(undefined);
+    mockOpenUrl.mockReset();
+    __resetNotificationCenterForTests();
+    __resetProjectStoreForTests();
+    __resetTerminalStoreForTests();
+    seedProject("raum", "raum", "α");
+    await ensureNotificationPermission();
+    mockInvoke.mockClear();
+  });
+
+  it("adds a rail row without an OS banner while raum is focused", () => {
+    __setWindowFocusedForTests(true);
+    __handleGithubPrTransitionForTests(prTransition("checks_passed", pullRequest()));
+
+    const rows = githubAttention();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.kind).toBe("pr");
+    expect(rows[0]!.label).toBe("#412 ready to merge");
+    expect(rows[0]!.sub).toBe("pr · approved · 7/7");
+    expect(rows[0]!.bucket).toBe("pass");
+    expect(sendCalls()).toHaveLength(0);
+  });
+
+  it("escalates to an OS banner while raum is backgrounded", () => {
+    __setWindowFocusedForTests(false);
+    __handleGithubPrTransitionForTests(prTransition("checks_passed", pullRequest()));
+
+    expect(githubAttention()).toHaveLength(1);
+    const calls = sendCalls();
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.title).toBe("#412 checks passed · 7/7");
+    // The project leads the banner body — banners have no sigil to lean on.
+    expect(calls[0]!.body).toBe("raum · fix/flaky-bridge · approved · ready to merge");
+    // No session owns a PR banner, so an opportunistic clear can't hit it.
+    expect(calls[0]!.sessionId).toBeNull();
+  });
+
+  it("names the first failing check and counts the failures", () => {
+    __setWindowFocusedForTests(false);
+    __handleGithubPrTransitionForTests(
+      prTransition(
+        "checks_failed",
+        pullRequest({
+          reviewDecision: "REVIEW_REQUIRED",
+          rollup: "fail",
+          checksSummary: { total: 7, pass: 5, fail: 1, pending: 1, skipped: 0 },
+          checks: [
+            {
+              name: "clippy",
+              bucket: "fail",
+              url: null,
+              workflow: "ci",
+              startedAt: null,
+              completedAt: null,
+              description: null,
+            },
+          ],
+        }),
+      ),
+    );
+
+    const calls = sendCalls();
+    expect(calls[0]!.title).toBe("#412 clippy failed");
+    expect(calls[0]!.body).toBe("raum · fix/flaky-bridge · 1 of 7 failing");
+    expect(githubAttention()[0]!.label).toBe("#412 checks failing");
+  });
+
+  it("keeps at most one live row per (path, kind)", () => {
+    __setWindowFocusedForTests(true);
+    const pr = pullRequest({ rollup: "fail" });
+    __handleGithubPrTransitionForTests(prTransition("checks_failed", pr));
+    __handleGithubPrTransitionForTests(prTransition("checks_failed", pr));
+
+    expect(githubAttention()).toHaveLength(1);
+
+    // A different PR is a different group and coexists.
+    __handleGithubPrTransitionForTests(
+      prTransition("checks_failed", pullRequest({ number: 401 }), "/tmp/raum/.raum/other"),
+    );
+    expect(githubAttention()).toHaveLength(2);
+  });
+
+  it("retires a checks-passed row when a later transition arrives", () => {
+    __setWindowFocusedForTests(true);
+    __handleGithubPrTransitionForTests(prTransition("checks_passed", pullRequest()));
+    expect(githubAttention()).toHaveLength(1);
+
+    __handleGithubPrTransitionForTests(prTransition("merged", pullRequest({ state: "MERGED" })));
+    const rows = githubAttention();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.label).toBe("#412 merged");
+  });
+
+  it("drops every row for a PR once it merges", () => {
+    __setWindowFocusedForTests(true);
+    __handleGithubPrTransitionForTests(
+      prTransition("checks_failed", pullRequest({ rollup: "fail" })),
+    );
+    __handleGithubPrTransitionForTests(prTransition("changes_requested", pullRequest()));
+    expect(githubAttention()).toHaveLength(2);
+
+    __handleGithubPrTransitionForTests(prTransition("merged", pullRequest()));
+    expect(githubAttention().map((r) => r.label)).toEqual(["#412 merged"]);
+  });
+
+  it("maps a failed deployment to a row, a banner and the log url", () => {
+    __setWindowFocusedForTests(false);
+    __handleGithubDeploymentTransitionForTests({
+      slug: "raum",
+      environment: "staging",
+      bucket: "fail",
+      env: deployment(),
+    });
+
+    const rows = githubAttention();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.kind).toBe("deploy");
+    expect(rows[0]!.label).toBe("staging deploy failed");
+    expect(rows[0]!.sub).toBe("deploy · main");
+    expect(rows[0]!.url).toBe("https://github.com/acme/raum/actions/runs/1");
+
+    const calls = sendCalls();
+    expect(calls[0]!.title).toBe("staging deploy failed");
+    expect(calls[0]!.body).toBe("raum · deploy job exited 1");
+  });
+
+  it("prefers the environment url and dedupes per (slug, environment)", () => {
+    __setWindowFocusedForTests(true);
+    const base = {
+      slug: "raum",
+      environment: "prod",
+      bucket: "pass" as const,
+    };
+    __handleGithubDeploymentTransitionForTests({
+      ...base,
+      env: deployment({
+        environment: "prod",
+        state: "ACTIVE",
+        bucket: "pass",
+        environmentUrl: "https://raum.example",
+        updatedAt: "2026-09-16T11:00:00Z",
+      }),
+    });
+    __handleGithubDeploymentTransitionForTests({
+      ...base,
+      env: deployment({
+        environment: "prod",
+        state: "ACTIVE",
+        bucket: "pass",
+        environmentUrl: "https://raum.example",
+        updatedAt: "2026-09-16T12:00:00Z",
+      }),
+    });
+
+    const rows = githubAttention();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.label).toBe("prod deployed");
+    expect(rows[0]!.url).toBe("https://raum.example");
+  });
+
+  it("registers both github listeners", async () => {
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "notifications_check_authorization") {
+        return { status: "granted", bundle_id: "de.raum.desktop", is_dev_mode: false, note: null };
+      }
+      if (cmd === "config_get") return { notifications: {} };
+      return undefined;
+    });
+
+    const dispose = await startNotificationCenter();
+    expect(listenHandlers.get("github-pr-transition")).toBeDefined();
+    expect(listenHandlers.get("github-deployment-transition")).toBeDefined();
     dispose();
   });
 });

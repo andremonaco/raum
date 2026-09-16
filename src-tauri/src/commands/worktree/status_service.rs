@@ -348,7 +348,7 @@ fn project_root_for(app: &tauri::AppHandle, slug: &str) -> Option<PathBuf> {
 /// is the path itself; for a linked worktree the `.git` *file* points at
 /// `<main>/.git/worktrees/<id>`, so we climb back out. Returns `None` when the
 /// path has no `.git` at all (not a worktree — nothing a project pulse owns).
-fn main_repo_root(path: &Path) -> Option<PathBuf> {
+pub(crate) fn main_repo_root(path: &Path) -> Option<PathBuf> {
     let git = path.join(".git");
     if git.is_dir() {
         return Some(canonical(path));

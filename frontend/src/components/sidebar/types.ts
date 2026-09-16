@@ -32,7 +32,7 @@ export type DiffTarget =
   | { mode: "worktree"; file: string; staged: boolean }
   | { mode: "commit"; file: string; hash: string; shortHash: string };
 
-export type ExpandedTabId = "changes" | "history" | "files";
+export type ExpandedTabId = "changes" | "history" | "files" | "github";
 
 // ── Tab bar (replaces SegmentedSwitcherProps) ───────────────────────────────
 /** One entry in the icon-only underline view-tab bar. */
@@ -75,6 +75,23 @@ export interface WorktreeDetailProps {
   onOpenEditor: (absPath: string) => void;
   /** Abs path of the file most recently opened in the editor (active-file highlight). */
   activeEditorPath?: string | null;
+  /** True when this is the project root — the repo-wide GitHub sections start
+   *  expanded there and collapsed in feature worktrees. */
+  isMain?: boolean;
+  /** Tab to land on when this detail mounts (the sidebar PR chip deep-links
+   *  to `github`). */
+  initialTab?: ExpandedTabId;
+  /** Hands the tab selector back to the owner so an already-open detail can be
+   *  switched from outside (again: the PR chip). */
+  onReady?: (select: (id: ExpandedTabId) => void) => void;
+}
+
+export interface GithubViewProps {
+  worktree: Worktree;
+  projectSlug: string;
+  status: WorktreeStatus;
+  /** Repo-wide Deployments/Releases sections start expanded on the base row. */
+  isMain: boolean;
 }
 
 // ── Worktree tab (one vertical accordion tab: header + expandable detail) ────

@@ -1,8 +1,10 @@
 import { Component, For, Show, createEffect, createResource, createSignal, on } from "solid-js";
+import { Dynamic } from "solid-js/web";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 
 import { cx } from "~/lib/cva";
+import { GITHUB_COMMANDS, type GhStatus } from "~/lib/githubTypes";
 import { tildify } from "~/lib/pathDisplay";
 import { permissionState } from "../../lib/notificationCenter";
 import {
@@ -18,10 +20,39 @@ import {
 import { activeProjectSlug, projectStore } from "../../stores/projectStore";
 
 import { CheckIcon, HARNESS_ICONS, LoaderIcon, type HarnessIconKind } from "../icons";
+import { kindDisplayLabel } from "../../lib/agentKind";
+import {
+  COMMIT_DEFAULT_TIER,
+  COMMIT_HARNESSES,
+  commitConfig,
+  commitHarnessPreference,
+  commitTier,
+  loadCommitHarnessPreference,
+  setCommitHarnessPreference,
+  setCommitModel,
+  type CommitHarness,
+  type CommitTier,
+} from "../sidebar/commit-harness";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuPortal,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "../ui/dropdown-menu";
 
 import { StatusPill } from "./shared";
 import { HARNESS_ENTRIES, INSTALL_COMMANDS } from "./constants";
 import { copyToClipboard, pathsReady } from "./utils";
+
+/** Wire shape mirroring `raum_core::harness::HarnessModel`. */
+interface HarnessModel {
+  id: string;
+  label: string;
+  supportedEfforts: string[];
+  defaultEffort?: string | null;
+}
 
 const HarnessStatusBadge: Component<{
   status: HarnessStatus | undefined;
@@ -362,6 +393,108 @@ const HarnessNotificationStatus: Component<{ kind: HarnessIconKind }> = (props) 
   );
 };
 
+// ---------------------------------------------------------------------------
+// GitHub CLI prerequisite
+// ---------------------------------------------------------------------------
+
+/**
+ * Probe row for the optional `gh` binary (see `docs/github-integration.md`).
+ *
+ * The GitHub features are off until `gh` is both installed *and* logged in,
+ * so the row has three states: active, installed-but-signed-out (with a
+ * Re-check button, since `gh auth login` happens in a pane), and missing.
+ * raum never stores a token — every request is made by `gh` itself.
+ */
+const GithubCliRow: Component<{ active: boolean }> = (props) => {
+  // Probe only while the section is on screen; flipping back to `undefined`
+  // parks the resource, and returning here refetches (same rule as the
+  // harness re-probe above).
+  const [status, { refetch }] = createResource(
+    () => props.active || undefined,
+    () =>
+      invoke<GhStatus>(GITHUB_COMMANDS.status).catch(
+        (e): GhStatus => ({
+          installed: false,
+          version: null,
+          path: null,
+          hosts: [],
+          error: String(e),
+        }),
+      ),
+  );
+
+  const signedIn = () => (status()?.hosts.length ?? 0) > 0;
+
+  const summary = () => {
+    const s = status();
+    if (!s?.installed) {
+      return "Enables PR status, deployments, releases and merge inside raum. Optional.";
+    }
+    if (!signedIn()) {
+      return "Not logged in. Run gh auth login in any pane, then click Re-check.";
+    }
+    return `Logged in to ${s.hosts.join(", ")}. Enables PR status, checks, deployments, releases and merge. Requests are made by gh with your token.`;
+  };
+
+  const openInstallDocs = async () => {
+    try {
+      await openUrl("https://cli.github.com");
+    } catch (e) {
+      console.warn("openUrl failed", e);
+    }
+  };
+
+  return (
+    <div class="rounded border border-border bg-card/30 px-3 py-2">
+      <div class="flex items-baseline justify-between gap-3">
+        <p class="text-xs text-foreground">
+          GitHub CLI
+          <Show when={status()?.version}>
+            {(v) => <span class="text-muted-foreground"> · gh {v()}</span>}
+          </Show>
+        </p>
+        <Show
+          when={status()}
+          fallback={<span class="text-[10px] text-muted-foreground">Checking…</span>}
+        >
+          {(s) => (
+            <Show
+              when={s().installed}
+              fallback={
+                <button
+                  type="button"
+                  class="shrink-0 rounded border border-border bg-background px-2 py-0.5 text-[10px] text-foreground transition-colors hover:bg-accent"
+                  onClick={() => void openInstallDocs()}
+                >
+                  Install ↗
+                </button>
+              }
+            >
+              <span class={cx("text-[10px]", signedIn() ? "text-success" : "text-warning")}>
+                {signedIn() ? "✓ active" : "○ sign in"}
+              </span>
+            </Show>
+          )}
+        </Show>
+      </div>
+      <p class="mt-0.5 text-[10px] text-muted-foreground">{summary()}</p>
+      <Show when={status()?.error}>
+        {(err) => <p class="mt-0.5 text-[10px] text-foreground-dim">{err()}</p>}
+      </Show>
+      <Show when={status()?.installed && !signedIn()}>
+        <button
+          type="button"
+          class="mt-1.5 rounded border border-border bg-background px-2 py-0.5 text-[10px] text-foreground transition-colors hover:bg-accent disabled:pointer-events-none disabled:opacity-50"
+          onClick={() => void refetch()}
+          disabled={status.loading}
+        >
+          {status.loading ? "Checking…" : "Re-check"}
+        </button>
+      </Show>
+    </div>
+  );
+};
+
 export const HarnessesSection: Component<{ active: boolean }> = (props) => {
   const [config, { mutate: mutateConfig }] = createResource(async () => {
     const cfg = await invoke<{
@@ -477,8 +610,164 @@ export const HarnessesSection: Component<{ active: boolean }> = (props) => {
     }
   };
 
+  // Commit & push agent. `null` = auto (first installed harness).
+  void loadCommitHarnessPreference();
+  const [savingCommit, setSavingCommit] = createSignal(false);
+  const pickCommitHarness = async (kind: CommitHarness | null) => {
+    setSavingCommit(true);
+    try {
+      await setCommitHarnessPreference(kind);
+    } catch (e) {
+      console.warn("config_set_commit_harness failed", e);
+    } finally {
+      setSavingCommit(false);
+    }
+  };
+  const commitChoice = (kind: CommitHarness | null, label: string) => (
+    <button
+      type="button"
+      disabled={savingCommit() || commitHarnessPreference() === undefined}
+      class={cx(
+        "flex items-center gap-1.5 rounded border px-2 py-1 text-[10px] transition-colors disabled:pointer-events-none disabled:opacity-50",
+        commitHarnessPreference() === kind
+          ? "border-primary/60 bg-primary/10 text-foreground"
+          : "border-border bg-card/30 text-muted-foreground hover:bg-accent/50",
+      )}
+      onClick={() => void pickCommitHarness(kind)}
+    >
+      <Show when={kind}>{(k) => <Dynamic component={HARNESS_ICONS[k()]} class="size-3" />}</Show>
+      <span>{label}</span>
+    </button>
+  );
+
+  // Per-harness model + effort for the commit agent. Models come from the
+  // same discovery the review picker uses; the first entry is raum's
+  // built-in cheap tier (clears the override).
+  const [commitModels] = createResource(
+    () => commitConfig() !== undefined,
+    async () => {
+      const out: Partial<Record<CommitHarness, HarnessModel[]>> = {};
+      await Promise.all(
+        COMMIT_HARNESSES.map(async (kind) => {
+          out[kind] = await invoke<HarnessModel[]>("list_harness_models", { kind }).catch(() => []);
+        }),
+      );
+      return out;
+    },
+  );
+  const pickCommitModel = async (kind: CommitHarness, tier: CommitTier | null) => {
+    setSavingCommit(true);
+    try {
+      await setCommitModel(kind, tier);
+    } catch (e) {
+      console.warn("config_set_commit_model failed", e);
+    } finally {
+      setSavingCommit(false);
+    }
+  };
+  const commitModelRow = (kind: CommitHarness) => {
+    const Icon = HARNESS_ICONS[kind];
+    const pinned = () => commitConfig()?.[kind] ?? null;
+    const tier = () => commitTier(kind);
+    const def = COMMIT_DEFAULT_TIER[kind];
+    const models = () => commitModels()?.[kind] ?? [];
+    const efforts = () => models().find((m) => m.id === tier()?.model)?.supportedEfforts ?? [];
+    return (
+      <div class="flex flex-wrap items-center gap-2 border-t border-border/50 py-1.5 text-[10px]">
+        <span class="flex w-20 items-center gap-1.5 text-foreground">
+          <Icon class="size-3" />
+          {kindDisplayLabel(kind)}
+        </span>
+        <DropdownMenu>
+          <DropdownMenuTrigger
+            as="button"
+            type="button"
+            disabled={savingCommit() || commitModels.loading}
+            class="flex min-w-36 items-center justify-between gap-2 rounded border border-border bg-background px-2 py-1 text-left text-foreground hover:bg-accent disabled:opacity-50"
+            aria-label={`Commit model for ${kindDisplayLabel(kind)}`}
+          >
+            <span class="truncate">
+              {tier()?.model ?? "Harness default"}
+              <Show when={!pinned()}>
+                <span class="text-muted-foreground"> (default)</span>
+              </Show>
+            </span>
+            <span aria-hidden="true">▾</span>
+          </DropdownMenuTrigger>
+          <DropdownMenuPortal>
+            <DropdownMenuContent class="max-h-72 min-w-48 overflow-y-auto">
+              <DropdownMenuItem class="text-xs" onSelect={() => void pickCommitModel(kind, null)}>
+                <CheckIcon class={cx("size-3", pinned() ? "invisible" : "")} />
+                {def ? `${def.model} · ${def.effort} (raum default)` : "Harness default"}
+              </DropdownMenuItem>
+              <Show when={models().length > 0}>
+                <DropdownMenuSeparator />
+              </Show>
+              <For each={models()}>
+                {(m) => (
+                  <DropdownMenuItem
+                    class="text-xs"
+                    onSelect={() =>
+                      void pickCommitModel(kind, {
+                        model: m.id,
+                        effort: m.supportedEfforts.includes("low")
+                          ? "low"
+                          : (m.defaultEffort ?? m.supportedEfforts[0]),
+                      })
+                    }
+                  >
+                    <CheckIcon class={cx("size-3", pinned()?.model === m.id ? "" : "invisible")} />
+                    {m.label}
+                  </DropdownMenuItem>
+                )}
+              </For>
+            </DropdownMenuContent>
+          </DropdownMenuPortal>
+        </DropdownMenu>
+        <Show when={efforts().length > 0}>
+          <div class="flex overflow-hidden rounded border border-border" role="radiogroup">
+            <For each={efforts()}>
+              {(effort) => (
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={tier()?.effort === effort}
+                  disabled={savingCommit()}
+                  class={cx(
+                    "px-1.5 py-1 transition-colors disabled:opacity-50",
+                    tier()?.effort === effort
+                      ? "bg-primary/15 text-foreground"
+                      : "text-muted-foreground hover:bg-accent/50",
+                  )}
+                  onClick={() => {
+                    const t = tier();
+                    if (t) void pickCommitModel(kind, { model: t.model, effort });
+                  }}
+                >
+                  {effort}
+                </button>
+              )}
+            </For>
+          </div>
+        </Show>
+      </div>
+    );
+  };
+
   return (
     <div class="flex flex-col gap-3">
+      <div class="rounded border border-border bg-card/30 px-3 py-2">
+        <p class="text-xs text-foreground">Commit &amp; push agent</p>
+        <p class="mb-2 text-[10px] text-muted-foreground">
+          Harness the sidebar "Commit &amp; push" button spawns, and the model it runs per harness.
+          A <code>--model</code> in that harness's extra flags takes precedence.
+        </p>
+        <div class="mb-2 flex flex-wrap gap-1.5">
+          {commitChoice(null, "Auto (first installed)")}
+          <For each={[...COMMIT_HARNESSES]}>{(k) => commitChoice(k, kindDisplayLabel(k))}</For>
+        </div>
+        <For each={[...COMMIT_HARNESSES]}>{commitModelRow}</For>
+      </div>
       <div class="flex items-start justify-between gap-3">
         <p class="text-[10px] text-muted-foreground">
           Detected harnesses and the extra flags raum passes when launching them.
@@ -629,6 +918,10 @@ export const HarnessesSection: Component<{ active: boolean }> = (props) => {
             );
           }}
         </For>
+      </div>
+      <div class="flex flex-col gap-1.5">
+        <p class="text-[9px] uppercase tracking-wider text-muted-foreground/60">Prerequisites</p>
+        <GithubCliRow active={props.active} />
       </div>
     </div>
   );

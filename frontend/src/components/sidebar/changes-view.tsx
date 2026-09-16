@@ -1,10 +1,11 @@
 /**
  * §9.5 — the Changes view of an open worktree tab. A source-control panel
  * that owns:
- *   • a Commit button that opens a harness picker; the chosen agent spawns in
- *     this worktree, pre-loaded with a prompt to review the changes and create
- *     logical, file-whole commits per the project's conventions (no message
- *     box — the agent writes them).
+ *   • a "Commit & push" split button: the primary hit spawns the user's
+ *     preferred harness at its cheap tier (haiku low / gpt-5.6-luna low) in
+ *     this worktree, pre-loaded with a prompt to review the changes, create
+ *     logical, file-whole commits and push. The chevron offers the other
+ *     installed harnesses and a commit-only variant.
  *   • collapsible, sticky "Staged"/"Changed" groups with count chips, status
  *     letters, per-file +/− counts, click-to-diff, and a context menu; the
  *     group headers carry hover-revealed bulk stage/unstage/discard actions.
@@ -21,32 +22,42 @@
  */
 
 import { Component, For, Show, createEffect, createMemo, createSignal } from "solid-js";
-import { Portal } from "solid-js/web";
+import { Dynamic, Portal } from "solid-js/web";
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 
 import { splitChanges } from "../../lib/gitChangeDisplay";
-import type { AgentKind } from "../../stores/agentStore";
-import { CheckIcon, ChevronDownIcon, ChevronRightIcon, LoaderIcon, PlusIcon } from "../icons";
-import { CommitHarnessDialog } from "./commit-harness-dialog";
+import { kindDisplayLabel } from "../../lib/agentKind";
+import {
+  CheckIcon,
+  ChevronDownIcon,
+  ChevronRightIcon,
+  HARNESS_ICONS,
+  LoaderIcon,
+  PlusIcon,
+} from "../icons";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuPortal,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "../ui/dropdown-menu";
+import {
+  availableCommitHarnesses,
+  commitHarnessPreference,
+  commitTierLabel,
+  loadCommitHarnessPreference,
+  resolveCommitHarness,
+  spawnCommitHarness,
+  type CommitHarness,
+} from "./commit-harness";
 import { DiscardConfirmDialog } from "./discard-confirm-dialog";
 import { FileChangeRow } from "./file-change-row";
 import { gitDiscard, gitDiscardAll, gitStage, gitUnstage } from "./git-commands";
 import { MinusGlyph, TrashGlyph } from "./glyphs";
 import { RaumLogo } from "./main-branch-picker";
 import type { ChangesViewProps } from "./types";
-
-// Instruction handed to the spawned harness. It inspects the worktree's own
-// uncommitted changes and commits them in logical, file-whole commits so each
-// commit is self-consistent and safe.
-const COMMIT_PROMPT = [
-  "Review the uncommitted changes in this git worktree and commit them for me.",
-  "",
-  "- Inspect the work first: run `git status` and `git diff` (both staged and unstaged) to understand what changed.",
-  "- Group the changes into logical commits by feature or fix. If the work spans more than one distinct feature or fix, make multiple commits — one per logical unit.",
-  "- NEVER split a single file across commits. Stage whole files only (no `git add -p` / hunk or patch splitting) so every commit is self-consistent and builds.",
-  "- Follow this project's commit conventions (check AGENTS.md / CLAUDE.md and recent `git log` for the message style).",
-  "- Create the commit(s). Do not push.",
-].join("\n");
 
 export const ChangesView: Component<ChangesViewProps> = (props) => {
   // Right-click context menu on file rows. Coordinates are viewport-relative
@@ -170,39 +181,69 @@ export const ChangesView: Component<ChangesViewProps> = (props) => {
     }
   };
 
-  // Commit opens a harness picker; choosing a harness spawns it in this worktree
-  // pre-loaded with the commit prompt. The agent reviews the changes and writes
-  // the commits itself (logical, file-whole) — there is no message box.
-  const [pickerOpen, setPickerOpen] = createSignal(false);
-  const commitWith = (kind: AgentKind) => {
-    setPickerOpen(false);
-    window.dispatchEvent(
-      new CustomEvent("raum:spawn-requested", {
-        detail: {
-          kind,
-          projectSlug: props.projectSlug,
-          worktreeId: props.worktree.path,
-          initialPrompt: COMMIT_PROMPT,
-        },
-      }),
-    );
-  };
+  // Commit & push: the primary button spawns the preferred (or first
+  // installed) harness at its cheap tier with the commit+push prompt. The
+  // chevron menu lists every installed harness plus a commit-only variant.
+  const [installed, setInstalled] = createSignal<CommitHarness[]>([]);
+  void loadCommitHarnessPreference();
+  void availableCommitHarnesses().then(setInstalled);
+  const commitHarness = () => resolveCommitHarness(commitHarnessPreference(), installed());
+  const commitWith = (kind: CommitHarness, push: boolean) =>
+    spawnCommitHarness({
+      kind,
+      projectSlug: props.projectSlug,
+      worktreeId: props.worktree.path,
+      push,
+    });
 
   return (
     <div class="flex flex-col gap-2 pt-2">
-      {/* Commit — opens a harness picker; the chosen agent reviews the changes
-          and writes logical, file-whole commits. No message box. */}
-      <button
-        type="button"
-        class="flex h-8 w-full items-center justify-center gap-1.5 rounded-md bg-selected text-[11px] font-medium text-foreground transition-colors hover:bg-hover disabled:cursor-not-allowed disabled:bg-surface-sunken disabled:text-foreground-dim"
-        title="Commit — pick an agent to review the changes and commit them in logical, file-whole commits"
-        aria-label="Commit changes with an agent"
-        disabled={!hasChanges()}
-        onClick={() => setPickerOpen(true)}
-      >
-        <CheckIcon class="size-3.5" />
-        <span>Commit</span>
-      </button>
+      {/* Commit & push split button. */}
+      <div class="flex h-8 w-full items-stretch">
+        <button
+          type="button"
+          class="flex min-w-0 flex-1 items-center justify-center gap-1.5 rounded-l-md bg-selected text-[11px] font-medium text-foreground transition-colors hover:bg-hover disabled:cursor-not-allowed disabled:bg-surface-sunken disabled:text-foreground-dim"
+          title={`Commit & push with ${kindDisplayLabel(commitHarness())} (${commitTierLabel(commitHarness())}) — logical, file-whole commits, then push`}
+          aria-label="Commit and push changes with an agent"
+          disabled={!hasChanges() || installed().length === 0}
+          onClick={() => commitWith(commitHarness(), true)}
+        >
+          <Dynamic component={HARNESS_ICONS[commitHarness()]} class="size-3.5 shrink-0" />
+          <span class="truncate">Commit & push</span>
+        </button>
+        <DropdownMenu placement="bottom-end">
+          <DropdownMenuTrigger
+            as="button"
+            type="button"
+            class="flex w-6 shrink-0 items-center justify-center rounded-r-md border-l border-border/50 bg-selected text-foreground transition-colors hover:bg-hover disabled:cursor-not-allowed disabled:bg-surface-sunken disabled:text-foreground-dim"
+            aria-label="More commit options"
+            disabled={!hasChanges() || installed().length === 0}
+          >
+            <ChevronDownIcon class="size-3" />
+          </DropdownMenuTrigger>
+          <DropdownMenuPortal>
+            <DropdownMenuContent class="min-w-56">
+              <For each={installed()}>
+                {(kind) => (
+                  <DropdownMenuItem class="text-xs" onSelect={() => commitWith(kind, true)}>
+                    <Dynamic component={HARNESS_ICONS[kind]} class="size-3.5 shrink-0" />
+                    <span class="flex-1">Commit & push with {kindDisplayLabel(kind)}</span>
+                    <span class="text-[10px] text-muted-foreground">{commitTierLabel(kind)}</span>
+                  </DropdownMenuItem>
+                )}
+              </For>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem class="text-xs" onSelect={() => commitWith(commitHarness(), false)}>
+                <CheckIcon class="size-3.5 shrink-0" />
+                <span class="flex-1">Commit only (no push)</span>
+                <span class="text-[10px] text-muted-foreground">
+                  {kindDisplayLabel(commitHarness())}
+                </span>
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenuPortal>
+        </DropdownMenu>
+      </div>
 
       {/* Git staging view */}
       <Show
@@ -526,13 +567,6 @@ export const ChangesView: Component<ChangesViewProps> = (props) => {
           setDiscardTarget(null);
           setDiscardError(null);
         }}
-      />
-
-      {/* Harness picker for the Commit action. */}
-      <CommitHarnessDialog
-        open={pickerOpen()}
-        onClose={() => setPickerOpen(false)}
-        onPick={commitWith}
       />
     </div>
   );

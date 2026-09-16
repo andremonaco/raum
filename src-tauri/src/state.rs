@@ -49,6 +49,12 @@ pub struct AppHandleState {
     /// `None` when setup failed — status then degrades to the one-shot
     /// `worktree_status` command.
     pub status_service: Mutex<Option<crate::commands::worktree::WorktreeStatusService>>,
+    /// Per-worktree GitHub pull-request poll service. Same lifecycle as
+    /// [`Self::status_service`]: populated during Tauri `setup`, `None` when
+    /// that failed — the PR chip then simply never appears.
+    pub github_pr: Mutex<Option<crate::commands::github::GithubPrService>>,
+    /// Deployments + releases poll service for the active project.
+    pub github_repo: Mutex<Option<crate::commands::github::GithubRepoService>>,
     /// §7.6 — hook-event UDS socket handle. Populated once during Tauri
     /// `setup`; `None` when socket bind failed (logged as a warning so we
     /// degrade to the silence heuristic instead of crashing the app).
@@ -271,6 +277,8 @@ impl Default for AppHandleState {
             agent_events: AgentEventBus::new(),
             git_watchers: Mutex::new(HashMap::new()),
             status_service: Mutex::new(None),
+            github_pr: Mutex::new(None),
+            github_repo: Mutex::new(None),
             event_socket: Mutex::new(None),
             harness_runtimes: HarnessRuntimeRegistry::new(),
             channel_event_tx: Mutex::new(None),

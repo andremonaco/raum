@@ -22,6 +22,11 @@ Optional (only required if you want to spawn the matching harness):
 | Codex        | `codex`    | OpenAI Codex CLI                        |
 | OpenCode     | `opencode` | <https://github.com/opencode-ai/opencode> |
 
+Also optional: GitHub's `gh` CLI (2.42 or newer) plus a `gh auth login`. With
+it, raum shows pull-request status, checks, deployments and releases per
+worktree and can merge from the UI — see
+[GitHub integration](./github-integration.md). Without it, nothing changes.
+
 Install raum itself:
 
 - **macOS** — `brew install --cask andremonaco/raum/raum`, or download the
@@ -148,5 +153,7 @@ socket.
 
 See [`config.md`](./config.md) for the full TOML reference,
 [`harnesses.md`](./harnesses.md) for the per-harness reliability / reply
-matrix, and [`harness-integration.md`](./harness-integration.md) for how
-hooks and the `<raum-managed>` block work.
+matrix, [`harness-integration.md`](./harness-integration.md) for how hooks
+and the `<raum-managed>` block work, and
+[`github-integration.md`](./github-integration.md) for pull-request status
+and merge via `gh`.

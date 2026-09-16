@@ -191,6 +191,13 @@ pub async fn drive_event_socket<R: Runtime>(
             /// permission notification below.
             routable: bool,
         }
+        let siblings_parked = ev.event == "PostToolUse"
+            && ev.session_id.as_deref().is_some_and(|sid| {
+                state.event_socket.lock().is_ok_and(|slot| {
+                    slot.as_ref()
+                        .is_some_and(|h| h.pending.parked_for_session(sid) > 0)
+                })
+            });
         let Drained {
             changes,
             prompt_update,
@@ -207,7 +214,20 @@ pub async fn drive_event_socket<R: Runtime>(
             // to a different harness's machine) must not record prompts
             // onto the wrong machine or insert phantom rows into
             // sessions.toml via `update_session_harness_id`.
-            let routed = registry.route_hook_event(kind, ev.session_id.as_deref(), &core_event);
+            //
+            // `PostToolUse` is the Working edge for a prompt answered in
+            // the harness TUI (the socket server evicted its parked
+            // request just before forwarding this). While sibling
+            // requests are still parked the session is still blocked on
+            // a prompt, so leave the machine in Waiting — mirrors the
+            // reply path in `commands::permission`.
+            let routed = if siblings_parked {
+                registry
+                    .route_target(kind, ev.session_id.as_deref())
+                    .map(|_| Vec::new())
+            } else {
+                registry.route_hook_event(kind, ev.session_id.as_deref(), &core_event)
+            };
             let routable = routed.is_some();
             let changes = routed.unwrap_or_default();
             // The harness pipes its full hook payload to the script

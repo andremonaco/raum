@@ -140,7 +140,13 @@ pub async fn deliver_permission_decision<R: Runtime>(
     let key = PendingKey::new(session_id.map(str::to_string), request_id.to_string());
     match pending.reply(&key, decision.wire_tag()).await {
         Ok(()) => {
-            if let Some(session_id) = session_id {
+            // Only the LAST parked request unblocks the session: Claude
+            // Code prompts for parallel tool calls concurrently, and
+            // demoting on the first answer would hide the sibling prompt
+            // (the rail and toasts are keyed on `waiting`).
+            if let Some(session_id) = session_id
+                && pending.parked_for_session(session_id) == 0
+            {
                 demote_after_reply(app, session_id);
             }
             info!(

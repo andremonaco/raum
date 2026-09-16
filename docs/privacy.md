@@ -1,7 +1,11 @@
 # raum privacy
 
-raum is a local-first, offline-first tool. We make **one** outbound network
-call from the app itself.
+raum is a local-first, offline-first tool. The app process itself makes
+**one** kind of outbound network call: the update check below. Everything
+else that touches the network runs as a separate binary you installed and
+authenticated yourself — the agent harnesses, and the optional GitHub
+integration through the `gh` CLI. raum spawns those as subprocesses the same
+way it spawns `git`; it holds no tokens and opens no sockets of its own.
 
 ## The updater check
 
@@ -41,8 +45,56 @@ services over their own network paths. Those requests are originated by the
 harness binary, not by raum. Consult each harness' privacy policy for the
 specifics.
 
+## GitHub integration (opt-in, via gh)
+
+The pull-request, checks, deployments, releases and merge features are
+**off** until two things are true: GitHub's own `gh` CLI is on your `PATH`,
+and `gh auth status` reports a logged-in host. Settings → Harnesses →
+Prerequisites shows the probe result. If either is missing, raum never
+spawns `gh` and the GitHub chrome stays hidden.
+
+When it is on, raum runs `gh` as a subprocess — exactly how it already runs
+`git` — and reads the JSON on stdout. The HTTPS request is made by the `gh`
+binary with the token `gh auth login` stored in your keychain. raum never
+sees, copies or persists that token, and no HTTP client crate is linked into
+the app.
+
+**What is sent to GitHub** (as arguments to `gh`, and from there into the
+GitHub API):
+
+- The repository owner and name, which `gh` derives from the `origin` remote
+  of the worktree it runs in.
+- Branch names, pull-request numbers and merge options you pick in the merge
+  sheet.
+- The text you type into the Spotlight PR search.
+
+**What is never sent:** terminal output, pane or session contents, agent
+prompts and replies, file contents, project paths, and your raum config.
+
+**Polling cadence.** raum polls, because GitHub offers no client-side push
+channel. The rate follows the state: every 10 s while checks or deployments
+are still running, every 90 s for a settled open PR, every 2–5 min for
+settled deployments and releases, and every 5 min for branches with no PR.
+Polling is paused whenever the raum window is unfocused, and runs only for
+the active project.
+
+**How to disable it.** Run `gh auth logout`, or uninstall `gh`. The next
+probe finds no authenticated host and the integration goes dark; nothing
+needs to be reset inside raum.
+
+**GitHub Enterprise.** raum compares the host of your `origin` remote against
+the hosts `gh auth status` lists, so an Enterprise host works as soon as
+`gh auth login --hostname <host>` succeeds. Worktrees whose remote is not a
+host `gh` is logged into are skipped entirely.
+
 ## CI-enforced audit
 
 `Notifications` §11.7 integration tests assert that raum performs **no**
 outbound network calls during a `waiting`-state notification burst. The
 test runs in a network-denying harness in CI.
+
+`crates/raum-core/tests/no_outbound_network.rs` additionally rejects any
+direct HTTP dependency (`reqwest`, `hyper`, `octocrab`, …) outside the
+updater plugin and the loopback-only OpenCode path. The GitHub integration
+adds no crate to that list — it shells out to `gh` instead, so the test is
+unchanged.

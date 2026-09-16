@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use toml::Value;
 
 use crate::agent::{AgentKind, AgentState};
+use crate::harness::launch::ModelOverride;
 
 pub const DEFAULT_PATH_PATTERN: &str = "{parent-dir}/{base-folder}-worktrees/{branch-slug}";
 /// Pattern for the `Nested` strategy — worktrees live inside the project at
@@ -49,6 +50,8 @@ pub struct Config {
     pub updater: UpdaterConfig,
     pub projects: ProjectsConfig,
     pub terminals: TerminalsConfig,
+    #[serde(skip_serializing_if = "CommitConfig::is_default")]
+    pub commit: CommitConfig,
     /// Catch-all for forward-compatible keys so unknown user-added settings
     /// survive a round-trip. Logged at INFO by the store when populated.
     #[serde(flatten, skip_serializing_if = "BTreeMap::is_empty")]
@@ -70,7 +73,42 @@ impl Default for Config {
             updater: UpdaterConfig::default(),
             projects: ProjectsConfig::default(),
             terminals: TerminalsConfig::default(),
+            commit: CommitConfig::default(),
             unknown: BTreeMap::new(),
+        }
+    }
+}
+
+/// Sidebar "Commit & push" button. `harness = None` means "first installed
+/// harness in raum's preference order" (resolved by the frontend, which owns
+/// the install probe). Per-harness `ModelOverride`s replace the frontend's
+/// built-in cheap tier (haiku low / gpt-5.6-luna low); `None` keeps it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CommitConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub harness: Option<AgentKind>,
+    #[serde(rename = "claude-code", skip_serializing_if = "Option::is_none")]
+    pub claude_code: Option<ModelOverride>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codex: Option<ModelOverride>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opencode: Option<ModelOverride>,
+}
+
+impl CommitConfig {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Set (or clear with `None`) the model override for `kind`. Shell has
+    /// no commit role and is ignored.
+    pub fn set_model(&mut self, kind: AgentKind, model: Option<ModelOverride>) {
+        match kind {
+            AgentKind::ClaudeCode => self.claude_code = model,
+            AgentKind::Codex => self.codex = model,
+            AgentKind::OpenCode => self.opencode = model,
+            AgentKind::Shell => {}
         }
     }
 }
@@ -917,6 +955,14 @@ mod tests {
                 branch_prefix_mode: BranchPrefixMode::Custom,
                 branch_prefix_custom: Some("feature/".into()),
                 ..WorktreeConfig::default()
+            },
+            commit: CommitConfig {
+                harness: Some(AgentKind::Codex),
+                codex: Some(ModelOverride {
+                    model: "gpt-5.5".into(),
+                    effort: Some("medium".into()),
+                }),
+                ..CommitConfig::default()
             },
             ..Config::default()
         };

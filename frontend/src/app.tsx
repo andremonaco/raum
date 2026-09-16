@@ -1,4 +1,12 @@
-import { Show, createResource, createSignal, onCleanup, onMount, type Component } from "solid-js";
+import {
+  Show,
+  createEffect,
+  createResource,
+  createSignal,
+  onCleanup,
+  onMount,
+  type Component,
+} from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { toast } from "solid-sonner";
@@ -50,7 +58,12 @@ import {
   prewarmAllWorktrees,
   resyncStatusSubscriptions,
 } from "./stores/worktreeStore";
-import { setActiveProjectSlug } from "./stores/projectStore";
+import { activeProjectSlug, setActiveProjectSlug } from "./stores/projectStore";
+import {
+  refreshGhStatus,
+  setGithubActiveProject,
+  subscribeGithubEvents,
+} from "./stores/githubStore";
 import "overlayscrollbars/overlayscrollbars.css";
 
 interface RaumConfigSnapshot {
@@ -319,6 +332,26 @@ const App: Component = () => {
     void loadThemeFromConfig().catch((e) => console.warn("loadThemeFromConfig failed", e));
     void initHomeDir();
     let disposed = false;
+    // GitHub integration: one event fan-in for the whole app plus the `gh`
+    // prerequisite probe. The repo pollers follow the active project (effect
+    // below), the same rule the git watcher uses.
+    let stopGithub: (() => void) | undefined;
+    void subscribeGithubEvents()
+      .then((unlisten) => {
+        if (disposed) {
+          unlisten();
+          return;
+        }
+        stopGithub = unlisten;
+      })
+      .catch(() => {
+        /* Tauri context unavailable (tests). */
+      });
+    void refreshGhStatus();
+    createEffect(() => {
+      setGithubActiveProject(activeProjectSlug() ?? null);
+    });
+    onCleanup(() => stopGithub?.());
     let stopFileDrop: (() => void) | undefined;
     void installFileDrop()
       .then((unlisten) => {

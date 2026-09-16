@@ -9,6 +9,7 @@ pub mod config;
 pub mod devtools;
 pub mod files;
 pub mod git_watcher;
+pub mod github;
 pub mod harness;
 pub mod harness_runtime;
 pub mod hotkeys;
