@@ -20,6 +20,13 @@ import { projectBySlug } from "../stores/projectStore";
 import { terminalStore } from "../stores/terminalStore";
 import { resolveSessionTabLabel } from "../lib/harnessTabLabel";
 import { pendingPermissionForSession, replyPermission } from "../lib/notificationCenter";
+import {
+  ackGithubAttention,
+  activateGithubAttention,
+  bucketDotClass,
+  githubAttention,
+  type GithubAttentionRow,
+} from "../lib/githubAttention";
 import { permissionSummary } from "../lib/permissionSummary";
 import { HARNESS_ICONS, type HarnessIconKind } from "./icons";
 
@@ -43,6 +50,64 @@ export function stateVerb(state: AttentionItem["session"]["state"]): string {
   return state;
 }
 
+/**
+ * A PR or deployment row. The dot is the only coloured element — see the
+ * restraint rule in `githubAttention.ts`. Clicking focuses the worktree the
+ * branch is checked out in, or opens GitHub; × acknowledges.
+ */
+export const GithubAttentionRailRow: Component<{
+  row: GithubAttentionRow;
+  now: number;
+  onClose?: () => void;
+}> = (props) => (
+  <div
+    class="group flex items-center gap-2 rounded-md px-1.5 py-1.5 text-xs hover:bg-hover"
+    data-testid="attention-github"
+  >
+    <button
+      type="button"
+      class="flex min-w-0 flex-1 items-center gap-2 text-left focus:outline-none"
+      onClick={() => {
+        activateGithubAttention(props.row);
+        props.onClose?.();
+      }}
+    >
+      <span class={`size-2 shrink-0 rounded-full ${bucketDotClass(props.row.bucket)}`} />
+      <span class="min-w-0 flex-1 truncate text-foreground/90">{props.row.label}</span>
+      <span class="max-w-[35%] shrink-0 truncate text-[10px] text-muted-foreground">
+        {props.row.sub}
+      </span>
+      <Show when={props.row.projectSlug ? projectBySlug().get(props.row.projectSlug) : undefined}>
+        {(p) => (
+          <span
+            class="shrink-0 font-mono text-[10px]"
+            style={{ color: p().color }}
+            title={p().name}
+          >
+            {p().sigil}
+          </span>
+        )}
+      </Show>
+      <span class="shrink-0 text-[10px] tabular-nums text-muted-foreground">
+        {formatAge(props.row.at, props.now)}
+      </span>
+    </button>
+    <button
+      type="button"
+      class="focus-ring pointer-events-none shrink-0 rounded px-0.5 text-xs leading-none text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover:pointer-events-auto group-hover:opacity-100 focus-visible:pointer-events-auto focus-visible:opacity-100"
+      title="Dismiss"
+      aria-label="Dismiss"
+      data-testid="attention-dismiss"
+      onClick={(e) => {
+        e.stopPropagation();
+        ackGithubAttention(props.row.id);
+      }}
+    >
+      ×
+    </button>
+  </div>
+);
+
 export interface AttentionRailProps {
   /** Dismiss the rail (e.g. after a focus action) — supplied by the caller. */
   onClose?: () => void;
@@ -58,6 +123,7 @@ export const AttentionRail: Component<AttentionRailProps> = (props) => {
   });
 
   const queue = createMemo<AttentionItem[]>(() => attentionQueue());
+  const github = createMemo<GithubAttentionRow[]>(() => githubAttention());
 
   function focusSession(sessionId: string): void {
     window.dispatchEvent(new CustomEvent("terminal-focus-requested", { detail: { sessionId } }));
@@ -72,7 +138,7 @@ export const AttentionRail: Component<AttentionRailProps> = (props) => {
       </div>
 
       <Show
-        when={queue().length > 0}
+        when={queue().length > 0 || github().length > 0}
         fallback={
           <p class="px-2 pb-2 text-[11px] leading-snug text-muted-foreground">
             No agents need you right now.
@@ -80,6 +146,11 @@ export const AttentionRail: Component<AttentionRailProps> = (props) => {
         }
       >
         <div class="max-h-80 overflow-y-auto px-1">
+          <For each={github()}>
+            {(row) => (
+              <GithubAttentionRailRow row={row} now={now()} onClose={() => props.onClose?.()} />
+            )}
+          </For>
           <For each={queue()}>
             {(item) => {
               const id = item.session.session_id;

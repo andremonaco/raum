@@ -35,6 +35,17 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { createEffect, createRoot, createSignal } from "solid-js";
 
 import { kindDisplayLabel } from "./agentKind";
+import {
+  __resetGithubAttentionForTests,
+  projectSlugForPath,
+  pushGithubAttention,
+  type GithubAttentionRow,
+} from "./githubAttention";
+import type {
+  GithubDeploymentTransitionPayload,
+  GithubPrTransitionPayload,
+  ReviewDecision,
+} from "./githubTypes";
 import { permissionSummary } from "./permissionSummary";
 import { agentStore, markAcknowledged, unreadAgentCount } from "../stores/agentStore";
 import type { AgentKind, AgentState, Reliability } from "../stores/agentStore";
@@ -599,6 +610,144 @@ async function dispatchDoneNotification(
 }
 
 // ---------------------------------------------------------------------------
+// GitHub transitions — PR edges and deployment outcomes
+// ---------------------------------------------------------------------------
+//
+// Same shape as the agent dispatchers above: the in-app surfaces (attention
+// rail + toast) always get the row, and the OS banner is escalated only while
+// raum is backgrounded. The rail row is the in-app half of the focus gate, so
+// pushing it unconditionally is what makes the banner redundant when focused.
+
+function reviewLabel(decision: ReviewDecision): string {
+  if (decision === "APPROVED") return "approved";
+  if (decision === "CHANGES_REQUESTED") return "changes requested";
+  return "review required";
+}
+
+/** Banner copy plus the attention row for one PR transition. */
+function composePrTransition(payload: GithubPrTransitionPayload): {
+  title: string;
+  body: string;
+  row: GithubAttentionRow;
+} {
+  const { pr, path, kind } = payload;
+  const n = `#${pr.number}`;
+  const checks = pr.checksSummary;
+  const review = reviewLabel(pr.reviewDecision);
+  const projectSlug = projectSlugForPath(path);
+  const projectName = projectSlug ? projectBySlug().get(projectSlug)?.name : undefined;
+
+  let title: string;
+  let body: string;
+  let label: string;
+  let bucket: GithubAttentionRow["bucket"];
+
+  switch (kind) {
+    case "checks_passed": {
+      const ready = pr.mergeStateStatus === "CLEAN";
+      title = `${n} checks passed · ${checks.pass}/${checks.total}`;
+      body = [pr.headRefName, review, ready ? "ready to merge" : null].filter(Boolean).join(" · ");
+      label = ready ? `${n} ready to merge` : `${n} checks passed`;
+      bucket = "pass";
+      break;
+    }
+    case "checks_failed": {
+      // The contract orders `checks` failed-first, so the head of the list is
+      // the check worth naming in the banner.
+      const failing = pr.checks.find((c) => c.bucket === "fail")?.name ?? "checks";
+      title = `${n} ${failing} failed`;
+      body = `${pr.headRefName} · ${checks.fail} of ${checks.total} failing`;
+      label = `${n} checks failing`;
+      bucket = "fail";
+      break;
+    }
+    case "review_approved":
+      title = `${n} approved`;
+      body = pr.title;
+      label = title;
+      bucket = "pass";
+      break;
+    case "changes_requested":
+      title = `${n} changes requested`;
+      body = pr.title;
+      label = title;
+      bucket = "fail";
+      break;
+    case "merged":
+      title = `${n} merged into ${pr.baseRefName}`;
+      body = pr.title;
+      label = `${n} merged`;
+      bucket = "pass";
+      break;
+  }
+
+  return {
+    title,
+    // The banner has no sigil to lean on, so the project leads the body.
+    body: [projectName, body].filter(Boolean).join(" · "),
+    row: {
+      id: `github:pr:${path}:${kind}:${pr.number}`,
+      kind: "pr",
+      group: path,
+      transition: kind,
+      bucket,
+      label,
+      sub: `pr · ${review} · ${checks.pass}/${checks.total}`,
+      at: Date.now(),
+      projectSlug,
+      worktreePath: path,
+      url: pr.url,
+    },
+  };
+}
+
+function handleGithubPrTransition(payload: GithubPrTransitionPayload): void {
+  if (!payload.pr) return;
+  const { title, body, row } = composePrTransition(payload);
+  pushGithubAttention(row);
+  if (!notifyBannerEnabled()) return;
+  if (windowFocused()) return;
+  // No session owns a PR banner, so it carries no session id: an
+  // opportunistic `notifications_clear` for a real session can never target
+  // it. `done` is the non-actionable kind (no Allow/Deny attached).
+  void emitOsNotification(title, body, null, "done");
+}
+
+function handleGithubDeploymentTransition(payload: GithubDeploymentTransitionPayload): void {
+  const env = payload.env;
+  if (!env) return;
+  const at = env.ref ?? env.sha ?? "";
+  const passed = payload.bucket === "pass";
+  const title = passed
+    ? [`${payload.environment} deployed`, at].filter(Boolean).join(" · ")
+    : `${payload.environment} deploy failed`;
+
+  pushGithubAttention({
+    id: `github:deploy:${payload.slug}:${payload.environment}:${env.updatedAt}`,
+    kind: "deploy",
+    group: `${payload.slug}:${payload.environment}`,
+    transition: "deploy",
+    bucket: payload.bucket,
+    label: passed ? `${payload.environment} deployed` : `${payload.environment} deploy failed`,
+    sub: ["deploy", at].filter(Boolean).join(" · "),
+    at: Date.now(),
+    projectSlug: payload.slug,
+    worktreePath: null,
+    url: env.environmentUrl ?? env.logUrl,
+  });
+
+  if (!notifyBannerEnabled()) return;
+  if (windowFocused()) return;
+  const projectName = projectBySlug().get(payload.slug)?.name;
+  void emitOsNotification(
+    title,
+    [projectName, env.message].filter(Boolean).join(" · "),
+    null,
+    "done",
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Event wiring (§11.1)
 // ---------------------------------------------------------------------------
 
@@ -729,6 +878,20 @@ export async function startNotificationCenter(): Promise<UnlistenFn> {
     },
   );
 
+  const unlistenPrTransition = await listen<GithubPrTransitionPayload>(
+    "github-pr-transition",
+    (ev) => {
+      handleGithubPrTransition(ev.payload);
+    },
+  );
+
+  const unlistenDeploymentTransition = await listen<GithubDeploymentTransitionPayload>(
+    "github-deployment-transition",
+    (ev) => {
+      handleGithubDeploymentTransition(ev.payload);
+    },
+  );
+
   // §11.6 — click-to-focus. The Rust `UNUserNotificationCenterDelegate`
   // emits `notifications:clicked` with `{ sessionId }` when the user taps
   // a banner or a Notification Center entry.
@@ -785,6 +948,8 @@ export async function startNotificationCenter(): Promise<UnlistenFn> {
     unlistenRemoved();
     unlistenPermission();
     unlistenPermissionExpired();
+    unlistenPrTransition();
+    unlistenDeploymentTransition();
     unlistenClick();
     unlistenFocus();
     disposeReactive();
@@ -886,6 +1051,19 @@ export function __resetNotificationCenterForTests(): void {
   setNotifyOnDone(true);
   setNotifyBannerEnabled(true);
   setWindowFocused(false);
+  __resetGithubAttentionForTests();
+}
+
+/** @internal — drive the `github-pr-transition` handler without Tauri IPC. */
+export function __handleGithubPrTransitionForTests(payload: GithubPrTransitionPayload): void {
+  handleGithubPrTransition(payload);
+}
+
+/** @internal — drive the `github-deployment-transition` handler from tests. */
+export function __handleGithubDeploymentTransitionForTests(
+  payload: GithubDeploymentTransitionPayload,
+): void {
+  handleGithubDeploymentTransition(payload);
 }
 
 /** @internal — drive the window-focus signal without a Tauri runtime. */

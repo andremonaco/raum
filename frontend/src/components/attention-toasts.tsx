@@ -28,6 +28,13 @@ import { projectBySlug } from "../stores/projectStore";
 import { terminalStore } from "../stores/terminalStore";
 import { resolveSessionTabLabel } from "../lib/harnessTabLabel";
 import { pendingPermissionForSession, replyPermission } from "../lib/notificationCenter";
+import {
+  ackGithubAttention,
+  activateGithubAttention,
+  bucketDotClass,
+  githubAttention,
+  type GithubAttentionRow,
+} from "../lib/githubAttention";
 import { permissionSummary } from "../lib/permissionSummary";
 import { formatAge, stateVerb } from "./attention-rail";
 
@@ -150,6 +157,56 @@ const AttentionToast: Component<{ item: AttentionItem; toastId: string }> = (pro
   );
 };
 
+/**
+ * PR / deployment toast — the twin of the rail's GitHub row, laid out like the
+ * agent toast above: the project's sigil in its colour leads, the project name
+ * heads the first line, the status dot rides the second.
+ */
+const GithubToast: Component<{ row: GithubAttentionRow; toastId: string }> = (props) => {
+  const project = () =>
+    props.row.projectSlug ? (projectBySlug().get(props.row.projectSlug) ?? null) : null;
+  return (
+    <div
+      class="flex w-full items-start gap-2.5"
+      data-testid="attention-github-toast"
+      onMouseDown={(e) => e.preventDefault()}
+    >
+      <button
+        type="button"
+        class="flex min-w-0 flex-1 items-start gap-2.5 text-left focus:outline-none"
+        onClick={() => {
+          activateGithubAttention(props.row);
+          toast.dismiss(props.toastId);
+        }}
+      >
+        <span
+          class="w-4 shrink-0 text-center font-mono text-[15px] leading-none font-semibold"
+          style={{ color: project()?.color }}
+        >
+          {project()?.sigil ?? "·"}
+        </span>
+        <span class="flex min-w-0 flex-1 flex-col gap-0.5">
+          <span class="flex min-w-0 items-baseline gap-2">
+            <span class="shrink-0 text-[12.5px] font-medium text-foreground">
+              {project()?.name ?? "GitHub"}
+            </span>
+            <span class="min-w-0 flex-1 truncate font-mono text-[11px] text-foreground-subtle">
+              {props.row.label}
+            </span>
+            <span class="shrink-0 font-mono text-[10.5px] tabular-nums text-muted-foreground">
+              {formatAge(props.row.at, now())}
+            </span>
+          </span>
+          <span class="flex min-w-0 items-center gap-1.5 font-mono text-[10.5px] text-muted-foreground">
+            <span class={`size-1.5 shrink-0 rounded-full ${bucketDotClass(props.row.bucket)}`} />
+            <span class="truncate">{props.row.sub}</span>
+          </span>
+        </span>
+      </button>
+    </div>
+  );
+};
+
 export const AttentionToasts: Component = () => {
   onMount(() => {
     const t = setInterval(() => setNow(Date.now()), 1000);
@@ -188,6 +245,32 @@ export const AttentionToasts: Component = () => {
       toast.dismiss(key);
     }
     first = false;
+  });
+
+  // Same diff, for GitHub rows. They are never sticky: a PR edge is
+  // information, not a block, so the toast auto-closes and the rail keeps the
+  // row until the user dismisses it or a later transition supersedes it.
+  const shownGithub = new Set<string>();
+  createEffect(() => {
+    const rows = githubAttention();
+    const live = new Set(rows.map((r) => r.id));
+    for (const row of rows) {
+      if (shownGithub.has(row.id)) continue;
+      shownGithub.add(row.id);
+      toast(() => <GithubToast row={row} toastId={row.id} />, {
+        id: row.id,
+        duration: DONE_TOAST_MS,
+        classNames: { content: "min-w-0 flex-1", title: "w-full" },
+        // × acknowledges the row (sonner fires `onAutoClose`, not this, when
+        // the timer elapses, so a timed-out toast leaves the rail row alone).
+        onDismiss: () => ackGithubAttention(row.id),
+      });
+    }
+    for (const id of shownGithub) {
+      if (live.has(id)) continue;
+      shownGithub.delete(id);
+      toast.dismiss(id);
+    }
   });
 
   return null;
