@@ -18,6 +18,7 @@
 
 import {
   Component,
+  For,
   Match,
   Show,
   Suspense,
@@ -27,6 +28,7 @@ import {
   createSignal,
   lazy,
   onCleanup,
+  onMount,
 } from "solid-js";
 
 import {
@@ -36,6 +38,14 @@ import {
   worktreeStatusByPath,
   type Worktree,
 } from "../../stores/worktreeStore";
+import type { PullRequest } from "../../lib/githubTypes";
+import {
+  envDotsForProject,
+  prForPath,
+  releasePrStream,
+  retainPrStream,
+} from "../../stores/githubStore";
+import { bucketDotClass } from "../../lib/githubAttention";
 import { createCountUp } from "../../lib/createCountUp";
 import {
   AlertCircleIcon,
@@ -49,7 +59,7 @@ import { Tooltip, TooltipContent, TooltipPortal, TooltipTrigger } from "../ui/to
 import { countHarnessesForPaths } from "./harness-counter";
 import { MainBranchPicker } from "./main-branch-picker";
 import { WorktreeDetail } from "./worktree-detail";
-import type { DiffTarget, WorktreeTabProps } from "./types";
+import type { DiffTarget, ExpandedTabId, WorktreeTabProps } from "./types";
 
 const DiffViewerModal = lazy(() =>
   import("../diff-viewer-modal").then((m) => ({ default: m.DiffViewerModal })),
@@ -57,6 +67,27 @@ const DiffViewerModal = lazy(() =>
 const FileEditorModal = lazy(() =>
   import("../file-editor-modal").then((m) => ({ default: m.FileEditorModal })),
 );
+
+/**
+ * Suffix after the PR number. Empty when the dot already says everything
+ * (green, nothing to report) so a quiet row stays quiet; a run in flight shows
+ * `done/total`, failures show the count, a draft says so.
+ */
+function prChipLabel(pr: PullRequest): string {
+  if (pr.isDraft) return "draft";
+  if (pr.reviewDecision === "CHANGES_REQUESTED") return "\u2717";
+  const s = pr.checksSummary;
+  if (s.fail > 0) return `\u2717${s.fail}`;
+  if (s.pending > 0) return `${s.pass + s.skipped}/${s.total}`;
+  return "";
+}
+
+/** The chip's dot is the only thing carrying a semantic colour. */
+function prDotClass(pr: PullRequest): string {
+  if (pr.isDraft) return "bg-foreground-dim";
+  if (pr.reviewDecision === "CHANGES_REQUESTED") return "bg-destructive";
+  return bucketDotClass(pr.rollup);
+}
 
 /**
  * Resolve the "sprouted from" base label for additional worktrees. Prefers the
@@ -84,6 +115,18 @@ export const WorktreeTab: Component<WorktreeTabProps> = (props) => {
     null,
   );
 
+  // Which detail tab the next open should land on (the PR chip deep-links to
+  // `github`), plus a handle on the mounted detail's tab selector so a chip
+  // click on an already-open tab switches instead of doing nothing.
+  const [initialTab, setInitialTab] = createSignal<ExpandedTabId>("changes");
+  let selectDetailTab: ((id: ExpandedTabId) => void) | undefined;
+
+  const prEntry = createMemo(() => prForPath(props.worktree.path));
+  const pullRequest = createMemo(() => {
+    const entry = prEntry();
+    return entry?.available === true ? entry.pr : null;
+  });
+
   const status = createMemo(
     () => worktreeStatusByPath()[props.worktree.path] ?? EMPTY_WORKTREE_STATUS,
   );
@@ -107,7 +150,11 @@ export const WorktreeTab: Component<WorktreeTabProps> = (props) => {
     setDiffTarget(null);
     setEditorPath(null);
     retainWorktreeStatusStream(path);
-    onCleanup(() => releaseWorktreeStatusStream(path));
+    retainPrStream(path);
+    onCleanup(() => {
+      releaseWorktreeStatusStream(path);
+      releasePrStream(path);
+    });
   });
 
   const harnessCounts = createMemo(() => countHarnessesForPaths(new Set([props.worktree.path])));
@@ -156,6 +203,39 @@ export const WorktreeTab: Component<WorktreeTabProps> = (props) => {
   const deleteTitle = createMemo(() =>
     props.isMain ? "Unlink project from raum" : "Delete worktree",
   );
+
+  /** Ask for a detail view by dispatching the same window event Spotlight and
+   *  the attention rail use, so in-sidebar clicks and outside deep links share
+   *  one path (the listener below is the only place that acts on it). */
+  const requestDetailTab = (id: ExpandedTabId) => {
+    window.dispatchEvent(
+      new CustomEvent("raum:worktree-tab-requested", {
+        detail: { path: props.worktree.path, tab: id },
+      }),
+    );
+  };
+
+  /** Deep link into one detail view: open the accordion (if collapsed) on that
+   *  tab, or switch the already-mounted detail to it. */
+  const openDetailTab = (id: ExpandedTabId) => {
+    setInitialTab(id);
+    if (props.isOpen) selectDetailTab?.(id);
+    else props.onToggle();
+  };
+
+  // Same deep link from outside the sidebar: Spotlight PR activation and the
+  // attention rail select the worktree, then ask its tab to show a view (see
+  // `focusWorktree` in `lib/githubAttention.ts`). Only the tab whose path
+  // matches reacts.
+  onMount(() => {
+    const onTabRequested = (ev: Event) => {
+      const detail = (ev as CustomEvent<{ path?: string; tab?: ExpandedTabId }>).detail;
+      if (!detail || detail.path !== props.worktree.path || !detail.tab) return;
+      openDetailTab(detail.tab);
+    };
+    window.addEventListener("raum:worktree-tab-requested", onTabRequested);
+    onCleanup(() => window.removeEventListener("raum:worktree-tab-requested", onTabRequested));
+  });
 
   const openEditor = (absPath: string) => {
     setEditorPath(absPath);
@@ -290,6 +370,20 @@ export const WorktreeTab: Component<WorktreeTabProps> = (props) => {
                   </span>
                 </span>
               </Show>
+              {/* Base row only: one dot per deployment environment, newest
+                  first. The dot is the only coloured thing here. */}
+              <Show when={props.isMain}>
+                <span class="flex shrink-0 items-center gap-0.5">
+                  <For each={envDotsForProject(props.projectSlug)}>
+                    {(env) => (
+                      <span
+                        class={`size-1.5 rounded-full ${bucketDotClass(env.bucket)}`}
+                        title={`${env.environment} \u00b7 ${env.ageLabel}`}
+                      />
+                    )}
+                  </For>
+                </span>
+              </Show>
             </span>
             <Show when={status().ahead > 0 || status().behind > 0}>
               <span class="flex shrink-0 items-center gap-0.5 font-mono text-[10px] text-foreground-subtle">
@@ -300,6 +394,33 @@ export const WorktreeTab: Component<WorktreeTabProps> = (props) => {
                   <span>↓{status().behind}</span>
                 </Show>
               </span>
+            </Show>
+            <Show when={pullRequest()}>
+              {(pr) => (
+                <span
+                  role="button"
+                  tabindex="0"
+                  class="focus-ring flex shrink-0 items-center gap-1 rounded px-0.5 -mx-0.5 font-mono text-[10px] text-foreground-subtle hover:text-foreground"
+                  title={`#${pr().number} ${pr().title}`}
+                  onClick={(ev) => {
+                    ev.stopPropagation();
+                    requestDetailTab("github");
+                  }}
+                  onKeyDown={(ev) => {
+                    if (ev.key === "Enter" || ev.key === " ") {
+                      ev.preventDefault();
+                      ev.stopPropagation();
+                      requestDetailTab("github");
+                    }
+                  }}
+                >
+                  <span class={`size-1.5 shrink-0 rounded-full ${prDotClass(pr())}`} />
+                  <span>#{pr().number}</span>
+                  <Show when={prChipLabel(pr())}>
+                    {(label) => <span class="text-foreground-dim">{label()}</span>}
+                  </Show>
+                </span>
+              )}
             </Show>
           </span>
         </span>
@@ -410,6 +531,9 @@ export const WorktreeTab: Component<WorktreeTabProps> = (props) => {
               onOpenDiff={setDiffTarget}
               onOpenEditor={openEditor}
               activeEditorPath={activeEditorPath()}
+              isMain={props.isMain}
+              initialTab={initialTab()}
+              onReady={(select) => (selectDetailTab = select)}
             />
           </Scrollable>
         </div>
