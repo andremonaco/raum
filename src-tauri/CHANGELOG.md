@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.23](https://github.com/andremonaco/raum/releases/tag/v0.1.23) - 2026-09-16
+
+### Added
+
+- feat(backend): add GitHub status monitoring to git_watcher
+- feat(github): GitHub PR/issue tracking and merge sheet
+
+### Fixed
+
+- fix(agent): satisfy clippy manual_is_variant_and on Rust 1.98
+
+### Other
+
+- refactor(github): polish PR service, types, and test suites
+- refactor(ui): update app root, spotlight, and terminal grid for GitHub integration
+- refactor(core): update config and worktree module setup
+
+
 ## [0.1.22](https://github.com/andremonaco/raum/releases/tag/v0.1.22) - 2026-09-12
 
 
