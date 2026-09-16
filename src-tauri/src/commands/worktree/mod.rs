@@ -42,7 +42,7 @@ mod preview;
 mod remove;
 mod sidebar_persist;
 mod status;
-mod status_service;
+pub(crate) mod status_service;
 mod types;
 
 #[cfg(test)]

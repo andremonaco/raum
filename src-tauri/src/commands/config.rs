@@ -8,7 +8,11 @@
 //! Plus `os_info` so the wizard can pick the right install/upgrade commands
 //! (Homebrew on macOS vs apt/dnf/pacman/zypper/apk on Linux).
 
+#![allow(dead_code)]
+
+use raum_core::agent::AgentKind;
 use raum_core::config::{ActiveLayoutState, Config, NESTED_PATH_PATTERN};
+use raum_core::harness::launch::ModelOverride;
 use raum_core::prereqs::{self, HarnessReport, PrereqReport};
 use raum_hydration::validate_path_pattern;
 use serde::Serialize;
@@ -179,6 +183,33 @@ pub fn config_set_harness_flags(
         "opencode" => cfg.harnesses.opencode.extra_flags = flags,
         _ => return Err(format!("unknown harness: {harness}")),
     }
+    store.write_config(&cfg).map_err(|e| e.to_string())
+}
+
+/// Persist the harness the sidebar "Commit & push" button spawns. `None`
+/// clears the preference (first installed harness wins again).
+#[tauri::command(async)]
+pub fn config_set_commit_harness(
+    state: tauri::State<'_, AppHandleState>,
+    harness: Option<AgentKind>,
+) -> Result<(), String> {
+    let store = state.config_store.lock().map_err(|e| e.to_string())?;
+    let mut cfg: Config = store.read_config().map_err(|e| e.to_string())?;
+    cfg.commit.harness = harness;
+    store.write_config(&cfg).map_err(|e| e.to_string())
+}
+
+/// Persist (or clear with `None`) the model/effort the "Commit & push"
+/// button uses for `harness`, replacing raum's built-in cheap tier.
+#[tauri::command(async)]
+pub fn config_set_commit_model(
+    state: tauri::State<'_, AppHandleState>,
+    harness: AgentKind,
+    model: Option<ModelOverride>,
+) -> Result<(), String> {
+    let store = state.config_store.lock().map_err(|e| e.to_string())?;
+    let mut cfg: Config = store.read_config().map_err(|e| e.to_string())?;
+    cfg.commit.set_model(harness, model);
     store.write_config(&cfg).map_err(|e| e.to_string())
 }
 
